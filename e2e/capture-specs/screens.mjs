@@ -54,6 +54,7 @@ const AREAS = [
   ["skills", "Skills"],
   ["memory", "Memory & scratch pad"],
   ["connectors", "Connectors"],
+  ["create", "Create"],
   ["browser", "Private browser"],
 ];
 

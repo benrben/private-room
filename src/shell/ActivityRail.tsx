@@ -2,6 +2,7 @@ import type { ReactElement } from "react";
 import {
   ChevronLeftIcon,
   ChevronRightIcon,
+  CreateIcon,
   FocusIcon,
   GlobeIcon,
   GraphIcon,
@@ -41,6 +42,7 @@ const AREAS: {
   { key: "skills", label: "Skills", icon: (s) => <BookOpenIcon size={s} /> },
   { key: "memory", label: "Memory & scratch pad", icon: (s) => <MemoryIcon size={s} /> },
   { key: "connectors", label: "Connectors", icon: (s) => <LinkIcon size={s} /> },
+  { key: "create", label: "Create", icon: (s) => <CreateIcon size={s} /> },
   { key: "browser", label: "Private browser", icon: (s) => <GlobeIcon size={s} /> },
 ];
 
@@ -217,6 +219,10 @@ export default function ActivityRail({
       </div>
       <div className="rail-divider" aria-hidden />
       <RailAreaButton def={areaDef("recordings")} area={area} onArea={onArea} wide={wide} />
+      {/* Create sits with the other two ways content ARRIVES in the room —
+          recorded, browsed, or made — rather than under Automate, which is
+          about work the room does on material it already has. */}
+      <RailAreaButton def={areaDef("create")} area={area} onArea={onArea} wide={wide} />
       <RailAreaButton def={areaDef("browser")} area={area} onArea={onArea} wide={wide} />
 
       <div className="rail-group-label" aria-hidden>

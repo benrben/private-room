@@ -40,6 +40,19 @@ mod runtimes;
 mod models;
 mod capabilities;
 mod vision;
+// The Create page's catalogue: which models can actually make a picture.
+mod create;
+/// The room's cast and shot lists — the Story tab behind the Create page.
+mod story;
+/// Cut a long script into a fixed number of shots, in plain code — no model,
+/// nothing off the Mac, and no word can go missing.
+mod shotsplit;
+/// Read a character sheet the room already holds into people — so heroes that
+/// are already written down are not typed in a second time. Also modelless.
+mod castparse;
+/// What each picture/video model will actually accept: legal lengths, sizes,
+/// frame slots. Read from the provider, never guessed.
+pub(crate) mod media_limits;
 mod chat;
 mod retrieval;
 mod agent;
@@ -91,6 +104,8 @@ pub use runtimes::*;
 pub use models::*;
 pub use capabilities::*;
 pub use vision::*;
+pub use create::*;
+pub use story::*;
 pub use chat::*;
 pub(crate) use retrieval::*;
 pub use agent::*;

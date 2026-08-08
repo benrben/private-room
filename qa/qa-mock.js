@@ -287,6 +287,73 @@
    * history sections never drew at all, so a capture run could not tell an
    * empty log from a missing one. `parkedReason` is what a job the APP stopped
    * carries — it must read differently from a Stop the user chose. */
+  // The Story tab's fixtures: a cast with one face and one without, so the
+  // "no face yet" state is exercised rather than only the happy one.
+  let storyCast = [
+    {
+      id: "cast1",
+      name: "Mira",
+      description: "tall, grey wool coat, hair cut short",
+      story: "Lost her ship in the winter. Back to find out who sold it.",
+      faceFileId: "pic1",
+      ord: 0,
+    },
+    {
+      id: "cast2",
+      name: "Doran",
+      description: "broad, weathered, a burn scar on the left hand",
+      story: "",
+      faceFileId: null,
+      ord: 1,
+    },
+  ];
+  let storyLists = [
+    {
+      id: "list1",
+      title: "The harbour",
+      logline: "One night on the harbour, and a boat that should not be leaving",
+      aspectRatio: "",
+      stillResolution: "",
+      clipResolution: "",
+      shotCount: 2,
+      updatedAt: new Date().toISOString(),
+    },
+  ];
+  let storyShots = [
+    {
+      id: "shot1",
+      listId: "list1",
+      ord: 0,
+      action: "Mira walks the length of the quay, counting the moorings",
+      castIds: ["cast1"],
+      seconds: 6,
+      imageModel: "openrouter::qwen/qwen-image-3-pro",
+      videoModel: "openrouter::bytedance/seedance-2.0",
+      stillFileId: "pic1",
+      clipFileId: null,
+    },
+    {
+      id: "shot2",
+      listId: "list1",
+      ord: 1,
+      action: "Doran cuts the rope as the tide turns",
+      castIds: ["cast2", "cast1"],
+      seconds: null,
+      imageModel: "",
+      videoModel: "",
+      stillFileId: null,
+      clipFileId: null,
+    },
+  ];
+  // A 1x1 PNG is enough: the picker asserts that thumbnails RENDER, not what
+  // they contain.
+  const TINY_JPEG =
+    "/9j/4AAQSkZJRgABAQEAYABgAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/wAALCAABAAEBAREA/8QAFAABAAAAAAAAAAAAAAAAAAAACf/EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEAAD8AKp//2Q==";
+  const storyPictures = [
+    { fileId: "pic1", name: "Mira on the quay.png", thumbB64: TINY_JPEG },
+    { fileId: "pic2", name: "The harbour at dusk.png", thumbB64: TINY_JPEG },
+  ];
+
   const jobs = [
     { id: "j1", kind: "deep_summary", title: "Room summary", plan: null, state: null, cursor: 3, total: 5, status: "running", error: null, parkedReason: null, createdAt: iso(2), updatedAt: iso(0) },
     { id: "j2", kind: "file_pass", title: "Full pass — Arcelle UX direction.md", plan: null, state: null, cursor: 4, total: 11, status: "paused", error: null, parkedReason: "The room was locked while this was still running.", createdAt: iso(4), updatedAt: iso(3) },
@@ -1018,6 +1085,430 @@
       };
       jobs.push(job);
       return job.id;
+    },
+    // The Create page. A stocked shelf AND a populated "why not" list, because
+    // the exclusions are half of what the page is for — a fixture with only
+    // the models would let the ledger regress unnoticed.
+    list_create_models: () => ({
+      models: [
+        {
+          model: "openrouter::qwen/qwen-image-3-pro",
+          slug: "qwen/qwen-image-3-pro",
+          label: "Qwen Image 3 Pro",
+          engine: "openrouter",
+          engineLabel: "OpenRouter",
+          local: false,
+          description: "Highest-fidelity Qwen image model — holds legible text.",
+          image: true,
+          video: false,
+          outputPrice: "0.00004",
+          limits: {
+            durations: [],
+            resolutions: ["1K", "2K"],
+            aspectRatios: ["1:1", "16:9"],
+            frameImages: [],
+            maxReferences: 4,
+            generateAudio: false,
+          },
+        },
+        {
+          model: "openrouter::krea/krea-2-large",
+          slug: "krea/krea-2-large",
+          label: "Krea 2 Large",
+          engine: "openrouter",
+          engineLabel: "OpenRouter",
+          local: false,
+          description: "Photoreal lean, strong on lighting and material detail.",
+          image: true,
+          video: false,
+          outputPrice: "0.00003",
+          limits: null,
+        },
+        {
+          model: "openrouter::bytedance/seedance-2.0",
+          slug: "bytedance/seedance-2.0",
+          label: "Seedance 2.0",
+          engine: "openrouter",
+          engineLabel: "OpenRouter",
+          local: false,
+          description: "Holds a scene together while the camera moves.",
+          image: false,
+          video: true,
+          outputPrice: "0.0006",
+          // The real published shape: legal lengths only, and both frame
+          // slots — so the bench offers 4–15s and a starting picture.
+          limits: {
+            durations: [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+            resolutions: ["480p", "720p", "1080p", "4K"],
+            aspectRatios: ["16:9", "9:16", "1:1"],
+            frameImages: ["first_frame", "last_frame"],
+            maxReferences: null,
+            generateAudio: true,
+          },
+        },
+      ],
+      scanned: 34,
+      excluded: [
+        {
+          engineLabel: "OpenRouter",
+          reason: "Text output only, per the provider's own catalog.",
+          count: 29,
+          examples: ["deepseek/deepseek-v4", "moonshot/kimi-k3"],
+        },
+        {
+          engineLabel: "Claude Code",
+          reason: "Reads pictures, cannot make them — vision in, no image out.",
+          count: 1,
+          examples: ["Claude Code"],
+        },
+        {
+          engineLabel: "Ollama (this Mac)",
+          reason:
+            "Serves chat models. A drawing model is not reachable over its chat API at all.",
+          count: 1,
+          examples: ["Ollama (this Mac)"],
+        },
+      ],
+      anyProvider: true,
+      error: null,
+    }),
+    start_create_job: (a2) => {
+      const job = {
+        id: "j" + Math.random().toString(36).slice(2, 8),
+        kind: "create",
+        title: `Painting “${String((a2 && a2.prompt) || "").slice(0, 30)}”`,
+        plan: null,
+        state: null,
+        cursor: 0,
+        total: 100,
+        status: "running",
+        error: null,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+      jobs.push(job);
+      return job.id;
+    },
+    // ---- the Story tab: a room's cast and its shot lists ----
+    story_pictures: () => storyPictures,
+    // The room already HOLDS the script and the character sheet. These are
+    // what stop the Story tab asking for either to be typed in again.
+    story_documents: () => [
+      {
+        fileId: "f-script",
+        name: "Episode 1 — The First Echo.md",
+        words: 1240,
+        snippet:
+          "**00:00–00:15** — Establishing Lumina. Noa weaves through the market stalls.",
+      },
+      {
+        fileId: "f-cast",
+        name: "Characters.md",
+        words: 310,
+        snippet: "## Mira Halloran — tall, grey wool coat, hair cut short.",
+      },
+    ],
+    story_text_from_file: (a2) =>
+      (a2 && a2.fileId) === "f-cast"
+        ? "## Mira Halloran\nTall, grey wool coat.\n"
+        : [
+            "**00:00–00:15** — Establishing Lumina. Noa weaves through the market stalls.",
+            "",
+            "**00:15–00:30** — A fruit-seller's hand closes on empty air.",
+            "",
+            "**00:30–00:40** — Noa jolts back into her own body, gasping.",
+          ].join("\n"),
+    story_read_cast_file: (a2) => ({
+      // Which reader produced these. Shown on screen, because the model and
+      // the fallback are not equally good on a messy sheet.
+      readBy: "qwen3.5:4b",
+      fellBack: null,
+      name: (a2 && a2.fileId) === "f-cast" ? "Characters.md" : "Episode 1 — The First Echo.md",
+      found:
+        (a2 && a2.fileId) === "f-cast"
+          ? [
+              {
+                name: "Mira Halloran",
+                description: "Tall, grey wool coat, hair cut short.",
+                story: "Lost her ship in the winter.",
+              },
+              {
+                name: "Doran",
+                description: "Broad, weathered, salt-stained oilskin.",
+                story: "Harbourmaster for thirty years.",
+              },
+            ]
+          : // A script is not a character sheet, and the honest answer is
+            // nobody — never one invented hero, which would be believed.
+            [],
+    }),
+    story_add_cast_many: (a2) => {
+      const members = (a2 && a2.members) || [];
+      for (const m of members)
+        storyCast.push({
+          id: "cast" + (storyCast.length + 1),
+          name: m.name,
+          description: m.description,
+          story: m.story,
+          faceFileId: null,
+          ord: storyCast.length,
+        });
+      return members.length;
+    },
+    story_board: (a2) => {
+      const selected =
+        (a2 && a2.listId) || (storyLists[0] ? storyLists[0].id : null);
+      return {
+        cast: storyCast,
+        lists: storyLists,
+        shots: storyShots.filter((s2) => s2.listId === selected),
+        selected,
+      };
+    },
+    story_add_cast: (a2) => {
+      const member = {
+        id: "cast" + (storyCast.length + 1),
+        name: (a2 && a2.name) || "Someone",
+        description: (a2 && a2.description) || "",
+        story: (a2 && a2.story) || "",
+        faceFileId: null,
+        ord: storyCast.length,
+      };
+      storyCast.push(member);
+      return member;
+    },
+    story_update_cast: (a2) => {
+      const member = storyCast.find((c) => c.id === (a2 && a2.id));
+      if (member) Object.assign(member, {
+        name: a2.name,
+        description: a2.description,
+        story: a2.story,
+      });
+      return null;
+    },
+    story_set_face: (a2) => {
+      const member = storyCast.find((c) => c.id === (a2 && a2.id));
+      if (member) member.faceFileId = (a2 && a2.fileId) || null;
+      return null;
+    },
+    story_remove_cast: (a2) => {
+      storyCast = storyCast.filter((c) => c.id !== (a2 && a2.id));
+      return null;
+    },
+    story_create_list: (a2) => {
+      const id = "list" + (storyLists.length + 1);
+      storyLists.unshift({
+        id,
+        title: (a2 && a2.title) || "Untitled",
+        logline: (a2 && a2.logline) || "",
+        aspectRatio: "",
+        stillResolution: "",
+        clipResolution: "",
+        shotCount: 0,
+        updatedAt: new Date().toISOString(),
+      });
+      return id;
+    },
+    story_update_list: (a2) => {
+      const list = storyLists.find((l) => l.id === (a2 && a2.id));
+      if (list) Object.assign(list, { title: a2.title, logline: a2.logline });
+      return null;
+    },
+    story_delete_list: (a2) => {
+      storyLists = storyLists.filter((l) => l.id !== (a2 && a2.id));
+      return null;
+    },
+    story_add_shot: (a2) => {
+      const shot = {
+        id: "shot" + (storyShots.length + 1),
+        listId: (a2 && a2.listId) || "list1",
+        ord: storyShots.length,
+        action: (a2 && a2.action) || "",
+        castIds: [],
+        seconds: null,
+        imageModel: "",
+        videoModel: "",
+        stillFileId: null,
+        clipFileId: null,
+      };
+      storyShots.push(shot);
+      return shot;
+    },
+    story_update_shot: (a2) => {
+      const shot = storyShots.find((s2) => s2.id === (a2 && a2.id));
+      if (shot) Object.assign(shot, {
+        action: a2.action,
+        castIds: a2.castIds || [],
+        seconds: a2.seconds ?? null,
+        imageModel: a2.imageModel || "",
+        videoModel: a2.videoModel || "",
+      });
+      return null;
+    },
+    story_remove_shot: (a2) => {
+      storyShots = storyShots.filter((s2) => s2.id !== (a2 && a2.id));
+      return null;
+    },
+    story_reorder_shots: () => null,
+    // The five-minute-episode path: a script cut into fixed-length shots.
+    story_plan_split: (a2) => {
+      const script = String((a2 && a2.script) || "");
+      // A script that marks its own chunks is taken at its word — the same
+      // rule the real splitter follows, so the harness exercises both paths.
+      const marks = [...script.matchAll(/(\d{1,2}):(\d{2})\s*[-–—]\s*(\d{1,2}):(\d{2})/g)];
+      if (marks.length >= 2) {
+        const shots = marks.map((m, i) => {
+          const start = +m[1] * 60 + +m[2];
+          const end = +m[3] * 60 + +m[4];
+          const from = m.index + m[0].length;
+          const to = i + 1 < marks.length ? marks[i + 1].index : script.length;
+          return {
+            action: script.slice(from, to).replace(/[*#]/g, "").replace(/\s+/g, " ").trim(),
+            seconds: Math.max(1, end - start),
+          };
+        });
+        return {
+          parts: shots.length,
+          totalSeconds: shots.reduce((n, s2) => n + s2.seconds, 0),
+          shots,
+          fromScript: true,
+        };
+      }
+      const each = (a2 && a2.secondsEach) || 15;
+      const parts = Math.max(1, Math.ceil((((a2 && a2.minutes) || 0) * 60) / each));
+      const words = script.split(/\s+/).filter(Boolean);
+      const per = Math.max(1, Math.ceil(words.length / parts));
+      const shots = [];
+      for (let i = 0; i < parts; i++)
+        shots.push({ action: words.slice(i * per, (i + 1) * per).join(" "), seconds: each });
+      return { parts, totalSeconds: parts * each, shots, fromScript: false };
+    },
+    story_apply_split: (a2) => {
+      const planned = (a2 && a2.shots) || [];
+      let lastCastIds = [];
+      for (const { action, seconds } of planned) {
+        storyShots.push({
+          id: "shot" + (storyShots.length + 1),
+          listId: (a2 && a2.listId) || "list1",
+          ord: storyShots.length,
+          action,
+          // Mirrors `assign_cast`: a name in the shot's words puts that person
+          // in it, and a shot naming nobody inherits the one before.
+          castIds: (() => {
+            const here = storyCast
+              .filter((c) => {
+                const first = c.name.split(/\s+/)[0];
+                return new RegExp(`\\b(${c.name}|${first})\\b`, "i").test(action);
+              })
+              .map((c) => c.id);
+            if (here.length) {
+              lastCastIds = here;
+              return here;
+            }
+            return lastCastIds.slice();
+          })(),
+          seconds: seconds || 15,
+          imageModel: (a2 && a2.imageModel) || "",
+          videoModel: (a2 && a2.videoModel) || "",
+          stillFileId: null,
+          clipFileId: null,
+        });
+      }
+      return planned.length;
+    },
+    // The review sheet: what the run WOULD do, before any of it is billed.
+    // Mirrors the Rust — every shot appears, sent or skipped, and a skipped
+    // one carries its reason.
+    story_film_plan: (a2) => {
+      const kind = (a2 && a2.kind) || "video";
+      const video = kind === "video";
+      const chain = !a2 || a2.continuous !== false;
+      const listId = (a2 && a2.listId) || "list1";
+      const mine = storyShots.filter((s2) => s2.listId === listId);
+      const shots = mine.map((shot, i) => {
+        const model = video ? shot.videoModel : shot.imageModel;
+        const made = video ? shot.clipFileId : shot.stillFileId;
+        const next = mine[i + 1];
+        let skip = null;
+        if (made) skip = video ? "already filmed" : "already drawn";
+        else if (!model) skip = video ? "no clip model chosen" : "no picture model chosen";
+        return {
+          shotId: shot.id,
+          n: i + 1,
+          action: shot.action,
+          prompt: [storyLists.find((l) => l.id === listId)?.logline, shot.action]
+            .filter(Boolean)
+            .join(". "),
+          seconds: skip ? shot.seconds : (video ? shot.seconds || 15 : null),
+          model: (model || "").split("::")[1] || model || "",
+          startFileId: !skip && video ? shot.stillFileId : null,
+          endFileId: !skip && video && chain && next ? next.stillFileId : null,
+          referenceFileIds: [],
+          cast: shot.castIds
+            .map((id) => storyCast.find((c) => c.id === id)?.name)
+            .filter(Boolean),
+          // A hero with no portrait is drawn from words alone and comes out a
+          // different person every call — the thing that is invisible until
+          // twenty clips have been paid for.
+          faceless: shot.castIds
+            .map((id) => storyCast.find((c) => c.id === id))
+            .filter((c) => c && !c.faceFileId)
+            .map((c) => c.name),
+          joinDropped: null,
+          // Mirrors the Rust rule INCLUDING the skip gates: a skipped row
+          // promises nothing, and a skipped PREDECESSOR (no model) hands
+          // nothing forward.
+          startsOnPrevious:
+            !skip &&
+            video &&
+            chain &&
+            i > 0 &&
+            (!!mine[i - 1].clipFileId ||
+              (!!mine[i - 1].videoModel && !mine[i - 1].clipFileId)),
+          skip,
+        };
+      });
+      const sending = shots.filter((s2) => !s2.skip);
+      return {
+        kind,
+        shots,
+        sending: sending.length,
+        skipped: shots.length - sending.length,
+        totalSeconds: sending.reduce((n, s2) => n + (s2.seconds || 0), 0),
+        joined: sending.filter((s2) => s2.startsOnPrevious).length,
+        joinBlockedBy: null,
+        faceless: [
+          ...new Set(sending.flatMap((s2) => s2.faceless)),
+        ],
+        overCap: sending.length > 80,
+      };
+    },
+    story_set_shape: (a2) => {
+      const list = storyLists.find((l) => l.id === (a2 && a2.id));
+      if (list)
+        Object.assign(list, {
+          aspectRatio: a2.aspectRatio,
+          stillResolution: a2.stillResolution,
+          clipResolution: a2.clipResolution,
+        });
+      return null;
+    },
+    // Returns the shape the real command does: what STARTED, what was ASKED
+    // for, and the shortfall between them. A bare id list is what let a
+    // 21-shot run report "11" with nothing to compare it against.
+    start_shot_list_job: (a2) => {
+      const listId = (a2 && a2.listId) || "list1";
+      const video = ((a2 && a2.kind) || "video") === "video";
+      const asked = storyShots.filter(
+        (s2) =>
+          s2.listId === listId &&
+          (video ? s2.videoModel && !s2.clipFileId : s2.imageModel && !s2.stillFileId),
+      ).length;
+      return {
+        jobIds: Array.from({ length: asked }, (_, i) => "j-shot-" + (i + 1)),
+        asked,
+        shortfall: null,
+      };
     },
     // Settings → Connections → AI providers, and the picker's cloud catalog.
     list_ai_providers: () => aiProviders,

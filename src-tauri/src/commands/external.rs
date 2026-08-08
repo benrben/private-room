@@ -79,8 +79,20 @@ pub struct ExternalModelInfo {
     pub input_price: Option<String>,
     pub output_price: Option<String>,
     pub input_modalities: Vec<String>,
+    /// What this model can PRODUCE, from the catalog's own
+    /// `architecture.output_modalities`. The mirror of `input_modalities`, and
+    /// the only honest source for "can this model draw a picture" — a name
+    /// match on "image" would call `qwen2.5vl` (which reads pictures) a
+    /// generator, and would miss every model whose slug says nothing.
+    pub output_modalities: Vec<String>,
     pub tools: bool,
     pub vision: bool,
+    /// Derived from `output_modalities`, not from the slug. Empty modalities
+    /// mean the catalog said nothing, which is `false` here and `Unknown` in
+    /// `EngineCapabilities` — the Create page hides a model it cannot vouch
+    /// for rather than offering one that will fail at generation time.
+    pub image_output: bool,
+    pub video_output: bool,
     pub reasoning: bool,
     pub structured_outputs: bool,
 }
@@ -202,8 +214,12 @@ fn parse_codex_catalog(json: &[u8]) -> Result<Vec<ExternalModelInfo>, String> {
                 input_price: None,
                 output_price: None,
                 input_modalities: vec!["text".into()],
+                // Codex writes text. It has no channel that hands back pixels.
+                output_modalities: vec!["text".into()],
                 tools: true,
                 vision: false,
+                image_output: false,
+                video_output: false,
                 reasoning,
                 structured_outputs: true,
             })
@@ -423,8 +439,13 @@ fn claude_models_from_scan(scan: &ClaudeCatalogScan) -> Vec<ExternalModelInfo> {
                     // load-bearing now: a scraped catalog is a "rich" one to
                     // the picker, so its Vision filter chip acts on it.
                     input_modalities: vec!["text".into(), "image".into()],
+                    // Reads pictures, never draws one — the distinction the
+                    // Create page's whole model list turns on.
+                    output_modalities: vec!["text".into()],
                     tools: true,
                     vision: true,
+                    image_output: false,
+                    video_output: false,
                     reasoning: true,
                     structured_outputs: true,
                 },
@@ -533,8 +554,11 @@ fn claude_fallback_models() -> Vec<ExternalModelInfo> {
         input_price: None,
         output_price: None,
         input_modalities: vec!["text".into(), "image".into()],
+        output_modalities: vec!["text".into()],
         tools: true,
         vision: true,
+        image_output: false,
+        video_output: false,
         reasoning: true,
         structured_outputs: true,
     };

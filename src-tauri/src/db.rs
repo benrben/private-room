@@ -28,6 +28,8 @@ mod privacy;
 mod recordings;
 mod schema;
 mod settings;
+/// The room's cast and shot lists — who a story is about, and what happens.
+mod story;
 mod skills;
 mod util;
 mod versions;
@@ -50,6 +52,7 @@ pub use privacy::*;
 pub use recordings::*;
 pub use schema::*;
 pub use settings::*;
+pub use story::*;
 pub use skills::*;
 pub(crate) use util::*;
 pub use versions::*;

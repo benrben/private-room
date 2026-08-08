@@ -247,6 +247,13 @@ export function useWorkspaceEffects(
           if (p.fileId) void a.viewFile(p.fileId);
         } else if (p.paused) {
           s.pushToast("info", "Paused — resume it any time from the sidebar.");
+        } else if (p.failed) {
+          // A failed job said nothing at all until now: `finished` and `paused`
+          // each had a branch and failure had none, so the card simply left the
+          // live list and the reason stayed on a row nobody was looking at.
+          // Work that stops because it went wrong is exactly the case that owes
+          // the person an explanation — the label already carries it.
+          s.pushToast("error", p.label || "Background job failed.");
         }
       } else {
         if (!seenJobs.has(p.jobId)) {

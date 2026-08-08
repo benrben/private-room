@@ -53,6 +53,9 @@ export type WorkArea =
   | "skills"
   | "memory"
   | "connectors"
+  // Pictures and video, made by whichever connected model can actually make
+  // one. Only models a live catalog vouches for are offered.
+  | "create"
   // BROWSE-1: the private browser. Its page is a native child webview
   // parked over the workspace pane, not a React subtree.
   | "browser";
@@ -71,6 +74,7 @@ export const WORK_AREAS = [
   "skills",
   "memory",
   "connectors",
+  "create",
   "browser",
 ] as const;
 

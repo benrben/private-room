@@ -43,6 +43,7 @@ import { WorkflowsPage } from "./workflows/WorkflowsPage";
 import { WorkflowGlyph } from "./workflows/workflowGlyph";
 import { ScriptsPage } from "./scripts/ScriptsPage";
 import SkillsView from "./skills/SkillsView";
+import { CreatePage } from "./create/CreatePage";
 import { QuickActionsMenu, bindingMatches, QuickAction } from "./QuickActions";
 import type { ViewerKind } from "../api";
 
@@ -185,6 +186,7 @@ export default function ViewerPane({
     skills: "Skills",
     memory: "Memory & scratch pad",
     connectors: "Connectors",
+    create: "Create",
     browser: "Private browser",
   };
   const folderName = openFile
@@ -885,6 +887,8 @@ export default function ViewerPane({
         <MemoryView s={s} a={a} info={info} />
       ) : area === "recordings" ? (
         <RecordingsPage s={s} a={a} info={info} />
+      ) : area === "create" ? (
+        <CreatePage s={s} a={a} />
       ) : frontPageView ? (
         <FrontPage page={frontPageView} s={s} a={a} layout={layout} info={info} />
       ) : (

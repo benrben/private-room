@@ -371,3 +371,128 @@ def test_recover_json_slices_first_to_last_bracket() -> None:
     assert model_text.recover_json("noise {\"a\":1} tail") == '{"a":1}'
     assert model_text.recover_json("```json\n[1,2]\n```") == "[1,2]"
     assert model_text.recover_json("plain text") == "plain text"
+
+
+# --- /knowledge_extract mode="cast" (story.rs character sheets) -------------
+
+
+def test_a_short_sheet_is_one_window() -> None:
+    assert chat_docs.cast_windows("## Mira\nTall.") == ["## Mira\nTall."]
+    assert chat_docs.cast_windows("   ") == []
+
+
+def test_a_long_sheet_is_windowed_with_overlap_not_clamped() -> None:
+    """A clamp would read the first N characters and report the rest as "no
+    characters found" — a confident answer about the part it happened to see,
+    which is the `#minutes` failure exactly."""
+    doc = "\n\n".join(f"## Person {i}\n{'x' * 400}" for i in range(120))
+    windows = chat_docs.cast_windows(doc)
+    assert len(windows) > 1, "a 50 KB sheet must not be read in one bite"
+    # Every window is under the ceiling, and the whole document is covered.
+    assert all(len(w) <= chat_docs.CAST_WINDOW_CHARS for w in windows)
+    assert "Person 0" in windows[0]
+    assert "Person 119" in windows[-1]
+
+
+def test_the_same_person_in_two_windows_is_one_person() -> None:
+    """The overlap means a person can come back twice. Two heroes with the same
+    name, each knowing half of themselves, is the failure to avoid."""
+    merged = chat_docs.merge_cast(
+        [
+            {"name": "Mira", "description": "Tall, grey coat.", "story": ""},
+            {"name": "MIRA", "description": "", "story": "Lost her ship."},
+            {"name": "Doran", "description": "Broad.", "story": ""},
+        ]
+    )
+    assert [m["name"] for m in merged] == ["Mira", "Doran"], "first mention wins the name"
+    assert merged[0]["description"] == "Tall, grey coat."
+    assert merged[0]["story"] == "Lost her ship."
+
+
+def test_a_later_thinner_window_never_erases_a_fuller_one() -> None:
+    merged = chat_docs.merge_cast(
+        [
+            {"name": "Mira", "description": "Tall, grey wool coat, cropped hair.", "story": ""},
+            {"name": "Mira", "description": "", "story": ""},
+        ]
+    )
+    assert merged[0]["description"] == "Tall, grey wool coat, cropped hair."
+
+
+def test_a_nameless_row_is_dropped_and_the_ceiling_holds() -> None:
+    rows = [{"name": "", "description": "x", "story": ""}]
+    rows += [{"name": f"P{i}", "description": "", "story": ""} for i in range(100)]
+    merged = chat_docs.merge_cast(rows)
+    assert len(merged) == chat_docs.CAST_MAX
+    assert all(m["name"] for m in merged)
+
+
+@pytest.mark.asyncio
+async def test_reading_a_character_sheet_returns_the_people(
+    fake_client: type[FakeAsyncClient],
+) -> None:
+    fake_client.script["chat"] = _chat_reply(
+        '{"cast":[{"name":"Mira","description":"Tall, grey wool coat.",'
+        '"story":"Lost her ship."}]}'
+    )
+    app = create_app()
+    async with client_for(app) as c:
+        resp = await c.post(
+            "/knowledge_extract",
+            json={
+                "model": "llama3.2",
+                "base_url": "http://h:1",
+                "mode": "cast",
+                "document": "## Mira\nTall, grey wool coat.\n\nLost her ship.",
+            },
+        )
+    assert resp.status_code == 200
+    cast = resp.json()["cast"]
+    assert cast == [
+        {"name": "Mira", "description": "Tall, grey wool coat.", "story": "Lost her ship."}
+    ]
+    # The two rules a model gets wrong are the two the prompt leads with.
+    sent = fake_client.calls["chat"]["messages"][0]["content"]
+    assert "Never invent a character" in sent
+    assert "what they LOOK like" in sent
+
+
+@pytest.mark.asyncio
+async def test_a_document_with_no_characters_says_so_rather_than_inventing_one(
+    fake_client: type[FakeAsyncClient],
+) -> None:
+    fake_client.script["chat"] = _chat_reply('{"cast":[]}')
+    app = create_app()
+    async with client_for(app) as c:
+        resp = await c.post(
+            "/knowledge_extract",
+            json={
+                "model": "llama3.2",
+                "base_url": "http://h:1",
+                "mode": "cast",
+                "document": "The harbour is empty. The tide turns.",
+            },
+        )
+    assert resp.json()["cast"] == []
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_answer_is_not_reported_as_an_empty_cast(
+    fake_client: type[FakeAsyncClient],
+) -> None:
+    """"The model could not read this" must never arrive dressed as "this file
+    has no characters in it" — they call for completely different next steps."""
+    fake_client.script["chat"] = _chat_reply("I'm afraid I can't help with that.")
+    app = create_app()
+    async with client_for(app) as c:
+        resp = await c.post(
+            "/knowledge_extract",
+            json={
+                "model": "llama3.2",
+                "base_url": "http://h:1",
+                "mode": "cast",
+                "document": "## Mira\nTall.",
+            },
+        )
+    assert resp.status_code == 502
+    assert "could not read" in resp.json()["error"]

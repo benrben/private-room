@@ -152,3 +152,16 @@ export function ListFilterIcon(p: IconProps) {
     </Stroke>
   );
 }
+
+/** Create: a framed picture with a horizon and a sun — the thing the page
+ * makes, rather than a generic wand. Deliberately not a sparkle: half the app
+ * already uses SparklesIcon to mean "the AI did this", and this is a place. */
+export function CreateIcon(p: IconProps) {
+  return (
+    <Stroke {...p}>
+      <rect x="3.5" y="4.5" width="17" height="15" rx="2" />
+      <path d="M3.7 15.5 8.5 11l3.5 3.2L15 11.5l5.3 4.6" />
+      <circle cx="14.8" cy="8.6" r="1.5" />
+    </Stroke>
+  );
+}

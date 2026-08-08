@@ -4,7 +4,7 @@ use std::sync::{OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 const OPENROUTER_ID: &str = "openrouter";
-const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
+pub(crate) const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
 const KEYCHAIN_SERVICE: &str = "Arcelle LLM Providers";
 
 #[derive(Serialize)]
@@ -36,6 +36,12 @@ pub(crate) struct ModelRuntimeFacts {
     pub tools: bool,
     pub vision: bool,
     pub structured_outputs: bool,
+    /// Kept as plain `bool`s rather than the modality `Vec` they are derived
+    /// from, so this stays `Copy` — `provider_model_facts` hands it out of a
+    /// read lock by `.copied()`, and a `Vec` here would make every capability
+    /// lookup clone or hold the lock longer.
+    pub image_output: bool,
+    pub video_output: bool,
 }
 
 fn model_runtime_cache() -> &'static RwLock<HashMap<String, ModelRuntimeFacts>> {
@@ -202,11 +208,43 @@ fn provider_client() -> Result<reqwest::Client, String> {
         .map_err(|e| e.to_string())
 }
 
-async fn fetch_openrouter_models(key: &str) -> Result<Vec<ExternalModelInfo>, String> {
+/// The media catalogues OpenRouter keeps OUT of its default listing.
+///
+/// Verified live 2026-08-08: `/models` (and `/models/user`) return 400 entries
+/// and NOT ONE of them declares `video` output, while
+/// `/models?output_modalities=video` returns 21 — Veo, Sora, Kling, Seedance,
+/// Aleph, FLUX.3 Video. The image side is the same shape: 11 in the default
+/// listing against 42 behind the filter, so `qwen/qwen-image-3-pro`,
+/// `krea/krea-2-large`, `flux.2-pro` and the whole Recraft family were
+/// invisible.
+///
+/// So the catalogue has to be asked for these explicitly. Anything that reads
+/// the default listing alone concludes, wrongly and with total confidence,
+/// that this account cannot make pictures at all.
+const MEDIA_MODALITIES: [&str; 2] = ["image", "video"];
+
+/// Where to ask for one media catalogue.
+///
+/// The PUBLIC `/models`, deliberately — not the user-scoped `/models/user`
+/// this function's caller uses for everything else. `/models/user` ignores the
+/// filter rather than honouring it (OpenRouter drops unknown query parameters
+/// silently: `?bogus_param=1` answers 200 with the full 400-model list), so
+/// asking it for the video catalogue returns the ordinary chat catalogue, the
+/// merge finds nothing new, and the Create page shows a video tab reading zero
+/// while twenty-one video models sit one endpoint away. That is precisely the
+/// bug this comment exists to stop someone re-introducing by "tidying" these
+/// two paths into one.
+fn media_catalog_path(modality: &str) -> String {
+    format!("/models?output_modalities={modality}")
+}
+
+/// One authenticated catalogue GET, parsed. `query` is appended verbatim.
+async fn fetch_openrouter_catalog(
+    key: &str,
+    path: &str,
+) -> Result<Vec<ExternalModelInfo>, String> {
     let response = provider_client()?
-        // The user-scoped catalog respects their provider preferences, privacy
-        // settings, and guardrails. It is also an authenticated key check.
-        .get(format!("{OPENROUTER_BASE_URL}/models/user"))
+        .get(format!("{OPENROUTER_BASE_URL}{path}"))
         .bearer_auth(key)
         .header("HTTP-Referer", "https://arcelle.app")
         .header("X-OpenRouter-Title", "Arcelle")
@@ -226,9 +264,39 @@ async fn fetch_openrouter_models(key: &str) -> Result<Vec<ExternalModelInfo>, St
         }
         return Err(format!("OpenRouter error ({status}): {message}"));
     }
+    Ok(parse_openrouter_models(&value))
+}
+
+async fn fetch_openrouter_models(key: &str) -> Result<Vec<ExternalModelInfo>, String> {
+    // The user-scoped catalog respects their provider preferences, privacy
+    // settings, and guardrails. It is also an authenticated key check — so a
+    // bad key fails HERE, before the supplementary calls below.
+    let mut models = fetch_openrouter_catalog(key, "/models/user").await?;
     clear_key_rejected(OPENROUTER_ID);
 
-    let models = parse_openrouter_models(&value);
+    // Then the media catalogues, merged in by slug. A failure on one of these
+    // is NOT fatal: the chat catalog above already succeeded, and losing the
+    // whole model list because the picture models could not be listed would
+    // be a far worse outcome than a Create page that is short a few rows.
+    let mut known: std::collections::HashSet<String> =
+        models.iter().map(|m| m.slug.clone()).collect();
+    for modality in MEDIA_MODALITIES {
+        let path = media_catalog_path(modality);
+        match fetch_openrouter_catalog(key, &path).await {
+            Ok(extra) => {
+                for model in extra {
+                    if known.insert(model.slug.clone()) {
+                        models.push(model);
+                    }
+                }
+            }
+            Err(e) => eprintln!("OpenRouter {modality} catalog unavailable: {e}"),
+        }
+    }
+    // Each batch arrives sorted, but appending three of them does not stay
+    // sorted — and the picker shows this list verbatim.
+    models.sort_by(|a, b| a.label.to_lowercase().cmp(&b.label.to_lowercase()));
+
     if let Ok(mut cache) = model_runtime_cache().write() {
         for model in &models {
             cache.insert(
@@ -238,6 +306,8 @@ async fn fetch_openrouter_models(key: &str) -> Result<Vec<ExternalModelInfo>, St
                     tools: model.tools,
                     vision: model.vision,
                     structured_outputs: model.structured_outputs,
+                    image_output: model.image_output,
+                    video_output: model.video_output,
                 },
             );
         }
@@ -266,6 +336,17 @@ fn parse_openrouter_models(value: &serde_json::Value) -> Vec<ExternalModelInfo> 
                 .flatten()
                 .filter_map(|v| v.as_str().map(str::to_string))
                 .collect();
+            // The catalog's own account of what comes BACK. Read the same way
+            // as the input side and never inferred from the slug: "flux",
+            // "image" and "video" appear in the names of models that only
+            // describe pictures, and the models that do draw are not obliged
+            // to say so in their id.
+            let output_modalities: Vec<String> = model["architecture"]["output_modalities"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect();
             Some(ExternalModelInfo {
                 slug,
                 label,
@@ -276,6 +357,9 @@ fn parse_openrouter_models(value: &serde_json::Value) -> Vec<ExternalModelInfo> 
                 input_price: model["pricing"]["prompt"].as_str().map(str::to_string),
                 output_price: model["pricing"]["completion"].as_str().map(str::to_string),
                 input_modalities: input_modalities.clone(),
+                image_output: output_modalities.iter().any(|m| m == "image"),
+                video_output: output_modalities.iter().any(|m| m == "video"),
+                output_modalities,
                 tools: parameters.iter().any(|p| p == "tools"),
                 vision: input_modalities.iter().any(|m| m == "image"),
                 reasoning: parameters
@@ -319,6 +403,15 @@ fn clear_key_rejected(provider: &str) {
 
 fn key_rejected(provider: &str) -> bool {
     rejected_keys().read().is_ok_and(|set| set.contains(provider))
+}
+
+/// The stored OpenRouter key, when one is connected.
+///
+/// Exposed so the media-limits tables can be fetched with the same credential
+/// the catalogue uses, without a second Keychain vocabulary growing up beside
+/// this one.
+pub(crate) fn openrouter_key() -> Option<String> {
+    read_key(OPENROUTER_ID).ok().filter(|k| !k.trim().is_empty())
 }
 
 pub(crate) fn provider_connected(provider: &str) -> bool {
@@ -456,6 +549,126 @@ mod tests {
         assert!(model.reasoning);
         assert!(model.structured_outputs);
         assert_eq!(model.input_price.as_deref(), Some("0.000001"));
+        // Reads pictures, does not make them. The Create page's whole shelf
+        // turns on these two staying apart from `vision`.
+        assert!(!model.image_output);
+        assert!(!model.video_output);
+    }
+
+    #[test]
+    fn output_modalities_are_what_says_a_model_can_draw() {
+        let value = serde_json::json!({"data": [
+            {
+                "id": "vendor/painter",
+                "name": "Painter",
+                "architecture": {
+                    "input_modalities": ["text"],
+                    "output_modalities": ["image"]
+                },
+            },
+            {
+                "id": "vendor/mover",
+                "name": "Mover",
+                "architecture": {
+                    "input_modalities": ["text", "image"],
+                    "output_modalities": ["video"]
+                },
+            },
+            {
+                // The trap a name test falls into: "image" and "vision" in the
+                // slug, image INPUT, and no ability to draw whatsoever.
+                "id": "vendor/qwen-image-vision",
+                "name": "Image Reader",
+                "architecture": {
+                    "input_modalities": ["text", "image"],
+                    "output_modalities": ["text"]
+                },
+            },
+            {
+                // A catalog entry that declares no modalities at all. Silence
+                // is not permission — this must not read as "can draw".
+                "id": "vendor/silent",
+                "name": "Silent",
+            },
+        ]});
+        let by = |slug: &str| {
+            parse_openrouter_models(&value)
+                .into_iter()
+                .find(|m| m.slug == slug)
+                .expect("model present")
+        };
+
+        let painter = by("vendor/painter");
+        assert!(painter.image_output && !painter.video_output);
+        assert!(!painter.vision, "text-in: it draws, it does not read pictures");
+
+        let mover = by("vendor/mover");
+        assert!(mover.video_output && !mover.image_output);
+        assert!(mover.vision, "takes a source still");
+
+        let reader = by("vendor/qwen-image-vision");
+        assert!(reader.vision, "it does read pictures");
+        assert!(
+            !reader.image_output && !reader.video_output,
+            "a slug saying 'image' must never be mistaken for the ability to make one"
+        );
+
+        let silent = by("vendor/silent");
+        assert!(silent.output_modalities.is_empty());
+        assert!(!silent.image_output && !silent.video_output);
+    }
+
+    #[test]
+    fn the_media_catalog_is_asked_of_the_endpoint_that_actually_filters() {
+        // This shipped wrong once and the symptom was silent: the Create page
+        // read "Video 0" while OpenRouter served 21 video models. The cause was
+        // asking `/models/user`, which IGNORES an unsupported query parameter
+        // and answers with the ordinary chat catalogue — so the merge found no
+        // new slugs and nothing anywhere reported a failure.
+        for modality in MEDIA_MODALITIES {
+            let path = media_catalog_path(modality);
+            assert!(
+                path.starts_with("/models?"),
+                "media catalogues must come from the PUBLIC /models, which \
+                 honours the filter — /models/user silently does not: {path}"
+            );
+            assert!(!path.contains("/models/user"), "got: {path}");
+            assert!(path.ends_with(&format!("output_modalities={modality}")), "got: {path}");
+        }
+        assert_eq!(media_catalog_path("video"), "/models?output_modalities=video");
+    }
+
+    #[test]
+    fn a_media_model_parses_from_the_shape_the_filtered_catalog_returns() {
+        // Verbatim shape of `GET /models?output_modalities=video`, captured
+        // live 2026-08-08. Media entries differ from chat entries in three
+        // ways that all have to survive: `context_length` is 0, there are no
+        // `supported_parameters` at all, and per-token pricing is "0" because
+        // these are billed per second. None of that may cause a drop.
+        let value = serde_json::json!({"data": [{
+            "id": "black-forest-labs/flux-3-video",
+            "name": "Black Forest Labs: FLUX.3 Video",
+            "description": "A video generation model.",
+            "context_length": 0,
+            "architecture": {
+                "modality": "text+image+video->video",
+                "input_modalities": ["text", "image", "video"],
+                "output_modalities": ["video"],
+                "tokenizer": "Media"
+            },
+            "supported_parameters": [],
+            "pricing": {"prompt": "0", "completion": "0"}
+        }]});
+        let models = parse_openrouter_models(&value);
+        assert_eq!(models.len(), 1, "a media entry must not be dropped");
+        let model = &models[0];
+        assert_eq!(model.slug, "black-forest-labs/flux-3-video");
+        assert!(model.video_output, "this is the whole reason it is listed");
+        assert!(!model.image_output, "it makes clips, not stills");
+        // It takes a source still/clip, which is image INPUT — the axis that
+        // must never be confused with the ability to produce one.
+        assert!(model.vision);
+        assert!(!model.tools && !model.structured_outputs);
     }
 
     #[test]

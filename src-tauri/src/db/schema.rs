@@ -427,6 +427,76 @@ CREATE TABLE IF NOT EXISTS voice_rejects (
   emb BLOB NOT NULL,
   PRIMARY KEY (name, emb)
 );
+-- The room's CAST: the people a story is about.
+--
+-- Room-level, not per-story, because a cast is reused — the same hero appears
+-- in every scene, and re-describing them per shot is exactly what makes a
+-- character look different in every picture.
+--
+-- `face_file_id` is the load-bearing column, and it is a FILE not a prompt.
+-- Character consistency does not come from words: "a woman with red hair"
+-- is re-imagined from scratch on every call. It comes from handing the model
+-- the SAME picture each time, which is what `input_references` is for. The
+-- description and backstory are for the prompt and for the user's own memory;
+-- the picture is what actually holds a face together across shots.
+--
+-- ON DELETE SET NULL, not CASCADE: trashing a hero's portrait must not delete
+-- the hero. Their description and story are the user's writing.
+CREATE TABLE IF NOT EXISTS story_cast (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  story TEXT NOT NULL DEFAULT '',
+  face_file_id TEXT REFERENCES files(id) ON DELETE SET NULL,
+  ord INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
+-- One script. NOT called a "script" anywhere the user can see it: this app
+-- already has Scripts, meaning runnable Python (`run_script`, the Scripts
+-- page, the `script_run` workflow node). Two meanings for one word in one
+-- product is a bug in the product. On screen it is a SHOT LIST.
+-- `aspect_ratio` is ONE value for the whole list, not one per shot, and that
+-- is a claim about the domain rather than a shortcut: an episode whose shots
+-- change shape halfway through is a mistake, never an intention. It is also
+-- load-bearing — a shot's still becomes its clip's literal first frame, so a
+-- 1:1 picture handed to a 16:9 clip is pinned to a frame the wrong shape.
+--
+-- Size is per medium because the two endpoints publish different vocabularies
+-- for it: `/images/models` says "1K"/"2K", `/videos/models` says
+-- "720p"/"1080p"/"4K". One column would have to mean both.
+CREATE TABLE IF NOT EXISTS story_lists (
+  id TEXT PRIMARY KEY,
+  title TEXT NOT NULL,
+  logline TEXT NOT NULL DEFAULT '',
+  aspect_ratio TEXT NOT NULL DEFAULT '',
+  still_resolution TEXT NOT NULL DEFAULT '',
+  clip_resolution TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
+-- One shot: what happens, who is in it, how long, and what came back.
+--
+-- `still_file_id` and `clip_file_id` are the chain. A shot is made in two
+-- steps — draw the frame, then animate it — and keeping both means the still
+-- can be re-animated (a different length, a different model) without paying
+-- to draw it again. `cast_ids` is JSON because SQLite has no array type and a
+-- join table for a handful of ids per shot buys nothing here.
+CREATE TABLE IF NOT EXISTS story_shots (
+  id TEXT PRIMARY KEY,
+  list_id TEXT NOT NULL REFERENCES story_lists(id) ON DELETE CASCADE,
+  ord INTEGER NOT NULL DEFAULT 0,
+  action TEXT NOT NULL DEFAULT '',
+  cast_ids TEXT NOT NULL DEFAULT '[]',
+  seconds INTEGER,
+  image_model TEXT NOT NULL DEFAULT '',
+  video_model TEXT NOT NULL DEFAULT '',
+  still_file_id TEXT REFERENCES files(id) ON DELETE SET NULL,
+  clip_file_id TEXT REFERENCES files(id) ON DELETE SET NULL,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_story_shots_list ON story_shots(list_id, ord);
 "#;
 
 /// Key a connection AND pin the on-disk cipher parameters (A1).
@@ -1230,6 +1300,62 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
 
+    // The Create page's cast and shot lists. Mirrored from SCHEMA for the same
+    // reason as everything above it: an existing room never runs SCHEMA again,
+    // so a table declared only there would be missing from every room the user
+    // already has — which is all of them.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS story_cast (
+           id TEXT PRIMARY KEY,
+           name TEXT NOT NULL,
+           description TEXT NOT NULL DEFAULT '',
+           story TEXT NOT NULL DEFAULT '',
+           face_file_id TEXT REFERENCES files(id) ON DELETE SET NULL,
+           ord INTEGER NOT NULL DEFAULT 0,
+           created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+           updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+         );
+         CREATE TABLE IF NOT EXISTS story_lists (
+           id TEXT PRIMARY KEY,
+           title TEXT NOT NULL,
+           logline TEXT NOT NULL DEFAULT '',
+           aspect_ratio TEXT NOT NULL DEFAULT '',
+           still_resolution TEXT NOT NULL DEFAULT '',
+           clip_resolution TEXT NOT NULL DEFAULT '',
+           created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+           updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+         );
+         CREATE TABLE IF NOT EXISTS story_shots (
+           id TEXT PRIMARY KEY,
+           list_id TEXT NOT NULL REFERENCES story_lists(id) ON DELETE CASCADE,
+           ord INTEGER NOT NULL DEFAULT 0,
+           action TEXT NOT NULL DEFAULT '',
+           cast_ids TEXT NOT NULL DEFAULT '[]',
+           seconds INTEGER,
+           image_model TEXT NOT NULL DEFAULT '',
+           video_model TEXT NOT NULL DEFAULT '',
+           still_file_id TEXT REFERENCES files(id) ON DELETE SET NULL,
+           clip_file_id TEXT REFERENCES files(id) ON DELETE SET NULL,
+           created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+           updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+         );
+         CREATE INDEX IF NOT EXISTS idx_story_shots_list ON story_shots(list_id, ord);",
+    )
+    .map_err(|e| e.to_string())?;
+    // The frame shape and the two output sizes, added after the table shipped.
+    // `CREATE TABLE IF NOT EXISTS` above is a no-op for a room that already has
+    // story_lists — which is every room that has ever opened the Create page —
+    // so without these the new columns would exist only in rooms made from
+    // scratch, and the shape controls would fail on exactly the rooms that have
+    // a story in them.
+    for stmt in [
+        "ALTER TABLE story_lists ADD COLUMN aspect_ratio TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE story_lists ADD COLUMN still_resolution TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE story_lists ADD COLUMN clip_resolution TEXT NOT NULL DEFAULT ''",
+    ] {
+        add_column_if_missing(conn, stmt)?;
+    }
+
     // Rooms opened before the jobs write path enforced one parked entry per unit
     // of work carry the pile-up it allowed: several indistinguishable paused
     // copies of the same workflow in Activity. Repair them here rather than
@@ -1357,6 +1483,52 @@ fn rebuild_marked_hebrew_chunks(conn: &Connection) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A room that already has `story_lists` gets the shape columns anyway.
+    ///
+    /// `CREATE TABLE IF NOT EXISTS` in `migrate` is a NO-OP once the table
+    /// exists — which is every room that has ever opened the Create page. So
+    /// without the `ALTER`s, the new columns would land only in rooms made
+    /// from scratch, and the shape controls would fail on exactly the rooms
+    /// that have a story in them to shape.
+    #[test]
+    fn an_older_story_list_gains_its_shape_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        // Put the table back the way it shipped, without the three new
+        // columns — which is the state every room that used the Story tab
+        // before today is actually in.
+        conn.execute_batch(
+            "DROP TABLE story_lists;
+             CREATE TABLE story_lists (
+               id TEXT PRIMARY KEY,
+               title TEXT NOT NULL,
+               logline TEXT NOT NULL DEFAULT '',
+               created_at TEXT NOT NULL DEFAULT '',
+               updated_at TEXT NOT NULL DEFAULT ''
+             );
+             INSERT INTO story_lists (id, title) VALUES ('l1', 'Episode 1');",
+        )
+        .unwrap();
+        assert!(!column_exists(&conn, "story_lists", "aspect_ratio").unwrap());
+
+        migrate(&conn).unwrap();
+
+        for column in ["aspect_ratio", "still_resolution", "clip_resolution"] {
+            assert!(
+                column_exists(&conn, "story_lists", column).unwrap(),
+                "{column} must be added to a room that already had the table"
+            );
+        }
+        // The list that was already there survives, with an empty shape —
+        // which reads as "let each model's own default stand".
+        let shape: String = conn
+            .query_row("SELECT aspect_ratio FROM story_lists WHERE id = 'l1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(shape, "");
+    }
 
     /// `roomai verify` promises to look, not touch. It used to go through
     /// `open_room`, which always runs `migrate` — at least one write — so the

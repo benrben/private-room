@@ -10,6 +10,18 @@ import {
 export * from "./apiTypes";
 import type {
   AppDiag,
+  CastMember,
+  CreateCatalog,
+  RoomPicture,
+  PlannedShot,
+  ShotPlan,
+  FilmPlan,
+  ShotRunStarted,
+  RoomDocument,
+  ParsedMember,
+  CastFromFile,
+  StoryBoard,
+  StoryShot,
   FeedbackDraft,
   RecFile,
   RecLive,
@@ -405,6 +417,113 @@ export const api = {
    *  job id; progress arrives on the normal job-progress events. */
   startDownloadJob: (url: string, engine: "fetch" | "media") =>
     invoke<string>("start_download_job", { url, engine }),
+
+  /** The Create page's shelf: every model this room's providers say can make
+   *  a picture or a clip, plus why the rest cannot. Read live from the
+   *  catalog — never a list kept here. */
+  listCreateModels: () => invoke<CreateCatalog>("list_create_models"),
+  /** Make one. Returns the job id; the pictures land as room files and
+   *  progress arrives on the normal job-progress events. */
+  startCreateJob: (opts: {
+    prompt: string;
+    model: string;
+    kind: "image" | "video";
+    variations?: number;
+    /** Clip length. Only ever a value the model's own catalogue lists. */
+    seconds?: number | null;
+    resolution?: string;
+    aspectRatio?: string;
+    /** Room files sent as guiding pictures — the cast's faces. */
+    referenceFileIds?: string[];
+    /** A room file pinned as the clip's FIRST FRAME. Not a reference: the
+     *  clip literally begins on this picture. */
+    frameFileId?: string | null;
+    /** The user was shown these pictures and pressed a button saying they
+     *  would be sent. Nothing else may set this — see `videogen.guard`. */
+    referencesAck?: boolean;
+    shotId?: string | null;
+  }) => invoke<string>("start_create_job", opts),
+  /** What making the whole list WOULD do — every part's exact prompt, its
+   *  length, and both ends of its clip — before a penny of it is spent.
+   *  Built by the same Rust that runs the job, so it cannot drift from it. */
+  storyFilmPlan: (listId: string, kind: "image" | "video", continuous = true) =>
+    invoke<FilmPlan>("story_film_plan", { listId, kind, continuous }),
+  /** Make every unmade shot in a list. One call rather than N, so a list of
+   *  twenty is one decision with one outcome rather than twenty races. They
+   *  run one at a time — the queue has a single running slot. */
+  startShotListJob: (
+    listId: string,
+    kind: "image" | "video",
+    /** Join each clip to the next by ending it on the following shot's
+     *  opening picture. This is what makes twenty clips one episode. */
+    continuous = true,
+  ) => invoke<ShotRunStarted>("start_shot_list_job", { listId, kind, continuous }),
+  /** Every picture in this room, as thumbnails to choose from. */
+  storyPictures: () => invoke<RoomPicture[]>("story_pictures"),
+  /** Every room file with text in it — the ones a script or a cast can come
+   *  from. This is what stops the Story tab asking for a document the room is
+   *  already holding to be typed in again. */
+  storyDocuments: () => invoke<RoomDocument[]>("story_documents"),
+  /** The WHOLE text of one room file. Never clamped — a clamp here is the
+   *  `#minutes` bug again, where 6 KB of an hour-long transcript passed for
+   *  the whole thing. */
+  storyTextFromFile: (fileId: string) =>
+    invoke<string>("story_text_from_file", { fileId }),
+  /** Read a character sheet. Nothing is written — the people come back to be
+   *  looked at and edited first. */
+  storyReadCastFile: (fileId: string) =>
+    invoke<CastFromFile>("story_read_cast_file", { fileId }),
+  /** Keep the people that survived the preview. */
+  storyAddCastMany: (members: ParsedMember[]) =>
+    invoke<number>("story_add_cast_many", { members }),
+  storyBoard: (listId?: string | null) =>
+    invoke<StoryBoard>("story_board", { listId: listId ?? null }),
+  storyAddCast: (name: string, description: string, story: string) =>
+    invoke<CastMember>("story_add_cast", { name, description, story }),
+  storyUpdateCast: (id: string, name: string, description: string, story: string) =>
+    invoke<void>("story_update_cast", { id, name, description, story }),
+  storySetFace: (id: string, fileId: string | null) =>
+    invoke<void>("story_set_face", { id, fileId }),
+  storyRemoveCast: (id: string) => invoke<void>("story_remove_cast", { id }),
+  storyCreateList: (title: string, logline: string) =>
+    invoke<string>("story_create_list", { title, logline }),
+  storyUpdateList: (id: string, title: string, logline: string) =>
+    invoke<void>("story_update_list", { id, title, logline }),
+  /** The frame shape and output size for a whole list. Separate from the
+   *  title and logline, which are re-saved on every keystroke — the shape is
+   *  picked from a menu and has no business being written that often. */
+  storySetShape: (opts: {
+    id: string;
+    aspectRatio: string;
+    stillResolution: string;
+    clipResolution: string;
+  }) => invoke<void>("story_set_shape", opts),
+  storyDeleteList: (id: string) => invoke<void>("story_delete_list", { id }),
+  storyAddShot: (listId: string, action: string) =>
+    invoke<StoryShot>("story_add_shot", { listId, action }),
+  storyUpdateShot: (opts: {
+    id: string;
+    action: string;
+    castIds: string[];
+    seconds: number | null;
+    imageModel: string;
+    videoModel: string;
+  }) => invoke<void>("story_update_shot", opts),
+  storyRemoveShot: (id: string) => invoke<void>("story_remove_shot", { id }),
+  storyReorderShots: (listId: string, ids: string[]) =>
+    invoke<void>("story_reorder_shots", { listId, ids }),
+  /** Cut a script into shots of a fixed length. Pure local text work — no
+   *  model, nothing leaves the Mac, and no word can go missing. */
+  storyPlanSplit: (script: string, minutes: number, secondsEach: number) =>
+    invoke<ShotPlan>("story_plan_split", { script, minutes, secondsEach }),
+  /** Write a planned split into a list. APPENDS — it never deletes shots that
+   *  may already have paid-for pictures against them. */
+  storyApplySplit: (opts: {
+    listId: string;
+    shots: PlannedShot[];
+    imageModel: string;
+    videoModel: string;
+  }) => invoke<number>("story_apply_split", opts),
   onBrowserJournal: (cb: (row: BrowseJournalRow) => void): Promise<UnlistenFn> =>
     listen<BrowseJournalRow>("browser-journal", (e) => cb(e.payload)),
   onBrowserNavigated: (cb: (url: string) => void): Promise<UnlistenFn> =>

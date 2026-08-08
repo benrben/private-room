@@ -65,6 +65,74 @@ DOC_SYS = (
 #: The value a field gets when the document does not contain it (cmd_extract).
 NOT_FOUND = "(not found)"
 
+#: story.rs — reading a character sheet into a cast.
+#:
+#: Replaced a hand-written parser that matched headings and labels. It read a
+#: tidy sheet correctly and mangled a real one, which is the usual fate of a
+#: heuristic meeting a document a person actually wrote: nested lists, tables,
+#: numbered items, an appearance split over three bullets under a sub-heading.
+#:
+#: The two rules that matter are the two a model gets wrong. **Do not invent
+#: anyone** — an added character is believed, and ends up in shots. And
+#: `description` is for a PICTURE MODEL: it goes verbatim into every prompt
+#: that person appears in, so "brave and loyal" is worse than useless there
+#: while "tall, grey wool coat, cropped hair" is the whole job.
+CAST_SHEET_SYSTEM = (
+    "You read a document and list the CHARACTERS it describes.\n"
+    "Rules:\n"
+    "1. Only people the document actually describes. Never invent a character, "
+    "and never turn a place, a chapter heading, a section title, an episode "
+    "name or a list label into one. If the document describes no characters, "
+    "return an empty list.\n"
+    "2. `name` is what they are called, nothing else — no title line, no "
+    "numbering, no markdown, no colon.\n"
+    "3. `description` is ONLY what they LOOK like — build, age, hair, clothing, "
+    "distinguishing marks. It is fed straight to an image model, so personality, "
+    "role and history do not belong in it. Gather the appearance from wherever "
+    "it appears in their entry, including lists and tables. If the document "
+    "never says what they look like, use an empty string rather than guessing.\n"
+    "4. `story` is who they are: role, history, what they want, how they speak. "
+    "Empty string if the document does not say.\n"
+    "5. Copy the document's own wording. Do not embellish, translate or "
+    "summarise into your own phrasing.\n"
+    "6. Keep the document's language."
+)
+
+#: One person as the sheet reader returns them.
+CAST_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "cast": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "description": {"type": "string"},
+                    "story": {"type": "string"},
+                },
+                "required": ["name", "description", "story"],
+            },
+        }
+    },
+    "required": ["cast"],
+}
+
+#: How much document goes into one call.
+#:
+#: Windowed rather than clamped, and the difference is the whole point: a clamp
+#: reads the first N characters and silently reports the rest as "no characters
+#: found", which is exactly the `#minutes` failure — a confident answer about
+#: the part it happened to see. Every window is read and the results merged.
+CAST_WINDOW_CHARS = 12_000
+#: Carried between windows so a person split across a boundary is still whole
+#: in one of them.
+CAST_WINDOW_OVERLAP = 1_200
+#: A ceiling on one import, mirroring the Rust. A document that yields more
+#: than this is being misread, and importing sixty people nobody asked for is
+#: worse than importing none.
+CAST_MAX = 40
+
 # --- Rust helper reproductions ----------------------------------------------
 
 
@@ -316,9 +384,133 @@ async def generate_doc(
     )
 
 
+def cast_windows(document: str) -> list[str]:
+    """Cut a document into overlapping windows, on paragraph breaks where it can.
+
+    Splitting mid-sentence would hand a window half a character's appearance
+    and nothing to attach it to, so a boundary is nudged back to the last blank
+    line in the tail of the window when there is one.
+    """
+    text = document.strip()
+    if len(text) <= CAST_WINDOW_CHARS:
+        return [text] if text else []
+    windows: list[str] = []
+    start = 0
+    while start < len(text):
+        end = min(start + CAST_WINDOW_CHARS, len(text))
+        if end < len(text):
+            # Look for a paragraph break in the last fifth of the window.
+            floor = end - CAST_WINDOW_CHARS // 5
+            brk = text.rfind("\n\n", max(start, floor), end)
+            if brk > start:
+                end = brk
+        windows.append(text[start:end].strip())
+        if end >= len(text):
+            break
+        start = max(end - CAST_WINDOW_OVERLAP, start + 1)
+    return [w for w in windows if w]
+
+
+def merge_cast(found: list[dict[str, str]]) -> list[dict[str, str]]:
+    """Fold the windows' answers into one cast, first mention wins the name.
+
+    The overlap means a person can come back twice; the same person described
+    in two places should be ONE entry with both halves, not two heroes with the
+    same name who each know half of themselves. Matched case-insensitively
+    because a sheet writes "MIRA" in a heading and "Mira" in the prose.
+    """
+    merged: list[dict[str, str]] = []
+    seen: dict[str, int] = {}
+    for person in found:
+        name = (person.get("name") or "").strip()
+        if not name:
+            continue
+        key = name.casefold()
+        description = (person.get("description") or "").strip()
+        story = (person.get("story") or "").strip()
+        if key in seen:
+            at = merged[seen[key]]
+            # Only ADD what is missing. Overwriting would let a later, thinner
+            # window erase a full description from an earlier one.
+            for field, value in (("description", description), ("story", story)):
+                if not value:
+                    continue
+                if not at[field]:
+                    at[field] = value
+                elif value.casefold() not in at[field].casefold():
+                    at[field] = f"{at[field]} {value}".strip()
+            continue
+        if len(merged) >= CAST_MAX:
+            continue
+        seen[key] = len(merged)
+        merged.append({"name": name, "description": description, "story": story})
+    return merged
+
+
+async def extract_cast(
+    model: str,
+    base_url: str,
+    document: str,
+    *,
+    temperature: float = 0.0,
+    keep_alive: str = KEEP_ALIVE_WARM,
+    privacy: dict[str, Any] | None = None,
+    provider: Any | None = None,
+) -> list[dict[str, str]]:
+    """Read a character sheet into people.
+
+    Every window is read; an unreadable answer for ONE window is skipped rather
+    than failing the import, because the other windows still hold real
+    characters and losing them to one bad reply would be the worse trade. A
+    document where NO window could be read raises, so "the model could not read
+    this" never arrives disguised as "this file has no characters in it".
+    """
+    windows = cast_windows(document)
+    if not windows:
+        return []
+    found: list[dict[str, str]] = []
+    failures = 0
+    for window in windows:
+        messages = [
+            system_message(CAST_SHEET_SYSTEM),
+            user_message(f"Document:\n{window}"),
+        ]
+        try:
+            reply = await _structured(
+                model,
+                base_url,
+                messages,
+                CAST_SCHEMA,
+                temperature=temperature,
+                keep_alive=keep_alive,
+                privacy=privacy,
+                provider=provider,
+            )
+            parsed = json.loads(reply.strip())
+        except (ValueError, TypeError, llm.LlmError):
+            failures += 1
+            continue
+        people = parsed.get("cast") if isinstance(parsed, dict) else None
+        if isinstance(people, list):
+            found.extend(p for p in people if isinstance(p, dict))
+        else:
+            failures += 1
+    if failures == len(windows):
+        raise llm.LlmError(
+            "ENGINE_ERROR",
+            "the model could not read this file as a character sheet — its "
+            "answer was not usable",
+        )
+    return merge_cast(found)
+
+
 __all__ = [
     "EXTRACT_FIELDS_SYSTEM",
     "LIST_NAMES_SYSTEM",
+    "CAST_SHEET_SYSTEM",
+    "cast_windows",
+    "merge_cast",
+    "extract_cast",
     "DOC_SYS",
     "NOT_FOUND",
     "parse_string_list",

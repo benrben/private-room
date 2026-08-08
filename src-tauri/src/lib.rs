@@ -333,6 +333,39 @@ pub fn run() {
             commands::import_media_url,
             commands::cancel_media_download,
             commands::start_download_job,
+            // The Create page: which models can make a picture, and the job
+            // that makes one.
+            commands::list_create_models,
+            commands::start_create_job,
+            // The Story tab: a room's cast, its shot lists, and making a
+            // whole list in one go. `story_film_plan` is the review sheet —
+            // what the run WOULD do, itemised, before any of it is billed.
+            commands::story_film_plan,
+            commands::start_shot_list_job,
+            commands::story_board,
+            commands::story_pictures,
+            commands::story_add_cast,
+            // The room already HOLDS the script and the character sheets.
+            // These are what stop the Story tab asking for them to be typed
+            // in a second time.
+            commands::story_documents,
+            commands::story_text_from_file,
+            commands::story_read_cast_file,
+            commands::story_add_cast_many,
+            commands::story_update_cast,
+            commands::story_set_face,
+            commands::story_remove_cast,
+            commands::story_create_list,
+            commands::story_update_list,
+            commands::story_set_shape,
+            commands::story_delete_list,
+            commands::story_add_shot,
+            commands::story_update_shot,
+            commands::story_remove_shot,
+            commands::story_reorder_shots,
+            // A five-minute script -> twenty 15-second shots, joined end to end.
+            commands::story_plan_split,
+            commands::story_apply_split,
             // ADD-27: live Recording file (streaming transcription, editing,
             // translate). ADD-28: feedback → GitHub issue.
             commands::rec_start,

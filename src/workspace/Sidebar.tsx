@@ -45,6 +45,9 @@ const AREA_HEADINGS: Record<WorkArea, string> = {
   skills: "Skills",
   memory: "Memory",
   connectors: "Connectors",
+  // The library stays the heading here: a generation lands as an ordinary
+  // room file, so the pane beside Create is showing files, not "Create".
+  create: "Library",
   browser: "Private browser",
 };
 

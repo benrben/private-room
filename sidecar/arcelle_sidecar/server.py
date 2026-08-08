@@ -36,9 +36,11 @@ from . import (
     features,
     file_pass,
     handoff,
+    imagegen,
     llm,
     model_limits,
     rec_read,
+    videogen,
     vision,
     websearch,
     wf_nodes,
@@ -58,6 +60,7 @@ from .config import (
     GenerateDocRequest,
     GenerateRequest,
     HealthResponse,
+    ImageGenerateRequest,
     KnowledgeExtractRequest,
     LabelRequest,
     ModelsRequest,
@@ -68,6 +71,8 @@ from .config import (
     SpecialistsRequest,
     PodcastTtsRequest,
     TtsRequest,
+    VideoJobRequest,
+    VideoStartRequest,
     VisionLocateRequest,
     WarmRequest,
     WebSearchRequest,
@@ -668,6 +673,122 @@ def create_app(
             )
         return {"audio_b64": tts_mod.wav_b64(wav)}
 
+    @app.post("/image_generate")
+    async def image_generate(req: ImageGenerateRequest) -> Any:
+        """One prompt -> one picture or clip, as base64 for the host to file.
+
+        Deliberately not part of the chat path: ``generate`` there is typed
+        ``-> str`` and drops non-text blocks, so a returned image would vanish
+        silently. See :mod:`.imagegen` for the privacy rule, which REFUSES a
+        reference image rather than stripping it.
+
+        A missing ``provider`` is a 400 rather than a crash: it means the host
+        could not mint a key for this model, which is a setup problem the user
+        can act on ("connect OpenRouter"), not a provider failure.
+        """
+        if req.provider is None:
+            return JSONResponse(
+                {
+                    "code": "IMAGEGEN_BAD_REQUEST",
+                    "error": (
+                        "No API key is connected for this model. Add one in "
+                        "Settings, under AI providers."
+                    ),
+                },
+                status_code=400,
+            )
+        try:
+            result = await imagegen.generate(
+                prompt=req.prompt,
+                model=req.model,
+                provider=req.provider,
+                privacy=req.privacy,
+                reference_b64=req.reference_b64,
+                reference_mime=req.reference_mime,
+                references_ack=req.references_ack,
+                aspect_ratio=req.aspect_ratio,
+                resolution=req.resolution,
+                kind=req.kind,
+            )
+        except imagegen.ImageGenError as exc:
+            return JSONResponse(
+                {"code": "IMAGEGEN_FAILED", "error": str(exc)}, status_code=502
+            )
+        return result
+
+    def _no_key() -> JSONResponse:
+        return JSONResponse(
+            {
+                "code": "VIDEOGEN_BAD_REQUEST",
+                "error": (
+                    "No API key is connected for this model. Add one in "
+                    "Settings, under AI providers."
+                ),
+            },
+            status_code=400,
+        )
+
+    @app.post("/video_start")
+    async def video_start(req: VideoStartRequest) -> Any:
+        """Submit one clip and return the provider's job id. Does NOT wait.
+
+        Video is a three-call API, not a chat completion — see
+        :mod:`.videogen`. Submission is split from polling so the host's Stop
+        is real and the progress bar moves; a loop that blocked here would give
+        the user a frozen bar and nothing to cancel, on work that is billed.
+        """
+        if req.provider is None:
+            return _no_key()
+        try:
+            return await videogen.submit(
+                prompt=req.prompt,
+                model=req.model,
+                provider=req.provider,
+                privacy=req.privacy,
+                seconds=req.seconds,
+                resolution=req.resolution,
+                aspect_ratio=req.aspect_ratio,
+                frames=[frame.model_dump() for frame in req.frames],
+                references=[ref.model_dump() for ref in req.references],
+                references_ack=req.references_ack,
+                generate_audio=req.generate_audio,
+            )
+        except videogen.VideoGenError as exc:
+            return JSONResponse(
+                {"code": "VIDEOGEN_FAILED", "error": str(exc)}, status_code=502
+            )
+
+    @app.post("/video_status")
+    async def video_status(req: VideoJobRequest) -> Any:
+        """Where one submitted clip has got to."""
+        if req.provider is None:
+            return _no_key()
+        try:
+            return await videogen.status(
+                model=req.model, video_id=req.video_id, provider=req.provider
+            )
+        except videogen.VideoGenError as exc:
+            return JSONResponse(
+                {"code": "VIDEOGEN_FAILED", "error": str(exc)}, status_code=502
+            )
+
+    @app.post("/video_fetch")
+    async def video_fetch(req: VideoJobRequest) -> Any:
+        """Download a finished clip as base64 for the host to file."""
+        if req.provider is None:
+            return _no_key()
+        try:
+            return await videogen.fetch(
+                model=req.model,
+                video_id=req.video_id,
+                provider=req.provider,
+                index=req.index,
+            )
+        except videogen.VideoGenError as exc:
+            return JSONResponse(
+                {"code": "VIDEOGEN_FAILED", "error": str(exc)}, status_code=502
+            )
+
     @app.post("/tts/podcast")
     async def tts_podcast(req: PodcastTtsRequest) -> Any:
         """A whole episode: many turns, each in its own voice, one WAV back.
@@ -786,6 +907,24 @@ def create_app(
         # a superset — Rust maps it back to an empty row if it wants the old
         # best-effort behavior.)
         try:
+            if req.mode == "cast":
+                # story.rs: a character sheet -> the people in it. Nothing is
+                # written by this call; the host shows them to be checked and
+                # edited first, which is what makes a MODEL safe to use here
+                # at all — it can misread, and the preview is the guard.
+                cast = await until_hangup(
+                    request,
+                    chat_docs.extract_cast(
+                        req.model,
+                        req.base_url,
+                        req.document,
+                        temperature=req.temperature,
+                        keep_alive=req.keep_alive,
+                        privacy=req.privacy,
+                        provider=req.provider,
+                    ),
+                )
+                return {"cast": cast}
             if req.mode == "list":
                 items = await until_hangup(
                     request,

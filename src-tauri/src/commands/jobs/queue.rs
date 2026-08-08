@@ -199,6 +199,7 @@ async fn start_job_from_row(
             start_podcast_audio_row(window, &state, &job, &room_path, cancel).map(|_| true)
         }
         "download" => start_download_row(window, &state, &job, &room_path, cancel).map(|_| true),
+        "create" => start_create_row(window, &state, &job, &room_path, cancel).map(|_| true),
         "rec_read" => start_rec_read_row(window, &state, &job, &room_path, cancel)
             .await
             .map(|_| true),

@@ -101,7 +101,7 @@ describe("GH #2a — the activity rail expands", () => {
   it("keeps every rail destination reachable while expanded", async () => {
     await browser.waitUntil(async () => (await widthOf(RAIL)) > 150);
     // A wider rail must not push its own buttons out of the viewport.
-    for (const area of ["map", "recordings", "workflows", "memory", "connectors"]) {
+    for (const area of ["map", "recordings", "workflows", "memory", "connectors", "create"]) {
       await expect(await $(RAIL).$(`[data-area="${area}"]`)).toBeDisplayed();
     }
   });

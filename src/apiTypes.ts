@@ -832,10 +832,264 @@ export interface ExternalModelInfo {
   inputPrice: string | null;
   outputPrice: string | null;
   inputModalities: string[];
+  /** What the model PRODUCES, from the catalog's `architecture
+   * .output_modalities`. The mirror of `inputModalities`. */
+  outputModalities: string[];
   tools: boolean;
   vision: boolean;
+  /** Derived from `outputModalities`, never from the slug — `vision` means it
+   * can READ a picture, these mean it can MAKE one, and every vision model in
+   * the app is the former and none is the latter. */
+  imageOutput: boolean;
+  videoOutput: boolean;
   reasoning: boolean;
   structuredOutputs: boolean;
+}
+
+/** One model the Create page may offer, as `list_create_models` returns it. */
+export interface CreateModel {
+  /** The full selection string a generation is started with, engine prefix
+   * included ("openrouter::vendor/slug"). */
+  model: string;
+  slug: string;
+  label: string;
+  engine: string;
+  engineLabel: string;
+  local: boolean;
+  description: string | null;
+  /** Both may be true — a model that makes stills and clips shows on both tabs. */
+  image: boolean;
+  video: boolean;
+  /** The provider's own per-token price, verbatim. Not converted to a
+   * per-picture figure, which the room would have to invent. */
+  outputPrice: string | null;
+  /** What this model will actually accept, read from the provider's own media
+   * endpoints. Null when it published nothing. Veo takes 4/6/8 seconds and
+   * nothing else; Kling takes 3–15 — so a single invented list of lengths
+   * would be refused by most of the shelf. */
+  limits: MediaLimits | null;
+}
+
+/** The legal shapes for one media model. An EMPTY list means the provider
+ * declined to say, which is not the same as "anything goes": the caller sends
+ * nothing and the model's own default stands. */
+export interface MediaLimits {
+  durations: number[];
+  resolutions: string[];
+  aspectRatios: string[];
+  /** "first_frame" / "last_frame". Empty = this model animates from words
+   * alone, so offering a starting picture would be offering nothing. */
+  frameImages: string[];
+  /** How many guiding pictures it will look at. Null = unpublished. */
+  maxReferences: number | null;
+  generateAudio: boolean;
+}
+
+/** Someone a story is about.
+ *
+ * `faceFileId` is the load-bearing field. Character consistency does not come
+ * from words — "a woman with red hair" is re-imagined on every call — it comes
+ * from handing the model the same picture each time. */
+export interface CastMember {
+  id: string;
+  name: string;
+  description: string;
+  story: string;
+  faceFileId: string | null;
+  ord: number;
+}
+
+/** One shot list. Called a SHOT LIST on screen, never a "script": this app
+ * already uses that word for runnable Python. */
+export interface StoryList {
+  id: string;
+  title: string;
+  logline: string;
+  /** The frame shape for every shot in the list, e.g. "16:9". One value for
+   * the whole thing on purpose: a shot's still becomes its clip's literal
+   * first frame, so a 1:1 picture pinned to a 16:9 clip is the wrong shape.
+   * Empty = let each model's own default stand. */
+  aspectRatio: string;
+  /** Output size, per medium — the two catalogues publish different words for
+   * it ("1K"/"2K" for pictures, "720p"/"1080p"/"4K" for clips). */
+  stillResolution: string;
+  clipResolution: string;
+  shotCount: number;
+  updatedAt: string;
+}
+
+/** A room file with readable text in it — something a script or a cast can be
+ * read out of, rather than typed in again. */
+export interface RoomDocument {
+  fileId: string;
+  name: string;
+  /** Roughly how long, so a note and a 40-page script are told apart before
+   * either is opened. */
+  words: number;
+  snippet: string;
+}
+
+/** Someone found in a document, before anyone has agreed to keep them. */
+export interface ParsedMember {
+  name: string;
+  description: string;
+  story: string;
+}
+
+/** What a character sheet turned out to contain. */
+export interface CastFromFile {
+  name: string;
+  found: ParsedMember[];
+  /** WHICH reader produced these — the room's model, or the pattern reader.
+   * Shown, because the two are not equally trustworthy on a messy file and
+   * "why did it split this wrong" is unanswerable without it. */
+  readBy: string;
+  /** Set when the model was meant to read it and could not. The fallback rows
+   * must never pass for the model's work. */
+  fellBack: string | null;
+}
+
+/** One shot exactly as it will be sent — or why it will not be.
+ *
+ * Built by the same Rust that runs the job, never assembled separately: a
+ * preview that drifts from what it previews is worse than none, because it
+ * puts one claim on screen above a button that pays for another. */
+export interface ShotPreview {
+  shotId: string;
+  /** 1-based place in the list, as the row is labelled. */
+  n: number;
+  action: string;
+  /** The words that will be sent, verbatim. */
+  prompt: string;
+  /** The length after the model's own published list has had its say. */
+  seconds: number | null;
+  model: string;
+  /** The picture the clip opens on, and the one it closes on — the second is
+   * the next shot's opening picture, which is what joins them. */
+  startFileId: string | null;
+  endFileId: string | null;
+  /** The portraits that ride along as guidance. "Mira is in this shot" is a
+   * claim; the picture that will be sent is the evidence for it. */
+  referenceFileIds: string[];
+  cast: string[];
+  /** Cast in this shot with NO picture — the ones who will be re-imagined from
+   * words on every call rather than looking like themselves. */
+  faceless: string[];
+  /** The model that would not take an ending picture here, so the join was
+   * dropped. Per shot, because a list can mix models. */
+  joinDropped: string | null;
+  /** True when this clip OPENS on the frame the previous clip really ends on —
+   * captured from the finished video, not aimed at. The join, stated as a
+   * promise the run can actually keep. */
+  startsOnPrevious: boolean;
+  /** Why this shot is not being sent. Null means it is. */
+  skip: string | null;
+}
+
+/** What pressing "Draw them" / "Film them" would actually do. */
+export interface FilmPlan {
+  kind: "image" | "video";
+  /** Every shot, sent or not — a row missing from the review is a row nobody
+   * can ask about. */
+  shots: ShotPreview[];
+  sending: number;
+  skipped: number;
+  totalSeconds: number;
+  /** How many clips OPEN on the captured end of the one before. Aiming with a
+   * last frame is not counted — it is aim, not contact. */
+  joined: number;
+  overCap: boolean;
+  /** The model that will not take an ending picture. THE reason "clip one ends
+   * on a frame clip two does not start with" — the clips get made either way,
+   * so without this the failure is only findable by watching twenty videos. */
+  joinBlockedBy: string | null;
+  /** Everyone in the run with no portrait, deduplicated. */
+  faceless: string[];
+}
+
+/** The outcome of one press of "Draw them" / "Film them". */
+export interface ShotRunStarted {
+  jobIds: string[];
+  /** How many were meant to start, so a short run reads as a shortfall rather
+   * than as a smaller number with nothing to compare it against. */
+  asked: number;
+  shortfall: string | null;
+}
+
+/** One shot: what happens, who is in it, and what has been made of it. */
+export interface StoryShot {
+  id: string;
+  listId: string;
+  ord: number;
+  action: string;
+  castIds: string[];
+  /** Null = the model's own default. Legal lengths differ per model, so a
+   * number chosen before the model may be illegal after it. */
+  seconds: number | null;
+  imageModel: string;
+  videoModel: string;
+  stillFileId: string | null;
+  clipFileId: string | null;
+}
+
+/** One room picture, small enough to draw a hundred of. The thumbnail is a
+ * downscaled JPEG — a grid of full-size pictures would cost hundreds of
+ * megabytes to show a few kilobytes of information. */
+export interface RoomPicture {
+  fileId: string;
+  name: string;
+  thumbB64: string;
+}
+
+/** One shot a split would produce. */
+export interface PlannedShot {
+  action: string;
+  /** This shot's OWN length — per shot, not one number for all of them. A
+   * real script has a ten-second beat in it, and flattening that to fifteen
+   * would change the author's pacing without saying so. */
+  seconds: number;
+}
+
+/** What breaking a script into shots would produce, before it is written. */
+export interface ShotPlan {
+  parts: number;
+  totalSeconds: number;
+  /** Every shot, so the split can be seen before it is committed. */
+  shots: PlannedShot[];
+  /** True when the SCRIPT declared its own chunks (`**00:00–00:15** — …`) and
+   * they were used verbatim, rather than the room cutting it by length. The
+   * two produce very different results, so the page says which happened. */
+  fromScript: boolean;
+}
+
+/** Everything the Story tab draws itself from, in one round trip. */
+export interface StoryBoard {
+  cast: CastMember[];
+  lists: StoryList[];
+  shots: StoryShot[];
+  selected: string | null;
+}
+
+/** Why a set of models is NOT on the Create shelf. Returned rather than
+ * dropped: "where is Claude" is the question this page has to answer. */
+export interface CreateExclusion {
+  engineLabel: string;
+  reason: string;
+  count: number;
+  examples: string[];
+}
+
+/** Everything the Create page needs to draw itself. */
+export interface CreateCatalog {
+  models: CreateModel[];
+  /** The denominator in "11 of 34 can make a picture". */
+  scanned: number;
+  excluded: CreateExclusion[];
+  /** False means "connect a provider", which is a different sentence from
+   * "nothing here can draw". */
+  anyProvider: boolean;
+  /** A provider is connected but its catalog would not load. */
+  error: string | null;
 }
 
 export interface AiProviderStatus {

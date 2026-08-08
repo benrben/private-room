@@ -191,6 +191,132 @@ mod imp {
             (!meta.is_empty()).then_some(meta)
         })
     }
+
+    /// A CMTime as seconds, or None when it is not a usable number.
+    fn seconds_of(t: objc2_core_media::CMTime) -> Option<f64> {
+        if !t.flags.contains(objc2_core_media::CMTimeFlags::Valid) || t.timescale <= 0 {
+            return None;
+        }
+        let secs = t.value as f64 / t.timescale as f64;
+        (secs.is_finite() && secs >= 0.0).then_some(secs)
+    }
+
+    /// The last frame of the clip at `path`, as PNG.
+    #[allow(deprecated)] // duration + copyCGImageAtTime: sync accessors, same
+                         // bargain as `probe` — every caller is on a blocking
+                         // worker with nothing to do but wait.
+    pub fn last_frame(path: &std::path::Path) -> Option<Vec<u8>> {
+        use objc2::AnyThread;
+        use objc2_av_foundation::AVAssetImageGenerator;
+        use objc2_core_media::CMTime;
+
+        let path_str = path.to_str()?;
+        autoreleasepool(|_| {
+            let url = NSURL::fileURLWithPath(&NSString::from_str(path_str));
+            let asset = unsafe { AVURLAsset::URLAssetWithURL_options(&url, None) };
+            let d = unsafe { asset.duration() };
+            if !d.flags.contains(objc2_core_media::CMTimeFlags::Valid) || d.timescale <= 0 {
+                return None;
+            }
+
+            let generator = unsafe {
+                AVAssetImageGenerator::initWithAsset(AVAssetImageGenerator::alloc(), &asset)
+            };
+            // A portrait clip stores landscape pixels plus a rotation; without
+            // this the captured frame — and therefore the whole next clip —
+            // comes out sideways.
+            unsafe { generator.setAppliesPreferredTrackTransform(true) };
+
+            // Anchor to the VIDEO TRACK's end, not the asset duration. The
+            // asset duration is the max across ALL tracks, and an audio track
+            // routinely outruns the video by a few dozen milliseconds (AAC
+            // priming padding — reproduced live with a 76 ms overhang). A
+            // zero-tolerance request in that gap sits after the last video
+            // frame and fails outright with "Cannot Open".
+            let video_end_secs: f64 = unsafe { AVMediaTypeVideo }
+                .and_then(|kind| {
+                    let tracks = unsafe { asset.tracksWithMediaType(kind) };
+                    let track = tracks.firstObject()?;
+                    let range = unsafe { track.timeRange() };
+                    let start = seconds_of(range.start)?;
+                    let length = seconds_of(range.duration)?;
+                    Some(start + length)
+                })
+                .or_else(|| seconds_of(d))?;
+
+            // "The last frame" cannot be asked for as the end itself: that is
+            // the boundary AFTER the final frame. A thirtieth of a second
+            // earlier lands inside the final frame's display window.
+            let at_secs = (video_end_secs - 1.0 / 30.0).max(0.0);
+            // 600 is the classic movie timescale — exact for every common
+            // frame rate, and it sidesteps building times in a track's own
+            // (sometimes enormous) timescale.
+            let at = CMTime {
+                value: (at_secs * 600.0).round() as i64,
+                timescale: 600,
+                flags: objc2_core_media::CMTimeFlags::Valid,
+                epoch: 0,
+            };
+            // Zero tolerance first: the point of this capture is exactness.
+            // With the default tolerance AVFoundation may answer with a nearby
+            // KEYFRAME, which on a 15-second clip can be half a second early —
+            // visibly not the frame the clip ends on.
+            let zero = CMTime {
+                value: 0,
+                timescale: 1,
+                flags: objc2_core_media::CMTimeFlags::Valid,
+                epoch: 0,
+            };
+            unsafe {
+                generator.setRequestedTimeToleranceBefore(zero);
+                generator.setRequestedTimeToleranceAfter(zero);
+            }
+
+            let exact = unsafe {
+                generator
+                    .copyCGImageAtTime_actualTime_error(at, std::ptr::null_mut())
+                    .ok()
+            };
+            let cg = match exact {
+                Some(cg) => cg,
+                None => {
+                    // The exact request failed — an odd container, a
+                    // fragmented mp4, a track that lied about its range. A
+                    // frame NEAR the end, from the real clip, still beats the
+                    // drawn still by a mile, so retry with the tolerance the
+                    // OS wants before giving up.
+                    let any = CMTime {
+                        value: i64::MAX,
+                        timescale: 1,
+                        flags: objc2_core_media::CMTimeFlags::Valid
+                            | objc2_core_media::CMTimeFlags::PositiveInfinity,
+                        epoch: 0,
+                    };
+                    unsafe {
+                        generator.setRequestedTimeToleranceBefore(any);
+                        generator.setRequestedTimeToleranceAfter(zero);
+                    }
+                    unsafe {
+                        generator
+                            .copyCGImageAtTime_actualTime_error(at, std::ptr::null_mut())
+                            .ok()?
+                    }
+                }
+            };
+
+            // CGImage -> PNG, the same way quicklook.rs encodes its previews.
+            use objc2_app_kit::{NSBitmapImageFileType, NSBitmapImageRep};
+            use objc2_foundation::NSDictionary;
+            let bitmap = NSBitmapImageRep::initWithCGImage(NSBitmapImageRep::alloc(), &cg);
+            let data = unsafe {
+                bitmap.representationUsingType_properties(
+                    NSBitmapImageFileType::PNG,
+                    &NSDictionary::new(),
+                )
+            };
+            data.map(|d| d.to_vec())
+        })
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -199,6 +325,10 @@ mod imp {
     /// there is nothing to probe with, and inventing fields would be worse
     /// than saying so.
     pub fn probe(_path: &std::path::Path) -> Option<super::MediaMeta> {
+        None
+    }
+
+    pub fn last_frame(_path: &std::path::Path) -> Option<Vec<u8>> {
         None
     }
 }
@@ -226,12 +356,57 @@ pub fn probe_bytes(bytes: &[u8], ext: &str) -> Option<MediaMeta> {
         format!("arcelle-probe-{stem}.{ext}")
     });
     if write_private(&file, bytes).is_err() {
+        // A PARTIAL write (disk full mid-file) has already created the file,
+        // and the early return used to skip the cleanup below — leaving
+        // decrypted video on disk, which is exactly what this function
+        // promises never to do. Removing a file that never got created is a
+        // no-op, so this is unconditional.
+        let _ = std::fs::remove_file(&file);
         return None;
     }
     let meta = imp::probe(&file);
     // Always, on both paths — a probe must not leave decrypted video behind.
     let _ = std::fs::remove_file(&file);
     meta
+}
+
+/// The REAL final frame of a clip, as PNG bytes.
+///
+/// This is the Story tab's continuous mode. The first design pinned clip N's
+/// `last_frame` to shot N+1's still and trusted the model to land on it —
+/// and models treat that slot as a target they drift toward, not a frame they
+/// guarantee, so scene 2 did not start where scene 1 ended (reported live).
+/// Capturing the frame the finished clip ACTUALLY ends on and starting the
+/// next clip from it makes the join exact by construction, on any model that
+/// takes a first frame at all — 19 of the 21, not the 12 with a last-frame
+/// slot.
+///
+/// Same privacy bargain as [`probe_bytes`]: AVFoundation takes a file URL, so
+/// the decrypted clip sits in an owner-only temp file for the moment the
+/// capture takes and is removed on every exit path.
+///
+/// `None` means the frame could not be read — a codec AVFoundation does not
+/// decode (a WebM, say). The caller falls back to the drawn still, which is
+/// yesterday's behaviour: an approximate cut, never a lost clip.
+pub fn last_frame_png(bytes: &[u8], ext: &str) -> Option<Vec<u8>> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let stem = uuid::Uuid::new_v4();
+    let file = std::env::temp_dir().join(if ext.is_empty() {
+        format!("arcelle-endframe-{stem}")
+    } else {
+        format!("arcelle-endframe-{stem}.{ext}")
+    });
+    if write_private(&file, bytes).is_err() {
+        // Same promise as probe_bytes: a partial write is still a file, and
+        // it holds decrypted clip bytes. Removed on THIS path too.
+        let _ = std::fs::remove_file(&file);
+        return None;
+    }
+    let png = imp::last_frame(&file);
+    let _ = std::fs::remove_file(&file);
+    png
 }
 
 /// Owner-only from the moment it exists, rather than created world-readable

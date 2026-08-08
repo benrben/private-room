@@ -74,6 +74,13 @@ pub enum Capability {
     StructuredOutput,
     /// Can hold a chat turn at all (an embedding-only model cannot).
     Chat,
+    /// Hands back PIXELS, not a description of them. The mirror of `Vision`,
+    /// and deliberately a separate question: every vision model in the app can
+    /// read a picture and none of them can draw one.
+    ImageGeneration,
+    /// Hands back a clip. Separate from `ImageGeneration` because a model that
+    /// draws a still is not thereby able to move it.
+    VideoGeneration,
 }
 
 impl Capability {
@@ -87,6 +94,8 @@ impl Capability {
             Capability::Vision => "look at an image",
             Capability::StructuredOutput => "return a strictly-shaped result",
             Capability::Chat => "hold a conversation",
+            Capability::ImageGeneration => "make a picture",
+            Capability::VideoGeneration => "make a video",
         }
     }
 }
@@ -289,6 +298,13 @@ pub struct EngineCapabilities {
     pub vision: Support,
     pub structured_output: Support,
     pub chat: Support,
+    /// Can it PRODUCE a picture / a clip. Only ever `Yes` because a live
+    /// catalog said so — `Unknown` on every engine that publishes no modality
+    /// list, which the Create page treats as "do not offer this", since an
+    /// offered model that turns out not to draw fails after the user has
+    /// already paid for the call.
+    pub image_generation: Support,
+    pub video_generation: Support,
     /// Real max context, when the engine publishes one. `None` is "we do not
     /// know", never a made-up default — the token-budget bar reads this.
     pub context_window: Option<u32>,
@@ -336,6 +352,18 @@ impl EngineCapabilities {
             },
             structured_output: decl.structured_output,
             chat: Support::Unknown,
+            // Same shape as `vision`: no image channel is a flat No from the
+            // transport, and everything else waits on the catalog.
+            image_generation: if decl.image_channel {
+                Support::Unknown
+            } else {
+                Support::No
+            },
+            video_generation: if decl.image_channel {
+                Support::Unknown
+            } else {
+                Support::No
+            },
             context_window: None,
             tier: tier_name(decl.tier).to_string(),
             image_reaches: decl.local && ollama_runs_here(),
@@ -349,6 +377,8 @@ impl EngineCapabilities {
             Capability::Vision => self.vision,
             Capability::StructuredOutput => self.structured_output,
             Capability::Chat => self.chat,
+            Capability::ImageGeneration => self.image_generation,
+            Capability::VideoGeneration => self.video_generation,
         }
     }
 }
@@ -382,6 +412,14 @@ pub(crate) async fn capabilities_for(model: &str) -> EngineCapabilities {
                 let has = |name: &str| listed.iter().any(|c| c == name);
                 caps.vision = Support::yes(has("vision"));
                 caps.chat = Support::yes(has("completion"));
+                // Ollama's capability vocabulary has no term for producing an
+                // image — it serves chat models, and a diffusion checkpoint is
+                // not reachable over /api/chat at all. So a listed local model
+                // is a definite No here rather than an Unknown: the Create page
+                // can then say WHY nothing local is on offer instead of
+                // silently showing an empty shelf.
+                caps.image_generation = Support::No;
+                caps.video_generation = Support::No;
                 // Only refine what the declaration left open: a `:cloud` relay
                 // reports `tools` in its catalog and still leaks the calls
                 // inline, so its declared No must survive the live answer.
@@ -401,6 +439,8 @@ pub(crate) async fn capabilities_for(model: &str) -> EngineCapabilities {
                 caps.vision = Support::yes(facts.vision);
                 caps.structured_output = Support::yes(facts.structured_outputs);
                 caps.chat = Support::Yes;
+                caps.image_generation = Support::yes(facts.image_output);
+                caps.video_generation = Support::yes(facts.video_output);
             }
         }
         "codex-cli" => {

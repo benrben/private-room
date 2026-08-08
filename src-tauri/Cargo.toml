@@ -138,6 +138,11 @@ objc2-core-media = { version = "0.3", features = [
     # for it only exists when this crate exposes the type — enabling the
     # optional dep is not enough, the module itself is feature-gated here.
     "CMTime",
+    # The continuity capture anchors to the VIDEO TRACK's own time range, not
+    # the asset duration — an audio track that runs 76 ms past the video (AAC
+    # priming padding, empirically reproduced) makes a zero-tolerance request
+    # at "duration − 1/30" land AFTER the last video frame and fail outright.
+    "CMTimeRange",
 ] }
 objc2-screen-capture-kit = { version = "0.3", features = [
     "SCStream",
@@ -205,9 +210,16 @@ objc2-av-foundation = { version = "0.3", default-features = false, features = [
     "std",
     "AVAsset",
     "AVAssetTrack",
+    # The Story tab's continuous mode: capture the REAL final frame of a
+    # finished clip so the next clip starts on exactly that picture. The
+    # alternative was trusting the model to land on its `last_frame` target,
+    # which they treat as guidance — the reported "scene 2 does not start
+    # where scene 1 ended".
+    "AVAssetImageGenerator",
     "AVMediaFormat",
     "objc2-core-media",
     "objc2-core-foundation",
+    "objc2-core-graphics",
 ] }
 objc2-vision = { version = "0.3", features = [
     "VNRequest",

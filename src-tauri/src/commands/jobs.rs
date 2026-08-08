@@ -39,6 +39,11 @@ pub use script_run::*;
 mod download;
 pub use download::*;
 
+// The "create" job kind — the Create page's picture and video generation.
+// A single billed atomic unit, like a download: no mid-work checkpoint.
+mod create;
+pub use create::*;
+
 // The "rec_read" job kind — the room reads a recording and writes its
 // chapters, highlights and notes. A simpler `file_pass`: windows of whole
 // speaker turns, and a reduce made of ordinary code rather than a model fold.
@@ -1176,7 +1181,16 @@ pub async fn resume_job(
     }
     if !matches!(
         job.kind.as_str(),
-        "deep_summary" | "file_pass" | "workflow" | "studio" | "download" | "podcast_audio"
+        "deep_summary"
+            | "file_pass"
+            | "workflow"
+            | "studio"
+            | "download"
+            | "podcast_audio"
+            // Resuming a generation re-runs it from scratch, which costs money
+            // — but so does the alternative of a card the user cannot retry
+            // after a crash, and the button says "Resume" not "Free".
+            | "create"
     ) {
         return Err("This job can't be resumed.".into());
     }

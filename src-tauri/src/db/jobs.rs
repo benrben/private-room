@@ -285,6 +285,21 @@ pub fn checkpoint_job(
     )
 }
 
+/// Stamp WHY a job paused itself, after `set_job_status` has parked it.
+///
+/// One caller: a chained clip that may not start because its predecessor's
+/// clip does not exist yet. The reason is shown on the job card, and its
+/// prefix is the marker `wake_chain_waiter` matches on — a user's own pause
+/// carries no such reason and is never resumed behind their back.
+pub fn set_parked_reason(conn: &Connection, id: &str, reason: &str) -> Result<(), String> {
+    execute_one(
+        conn,
+        "UPDATE jobs SET parked_reason = ?2 WHERE id = ?1 AND status = 'paused'",
+        params![id, reason],
+    )
+    .map(|_| ())
+}
+
 /// Move a job to a terminal or paused status. `error` is set only for 'error'.
 ///
 /// Any status but 'paused' also clears `parked_reason`: a job that was stamped

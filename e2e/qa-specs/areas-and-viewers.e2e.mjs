@@ -40,6 +40,7 @@ const AREAS = [
   ["skills", "Skills"],
   ["memory", "Memory & scratch pad"],
   ["connectors", "Connectors"],
+  ["create", "Create"],
   // The Browser area is here because it USED to be the one screen this list
   // could not include: `qa/qa-mock.js` answered none of the browser's
   // mutations, so the pane reached `browser_set_bounds` on mount and the

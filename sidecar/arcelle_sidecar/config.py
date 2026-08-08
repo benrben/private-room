@@ -428,6 +428,121 @@ class FeedbackDraftRequest(BaseModel):
     provider: ProviderConfig | None = None
 
 
+class ImageGenerateRequest(BaseModel):
+    """Body of ``POST /image_generate`` — the Create page's generation seam.
+
+    ``model`` is the composite ``"openrouter::vendor/slug"``, which is what
+    makes the host attach ``privacy`` and ``provider`` at all: ``sidecar_json``
+    only injects them for a body that names a model. A generation body without
+    one would be the un-modelled outbound seam that let TTS slip the door (see
+    ``speech_cmds.rs``), so the field is required rather than defaulted.
+
+    ``reference_b64`` are optional source pictures (PNG, base64). They are
+    REFUSED rather than stripped when the door is on — see :mod:`.imagegen`.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    model: str
+    prompt: str = ""
+    #: ``"image"`` or ``"video"`` — what the caller asked for, so a model that
+    #: answers with the wrong medium is caught rather than saved as a broken file.
+    kind: str = "image"
+    reference_b64: list[str] = Field(default_factory=list)
+    #: MIME per entry of ``reference_b64``, positionally. Short lists are padded
+    #: with PNG rather than rejected: an absent type is a caller that did not
+    #: know, and PNG is what every picture this room generates already is.
+    reference_mime: list[str] = Field(default_factory=list)
+    #: The user saw these specific pictures and pressed a button saying they
+    #: would be sent. Only this opens the door — never a bare setting. See
+    #: :func:`videogen.guard` for why consent has to name the files.
+    references_ack: bool = False
+    #: Frame shape, e.g. ``"16:9"``. Declared here rather than left to
+    #: ``extra="ignore"``: the host has been sending this field since the
+    #: Create page shipped and Pydantic was dropping it on the floor, so every
+    #: picture came back in the model's default shape however it was asked for.
+    #: An undeclared field on an ``extra="ignore"`` model is not a no-op the
+    #: caller can see — it is a control that silently does nothing.
+    aspect_ratio: str = ""
+    #: Output size, e.g. ``"1K"`` / ``"2K"``. Only ever a value the model's own
+    #: ``/images/models`` entry lists, so an invented size never reaches a
+    #: billable call.
+    resolution: str = ""
+    #: PRIV-1: room privacy policy payload (see :class:`RunRequest`).
+    privacy: dict[str, Any] | None = None
+    provider: ProviderConfig | None = None
+
+
+class VideoFrame(BaseModel):
+    """One picture pinned to an end of the clip.
+
+    ``frame_type`` is what separates this from a reference: a frame IS the
+    first (or last) image of the video, so the model animates out of it,
+    while a reference only guides how things look.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    b64: str
+    mime: str = "image/png"
+    frame_type: str = "first_frame"
+
+
+class VideoReference(BaseModel):
+    """A picture that guides the look — a hero, a place — but is not a frame."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    b64: str
+    mime: str = "image/png"
+
+
+class VideoStartRequest(BaseModel):
+    """Body of ``POST /video_start`` — submit one clip, do not wait for it.
+
+    ``model`` is the composite ``"openrouter::vendor/slug"`` for the same
+    reason :class:`ImageGenerateRequest` requires it: ``sidecar_json`` attaches
+    ``privacy`` and ``provider`` only to a body that names a model, so a body
+    without one would be an outbound seam the door never sees.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    model: str
+    prompt: str = ""
+    #: Length in seconds. The host sends only a value the model's own catalog
+    #: entry lists, so an illegal duration never reaches a billable call.
+    seconds: int | None = None
+    resolution: str = ""
+    aspect_ratio: str = ""
+    frames: list[VideoFrame] = Field(default_factory=list)
+    references: list[VideoReference] = Field(default_factory=list)
+    references_ack: bool = False
+    #: Tri-state on purpose: ``None`` means "whatever the model does by
+    #: default", which is not the same as asking for silence.
+    generate_audio: bool | None = None
+    privacy: dict[str, Any] | None = None
+    provider: ProviderConfig | None = None
+
+
+class VideoJobRequest(BaseModel):
+    """Body of ``POST /video_status`` and ``POST /video_fetch``.
+
+    ``model`` carries no information the provider needs — the job id is the
+    whole address — but it must be here anyway, because it is the field the
+    host keys provider-credential injection on.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    model: str
+    video_id: str
+    #: Which output to download, for the models that return more than one.
+    index: int = 0
+    privacy: dict[str, Any] | None = None
+    provider: ProviderConfig | None = None
+
+
 class VisionLocateRequest(BaseModel):
     """Body of ``POST /vision_locate`` (MIGRATION Phase 2 — vision.rs).
 
@@ -476,7 +591,12 @@ class KnowledgeExtractRequest(BaseModel):
 
     model: str
     base_url: str = "http://127.0.0.1:11434"
-    mode: Literal["fields", "list"] = "fields"
+    #: ``mode="cast"`` (story.rs) — read a character sheet into people. Returns
+    #: ``{"cast": [{name, description, story}]}``. Windowed inside the sidecar,
+    #: never clamped: a clamp reads the first N characters and reports the rest
+    #: as "no characters found", which is a confident answer about the part it
+    #: happened to see.
+    mode: Literal["fields", "list", "cast"] = "fields"
     #: mode "fields": the requested field names, in order (row-column order).
     fields: list[str] = Field(default_factory=list)
     #: mode "fields": the (already clamped) document text to extract from.

@@ -80,3 +80,7 @@ src-tauri/resources/sidecar/
 # Screenshots written by the opt-in capture specs (e2e/capture-specs/*.mjs).
 # Regenerated on every run and read once, by eye — build output, not evidence.
 qa-shots/
+
+# Screenshots written by the layout camera (e2e/qa-specs/create-look.e2e.mjs).
+# Evidence for a person to look at, not an artefact to version.
+qa/shots/

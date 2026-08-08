@@ -23,6 +23,7 @@ const AREAS = [
   "skills",
   "memory",
   "connectors",
+  "create",
   "browser",
 ];
 
