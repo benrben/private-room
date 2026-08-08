@@ -3,6 +3,54 @@
 All notable, user-facing changes to Arcelle. Versions follow
 [semver](https://semver.org); dates are the GitHub release dates.
 
+## 0.19.0 — 2026-08-08
+
+### The room describes itself
+
+Area subtitles, tab titles, and activity summaries are no longer fixed copy —
+Arcelle now drafts them from what's actually in the room. Recordings, Memory,
+Skills, and the room's front page each get a one-line description grounded in
+your own files; open files pick up a 2-3 word tab title instead of a bare
+filename; and repeated runs of the same script or workflow collapse into one
+activity-feed row with a summary line instead of a wall of duplicates. A
+plain static line always shows first — the generated one only swaps in if
+it's ready in a blink, otherwise it's ready next time you look, never mid-read.
+One switch covers all of it: **Settings → AI & behavior → "Let the local AI
+write small pieces of the interface."**
+
+Files in the Library can also show their own AI-written one-line description
+under the filename, when "Describe new files automatically" is on — that
+text already existed, it just wasn't shown until now.
+
+### A calmer left rail, and Find moved where you already look
+
+The rail's areas are grouped into four labeled sections — Room, Capture,
+Automate, Context — instead of one long list. Collapsed, it shows icon and
+tooltip instead of shrunken relabeled text. The standalone Find page is gone;
+the same filters, highlighting, and saved/recent searches now live inside
+⌘K.
+
+### A quieter composer and document toolbar
+
+The composer's two privacy ribbons collapse into a single line reflecting
+what's actually about to happen, instead of repeating on every message; the
+token meter only shows once you're actually using real context space. The
+document toolbar keeps 2-3 primary actions and tucks the rest into an
+overflow menu — "Preview cloud payload" is now "Show me exactly what would
+be sent."
+
+### Fixes
+
+- Pane toggle buttons show their actual on/off state, and the Library stays
+  readable when panes are hidden.
+- The composer's "# Action" button opens its popover reliably; "*
+  Specialist" and "# Action" now clear their active state on Escape/blur even
+  with a partial filter typed.
+- Settings is a fixed size and resets scroll position correctly when you
+  switch tabs.
+- ⌘A selects page content again — chat text, document content, form fields —
+  not the whole app chrome.
+
 ## 0.18.0 — 2026-08-07
 
 ### Do things to many files at once
