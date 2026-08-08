@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=83.0.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -16,7 +16,7 @@ dependencies = [
     # input_schema=/output_schema= kwargs the per-agent subgraph split needs do
     # not exist. uv.lock already resolves 1.2.9 — this only forbids a silent
     # downgrade on a fresh resolve.
-    "langgraph>=1.2,<2",
+    "langgraph>=1.2.10,<2",
     "langgraph-checkpoint>=4.1,<5",
     "langchain-ollama>=0.2",
     # The local-model client itself. `llm.py` and `chat.py` import `ollama`
@@ -26,12 +26,12 @@ dependencies = [
     # installs cleanly and then every local generation fails on an ImportError
     # at first use. Declare what we import.
     "ollama>=0.4",
-    "langchain-core>=1.4,<2",
-    "fastapi>=0.110",
+    "langchain-core>=1.5.3,<2",
+    "fastapi>=0.141.1",
     # starlette 1.x removed the on_startup kwarg fastapi (< 1.0) still passes;
     # without this cap uv resolves starlette 1.3.1 and the server cannot start.
-    "starlette>=0.40,<1.0",
-    "uvicorn>=0.27",
+    "starlette>=1.4.0,<2.0",
+    "uvicorn>=0.52.1",
     "httpx>=0.27",
     "pydantic>=2.6",
     # MIGRATION Phase 2: image grounding (/vision_locate) reproduces vision.rs
