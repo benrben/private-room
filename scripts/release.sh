@@ -154,7 +154,19 @@ fi
 # bundler packages the app BEFORE this script signs it. tauri.conf.json therefore
 # carries no dmg styling block; this plain hdiutil window is what users get.
 echo "▶ Packaging updater tar + DMG from the final app…"
-tar -czf "$TAR" -C "$MACOS" "Arcelle.app"
+# COPYFILE_DISABLE=1 is load-bearing: without it, macOS's bsdtar writes an
+# AppleDouble `._*` sidecar entry for every file carrying extended attributes
+# (which, post-codesign, is nearly everything in the bundle) -- including a
+# `._Arcelle.app` entry FIRST in the archive, ahead of the real `Arcelle.app`
+# directory. `tar -tzf` hides these from its own listing (bsdtar is
+# AppleDouble-aware when reading its own archives), so the archive looks clean
+# under casual inspection -- but the Tauri updater's extractor is not
+# AppleDouble-aware, tries to unpack that first bogus entry as the app bundle,
+# and fails with "failed to unpack '._Arcelle.app'". Confirmed by re-listing a
+# built archive with Python's tarfile (which has no such awareness): 1047 of
+# 2094 entries were `._*` noise. This one env var suppresses bsdtar's
+# copyfile()-based xattr shadowing entirely.
+COPYFILE_DISABLE=1 tar -czf "$TAR" -C "$MACOS" "Arcelle.app"
 # The key is handed over ONLY through the environment. `tauri signer sign` reads
 # --private-key from TAURI_SIGNING_PRIVATE_KEY and --password from
 # TAURI_SIGNING_PRIVATE_KEY_PASSWORD, so passing either on argv is pure downside:
