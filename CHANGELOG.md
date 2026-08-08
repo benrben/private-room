@@ -3,6 +3,22 @@
 All notable, user-facing changes to Arcelle. Versions follow
 [semver](https://semver.org); dates are the GitHub release dates.
 
+## 0.19.1 — 2026-08-08
+
+### In-app updates actually install now
+
+Checking for updates worked, but installing one didn't: the download would
+finish and then fail to unpack. The updater payload was built with a plain
+macOS `tar`, which silently smuggles in an invisible `._Arcelle.app` metadata
+entry ahead of the real app — invisible because macOS's own `tar` hides it
+from a normal listing, so it looked fine right up until the updater actually
+tried to install it. This release's payload is built without that entry, so
+**Settings → App → Check for updates** can now download and install in one
+click, the way it was always meant to. If you're on an older version, this is
+the first release your app should be able to install by itself — the bug was
+in how past releases were packaged, not in your app's updater, so this one
+clean payload is enough to fix it going forward.
+
 ## 0.19.0 — 2026-08-08
 
 ### The room describes itself

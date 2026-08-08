@@ -1,6 +1,6 @@
 [package]
 name = "arcelle"
-version = "0.19.0"
+version = "0.19.1"
 description = "Arcelle — an encrypted local AI workspace in a single file"
 authors = ["Ben Reich"]
 edition = "2021"
