@@ -11,7 +11,7 @@ import {
   ViewerContext,
 } from "../viewers/registry";
 import { languageForFile } from "../viewers/languages";
-import { encodingSaveNote, useTextEncoding } from "../viewers/TextEncoding";
+import { encodingSaveNote, EncodingState } from "../viewers/TextEncoding";
 import PageSource from "../viewers/PageSource";
 
 /** The lazy viewer bundle. Rebuildable (not a module const) because lazy()
@@ -57,6 +57,12 @@ interface ViewerRouterProps {
   viewerRev: number;
   editMode: boolean;
   editModeOf: (c: FileContent) => EditMode | null;
+  /** How the open file's bytes are being decoded, and the picker/alert to
+   * show for it. P1-4 lifted the hook that makes this up to ViewerPane, so
+   * its own header can draw the same picker in the overflow menu — this
+   * component used to call `useTextEncoding` itself and never shared the
+   * result with anything outside its own subtree. */
+  enc: EncodingState;
   editCell: (sheet: string, cell: string, value: string) => Promise<void>;
   /** Both resolve false when the write failed, so the editor keeps the buffer
    * dirty and the unsaved-edits dialog doesn't proceed with a lost edit. */
@@ -140,6 +146,7 @@ function ViewerBody({
   viewerRev,
   editMode,
   editModeOf,
+  enc,
   editCell,
   saveEdit,
   saveEditAsCopy,
@@ -149,8 +156,8 @@ function ViewerBody({
   sttStatus,
 }: ViewerRouterProps) {
   // How this file's bytes are being decoded, and the user's override if they
-  // gave one. A no-op for every kind whose text is read OUT of a container.
-  const enc = useTextEncoding(openFile.id, openFile.content);
+  // gave one — owned by ViewerPane now (see the prop doc above), still a
+  // no-op for every kind whose text is read OUT of a container.
   const c =
     enc.text === null
       ? openFile.content
@@ -234,12 +241,16 @@ function ViewerBody({
   }
 
   // ---- preview: one lookup, no switch ----------------------------------
-  // The encoding strip rides above the preview (not the editors: those already
-  // have a banner slot, and the reading is chosen before you start typing).
+  // Only the ALERT card rides above the preview now (not the editors: those
+  // already have a banner slot, and the reading is chosen before you start
+  // typing) — an error or a lossy read is worth interrupting the page for.
+  // The routine reading and the control to change it live in ViewerPane's
+  // overflow menu instead; see EncodingAlert/EncodingPicker in
+  // TextEncoding.tsx for why the two are split.
   const entry = FORMATS[c.kind] ?? FORMATS.binary;
   return (
     <>
-      {enc.strip}
+      {enc.alert}
       {/* A saved page says where it came from. Renders nothing for every file
           that is not one, and nothing for a page that declared nothing. */}
       <PageSource meta={c.webMeta} />

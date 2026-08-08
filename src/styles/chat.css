@@ -749,7 +749,12 @@
 .msg-footer > button {
   padding: 3px 8px;
   font-size: var(--fs-micro);
-  color: var(--faint);
+  /* P1-6: was --faint (the smallest-meta-text token, tuned for timestamps),
+     which on a row of actual actions — Play/Copy/Undo/Regenerate/Save — read
+     as disabled rather than present-but-secondary. --muted is the app's
+     normal secondary-text contrast (7.88:1 on --page, 5.70:1 on --hover, the
+     floor) and is what every other secondary label in the product uses. */
+  color: var(--muted);
   opacity: 0;
   transition:
     opacity var(--dur-fast) var(--ease-pen),

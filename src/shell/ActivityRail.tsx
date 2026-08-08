@@ -14,7 +14,6 @@ import {
   PanelRightIcon,
   ScriptIcon,
   BookOpenIcon,
-  SearchIcon,
   SettingsIcon,
   WorkflowsIcon,
 } from "../icons";
@@ -32,38 +31,27 @@ export function areaLabel(key: WorkArea): string {
 const AREAS: {
   key: Exclude<WorkArea, "files">;
   label: string;
-  /** Short label shown under the icon in the COLLAPSED rail (≤9 chars). */
-  short: string;
   icon: (size: number) => ReactElement;
 }[] = [
-  { key: "home", label: "Room home", short: "Home", icon: (s) => <HomeIcon size={s} /> },
-  // Find sits second because it is how you get anywhere in a room you have
-  // stopped remembering the shape of.
-  { key: "find", label: "Find", short: "Find", icon: (s) => <SearchIcon size={s} /> },
-  { key: "map", label: "Room Map", short: "Map", icon: (s) => <GraphIcon size={s} /> },
-  { key: "recordings", label: "Recordings", short: "Record", icon: (s) => <MicIcon size={s} /> },
-  {
-    key: "workflows",
-    label: "Workflows",
-    short: "Workflows",
-    icon: (s) => <WorkflowsIcon size={s} />,
-  },
-  { key: "scripts", label: "Scripts", short: "Scripts", icon: (s) => <ScriptIcon size={s} /> },
-  { key: "skills", label: "Skills", short: "Skills", icon: (s) => <BookOpenIcon size={s} /> },
-  {
-    key: "memory",
-    label: "Memory & scratch pad",
-    short: "Memory",
-    icon: (s) => <MemoryIcon size={s} />,
-  },
-  { key: "connectors", label: "Connectors", short: "Connect", icon: (s) => <LinkIcon size={s} /> },
-  {
-    key: "browser",
-    label: "Private browser",
-    short: "Browser",
-    icon: (s) => <GlobeIcon size={s} />,
-  },
+  { key: "home", label: "Room home", icon: (s) => <HomeIcon size={s} /> },
+  { key: "map", label: "Room Map", icon: (s) => <GraphIcon size={s} /> },
+  { key: "recordings", label: "Recordings", icon: (s) => <MicIcon size={s} /> },
+  { key: "workflows", label: "Workflows", icon: (s) => <WorkflowsIcon size={s} /> },
+  { key: "scripts", label: "Scripts", icon: (s) => <ScriptIcon size={s} /> },
+  { key: "skills", label: "Skills", icon: (s) => <BookOpenIcon size={s} /> },
+  { key: "memory", label: "Memory & scratch pad", icon: (s) => <MemoryIcon size={s} /> },
+  { key: "connectors", label: "Connectors", icon: (s) => <LinkIcon size={s} /> },
+  { key: "browser", label: "Private browser", icon: (s) => <GlobeIcon size={s} /> },
 ];
+
+/** Look an area up by key. AREAS is small and this is only ever called a
+ * handful of times per render, so a linear scan beats carrying a second Map
+ * in sync with it. */
+function areaDef(key: Exclude<WorkArea, "files">) {
+  const def = AREAS.find((a) => a.key === key);
+  if (!def) throw new Error(`no rail area registered for "${key}"`);
+  return def;
+}
 
 /** The activity rail: the app's ONE primary navigation.
  *
@@ -80,14 +68,27 @@ const AREAS: {
  *
  * Labels are shown by default and in full. Collapsing to the 84px icon strip
  * is still one click away and still persists per room, but a first-time reader
- * should never have to hover a column of glyphs to find out where they lead;
- * that is also why the collapsed labels stay under the icons rather than being
- * replaced by a tooltip, which the rail's own overflow would clip.
+ * should never have to hover a column of glyphs to find out where they lead —
+ * that is why full labels are what a new room opens with, not the collapsed
+ * strip.
  *
- * The ⌘K command launcher deliberately has NO entry here any more: it is a
- * command, not a place, it already owns the widest control in the top bar, and
- * a second magnifier in the rail next to Find would be exactly the duplication
- * this pass removes. ⌘K itself is untouched. */
+ * The collapsed strip itself (P1-7) is icon-only: it used to carry a renamed,
+ * shortened label under each glyph ("Connectors" → "Connect") shrunk small
+ * enough to clip against the status bar, which both mis-named the
+ * destination and was unreadable. A hover name now comes from a plain native
+ * `title` attribute rather than the rail's own `[data-tip]` CSS tooltip
+ * pattern used elsewhere in the shell — that pattern is positioned relative
+ * to its own button and would be clipped by the rail's `overflow: hidden
+ * auto`, same as a label would.
+ *
+ * The ⌘K command launcher deliberately has NO entry here: it is a command,
+ * not a place, and it already owns the widest control in the top bar. The
+ * rail used to also carry a "Find" destination — a second, full-page search
+ * surface the app had to explain alongside ⌘K and the Library's own filter
+ * box (P1-2). Find is retired and its useful parts (filters, previews, saved
+ * and recent searches) now render inside ⌘K itself — see
+ * workspace/SearchExpanded.tsx — so this rail has one fewer destination and
+ * the room has one fewer thing to explain. */
 export default function ActivityRail({
   layout,
   area,
@@ -127,12 +128,15 @@ export default function ActivityRail({
         <span className="rail-label">{wide ? "Collapse" : "Expand"}</span>
       </button>
 
-      {/* The two groups do different jobs — one shows and hides columns, the
-          other goes somewhere — and the headings say so out loud in the
-          expanded rail. aria-hidden because the <nav>'s own name already tells
-          a screen reader this is "Workspace panes and areas" and every button
-          below carries its full purpose in its label; a repeated heading would
-          only add noise to the tab order's read-out. */}
+      {/* Panes and destinations do different jobs — one shows and hides
+          columns, the rest go somewhere (and are now grouped into four
+          smaller headings of their own below, P1-1) — and the headings say
+          so out loud in the expanded rail. aria-hidden because the <nav>'s
+          own name already tells a screen reader this is "Workspace panes and
+          areas" and every button below carries its full purpose in its
+          label; a repeated heading would only add noise to the tab order's
+          read-out. Every rail-group-label in this file, not just this one,
+          relies on that same reasoning. */}
       <div className="rail-group-label" aria-hidden>
         Panes
       </div>
@@ -195,14 +199,40 @@ export default function ActivityRail({
         )}
       </button>
 
+      {/* P1-1: the flat area list, in four labeled sections instead of one
+          undifferentiated run — each section opens with the same
+          rail-group-label + rail-divider pair "Panes" does above, so the
+          single "Areas" heading this replaces is now four headings that
+          each name a smaller, truer group instead of the whole list at
+          once. */}
       <div className="rail-group-label" aria-hidden>
-        Areas
+        Room
       </div>
       <div className="rail-divider" aria-hidden />
+      <RailAreaButton def={areaDef("home")} area={area} onArea={onArea} wide={wide} />
+      <RailAreaButton def={areaDef("map")} area={area} onArea={onArea} wide={wide} />
 
-      {AREAS.map((a) => (
-        <RailAreaButton key={a.key} def={a} area={area} onArea={onArea} wide={wide} />
-      ))}
+      <div className="rail-group-label" aria-hidden>
+        Capture
+      </div>
+      <div className="rail-divider" aria-hidden />
+      <RailAreaButton def={areaDef("recordings")} area={area} onArea={onArea} wide={wide} />
+      <RailAreaButton def={areaDef("browser")} area={area} onArea={onArea} wide={wide} />
+
+      <div className="rail-group-label" aria-hidden>
+        Automate
+      </div>
+      <div className="rail-divider" aria-hidden />
+      <RailAreaButton def={areaDef("workflows")} area={area} onArea={onArea} wide={wide} />
+      <RailAreaButton def={areaDef("scripts")} area={area} onArea={onArea} wide={wide} />
+      <RailAreaButton def={areaDef("skills")} area={area} onArea={onArea} wide={wide} />
+      <RailAreaButton def={areaDef("connectors")} area={area} onArea={onArea} wide={wide} />
+
+      <div className="rail-group-label" aria-hidden>
+        Context
+      </div>
+      <div className="rail-divider" aria-hidden />
+      <RailAreaButton def={areaDef("memory")} area={area} onArea={onArea} wide={wide} />
 
       <div className="rail-spacer" />
 
@@ -241,8 +271,10 @@ function RailAreaButton({
   def: (typeof AREAS)[number];
   area: WorkArea;
   onArea: (area: Exclude<WorkArea, "files">) => void;
-  /** Expanded rail: room for the real name, so drop the ≤9-char abbreviation
-   * ("Connect" → "Connectors"). */
+  /** Expanded rail: room for the full label. Collapsed: icon only, with the
+   * same full label (P1-7) carried as a native `title` tooltip instead — see
+   * the ActivityRail doc comment above for why `title` and not the rail's
+   * own `[data-tip]` pattern. */
   wide: boolean;
 }) {
   const current = area === def.key;
@@ -253,10 +285,11 @@ function RailAreaButton({
       data-area={def.key}
       aria-current={current ? "true" : undefined}
       aria-label={`Open ${def.label}`}
+      title={wide ? undefined : def.label}
       onClick={() => onArea(def.key)}
     >
       {def.icon(17)}
-      <span className="rail-label">{wide ? def.label : def.short}</span>
+      {wide && <span className="rail-label">{def.label}</span>}
     </button>
   );
 }

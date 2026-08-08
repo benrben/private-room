@@ -318,6 +318,19 @@
   line-height: var(--lh-body);
   color: var(--muted);
 }
+/* Select-all: its own control rather than a click-gesture, matching the
+   per-row checkboxes it drives — this tab has no "open" affordance to
+   overload a click onto. */
+.trash-select-all {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 6px 8px;
+  font-size: var(--fs-micro);
+  color: var(--muted);
+  cursor: pointer;
+  user-select: none;
+}
 .trash-row {
   display: flex;
   align-items: center;

@@ -373,6 +373,19 @@
   flex-shrink: 0;
 }
 
+/* P1-4: the file's own core verbs (Edit, Run, Export, Minutes) — the plain
+   button default already draws the outlined-pill "real button" look (see
+   base.css), so this only adds the bold label weight that marks them apart
+   from the quiet .subtle text and the icon-only Rename/Close beside them.
+   Never filled ink: two or three of these sit side by side, and a filled
+   button is this system's ONE strong CTA (base.css `button.primary`) — a row
+   of them would compete with itself. Same restraint as `.script-go`, the
+   other place a toolbar-weight action already existed. */
+.viewer-primary {
+  font-weight: 600;
+  font-size: var(--fs-meta);
+}
+
 /* Full-size host for the Room Map in the center pane (RoomMap fills this). */
 .room-map-canvas {
   flex: 1;
@@ -393,10 +406,43 @@
   gap: 6px;
 }
 
-/* ADD-2 — version history popover, anchored under the History button. */
-.history-wrap {
+/* ADD-2 / P1-4 — anchors both popovers this corner of the toolbar owns: the
+   "..." overflow menu itself, and the version-history panel (`.history-pop`)
+   that used to hang off its own History button and now hangs off this one
+   instead — same corner, same panel, nothing inside it changed. Renamed from
+   `.history-wrap`: it was never anyone else's, but naming it for the one
+   thing it held stopped being accurate the day a second thing moved in. */
+.viewer-overflow-wrap {
   position: relative;
   display: inline-flex;
+}
+
+/* The "..." overflow menu's own items reuse `.pop-menu` / `.pop-item`
+   (workspace.css) — the same shell the room menu and model picker already
+   use — plus two rows of its own: a plain divider, and the encoding picker,
+   which holds a <select> rather than being a button itself and so skips the
+   button rows' hover wash. */
+.viewer-overflow-menu .pop-menu-sep {
+  height: 1px;
+  margin: 4px 6px;
+  background: var(--line-soft);
+}
+.viewer-overflow-menu .viewer-enc-row {
+  padding: 6px 10px 7px;
+}
+.viewer-overflow-menu .viewer-enc-row .encoding-label {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 5px;
+}
+.viewer-overflow-menu .viewer-enc-row .encoding-lede {
+  font-size: var(--fs-micro);
+  color: var(--muted);
+}
+.viewer-overflow-menu .viewer-enc-row .encoding-select {
+  width: 100%;
+  max-width: none;
 }
 
 /* A popover genuinely floats, so it is one of the few things allowed an

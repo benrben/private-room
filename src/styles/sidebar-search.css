@@ -4,11 +4,14 @@
 
    The LAUNCHER (.search-*) is a command: it floats, it occludes, it is opaque,
    and it is gone the moment you pick something. It is the only search surface
-   in the app that is allowed a fill — see paper.css section 9. The full Find
-   page (styles/find.css) is the other half of the same feature: a place you
-   stay in, drawn straight onto the sheet. Both read `search_all`, so they can
-   never disagree about what is in the room; they look different because they
-   ARE different, not because two people styled them.
+   in the app that is allowed a fill — see paper.css section 9. It used to have
+   a sibling, the room's full-page "Find" area — a place you stayed in, drawn
+   straight onto the sheet — but the app had to explain three search surfaces
+   to the user in a paragraph before that page was retired (P1-2): its filter
+   strip and its rows now render INSIDE this same launcher, once a query has
+   real results, in find.css (`.search-panel.is-expanded`, sized in shell.css).
+   Both still read the one `search_all` index, so a filtered view can never
+   disagree with a plain one about what is in the room.
 
    The FILE ROW (.file-row and friends) is the library's list line. It is
    transparent, and its states are drawn: a marker spine down the edge for the

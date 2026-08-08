@@ -375,9 +375,14 @@
   min-width: 0;
   display: grid;
   /* The rail width is a variable so it can expand to full labels. Collapsed is
-     84px, not the old 74: the icon-only mode still carries a word under every
-     glyph, and that word is now 12px — the design system's floor — rather than
-     the 9.5px it used to be shrunk to in order to fit. */
+     84px, not the old 74: the pane toggles and Focus/Settings still carry a
+     word under their glyph at this width, at 12px — the design system's
+     floor — rather than the 9.5px it used to be shrunk to in order to fit.
+     The destination buttons (Map/Scripts/Memory/…) dropped their word
+     entirely at this width instead (P1-7) — a shrunken, renamed abbreviation
+     ("Connect") was worse than no visible word at all, so they fall back to
+     a native `title` tooltip and 84px is now just resting width, not a fit
+     constraint for them. */
   grid-template-columns: var(--rail-w, 84px) minmax(0, 1fr);
   transition: grid-template-columns var(--dur-fast) var(--ease-pen);
 }
@@ -399,7 +404,14 @@
   flex-direction: column;
   align-items: center;
   gap: 2px;
-  padding: 8px 6px;
+  /* P1-7: 20px at the bottom, not 8 — the collapsed strip's own scroll
+     content (buttons + dividers, four groups' worth once .is-expanded's
+     `padding` shorthand below stops overriding it) used to run flush to the
+     rail's edge, right against the 26px status bar's hairline underneath.
+     `.activity-rail.is-expanded` replaces this whole `padding` shorthand
+     with its own, so the extra room here is collapsed-only by construction,
+     not by a second rule. */
+  padding: 8px 6px 20px;
   background: transparent;
   border-right: 1px solid var(--line);
   position: relative;
@@ -453,12 +465,16 @@
   transition: color var(--dur-fast) var(--ease-pen),
     background var(--dur-fast) var(--ease-pen);
 }
-/* The persistent text label under each rail icon — so a naïve user can tell
-   Map / Scripts / Memory / Connectors apart without hovering. Inherits the
-   button colour, so it brightens with the active/pressed state. Wraps onto a
-   2nd line rather than ellipsis-truncating: a silently clipped word ("Connec…")
-   is worse than a 2-line label, and `.rail-button`'s min-height (not a fixed
-   height) lets the button grow to fit it. */
+/* The persistent text label under a rail icon. Only the pane toggles
+   (Library/Workspace/AI) and Focus/Settings still render one at every rail
+   width — the destination buttons (Map/Scripts/Memory/Connectors/…) drop it
+   entirely once the rail collapses (P1-7: ActivityRail.tsx only renders the
+   `.rail-label` span when `wide`, falling back to a native `title` tooltip
+   instead of a second, shrunken, renamed copy of the same word). Inherits
+   the button colour, so it brightens with the active/pressed state. Wraps
+   onto a 2nd line rather than ellipsis-truncating: a silently clipped word
+   ("Connec…") is worse than a 2-line label, and `.rail-button`'s min-height
+   (not a fixed height) lets the button grow to fit it. */
 .rail-label {
   font-size: var(--fs-micro);
   line-height: 1.2;
@@ -1826,6 +1842,16 @@ button.status-trust.danger:hover {
   border-radius: var(--radius-lg);
   box-shadow: 0 22px 70px var(--shadow);
 }
+/* The launcher's own "expand into a full-page-equivalent view" (P1-2): once a
+   real query has real results, the panel grows to fit the filter strip and
+   the richer rows (find.css) instead of staying the width of a plain command
+   list. Set here, not in find.css, because .search-panel's base size is
+   already this file's — a second file setting the same property on the same
+   selector would just be the next cascade fight waiting to happen. */
+.search-panel.is-expanded {
+  width: min(880px, 94vw);
+  max-height: 82vh;
+}
 .search-input {
   padding: 13px 15px;
   font-size: 14px;
@@ -2121,42 +2147,6 @@ button.status-trust.danger:hover {
   line-height: 1.55;
 }
 
-/* ----- Find area (center) -----
-   Scaffolding for workspace/FindPage.tsx, which renders its heading and its
-   state and nothing else until the search page proper is built against
-   FindPageProps. Set in the same reading column as Room home and Memory, so
-   the areas read as pages of one notebook rather than as three products. */
-.find-view {
-  flex: 1;
-  min-height: 0;
-  overflow: auto;
-}
-.find-inner {
-  width: min(100% - 48px, 680px);
-  margin: 0 auto;
-  padding: 40px 0 80px;
-}
-.find-title {
-  margin: 0 0 6px;
-  color: var(--text-strong);
-  font-size: var(--fs-section);
-  font-weight: 600;
-  letter-spacing: -0.01em;
-  line-height: 1.15;
-}
-/* Instruction copy is never set small and never set in the hand. */
-.find-lead {
-  margin: 22px 0 0;
-  max-width: 62ch;
-  color: var(--muted);
-  font-size: var(--fs-lead);
-  line-height: var(--lh-body);
-}
-.find-lead strong {
-  color: var(--text-strong);
-  font-weight: 600;
-}
-
 /* --- Tabs -----------------------------------------------------------------
    The strip sits ABOVE the centre pane's measured rect. That is load-bearing,
    not cosmetic: the private browser is a native child webview positioned from
@@ -2169,47 +2159,67 @@ button.status-trust.danger:hover {
    wide enough to be a readable title in the body size, which is what a tab is
    FOR. Pages keep the globe, because a web page really is a different kind of
    thing from a room file and the strip mixes the two. */
+.tab-strip-wrap {
+  display: flex;
+  align-items: stretch;
+  min-height: 34px;
+  min-width: 0;
+  background: transparent;
+  border-bottom: 1px solid var(--line);
+  flex: 0 0 auto;
+}
 .tab-strip {
   display: flex;
   align-items: stretch;
   gap: 2px;
-  min-height: 34px;
+  min-width: 0;
   padding: 0 6px;
   background: transparent;
-  border-bottom: 1px solid var(--line);
   overflow-x: auto;
   overflow-y: hidden;
   scrollbar-width: none;
-  flex: 0 0 auto;
+  /* Takes whatever width the two edge columns don't. Without this the
+     scrolling box sized to its content like any other flex child and the
+     wrap grew past the pane instead of the box scrolling inside it. */
+  flex: 1 1 auto;
 }
 .tab-strip::-webkit-scrollbar {
   display: none;
 }
-/* "There are more this way." Sticky rather than a fade over the edge: the
-   strip is transparent so the sheet runs under it, and a gradient to an opaque
-   colour would be a grey block sitting on the paper. A pen arrow says the same
-   thing and stays on the page. Toggled with `visibility`, never mounted and
-   unmounted, so the strip's own scrollWidth — the number that decides whether
-   there IS more — cannot be changed by the mark that reports it. */
+/* "There are more this way." A pen arrow, not a fade over the edge: the
+   strip is transparent so the sheet runs under it, and a gradient to an
+   opaque colour would be a grey block sitting on the paper.
+   A column beside the scrolling box, not a `position: sticky` mark inside
+   it. Sticky was tried first and measurably failed: a sticky child keeps its
+   box at its ORIGINAL, pre-scroll flow position for layout purposes (that's
+   all `.tab-strip[data-more-start]` used to reserve) and only repaints it
+   pinned to the viewport edge once scrolled — so the reserved gutter was
+   only ever correct at scrollLeft 0. One scroll tick past that, whichever
+   tab had scrolled into the same pixels painted right through the arrow, and
+   rendering both versions and sampling pixels showed the sticky mark sitting
+   on top of a tab's own first characters at every scroll offset beyond a
+   few px, growing deeper the further you scrolled. A plain flex column next
+   to the scrolling box can't do that: `.tab-strip`'s own overflow clip ends
+   exactly where this column begins, so no tab pixel can ever land here, at
+   any scroll offset — the gutter is real, not merely reserved-looking at
+   rest. Toggled with `visibility`, never mounted and unmounted, so the
+   scrolling box's own scrollWidth — the number that decides whether there IS
+   more — cannot be changed by the mark that reports it. */
 .tab-edge {
-  position: sticky;
   flex: 0 0 auto;
   align-self: center;
   visibility: hidden;
   --nb-ico-size: 13px;
   width: 13px;
   height: 13px;
+  margin: 0 5px;
   color: var(--muted);
 }
 .tab-edge-start {
-  left: 0;
   transform: scaleX(-1);
 }
-.tab-edge-end {
-  right: 0;
-}
-.tab-strip[data-more-start] .tab-edge-start,
-.tab-strip[data-more-end] .tab-edge-end {
+.tab-strip-wrap[data-more-start] .tab-edge-start,
+.tab-strip-wrap[data-more-end] .tab-edge-end {
   visibility: visible;
 }
 /* Tabs read as clipped paper: the top corners are rounded unevenly, the bottom
@@ -2298,11 +2308,15 @@ button.status-trust.danger:hover {
 .tab.is-current .tab-icon {
   color: var(--accent-2);
 }
-/* Middle truncation: the head takes the ellipsis, the tail is never given up.
-   Two elements rather than `direction: rtl`, which reorders punctuation and
-   would render an RTL filename's own characters in the wrong order. */
+/* End truncation, plain and standard: the head is kept, the tail takes the
+   ellipsis. This used to be two elements (a shrinking head plus a held
+   fixed-length tail) so a name's last few characters would always survive —
+   which backfires on prose titles, where the words that actually tell two
+   tabs apart sit right after a shared opening rather than in a fixed last
+   few characters; the old scheme cut exactly that stretch out of both and
+   left two look-alike fragments standing in for two different files. One
+   element and the platform's own ellipsis keeps the opening intact instead. */
 .tab-title {
-  display: flex;
   /* Takes the free width, so Close is pinned to the tab's right edge. Without
      this the title sized to its text and Close sat wherever the text ended —
      which, once tabs stopped shrinking below 130px, put the close target in
@@ -2310,21 +2324,8 @@ button.status-trust.danger:hover {
   flex: 1 1 auto;
   min-width: 0;
   overflow: hidden;
-}
-/* `pre`, not the inherited `nowrap`. The split between head and tail can land
-   on a space — "Arcelle UX direction" cut nine from the end leaves the head
-   ending in one — and `nowrap` still collapses whitespace at a box boundary,
-   so the two halves rendered as "Arcelle UXdirection". `pre` keeps the spaces
-   exactly as the filename has them; it cannot introduce wrapping, because
-   neither box ever contains a newline. */
-.tab-title-head {
-  overflow: hidden;
   text-overflow: ellipsis;
-  white-space: pre;
-}
-.tab-title-tail {
-  flex: 0 0 auto;
-  white-space: pre;
+  white-space: nowrap;
 }
 /* 24px: closing a tab is a target like any other, and it used to be 16. It
    stays invisible until the tab is hovered or current, so a strip at rest is

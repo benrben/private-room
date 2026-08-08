@@ -47,10 +47,27 @@ export interface EncodingState {
   key: string;
   /** The banner sentence for the editor, when saving would convert the file. */
   decoded: DecodedFileText | null;
-  strip: React.ReactNode;
+  /** An inline card for the document column — but only the two readings
+   * worth interrupting the page for: the re-read failing outright, or
+   * landing on replacement characters. Null the rest of the time, INCLUDING
+   * the routine case ("Read as UTF-8.") that used to sit here as a strip over
+   * every plain-text file whether or not it had anything to say. P1-4 moved
+   * that routine sentence into `picker`, in the toolbar's overflow menu. */
+  alert: React.ReactNode;
+  /** The overflow-menu row: which encoding this file is being read as, and
+   * the control to pick a different one. Null for a kind with no encoding to
+   * argue about, or before the first read has landed — deliberately silent
+   * rather than a placeholder guess that might turn out wrong. */
+  picker: React.ReactNode;
 }
 
-const IDLE: EncodingState = { text: null, key: "auto", decoded: null, strip: null };
+const IDLE: EncodingState = {
+  text: null,
+  key: "auto",
+  decoded: null,
+  alert: null,
+  picker: null,
+};
 
 /**
  * Track (and let the user change) how the open file's bytes are being decoded.
@@ -122,9 +139,8 @@ export function useTextEncoding(fileId: string, content: FileContent): EncodingS
     text: decoded ? decoded.text : null,
     key: chosen ?? "auto",
     decoded,
-    strip: (
-      <EncodingStrip decoded={decoded} chosen={chosen} error={error} onPick={pick} />
-    ),
+    alert: <EncodingAlert decoded={decoded} error={error} />,
+    picker: <EncodingPicker decoded={decoded} chosen={chosen} onPick={pick} />,
   };
 }
 
@@ -132,16 +148,16 @@ export function useTextEncoding(fileId: string, content: FileContent): EncodingS
  * encoding name and so can never collide with one. */
 const AUTO = "";
 
-function EncodingStrip({
+/** The inline card over the document — reserved for the two readings that are
+ * actually a problem: the re-read failing outright, or landing on replacement
+ * characters. The routine case ("Read as UTF-8.") has nothing to say here
+ * and says nothing; see `EncodingPicker` for where changing it lives now. */
+function EncodingAlert({
   decoded,
-  chosen,
   error,
-  onPick,
 }: {
   decoded: DecodedFileText | null;
-  chosen: string | null;
   error: string;
-  onPick: (name: string) => void;
 }) {
   if (error) {
     // Its own class, not the lossy-reading one: "we could not check" is a
@@ -154,40 +170,60 @@ function EncodingStrip({
       </div>
     );
   }
-  // Nothing to say yet — the first read is in flight. Deliberately silent
-  // rather than showing a placeholder encoding that might turn out wrong.
-  if (!decoded) return null;
+  // Nothing to say yet (the first read is in flight), or nothing wrong with
+  // the reading — either way, deliberately silent rather than showing a
+  // placeholder or repeating the routine "Read as UTF-8." that used to sit
+  // here unconditionally.
+  if (!decoded?.lossy) return null;
 
   return (
-    <div className="encoding-strip">
-      <label className="encoding-label">
-        <span className="encoding-lede">{ledeFor(decoded)}</span>
-        <select
-          className="encoding-select"
-          aria-label="Read this file's text as a different encoding"
-          value={chosen ?? AUTO}
-          onChange={(e) => onPick(e.target.value)}
-        >
-          <option value={AUTO}>
-            {decoded.source === "chosen"
-              ? "Let Arcelle decide"
-              : `Read automatically (${decoded.encoding})`}
-          </option>
-          {decoded.options.map((o) => (
-            <option key={o.name} value={o.name}>
-              {o.title}
-            </option>
-          ))}
-        </select>
-      </label>
-      {decoded.lossy && (
-        <span className="encoding-warn">
-          Some bytes have no meaning in {decoded.encoding}, so they show as “�”.
-          This isn't the file's text — pick the encoding it was written in.
-          Editing stays off until the text reads correctly.
-        </span>
-      )}
+    <div className="encoding-strip" role="status">
+      <span className="encoding-lede">{ledeFor(decoded)}</span>
+      <span className="encoding-warn">
+        Some bytes have no meaning in {decoded.encoding}, so they show as “�”.
+        This isn't the file's text — open the ⋯ menu above the document and
+        pick the encoding it was actually written in. Editing stays off until
+        the text reads correctly.
+      </span>
     </div>
+  );
+}
+
+/** The overflow-menu row: the lede sentence plus the picker itself. Null
+ * while the first read is still in flight, or once it has failed outright
+ * (the `EncodingAlert` card is the whole story then — offering a picker next
+ * to "couldn't be checked" invites picking against bytes it never read). */
+function EncodingPicker({
+  decoded,
+  chosen,
+  onPick,
+}: {
+  decoded: DecodedFileText | null;
+  chosen: string | null;
+  onPick: (name: string) => void;
+}) {
+  if (!decoded) return null;
+  return (
+    <label className="encoding-label">
+      <span className="encoding-lede">{ledeFor(decoded)}</span>
+      <select
+        className="encoding-select"
+        aria-label="Read this file's text as a different encoding"
+        value={chosen ?? AUTO}
+        onChange={(e) => onPick(e.target.value)}
+      >
+        <option value={AUTO}>
+          {decoded.source === "chosen"
+            ? "Let Arcelle decide"
+            : `Read automatically (${decoded.encoding})`}
+        </option>
+        {decoded.options.map((o) => (
+          <option key={o.name} value={o.name}>
+            {o.title}
+          </option>
+        ))}
+      </select>
+    </label>
   );
 }
 

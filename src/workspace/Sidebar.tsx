@@ -1,10 +1,8 @@
-import { useEffect, type ReactNode } from "react";
+import { useEffect } from "react";
 import {
-  ChatBubbleIcon,
   CloseIcon,
   CollapseLeftIcon,
   DownloadIcon,
-  FilesIcon,
   FocusIcon,
   FolderIcon,
   LinkIcon,
@@ -17,6 +15,7 @@ import {
   BookOpenIcon,
   SearchIcon,
   TrashIcon,
+  UndoIcon,
   WorkflowsIcon,
 } from "../icons";
 import { displayName, fileLabel } from "./composer";
@@ -46,7 +45,6 @@ const AREA_HEADINGS: Record<WorkArea, string> = {
   skills: "Skills",
   memory: "Memory",
   connectors: "Connectors",
-  find: "Find",
   browser: "Private browser",
 };
 
@@ -188,7 +186,11 @@ export default function LibraryPane({
         </div>
       )}
 
-      {(fileArea || area === "recordings") && (
+      {/* Trash is a record of what left the room, not a list you browse — a
+          filter box and a "Newest first" sort control that don't move the
+          trash at all (it composes its own, unrelated order) don't belong
+          here. Suppressed for that tab only; Browse/AI sources keep both. */}
+      {((fileArea && s.libraryTab !== "trash") || area === "recordings") && (
         <div className="source-tools">
           <label className="search-field">
             <SearchIcon size={13} />
@@ -247,19 +249,38 @@ export default function LibraryPane({
       {fileArea && s.libraryTab === "sources" && (
         <SourcesPanel s={s} a={a} shownFiles={shownFiles} attachedIds={attachedIds} />
       )}
-      {fileArea && s.libraryTab === "trash" && (
-        <TrashPanel s={s} a={a} filterQ={filterQ} />
-      )}
+      {fileArea && s.libraryTab === "trash" && <TrashPanel s={s} a={a} />}
       {area === "recordings" && <RecordingsNav s={s} a={a} shownFiles={shownFiles} />}
       {area === "workflows" && <WorkflowsNav s={s} a={a} />}
       {area === "scripts" && <ScriptsNav s={s} a={a} />}
       {area === "skills" && <SkillsNav s={s} a={a} />}
       {area === "memory" && <MemoryNav s={s} a={a} />}
       {area === "connectors" && <ConnectorsNav s={s} />}
-      {area === "find" && <FindNav s={s} />}
       {area === "browser" && <BrowserNav />}
 
-      {(fileArea || area === "recordings") && (
+      {/* Trash has nothing to add — you cannot add a source to what has been
+          removed — so its footer does the one bulk action the tab actually
+          needs instead of duplicating "+ Add page or source" from Browse. */}
+      {fileArea && s.libraryTab === "trash" ? (
+        <div className="source-footer">
+          <button
+            className="add-source-button"
+            disabled={s.selectedTrashIds.size === 0}
+            title={
+              s.selectedTrashIds.size > 0
+                ? `Put ${s.selectedTrashIds.size} file${s.selectedTrashIds.size === 1 ? "" : "s"} back in the library`
+                : "Select one or more deleted files to restore them"
+            }
+            onClick={() => {
+              const ids = Array.from(s.selectedTrashIds);
+              s.setSelectedTrashIds(new Set());
+              void a.restoreFiles(ids);
+            }}
+          >
+            <UndoIcon size={14} /> Restore selected
+          </button>
+        </div>
+      ) : (fileArea || area === "recordings") && (
         <div className="source-footer">
           <div className="add-menu-wrap" style={{ width: "100%" }}>
             <button
@@ -1000,61 +1021,6 @@ function SkillsNav({ s, a }: { s: WSState; a: WSActions }) {
           <span className="area-nav-state">{skill.createdBy === "agent" ? "AI" : skill.createdBy}</span>
         </button>
       ))}
-    </div>
-  );
-}
-
-/* ---------- Find lens ---------- */
-
-/** The Find area has no list of its own: the search page in the centre owns
- * the results, the filters and the saved searches. What this pane can honestly
- * add is the SCOPE — the three things a room-wide search reads and how much is
- * in each — so "search this room" is a number rather than a promise.
- *
- * The rows are deliberately static (`is-static`, like the Memory lens's
- * counts): clicking a scope here would be a second, competing filter beside
- * the one on the page, and two controls for one setting is how they end up
- * disagreeing. */
-function FindNav({ s }: { s: WSState }) {
-  const scopes: { key: string; label: string; count: number; icon: ReactNode }[] = [
-    { key: "files", label: "Files", count: s.files.length, icon: <FilesIcon size={15} /> },
-    {
-      key: "chats",
-      label: "Conversations",
-      count: s.chats.length,
-      icon: <ChatBubbleIcon size={15} />,
-    },
-    {
-      key: "memories",
-      label: "Memories",
-      count: s.memories.length,
-      icon: <MemoryIcon size={15} />,
-    },
-  ];
-  return (
-    <div className="library-scroll">
-      <p className="area-nav-intro">
-        One search reads all three of these at once. Everything is indexed on
-        this Mac — searching never reaches the internet, whichever model the
-        room is using.
-      </p>
-      <div className="group-heading">What is searched</div>
-      {scopes.map((sc) => (
-        <div key={sc.key} className="area-nav-row is-static">
-          <span className="browse-icon">{sc.icon}</span>
-          <span className="area-nav-main">
-            <span className="area-nav-title">{sc.label}</span>
-          </span>
-          <span className="area-nav-state">{sc.count}</span>
-        </div>
-      ))}
-      <div className="group-heading">Elsewhere</div>
-      <p className="area-nav-intro">
-        ⌘K searches the same index and adds the room's commands, for when you
-        already know where you are going. The Library's filter box is a
-        different thing again — it narrows the list of files you can see, and
-        never looks inside one.
-      </p>
     </div>
   );
 }

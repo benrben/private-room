@@ -39,16 +39,17 @@ const TONE_MARK: Record<BriefTone, string> = {
   warn: "nb-sem-pending",
   info: "nb-sem-linked",
 };
-/** …and the colour never travels alone. The tape label spells the tone out in
- * a word, so a strip is still fully readable with colour ignored entirely —
- * by a screen reader, in greyscale, or by anyone who cannot separate the
- * yellow strip from the red one. */
-const TONE_WORD: Record<BriefTone, string> = {
+/* A word, not just a colour, so a strip is still fully readable with colour
+ * ignored entirely -- by a screen reader, in greyscale, or by anyone who
+ * cannot separate the yellow strip from the red one. "warn" is the one
+ * exception: its rows already open with a number ("3 scripts need review"),
+ * so the word is genuinely redundant there in a way it isn't for danger/info
+ * -- those don't lead with a number and lose their non-colour cue entirely
+ * without it. */
+const TONE_WORD: Partial<Record<BriefTone, string>> = {
   danger: "Urgent",
-  warn: "Check",
   info: "Note",
 };
-
 /** Room Brief: the one place Home leads with what NEEDS ATTENTION rather than
  * what's merely recent — raw-cloud exposure, unscanned files, scripts to
  * review, failed runs, drafts to activate. Every row resolves its own issue in
@@ -140,7 +141,9 @@ function RoomBrief({ s, a }: { s: WSState; a: WSActions }) {
       <ul className="rh-attn-list">
         {items.map((it) => (
           <li key={it.key} className={`rh-attn ${TONE_MARK[it.tone]}`}>
-            <span className="nb-tape rh-attn-tag">{TONE_WORD[it.tone]}</span>
+            {TONE_WORD[it.tone] && (
+              <span className="nb-tape rh-attn-tag">{TONE_WORD[it.tone]}</span>
+            )}
             <span className="rh-attn-text">{it.text}</span>
             <button className="nb-btn nb-btn-go rh-attn-cta" onClick={it.run}>
               {it.cta}

@@ -27,10 +27,12 @@ import { openApp, openFile } from "./helpers.mjs";
  * the current tab" is no longer a question with an answer. The breadcrumb is
  * what names the place on screen now, so that is what this asserts. `home`
  * reads "Home" there rather than the old tab's "Room home"; every other
- * wording is unchanged. `find` is the area the same pass added. */
+ * wording is unchanged. The notebook pass also added a `find` area — a
+ * second, full-page search surface — which P1-2 retired once its filters and
+ * result rows moved into ⌘K's own expanded state (SearchExpanded.tsx); ⌘K is
+ * a floating overlay rather than a rail destination, so it has no row here. */
 const AREAS = [
   ["home", "Home"],
-  ["find", "Find"],
   ["map", "Room Map"],
   ["recordings", "Recordings"],
   ["workflows", "Workflows"],

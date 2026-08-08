@@ -183,33 +183,46 @@ describe("post-QA round", () => {
     if (tight.length) {
       throw new Error(`tabs squeezed below a readable width: ${geom.map((g) => g.w).join(", ")}`);
     }
-    // The title is drawn in two boxes so the distinguishing tail survives
-    // truncation, and the seam between them can fall on a space. Whitespace at
-    // a box boundary is collapsed unless the box preserves it, which is how
-    // "Arcelle UX direction" once rendered as "Arcelle UXdirection".
-    const seams = await browser.execute(() =>
-      Array.from(document.querySelectorAll(".tab")).map((n) => {
-        const head = n.querySelector(".tab-title-head");
-        const tail = n.querySelector(".tab-title-tail");
-        const joined = (head?.textContent ?? "") + (tail?.textContent ?? "");
-        return {
-          joined,
-          title: n.getAttribute("title"),
-          keepsSpace:
-            !/\s$/.test(head?.textContent ?? "") ||
-            ["pre", "pre-wrap"].includes(getComputedStyle(head).whiteSpace),
-        };
-      }),
+    // The title is one element, visually clipped with a plain end ellipsis —
+    // but the DOM text itself is never cut, only painted short. A screen
+    // reader, a text search, or this check all still see the whole name.
+    const titles = await browser.execute(() =>
+      Array.from(document.querySelectorAll(".tab")).map((n) => ({
+        rendered: n.querySelector(".tab-title")?.textContent ?? "",
+        title: n.getAttribute("title"),
+      })),
     );
-    const broken = seams.filter((s) => s.joined !== s.title || !s.keepsSpace);
+    const broken = titles.filter((t) => t.rendered !== t.title);
     if (broken.length) {
-      throw new Error(`tab titles lose their seam: ${JSON.stringify(broken)}`);
+      throw new Error(`tab titles lose text under truncation: ${JSON.stringify(broken)}`);
     }
     const stranded = geom.filter((g) => g.gap == null || g.gap > 12);
     if (stranded.length) {
       throw new Error(
         `close button is not at the tab's right edge: ${geom.map((g) => g.gap).join(", ")}`,
       );
+    }
+    // The "more this way" arrow used to be a `position: sticky` mark inside
+    // the same scrolling row as the tabs, which painted right over whichever
+    // tab had scrolled into its pinned position. Force the overflow it needs
+    // (six tabs at a min-width of 130px is already wider than most capture
+    // windows, but don't rely on that) and hit-test its own centre: it must
+    // never resolve to a `.tab` or anything inside one.
+    const overlap = await browser.execute(() => {
+      const strip = document.querySelector(".tab-strip");
+      strip.scrollLeft = 60;
+      strip.dispatchEvent(new Event("scroll"));
+      const wrap = document.querySelector(".tab-strip-wrap");
+      if (!wrap.hasAttribute("data-more-start")) return null; // nothing to check
+      const r = document.querySelector(".tab-edge-start").getBoundingClientRect();
+      const hit = document.elementFromPoint(
+        Math.round((r.left + r.right) / 2),
+        Math.round((r.top + r.bottom) / 2),
+      );
+      return hit?.closest(".tab") ? hit.closest(".tab").getAttribute("title") : null;
+    });
+    if (overlap) {
+      throw new Error(`the start arrow is painted over a tab's own content: ${overlap}`);
     }
     await shot("tab-strip-many-dark");
   });

@@ -53,12 +53,6 @@ export type WorkArea =
   | "skills"
   | "memory"
   | "connectors"
-  // Full-page search. The ⌘K launcher and this are deliberately different
-  // things: the launcher is a COMMAND — type, jump, gone — while Find is a
-  // PLACE you stay in and work through, with room to scope, re-read and open
-  // several hits in turn. Both read the same room-wide search, so neither can
-  // show a different answer than the other.
-  | "find"
   // BROWSE-1: the private browser. Its page is a native child webview
   // parked over the workspace pane, not a React subtree.
   | "browser";
@@ -77,7 +71,6 @@ export const WORK_AREAS = [
   "skills",
   "memory",
   "connectors",
-  "find",
   "browser",
 ] as const;
 

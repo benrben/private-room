@@ -171,26 +171,13 @@
    (its only consumer, Overlays.tsx). The copy that used to sit here loaded
    AFTER that file and silently beat its colour and weight back to the old
    values, so the pencilled count never took. One definition, in the file that
-   owns the surface. */
+   owns the surface.
 
-/* The launcher's "3 files · 2 messages · 0 memories" line, ruled off below
-   with the pencil stroke that fades at both ends rather than a flat border. */
-.search-summary {
-  font-size: var(--fs-micro);
-  color: var(--muted);
-  padding: 4px 10px 8px;
-  margin-bottom: 4px;
-  background-image: linear-gradient(
-    90deg,
-    transparent 0%,
-    var(--line-soft) 4%,
-    var(--line-soft) 96%,
-    transparent 100%
-  );
-  background-repeat: no-repeat;
-  background-size: 100% 1px;
-  background-position: left bottom;
-}
+   `.search-summary` — the launcher's plain "3 files · 2 messages · 0
+   memories" line — used to live here too. P1-2 replaced it with the richer
+   `.find-count` / `.find-breakdown` pair (find.css) once the retired Find
+   page's filters and rows moved into the launcher's expanded state, so the
+   rule is gone rather than left declared with no element left rendering it. */
 
 /* ==========================================================================
    2. SETTINGS CHROME

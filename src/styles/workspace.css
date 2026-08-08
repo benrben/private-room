@@ -461,14 +461,12 @@
 
 /* ----- attention strips -----
    A marker stroke down the page rather than a filled alert box: a 3px edge in
-   the meaning's ink, a wash of the same hue across the paper behind it, and a
-   tape label that says the meaning in a word.
+   the meaning's ink, and a wash of the same hue across the paper behind it.
 
    The edge is drawn in --mk-ink and not with .nb-edge's --mk fill, because a
    3px stroke is meaningful non-text and owes 3:1 — a marker fill measures
    ~1.7:1 on ivory. Ink on the washed strip measures 4.5:1 (light yellow, the
-   worst pair) to 8.1:1 (dark red), so the edge pays its own way and the word
-   is not carrying the whole signal alone. */
+   worst pair) to 8.1:1 (dark red), well clear of that floor. */
 
 .rh-attn-list {
   list-style: none;
@@ -480,7 +478,7 @@
 }
 .rh-attn {
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
   gap: var(--sp-3);
   padding: var(--sp-3) var(--sp-4);
@@ -524,9 +522,11 @@
 
 /* ----- ruled timeline -----
    Files and chats interleave by time, with anything still running filed above
-   them. The dashed thread is .nb-connect; each row hangs a node off it.
+   them. The dashed thread is .nb-connect; each row's own icon (.rh-tl-ico)
+   is what says what kind of entry it is, so the thread stays a plain rule
+   rather than growing a second, unlabelled glyph of its own.
 
-   The thread deliberately runs a little past the last node: the room's history
+   The thread deliberately runs a little past the last row: the room's history
    does continue below what Home shows, and a stroke that stops dead would say
    otherwise. */
 
@@ -552,32 +552,8 @@
   border-radius: var(--radius-sm);
   transition: background-color var(--dur-fast) var(--ease-pen);
 }
-/* The node on the thread. Filled in --page so the dash passes behind it
-   rather than through it; the ring is --rule-strong, which is the 3:1 stroke,
-   because on a timeline the node is what says "an entry is here". */
-.rh-tl-row::before {
-  content: "";
-  position: absolute;
-  left: -22px;
-  top: calc(50% - 5px);
-  width: 9px;
-  height: 9px;
-  border: 1.5px solid var(--rule-strong);
-  border-radius: 50%;
-  background: var(--page);
-  pointer-events: none;
-}
-/* Running work gets a FILLED node — a shape difference, not just a hue — and
-   still carries the word "Running" on the right. */
-.rh-tl-row.is-running::before {
-  border-color: var(--sem-linked);
-  background: var(--sem-linked);
-}
 .rh-tl-row:hover {
   background-color: var(--hover);
-}
-.rh-tl-row:hover::before {
-  border-color: var(--accent);
 }
 .rh-tl-ico {
   display: grid;
@@ -792,7 +768,7 @@
 }
 
 /* ----- narrow column -----
-   Below this the three-column strips and rows stop fitting: the CTA and the
+   Below this the wide strips and rows stop fitting: the CTA and the
    handwritten date each drop to their own line rather than crushing the text
    they sit beside. */
 @container rh-home (max-width: 520px) {
@@ -806,7 +782,7 @@
     padding-top: 0;
   }
   .rh-attn {
-    grid-template-columns: auto minmax(0, 1fr);
+    grid-template-columns: minmax(0, 1fr);
   }
   .rh-attn-cta {
     grid-column: 1 / -1;

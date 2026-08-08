@@ -97,6 +97,9 @@
   gap: var(--sp-3);
   padding: var(--sp-4) var(--sp-6);
   font-weight: 600;
+  /* Masthead (P0-3): the "Settings" title and the close button, not content —
+     same idiom as .pane-header in shell.css. */
+  user-select: none;
   /* The rule under the head drawn the way .nb-rule draws one — thinning at
      both ends — but as a background, so it costs no element and gives a
      screen reader nothing extra to walk past. */
@@ -256,6 +259,9 @@
   padding: var(--sp-6) var(--sp-3);
   border-right: 0;
   overflow-y: auto;
+  /* Index (P0-3): the page-selector labels are app copy, not content — same
+     idiom as .pane-header in shell.css. */
+  user-select: none;
   background-image: linear-gradient(
     180deg,
     transparent 0%,

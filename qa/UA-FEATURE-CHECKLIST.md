@@ -83,13 +83,13 @@
 
 - [ ] Pane toggles with pressed state: Library (⌘1), Workspace (⌘2), AI (⌘3) (`ActivityRail.tsx`).
 - [ ] AI toggle shows an amber attention dot when a job is running or an approval is waiting (`ActivityRail.tsx`, `Workspace.tsx`).
-- [ ] Area buttons with current-state highlight — **exactly nine**, in this order, with "Search" wedged after the first: Room home · *Search* · Room Map · Recordings · Workflows · Scripts · **Skills** · Memory & scratch pad · **Connectors** · **Private browser** (`ActivityRail.tsx`). Every one must open its area; a rail entry that lands on an empty pane is a failure, not an empty room.
+- [ ] Area buttons with current-state highlight — **exactly nine**, in this order: Room home · Room Map · Recordings · Workflows · Scripts · **Skills** · Memory & scratch pad · **Connectors** · **Private browser** (`ActivityRail.tsx`). Every one must open its area; a rail entry that lands on an empty pane is a failure, not an empty room. (P1-2: the rail's own "Find" destination — a tenth entry, a second full-page search surface — is retired; ⌘K is the room's one search surface now and is reached only from the top bar / ⌘K itself, never from the rail.)
 - [ ] Each area button carries a stable `data-area` attribute (`home`/`map`/`recordings`/`workflows`/`scripts`/`skills`/`memory`/`connectors`/`browser`) — the capture harness and the GH #2 e2e both select on it (`ActivityRail.tsx`).
-- [ ] Collapsed rail shows the ≤9-char short label under each icon ("Record", "Connect", "Browser"); expanded shows the full one (`ActivityRail.tsx` `short`).
+- [ ] Collapsed rail is icon-only (P1-7: the old ≤9-char abbreviation under each icon — "Record", "Connect" — is gone, it clipped against the status bar); the full name is a native `title` tooltip on hover plus the existing `aria-label`, not the rail's own `[data-tip]` pattern. Expanded rail shows the full label as visible text next to each icon (`ActivityRail.tsx`).
 - [ ] "Search room (⌘K)" button opens the search/command palette (`ActivityRail.tsx`).
 - [ ] "Focus the editor" (zen) hides both side panes; click again restores; label flips Focus/Unfocus (`ActivityRail.tsx`).
 - [ ] "Room settings (⌘,)" opens Settings (`ActivityRail.tsx`).
-- [ ] **GH #2** Expand/Collapse toggle at the top widens the rail to ~184 px with FULL labels ("Connectors", not "Connect"); collapses back; persists per room (`ActivityRail.tsx`, `useLayout.ts` railExpanded). *e2e: `gh2-sidebar-expand.e2e.mjs`*
+- [ ] **GH #2** Expand/Collapse toggle at the top widens the rail to ~184 px, revealing each area's full label as visible text beside its icon (collapsed rail is icon-only, name via `title` tooltip — see §6 above); collapses back; persists per room (`ActivityRail.tsx`, `useLayout.ts` railExpanded). *e2e: `gh2-sidebar-expand.e2e.mjs`*
 
 ## 7. Three-pane layout
 
@@ -140,7 +140,7 @@
 - [ ] Privacy route badge: "Local & private" ⇄ cloud icon "Cloud model", tooltip states whether prompts leave the Mac (`TopBar.tsx`).
 - [ ] Theme toggle: dark ⇄ light, persists per device (`TopBar.tsx`).
 - [ ] Layout-reset button restores the balanced three panes (`TopBar.tsx`).
-- [ ] Room menu (•••): Room settings · Save a checkpoint (success toast names it) · Export all files… (disabled with 0 files) · Reveal in Finder · Send feedback… (`TopBar.tsx`).
+- [ ] Room menu (•••): Theme · Reset the three-pane layout · Save a checkpoint (success toast names it) · Export all files… (only when the room has files) · Reveal in Finder · Keyboard shortcuts (⌘/) · Send feedback… (`TopBar.tsx`). **P1-9**: "Room settings" was removed from this menu — the rail's persistent Settings button is the one entry point now, so finding a second one here is a failure.
 - [ ] **0.15.x** Send feedback…: after any error toast this session, the sheet offers "Append the N error messages shown this session" — UNTICKED by default, with the exact lines listed above it and a warning that an error can name one of your files; ticking it appends them under "### Error messages seen this session" to the issue body (`FeedbackModal.tsx`, captured by `state.ts pushToast`, in memory only).
 - [ ] Lock button (⌘L) — locks to the gate; marked `data-agent-blocked` so the UI-driving agent can never press it (`TopBar.tsx`).
 - [ ] Escape closes any open header popover (`TopBar.tsx`).
@@ -189,6 +189,8 @@
 - [ ] "Empty the trash" → confirm naming the exact number and saying it cannot be undone → toast reports the number ACTUALLY destroyed; on an already-empty trash it says "The trash was already empty." rather than claiming work.
 - [ ] Both armed trash confirms are `data-agent-blocked` — the agent driver cannot click ✓ on a permanent delete.
 - [ ] Trashed content never leaves the room: nothing appears in the macOS Trash, and "Export everything" writes only the files still in the library.
+- [ ] Viewing the Trash tab hides the Library's filter box and "Newest first" sort control (they still work normally on Browse/AI sources), and its footer reads "Restore selected" (enabled once ≥1 row is checked, calls `a.restoreFiles`) instead of "+ Add page or source" (`Sidebar.tsx`, 2026-08-08 design-review pass).
+- [ ] A tri-state select-all checkbox in the Trash tab checks/unchecks every currently-shown row and shows indeterminate when some but not all are checked (`TrashPanel.tsx`).
 
 ## 13. Import paths
 
@@ -207,9 +209,9 @@
 - [ ] "Cloud view" ⇄ "Normal view" toggle appears for any file that HAS text (not a picture with no OCR, not a bare binary); resets per file (`ViewerPane.tsx`).
 - [ ] Edit / Preview toggle: "Edit" for editable text/code AND for .docx (writes back into the Word file); "Edit as text" only for pdf/text (saving makes a Markdown copy); "Preview" back; hidden in cloud view (`ViewerPane.tsx`).
 - [ ] Every editor opens with a banner saying what Save does: .docx "writes them back into the Word file… reword paragraphs, but not add or delete them"; copy-mode "Saving creates a separate note… the original file is left exactly as it is" (`ViewerRouter.tsx` editBanner).
-- [ ] ENCODING STRIP on any plain-text kind (.txt/.log/.csv/code/.json/.md/.html/.svg/.ipynb/.srt/.eml): one line above the preview saying how the bytes are being read — "Read as UTF-8", "…, which this file states" (BOM), "…— a guess, because this file doesn't say" (detected), "…— your choice". Import a legacy ISO-8859-9 Turkish .txt: it reads as Turkish (NOT boxes), the strip says windows-1254 as a guess, and picking another encoding from the menu re-reads the file in front of you; "Read automatically" puts it back (`TextEncoding.tsx`, `decode_file_text`).
-- [ ] Picking an encoding the bytes don't fit → "Some bytes have no meaning in … so they show as “�”…" and Edit disappears until the reading is clean again.
-- [ ] Edit on a non-UTF-8 text file exists (this was missing) and its banner says the file is stored as e.g. windows-1254 and that saving "rewrites the whole file as UTF-8", with the previous version kept in History. Save, reopen: the strip now says "Read as UTF-8" and History has the pre-conversion version (`ViewerRouter.tsx` editBanner + `encodingSaveNote`).
+- [ ] ENCODING PICKER, in the document toolbar's "…" overflow menu (moved there from an always-visible strip in the 2026-08-08 design-review pass) on any plain-text kind (.txt/.log/.csv/code/.json/.md/.html/.svg/.ipynb/.srt/.eml): shows how the bytes are being read — "Read as UTF-8", "…, which this file states" (BOM), "…— a guess, because this file doesn't say" (detected), "…— your choice". Import a legacy ISO-8859-9 Turkish .txt: it reads as Turkish (NOT boxes), the overflow menu says windows-1254 as a guess, and picking another encoding from it re-reads the file in front of you; "Read automatically" puts it back (`TextEncoding.tsx` EncodingPicker, `decode_file_text`).
+- [ ] Picking an encoding the bytes don't fit → an inline alert card over the document itself (not the overflow menu — this is the one case still surfaced without a click) reading "Some bytes have no meaning in … so they show as “�”…" and Edit disappears until the reading is clean again (`TextEncoding.tsx` EncodingAlert).
+- [ ] Edit on a non-UTF-8 text file exists (this was missing) and its banner says the file is stored as e.g. windows-1254 and that saving "rewrites the whole file as UTF-8", with the previous version kept in History. Save, reopen: the overflow menu now says "Read as UTF-8" and History has the pre-conversion version (`ViewerRouter.tsx` editBanner + `encodingSaveNote`).
 - [ ] UNSAVED-EDITS DOOR — type in any editor, then try each of: viewer Close, tab ×, clicking another tab, ⌥⌘1-9, ⌘⇧[ / ⌘⇧], a rail area, ⌘T. Each shows "Save your changes?" with Save / Discard changes / Cancel. Cancel stays put and keeps the text; Discard leaves and drops it; Save writes then leaves. Escape = Cancel (`UnsavedEditsDialog.tsx`).
 - [ ] A save that FAILS keeps the dialog open ("That didn\'t save, so nothing was closed") and does not navigate.
 - [ ] …and the two exits that leave the APP: the red close button asks "Unsaved edits" and Cancel really keeps the window open (it needs `core:window:allow-destroy`, or the window stops closing at all), and **⌘Q** asks the same question. Cancel on ⌘Q leaves the app running; a SECOND ⌘Q always quits, so the guard can never trap you (`RunEvent::ExitRequested` + `set_unsaved_edits`).
@@ -388,8 +390,18 @@
 
 ## 20. Search / command palette (⌘K, also ⌘F)
 
-- [ ] Input with 200 ms debounced full-room search; ↑↓ move, Enter runs, Esc/backdrop close; hint bar (`Overlays.tsx`, `effects.ts`).
-- [ ] Result groups: Files, Messages, Memories (each row navigates to the hit) + summary counts line; "Nothing matches "…"" empty state (`Overlays.tsx`).
+**P1-2**: the room's standalone "Find" area is retired. Its filters, result
+previews, and saved/recent searches now render INSIDE this palette once a
+real query has real results — the panel itself widens (`.search-panel.is-expanded`)
+to fit them (`SearchExpanded.tsx`, rendered by `Overlays.tsx`). The Library's
+own file-filter box (§10) is unaffected and still a separate, narrower thing.
+
+- [ ] Input with 200 ms debounced full-room search; ↑↓ move across files/messages/memories AND commands together, Enter runs, Esc/backdrop close; hint bar (`Overlays.tsx`, `effects.ts`).
+- [ ] Result groups: Files, Messages, Memories, each row showing a highlighted title/snippet, kind + size, a margin date, and a note ("the name matched, not the text" / "only the first part of this file is indexed" / "written by the AI in this room" / "no longer in this room") (`SearchExpanded.tsx`).
+- [ ] Filter strip (shown once a query has results): Where (Files/Messages/Memories toggle chips with counts, last one can't be turned off), Type (file-kind chips, only when >1 kind is present), Added (Any time/Today/Past 7 days/Past 30 days/Past year), Match (Anywhere/In the text/In the file name), Sort files (Best match/Newest/Oldest/Name A–Z), "Clear filters" once any is non-default (`SearchExpanded.tsx`).
+- [ ] Live count line ("N results for "…"" / "N of M results…" / "No results for "…"") plus a files/messages/memories breakdown; narrowing a filter to zero shows its own notice ("Nothing matches "…" with these filters — N result(s) hidden") distinct from a query that truly matches nothing anywhere, including commands (`SearchExpanded.tsx`, `Overlays.tsx`).
+- [ ] "Save this search" toggle (keeps words + filters, per room) and "Ask the room instead" (closes the palette, fills the composer, focuses it) (`SearchExpanded.tsx`).
+- [ ] Idle (empty query): "Recent" chips (auto-recorded per completed search, prefix-deduped) and "Saved searches" rows (bookmark icon, per-row remove ×), both above the Commands list; "Clear recent" (`SearchExpanded.tsx`).
 - [ ] Commands group (filtered by query): New chat (⌘N) · Add files… · New page · Import a web link · Start a live recording · Record a voice note · Summarize the room · Go to Room home · Open the Room Map · Open Workflows · Open Scripts · Open Memory & scratch pad · Focus the editor · Reset the three-pane layout · Switch theme · Save a checkpoint · Export all files… · Room settings (⌘,) · Send feedback… · Lock this room (⌘L) — disabled entries skip on Enter (`Overlays.tsx`).
 
 ## 21. Global overlays, toasts, approval cards
@@ -428,7 +440,7 @@
 - [ ] Empty-state hero + 4 prompt chips (fill composer, don't auto-send) + command-hint chips (`#name`) (`ChatPane.tsx`).
 - [ ] Message rows: "Room AI" vs "You", assistant Markdown / user plain, `dir=auto`; annotated-image answers render the marked image inline (`ChatPane.tsx`).
 - [ ] Citation chips: quote/note/range + file name; verified quotes get check + "Verified" badge, approximate get "· ≈ closest match"; click opens the file at the highlight; "Copy as receipt" on verified quotes (`ChatPane.tsx`).
-- [ ] Assistant footer: source chips (open newest matching file; info toast if gone) · ▶ Play/◼ Stop TTS · Copy · "Undo edit"/"Undo N edits" (when the answer edited files) · Regenerate (last answer only; re-runs the turn, paperclip attachments intentionally dropped) · "Save to room" inline form (name default "AI note.md", Enter saves) (`ChatPane.tsx`).
+- [ ] Assistant footer: source chips (open newest matching file; info toast if gone) · ▶ Play/◼ Stop TTS · Copy · "Undo edit"/"Undo N edits" (when the answer edited files) · Regenerate (last answer only; re-runs the turn, paperclip attachments intentionally dropped) · "Save to room" inline form (name default "AI note.md", Enter saves) (`ChatPane.tsx`). Buttons render at normal secondary contrast (`--muted`), not the faint/near-invisible tint from before the 2026-08-08 design-review pass — they should read as present-but-secondary, never as disabled.
 - [ ] Streaming: pulsing placeholder ("Thinking locally…" vs "Asking your cloud AI — content leaves this Mac…"), lane + step chips (failed steps ⚠ with tooltip), live Markdown + ▍ cursor (`ChatPane.tsx`).
 - [ ] Agent graph (2026-07-27): a turn that DELEGATES shows a hub-and-spoke graph above the step chips — "Main agent" rooted left, one node per dispatched specialist to its right, curved spokes between them; each node reads label + truncated instruction + elapsed, with its state carried by glyph AND outline, never colour alone (○ dashed = queued, spinner + accent = running, ✓ = done, ⚠ + heavy red = failed); the header counts "N running" / "N/M done" (`AgentGraph.tsx`, `ask-plan` entries' `status`).
 - [ ] Parallel batch grouping: specialists dispatched in the SAME round sit inside one dashed "N IN PARALLEL" band, all lit at once, and go done/failed INDEPENDENTLY (a fast child must stop pulsing while a slow sibling still runs — not all at the end); a later round's specialist appears in its own band below (`ask-plan` entries' `batch`).
@@ -443,7 +455,7 @@
 - [ ] Anti-fabrication: an answer claiming an edit/highlight that no tool performed gets a visible appended correction (`agent.rs` `claims_unbacked_action`).
 
 **Token-budget bar & hand-off (0.10.0, `TokenBudgetBar.tsx`)**
-- [ ] Nothing renders until the first turn's usage snapshot arrives; after one ask a segmented bar appears under the messages (`TokenBudgetBar.tsx`).
+- [ ] Nothing renders until the first turn's usage snapshot arrives, AND (2026-08-08 design-review pass) the bar itself stays hidden below ~70% of the context window even once usage exists — only "Hand off" (see below) is unconditional (`TokenBudgetBar.tsx`).
 - [ ] The fill is the REAL ratio (used ÷ the model's context window); the near/at/over signal is a colour-only ring — ok < 75 % → warn ≥ 75 % → danger ≥ 92 % — and never changes the width (`TokenBudgetBar.tsx`).
 - [ ] Hover title reads "N / M tokens used this turn — click for a breakdown" (`TokenBudgetBar.tsx`).
 - [ ] Click opens the breakdown popover: the 5 fixed categories in a fixed order and fixed colours — System prompt · Conversation history · Tool results · Skill-injected content · File reads & attachments (`TokenBudgetBar.tsx`). Escape closes it (`TokenBudgetBar.tsx`).
@@ -455,8 +467,7 @@
 
 **Composer (`ComposerPane.tsx`)**
 - [ ] Import-tidy batch card ("N new files could be renamed and filed." — Tidy up / Review / ×) and per-file Apply/Dismiss chips (`ComposerPane.tsx`).
-- [ ] Cloud strip "Cloud · leaves this Mac" + "Use local" button (`ComposerPane.tsx`).
-- [ ] Internet badge "This room can reach the internet" (web on or MCP tools; suppressed for external CLI engines unless advisor-tools on) (`ComposerPane.tsx`).
+- [ ] Cloud strip + internet badge merged into ONE contextual line (2026-08-08 design-review pass, mutually exclusive, never stacked): on a cloud model, only shows once the composer has real typed text, reading "This will leave your Mac." or, if the room can also reach the internet, "This will leave your Mac — this room can also reach the internet." with the "Use local" button carried over; on a local model with internet reach, shows the standalone "This room can reach the internet" badge instead (web on or MCP tools; suppressed for external CLI engines unless advisor-tools on); on a local model with no reach, shows nothing (`ComposerPane.tsx`).
 - [ ] Attach-nudge when the question names an unattached image + "Attach it" (`ComposerPane.tsx`).
 - [ ] Attachment chips with × remove (`ComposerPane.tsx`).
 - [ ] `#`/`@` autocomplete popover: count header, ↑↓/Enter/Tab/Esc, mouse insert; `@folder/` expands to its files; unknown `#word` → error toast listing valid commands (`ComposerPane.tsx`, `composer.ts`).

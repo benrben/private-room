@@ -110,8 +110,38 @@ export default function Composer({ s, a }: { s: WSState; a: WSActions }) {
           </div>
         ))
       )}
-      {isCloudRoute(s.model, s.ai) &&
-        (() => {
+      {/* Engine parity: every engine can reach connected tools now — local
+          and `:cloud` through the sidecar loop, external CLIs through the
+          room bridge (web always when enabled; connected MCP tools only when
+          the advisor-tools switch says so). Reach is a fact about the ROOM's
+          own internet switch and its connected tools (Settings → Online:
+          "search queries and fetched pages leave this Mac"), not about which
+          model is answering — a local model keeps its OWN reasoning on this
+          Mac, but a local room with web search on still sends every query
+          out, which is exactly what the badge below exists to say. */}
+      {(() => {
+        const external = isExternalEngine(s.model);
+        const webReach = s.webOn;
+        const mcpReach =
+          s.mcpTools.length > 0 && (!external || s.advisorToolsOn);
+        const reachesInternet = webReach || mcpReach;
+        const reachTitle = [
+          webReach ? "Web search: on" : null,
+          mcpReach ? `Connected tools: ${s.mcpTools.join(", ")}` : null,
+        ]
+          .filter(Boolean)
+          .join("\n");
+
+        // ONE contextual line, not two permanent ribbons: it reflects what
+        // THIS turn is about to do, not a standing fact repeated under every
+        // past message (that lived here too, but rendered unconditionally —
+        // the same words under every answer in the transcript). A cloud
+        // model only says so once the user has actually started composing a
+        // message to send it — an empty box has nothing pending to warn
+        // about — and reach folds into the same sentence rather than a
+        // second parallel strip, since while actively composing on a cloud
+        // model both facts are true at once and saying so twice is noise.
+        if (isCloudRoute(s.model, s.ai) && s.question.trim().length > 0) {
           // "Use local" has to land on a model that actually runs on this Mac.
           // `ai.defaultModel` echoes the room's SAVED model setting, which in a
           // cloud room is the cloud model itself — switching to it was a no-op.
@@ -123,9 +153,20 @@ export default function Composer({ s, a }: { s: WSState; a: WSActions }) {
             RECOMMENDED_MODELS.map((m) => m.name),
           );
           return (
-            <div className="cloud-strip" title="This room is using a cloud model — your prompts and attached context are sent to it.">
+            <div
+              className="cloud-strip"
+              title={[
+                "This room is using a cloud model — your prompts and attached context are sent to it.",
+                reachTitle,
+              ]
+                .filter(Boolean)
+                .join("\n")}
+            >
               <span className="cloud-strip-label">
-                <CloudIcon size={13} /> Cloud · leaves this Mac
+                <CloudIcon size={13} />
+                {reachesInternet
+                  ? "This will leave your Mac — this room can also reach the internet."
+                  : "This will leave your Mac."}
               </span>
               <button
                 className="cloud-strip-action"
@@ -149,29 +190,17 @@ export default function Composer({ s, a }: { s: WSState; a: WSActions }) {
               </button>
             </div>
           );
-        })()}
-      {/* Engine parity: every engine can reach these tools now — local and
-          `:cloud` through the sidecar loop, external CLIs through the room
-          bridge (web always when enabled; connected MCP tools only when the
-          advisor-tools switch says so). The badge states the truth per engine. */}
-      {(() => {
-        const external = isExternalEngine(s.model);
-        const webReach = s.webOn;
-        const mcpReach =
-          s.mcpTools.length > 0 && (!external || s.advisorToolsOn);
-        if (!webReach && !mcpReach) return null;
+        }
+
+        // The complementary case: reach is real but the sentence above either
+        // isn't drawn (a local room, or a cloud room the reader hasn't
+        // started typing into yet) or already said its own thing without
+        // folding this in. A local room's own reasoning never leaves the
+        // Mac, but the room's internet switch and connected tools still can
+        // — this is the one honest place left to say so.
+        if (!reachesInternet) return null;
         return (
-          <div
-            className="mcp-badge"
-            title={[
-              webReach ? "Web search: on" : null,
-              mcpReach
-                ? `Connected tools: ${s.mcpTools.join(", ")}`
-                : null,
-            ]
-              .filter(Boolean)
-              .join("\n")}
-          >
+          <div className="mcp-badge" title={reachTitle}>
             <span className="badge-label">
               <GlobeIcon size={13} /> This room can reach the internet
             </span>
