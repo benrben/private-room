@@ -6,11 +6,18 @@
 
 # Arcelle
 
-**A private AI workspace that lives inside a single file.**
+**Using AI shouldn't require giving up your privacy.**
 
-Double-click it, unlock it with your password, and everything — your files,
-your chats, the AI's memory — is sealed in **one encrypted document**.
-Nothing leaves your Mac unless you say so.
+Every AI tool today asks the same trade: hand over your files and
+conversations to a server you'll never see, and trust a privacy policy that
+can change on their schedule, not yours. We think that's backwards — so we
+built one that runs the other way around. The AI lives on your Mac, and
+everything it touches — your files, your chats, its memory of you — is
+sealed inside **one encrypted file** that only you hold the key to. Nothing
+leaves your Mac unless you say so.
+
+That's Arcelle: a private AI workspace that lives inside a single file.
+Double-click it, unlock it with your password, and you're in.
 
 <a href="https://github.com/benrben/private-room/releases/latest"><img src="docs/badge-download.svg" alt="Download the latest DMG" height="28"></a>
 <img src="docs/badge-encrypted.svg" alt="Encrypted on your Mac" height="28">
@@ -77,17 +84,20 @@ Nothing leaves your Mac unless you say so.
 
 ## About the project
 
-An `.arcelle` file works like a document. Double-click it in Finder, unlock it
-with your password (or a fingerprint), and you're inside a private workspace
-containing your files, chat history, AI memory, recordings, and generated
-documents. Everything lives in **one SQLCipher-encrypted SQLite file** — copy
-it, back it up, or AirDrop it like any other document. (Rooms made before the
+Under the hood, an `.arcelle` file is an ordinary document. Everything you
+put in a room — files, chat history, AI memory, recordings, and generated
+documents — lives in **one SQLCipher-encrypted SQLite file**: copy it, back
+it up, or AirDrop it like any other document; unlock it with your password
+(or a fingerprint) and it opens like one, too. (Rooms made before the
 Arcelle rename end in `.roomai`; those still open, and nothing needs
 converting.) By default nothing leaves your computer: the AI runs locally
 through Ollama — and if you *choose*
 to point a room at a cloud engine, the app says so out loud, everywhere.
 
 ### Why it's different
+
+A belief is only worth something if it's load-bearing, not a policy promise.
+Here's where it actually shows up:
 
 - 📍 **A local AI that can't fake a citation.** Every claim is pinned to the
   exact sentence in your document — and the app *verifies the quote before it
@@ -441,8 +451,9 @@ same approval and content-fingerprint gate as a hand-written config.
 
 ### The private browser
 
-A full browser area inside the room, built on a native child webview — so it
-renders exactly what Safari renders and costs the app nothing extra in size.
+Browsing shouldn't leave a trail either. This is a full browser area inside
+the room, built on a native child webview — so it renders exactly what
+Safari renders and costs the app nothing extra in size.
 
 - **It persists nothing.** No history, no cookies, no cache, no form data, no
   saved logins — the webview uses a non-persistent data store, so none of it is
