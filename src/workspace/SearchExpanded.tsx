@@ -361,6 +361,7 @@ function placeholderMeta(id: string, name: string): FileMeta {
     createdAt: "",
     folderId: null,
     partiallyIndexed: false,
+    aiSummary: null,
   };
 }
 

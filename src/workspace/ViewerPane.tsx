@@ -192,6 +192,13 @@ export default function ViewerPane({
         (fo) => fo.id === s.files.find((f) => f.id === openFile.id)?.folderId,
       )?.name
     : undefined;
+  // "Describe new files automatically" (Settings > Behavior) — the cached
+  // one-liner, when this file has one. P1-4 removed the viewer's own title
+  // (the breadcrumb's crumb-title carries the name now), so this is the
+  // subtitle line that sits under it; most files won't have one yet.
+  const fileDescription = openFile
+    ? s.files.find((f) => f.id === openFile.id)?.aiSummary
+    : undefined;
   // The trail must name what is ON SCREEN. With nothing open the "files" area
   // renders the room's home page (or the sealed-room empty state), so saying
   // "Files" described a list the user wasn't looking at.
@@ -275,6 +282,16 @@ export default function ViewerPane({
           </button>
         </div>
       </div>
+      {/* The generated one-liner, when this file has one — see fileDescription
+          above. Its own strip rather than something squeezed into the
+          breadcrumb: the breadcrumb line is the room/folder TRAIL (P0-3) and
+          already truncates hard on a narrow pane; this is the file's own
+          content and deserves its own row, not a fight for the same pixels. */}
+      {openFile && fileDescription && (
+        <div className="viewer-file-description" title={fileDescription}>
+          {fileDescription}
+        </div>
+      )}
       {openFile ? (
         <>
           <div className="viewer-head">
@@ -863,13 +880,13 @@ export default function ViewerPane({
       ) : area === "connectors" ? (
         <ConnectorsView />
       ) : area === "skills" ? (
-        <SkillsView s={s} a={a} />
+        <SkillsView s={s} a={a} info={info} />
       ) : area === "memory" ? (
         <MemoryView s={s} a={a} info={info} />
       ) : area === "recordings" ? (
-        <RecordingsPage s={s} a={a} />
+        <RecordingsPage s={s} a={a} info={info} />
       ) : frontPageView ? (
-        <FrontPage page={frontPageView} s={s} a={a} layout={layout} />
+        <FrontPage page={frontPageView} s={s} a={a} layout={layout} info={info} />
       ) : (
         <div className="viewer-empty">
           <div className="viewer-empty-icon">

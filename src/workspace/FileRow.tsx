@@ -85,8 +85,18 @@ export default function FileRow({
           <span className="file-icon">
             <FileTypeIcon file={f} />
           </span>
-          <span className="file-name" title={f.name}>
-            {fileLabel(f.name, s.files)}
+          <span className="file-name-col">
+            <span className="file-name" title={f.name}>
+              {fileLabel(f.name, s.files)}
+            </span>
+            {/* "Describe new files automatically" (Settings > Behavior) fills
+                this in on its own schedule — most files won't have one yet,
+                which is why it's only drawn when present. */}
+            {f.aiSummary && (
+              <span className="file-description" title={f.aiSummary}>
+                {f.aiSummary}
+              </span>
+            )}
           </span>
           {/* Both badges below are STATE, and a row is rendered hundreds of
               times, so each is a single span with no per-row cost. They are

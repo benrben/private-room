@@ -86,6 +86,10 @@ export interface FileMeta {
   folderId: string | null;
   /** True when only the first N chunks were indexed (HLT-4). */
   partiallyIndexed: boolean;
+  /** The cached one-liner describing this file ("Describe new files
+   * automatically" in Settings, or a manual Summarize-room run) — null until
+   * that has run for this file, or for a file with nothing to describe. */
+  aiSummary: string | null;
 }
 
 /** Who deleted a file. Recorded at the moment of deletion — `"unknown"` is a

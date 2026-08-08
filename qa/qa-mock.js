@@ -132,18 +132,20 @@
   };
 
   const files = [
-    { id: "f-direction", name: "Arcelle UX direction.md", mimeType: "text/markdown", sizeBytes: 4210, source: "generated", hasText: true, createdAt: iso(2), folderId: "fo-product", partiallyIndexed: false },
-    { id: "f-ideas", name: "Ideas.md", mimeType: "text/markdown", sizeBytes: 2130, source: "upload", hasText: true, createdAt: iso(300), folderId: "fo-product", partiallyIndexed: false },
-    { id: "f-issues", name: "Issues.md", mimeType: "text/markdown", sizeBytes: 1830, source: "upload", hasText: true, createdAt: iso(14), folderId: "fo-product", partiallyIndexed: false },
-    { id: "f-clean", name: "clean-code.pdf", mimeType: "application/pdf", sizeBytes: 3_980_000, source: "upload", hasText: true, createdAt: iso(900), folderId: "fo-research", partiallyIndexed: true },
-    { id: "f-review", name: "review-sample.docx", mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document", sizeBytes: 188_000, source: "upload", hasText: true, createdAt: iso(1300), folderId: "fo-research", partiallyIndexed: false },
-    { id: "f-apollo", name: "Apollo missions.csv", mimeType: "text/csv", sizeBytes: 8210, source: "upload", hasText: true, createdAt: iso(2100), folderId: "fo-research", partiallyIndexed: false },
-    { id: "f-meeting", name: "Product review.m4a", mimeType: "audio/mp4", sizeBytes: 22_000_000, source: "recording", hasText: true, createdAt: iso(60), folderId: null, partiallyIndexed: false },
-    { id: "f-script", name: "prepare_release.py", mimeType: "text/x-python", sizeBytes: 1180, source: "upload", hasText: true, createdAt: iso(400), folderId: null, partiallyIndexed: false },
+    { id: "f-direction", name: "Arcelle UX direction.md", mimeType: "text/markdown", sizeBytes: 4210, source: "generated", hasText: true, createdAt: iso(2), folderId: "fo-product", partiallyIndexed: false, aiSummary: "Product notes on the shell redesign's rail, panes and token system." },
+    { id: "f-ideas", name: "Ideas.md", mimeType: "text/markdown", sizeBytes: 2130, source: "upload", hasText: true, createdAt: iso(300), folderId: "fo-product", partiallyIndexed: false, aiSummary: null },
+    { id: "f-issues", name: "Issues.md", mimeType: "text/markdown", sizeBytes: 1830, source: "upload", hasText: true, createdAt: iso(14), folderId: "fo-product", partiallyIndexed: false, aiSummary: null },
+    // No description: a large PDF that hasn't reached the auto-index filler
+    // yet — the fixture the "most files may not have one" case needs.
+    { id: "f-clean", name: "clean-code.pdf", mimeType: "application/pdf", sizeBytes: 3_980_000, source: "upload", hasText: true, createdAt: iso(900), folderId: "fo-research", partiallyIndexed: true, aiSummary: null },
+    { id: "f-review", name: "review-sample.docx", mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document", sizeBytes: 188_000, source: "upload", hasText: true, createdAt: iso(1300), folderId: "fo-research", partiallyIndexed: false, aiSummary: "A sample review document used to exercise the Word-doc viewer and editor." },
+    { id: "f-apollo", name: "Apollo missions.csv", mimeType: "text/csv", sizeBytes: 8210, source: "upload", hasText: true, createdAt: iso(2100), folderId: "fo-research", partiallyIndexed: false, aiSummary: null },
+    { id: "f-meeting", name: "Product review.m4a", mimeType: "audio/mp4", sizeBytes: 22_000_000, source: "recording", hasText: true, createdAt: iso(60), folderId: null, partiallyIndexed: false, aiSummary: "A recorded product review meeting with a full speaker transcript." },
+    { id: "f-script", name: "prepare_release.py", mimeType: "text/x-python", sizeBytes: 1180, source: "upload", hasText: true, createdAt: iso(400), folderId: null, partiallyIndexed: false, aiSummary: null },
     // The video viewer's own surface (technical strip, Set start/Set end, Trim,
     // Save frame) had NO fixture at all, so nothing in this harness could reach
     // it — the `probe_video_meta` fixture below was unreachable.
-    { id: "f-demo", name: "Kickoff demo.mp4", mimeType: "video/mp4", sizeBytes: 48_000_000, source: "upload", hasText: true, createdAt: iso(45), folderId: null, partiallyIndexed: false },
+    { id: "f-demo", name: "Kickoff demo.mp4", mimeType: "video/mp4", sizeBytes: 48_000_000, source: "upload", hasText: true, createdAt: iso(45), folderId: null, partiallyIndexed: false, aiSummary: null },
     // Two SAVED WEB PAGES, because the viewer's source strip renders from
     // `files.web_meta` and there was no fixture carrying one — so the strip was
     // unreachable from this harness even though the UA checklist asks a tester
@@ -151,12 +153,12 @@
     // author and dates, the other declared nothing but the address, and the
     // whole promise of the strip is that those two look different (no
     // "Author: unknown" row on the second).
-    { id: "f-heron", name: "The Heron Returns.md", mimeType: "text/markdown", sizeBytes: 4300, source: "web", hasText: true, createdAt: iso(20), folderId: "fo-research", partiallyIndexed: false },
-    { id: "f-bare", name: "Status page.md", mimeType: "text/markdown", sizeBytes: 900, source: "web", hasText: true, createdAt: iso(18), folderId: null, partiallyIndexed: false },
+    { id: "f-heron", name: "The Heron Returns.md", mimeType: "text/markdown", sizeBytes: 4300, source: "web", hasText: true, createdAt: iso(20), folderId: "fo-research", partiallyIndexed: false, aiSummary: null },
+    { id: "f-bare", name: "Status page.md", mimeType: "text/markdown", sizeBytes: 900, source: "web", hasText: true, createdAt: iso(18), folderId: null, partiallyIndexed: false, aiSummary: null },
     // A podcast SCRIPT, so the Studio tab's Voices panel is reachable at all.
     // Without a file that has a `podcasts` row behind it the panel only ever
     // renders its "this page has no script attached" branch.
-    { id: "f-podcast", name: "Diarization - podcast script.html", mimeType: "text/html", sizeBytes: 7400, source: "generated", hasText: true, createdAt: iso(9), folderId: null, partiallyIndexed: false },
+    { id: "f-podcast", name: "Diarization - podcast script.html", mimeType: "text/html", sizeBytes: 7400, source: "generated", hasText: true, createdAt: iso(9), folderId: null, partiallyIndexed: false, aiSummary: null },
   ];
 
   const folders = [

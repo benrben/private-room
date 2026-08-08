@@ -341,12 +341,36 @@
   line-height: 0;
 }
 
+/* Wraps the name (and, when present, the generated description) into one
+   column so the row can grow to two lines without disturbing the icon/size
+   flex row around it. A file with no description stays exactly the single
+   .file-name span it always was, at the same height as every other row. */
+.file-name-col {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
 /* --fs-meta, not the old 12px: this is the room's content, and the metadata
    floor is the smallest a file name is allowed to be. */
 .file-name {
   flex: 1;
   font-size: var(--fs-meta);
   color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The one-line generated description (Settings > Behavior > "Describe new
+   files automatically"). Sits at the metadata rung, one step quieter than the
+   name above it — it is a hint, not a second name — and truncates the same
+   way; the full sentence is the row's tooltip via `title`. */
+.file-description {
+  font-size: var(--fs-micro);
+  color: var(--faint);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;

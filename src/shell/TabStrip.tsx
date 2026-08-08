@@ -1,6 +1,66 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { CloseIcon, GlobeIcon, PlusIcon } from "../icons";
 import type { Tab, TabsApi } from "../workspace/tabs";
+import { useAdaptiveText } from "../workspace/adaptiveText";
+
+/** What a model-written tab title (B5) is generated from: the file's saved
+ * name and a short human word for its type — nothing else, and deliberately
+ * not the buffer's live text, so an edit in progress never changes what's
+ * fed to the generator. Supplied per tab by the shell (see `titleFacts`
+ * below) because, same as `icons`, the strip itself owns no file-type
+ * knowledge — only the shell knows a tab's `ref` well enough to look up its
+ * `FileMeta`. */
+export interface TabTitleFacts {
+  name: string;
+  kind: string;
+}
+
+/** One tab's on-screen label: the model-written 2-3 word title once the
+ * generator has produced one for this file, else the plain filename (still
+ * end-truncated by `.tab-title`'s own CSS, unchanged from before).
+ *
+ * A dedicated component, not inlined in the `.map()` below, because
+ * `useAdaptiveText` is a hook — the strip's tab count changes over the
+ * session, and a hook can only be called once per mounted component
+ * instance, never once per loop iteration of a variable-length list. Each
+ * `<TabTitleText>` is one such instance, keyed by its parent's `tab.id`, so
+ * its hook state (and the cache it reads) lives for exactly as long as the
+ * tab it labels. */
+function TabTitleText({
+  roomId,
+  fallback,
+  facts,
+}: {
+  roomId: string;
+  /** The plain filename to show until (or unless) a generated title lands —
+   * RULE 1/3: this is what paints on the very first render, always, and what
+   * stays if generation is off, offline, or degraded. */
+  fallback: string;
+  /** `null` = too little to generate from (not a file tab, or a file with no
+   * extractable text yet) — the hook is disabled and `fallback` is all that
+   * ever shows. */
+  facts: TabTitleFacts | null;
+}) {
+  // Composed fresh from `facts` every render rather than memoized: it is a
+  // pure function of `facts`' content, so two renders with the same facts
+  // produce byte-identical prompt text and therefore the same cache key —
+  // see adaptiveText.ts's cache-key comment on why that's fine to pass as a
+  // new object/string each time.
+  const prompt = facts
+    ? `Reader-facing tab label for this file — 2 or 3 words, never more than 4, naming what it's ABOUT rather than repeating its filename. File: "${facts.name}" (${facts.kind}). Plain words only: no punctuation, no quotes, no trailing period.`
+    : "";
+  const generated = useAdaptiveText({
+    roomId,
+    kind: "tab_title",
+    prompt,
+    facts,
+    maxWords: 4,
+    enabled: facts !== null,
+  });
+  // `generated` is `undefined` on a fresh miss and `null` once known-absent —
+  // both nullish, both mean "show the fallback" (RULE 1/3/8).
+  return <>{generated ?? fallback}</>;
+}
 
 /** The workspace's open DOCUMENTS.
  *
@@ -17,6 +77,8 @@ import type { Tab, TabsApi } from "../workspace/tabs";
 export default function TabStrip({
   tabs,
   icons,
+  roomId,
+  titleFacts,
   onNewPage,
 }: {
   tabs: TabsApi;
@@ -24,6 +86,13 @@ export default function TabStrip({
    * area knowledge of its own. Returning null (the shell does, for files) is
    * how a tab says "my title is the whole story"; no empty slot is drawn. */
   icons: (tab: Tab) => React.ReactNode;
+  /** Scopes the adaptive tab-title cache (B5) to this room, so switching
+   * rooms can never paint a title generated for a different room's file of
+   * the same name — see workspace/adaptiveText.ts's `roomId`. */
+  roomId: string;
+  /** Facts for a tab's model-written title, or `null` when there's too
+   * little to generate from — see `TabTitleFacts`. */
+  titleFacts: (tab: Tab) => TabTitleFacts | null;
   /** Opens another private-browser page. Absent when the browser is off. */
   onNewPage: (() => void) | null;
 }) {
@@ -199,7 +268,11 @@ export default function TabStrip({
                   still one hover (native `title=` above) or one glance at the
                   breadcrumb away. */}
               <span className="tab-title" aria-hidden>
-                {tab.title}
+                <TabTitleText
+                  roomId={roomId}
+                  fallback={tab.title}
+                  facts={titleFacts(tab)}
+                />
               </span>
               {/* The name, once, for anything reading rather than looking. Split
                   across two elements it would be announced with a seam in it. */}

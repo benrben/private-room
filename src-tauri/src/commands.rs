@@ -589,6 +589,14 @@ pub struct FileMeta {
     /// anything that came off this Mac. Lets a file row say "from boi.org.il"
     /// instead of leaving provenance buried in the Markdown body.
     pub origin_url: Option<String>,
+    /// The cached one-liner from `summarize_one_liner` (files.ai_summary) —
+    /// "describe a single file in ONE short, factual sentence", written by the
+    /// auto-index filler/job when "Describe new files automatically" is on
+    /// (see auto_index.rs), or by a manual Summarize-room run. None until that
+    /// has run for this file, or for a file with no extracted text to describe.
+    /// This column existed and was populated long before any UI read it —
+    /// same shape as `origin_url` above.
+    pub ai_summary: Option<String>,
 }
 
 /// Trash: one deleted file, as the trash view shows it. Deliberately NOT a

@@ -4,10 +4,10 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { exit } from "@tauri-apps/plugin-process";
 import { Props, WorkArea, areaHoldsFile, isWorkArea } from "./workspace/types";
 import { useTabs, tabId, type Tab } from "./workspace/tabs";
-import TabStrip from "./shell/TabStrip";
+import TabStrip, { type TabTitleFacts } from "./shell/TabStrip";
 import { fileLabel } from "./workspace/composer";
 import { GlobeIcon } from "./icons";
-import { api, type ViewerKind } from "./api";
+import { api, fileKindLabel, type ViewerKind } from "./api";
 import { useWorkspaceState } from "./workspace/state";
 import { useWorkspaceActions, type WSActions } from "./workspace/actions";
 import { useWorkspaceEffects } from "./workspace/effects";
@@ -632,6 +632,27 @@ export default function Workspace({ info, onLock, onRenamed }: Props) {
     [],
   );
 
+  // B5: what a tab's model-written title (see shell/TabStrip.tsx) is
+  // generated from — the file's saved name plus a short kind word, nothing
+  // else. `null` opts the tab out of generation entirely rather than
+  // supplying thin facts: a page/area tab has no file behind it at all, and
+  // a brand-new file with `hasText: false` has nothing to say about itself
+  // beyond its own filename — asking the model to paraphrase that would burn
+  // a call to (at best) restate the fallback and (at worst) invent a subject
+  // that isn't there. Reads `s.files` fresh each call rather than being
+  // memoized on the tab; `useAdaptiveText` keys its cache on this object's
+  // CONTENT, so a new-identity-same-content facts object every render is by
+  // design, not a missed optimization (see adaptiveText.ts).
+  const tabTitleFacts = useCallback(
+    (tab: Tab): TabTitleFacts | null => {
+      if (tab.kind !== "file") return null;
+      const file = s.files.find((f) => f.id === tab.ref);
+      if (!file || !file.hasText) return null;
+      return { name: file.name, kind: fileKindLabel(file) };
+    },
+    [s.files],
+  );
+
   // One definition of "waiting" and "running" for the whole shell (see
   // shell/activity.ts) — the status bar and the Activity tab used to count
   // separately and disagree for a second after a recording stopped.
@@ -706,6 +727,8 @@ export default function Workspace({ info, onLock, onRenamed }: Props) {
             <TabStrip
               tabs={{ ...tabs, activate: activateTab, close: closeTab }}
               icons={tabIcon}
+              roomId={info.path}
+              titleFacts={tabTitleFacts}
               onNewPage={s.webOn ? newBrowserPage : null}
             />
             {/* The viewers have their own chunk boundary; this one covers the

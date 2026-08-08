@@ -1509,6 +1509,25 @@ button.status-trust.danger:hover {
   }
 }
 
+/* The generated one-liner under the breadcrumb (P1-4 left no title of its own
+   in .viewer-head for this to sit under — see ViewerPane.tsx's
+   `fileDescription`). Metadata rung, quieter than the breadcrumb above it:
+   this is a hint about the file, not a heading. Truncates hard to one line;
+   the full sentence is the strip's own tooltip. Only rendered when the file
+   has one, so most rows never pay for this space at all. */
+.viewer-file-description {
+  flex: 0 0 auto;
+  padding: 3px 14px 5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--faint);
+  font-size: var(--fs-micro);
+  font-style: italic;
+  border-bottom: 1px solid var(--line-soft);
+  user-select: none;
+}
+
 /* Container-query adaptations: tight panes shed metadata, not actions. */
 @container (max-width: 260px) {
   .source-meta,

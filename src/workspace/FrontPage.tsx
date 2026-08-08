@@ -1,5 +1,5 @@
 import { ReactNode, useEffect, useId, useState } from "react";
-import { api, FrontPage as FrontPageData, fileKindLabel } from "../api";
+import { api, FrontPage as FrontPageData, fileKindLabel, RoomInfo } from "../api";
 import {
   BookOpenIcon,
   ChatBubbleIcon,
@@ -21,6 +21,7 @@ import { groupActivity, runningJobCount } from "../shell/activity";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
 import type { LayoutApi } from "../shell/useLayout";
+import { useAdaptiveText } from "./adaptiveText";
 
 type BriefTone = "danger" | "warn" | "info";
 interface BriefItem {
@@ -384,11 +385,13 @@ export default function FrontPage({
   s,
   a,
   layout,
+  info,
 }: {
   page: FrontPageData;
   s: WSState;
   a: WSActions;
   layout: LayoutApi;
+  info: RoomInfo;
 }) {
   const [suggestionsOpen, setSuggestionsOpen] = useState(false);
   const goArea = (area: "recordings" | "memory" | "skills" | "connectors" | "browser") => {
@@ -399,6 +402,33 @@ export default function FrontPage({
     s.setArea(area);
   };
   const recent = timeline(page, s, a, layout);
+  // A1 "living dek": the rh-subtitle below always renders first (RULE 1/3/8)
+  // — this only replaces it once there's a genuine fact to ground a sentence
+  // in. Facts are exactly what `RoomStamp` beside it and the timeline below it
+  // already show (file/chat counts, running-job count, the newest timeline
+  // entry) — nothing fetched fresh for this (RULE 4/10). Gated on the
+  // timeline having at least one entry: a brand-new empty room has nothing
+  // true to say beyond the static line.
+  const busy = runningJobCount(s);
+  const homeDekFacts =
+    recent.length > 0
+      ? {
+          fileCount: page.fileCount,
+          chatCount: page.chatCount,
+          runningCount: busy,
+          mostRecent: { title: recent[0].title, kind: recent[0].kind },
+        }
+      : null;
+  const homeDek = useAdaptiveText({
+    roomId: info.path,
+    kind: "dek",
+    prompt: homeDekFacts
+      ? `Write one plain sentence, max 20 words, describing what's in this room and what's happening right now. Use ONLY these facts: ${JSON.stringify(homeDekFacts)}. Match this voice: plain, direct, no hype (existing example: "Recent work, current background activity, and everything this room can do."). No preamble, just the sentence.`
+      : "",
+    facts: homeDekFacts,
+    maxWords: 20,
+    enabled: homeDekFacts !== null,
+  });
   return (
     <div className="rh-view">
       <div className="rh-inner">
@@ -406,8 +436,12 @@ export default function FrontPage({
           <div className="rh-masthead-main">
             <h1 className="rh-title">Continue where you left off</h1>
             <p className="rh-subtitle nb-subtitle">
-              Recent work, current background activity, and everything this room
-              can do — nothing here leaves this Mac on its own.
+              {homeDek ?? (
+                <>
+                  Recent work, current background activity, and everything this room
+                  can do — nothing here leaves this Mac on its own.
+                </>
+              )}
             </p>
           </div>
           <RoomStamp page={page} s={s} />

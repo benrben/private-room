@@ -1,9 +1,11 @@
-"""Phase-2 AI actions: /ai_action, /memory_suggestion, /suggest_file_meta.
+"""Phase-2 AI actions: /ai_action, /memory_suggestion, /suggest_file_meta,
+/generate_ui_text.
 
 No network, no Ollama: a scripted ``ollama.AsyncClient`` is injected (as in
 test_llm) and we assert the prompt wiring, the JSON recovery, and the exact
 error/degrade behaviour the Rust originals had (an engine failure propagates for
-/ai_action but is SWALLOWED for the other two).
+/ai_action but is SWALLOWED for the other three — /generate_ui_text has no Rust
+original but degrades to ``null`` by the same design).
 """
 
 from __future__ import annotations
@@ -441,3 +443,217 @@ async def test_suggest_file_meta_swallows_engine_failure_to_echo(fake_client: ty
     # Rust unwrap_or_default(): a model failure degrades to the echo, not an error.
     assert resp.status_code == 200
     assert resp.json() == {"title": "data", "folder": "", "tags": []}
+
+
+# --- /generate_ui_text -------------------------------------------------------
+#
+# The generic adaptive-UI-text pipe: NO baked-in prompt (the caller supplies the
+# whole `prompt`), and `null` is always a 200 -- never an error -- whether the
+# cause is an engine failure or one of the three post-generation validations.
+
+_FACTS = {"count": 3, "size_mb": 110}
+_UI_PROMPT = (
+    "Write one sentence, max 20 words, describing this Recordings area using "
+    "these facts: 3 recordings, all transcribed, largest is Wall Street Analyst at 110MB."
+)
+
+
+def _ui_text_body(**overrides: Any) -> dict[str, Any]:
+    body: dict[str, Any] = {
+        "model": "m",
+        "kind": "dek",
+        "prompt": _UI_PROMPT,
+        "facts": _FACTS,
+        "max_words": 20,
+        "base_url": "http://h:1",
+    }
+    body.update(overrides)
+    return body
+
+
+async def test_generate_ui_text_happy_path(fake_client: type[FakeAsyncClient]) -> None:
+    fake_client.script["chat"] = _reply('{"text": "3 recordings, all transcribed, largest 110MB."}')
+    app = create_app()
+    async with client_for(app) as c:
+        resp = await c.post("/generate_ui_text", json=_ui_text_body())
+    assert resp.status_code == 200
+    assert resp.json() == {"text": "3 recordings, all transcribed, largest 110MB."}
+    # low temperature, token budget ~= max_words * 2, the {text} grammar, and the
+    # short one-shot keep_alive (this is a quick shaping call, not a chat turn).
+    assert fake_client.calls["chat"]["options"]["temperature"] == 0.3
+    assert fake_client.calls["chat"]["options"]["num_predict"] == 40
+    assert fake_client.calls["chat"]["keep_alive"] == "2m"
+    assert fake_client.calls["chat"]["format"] == {
+        "type": "object",
+        "properties": {"text": {"type": "string"}},
+        "required": ["text"],
+    }
+
+
+async def test_generate_ui_text_sends_only_the_caller_prompt(fake_client: type[FakeAsyncClient]) -> None:
+    # facts are for the numeral guard ONLY -- never folded into the model call as
+    # a separate payload, since the caller already composed them into `prompt`.
+    fake_client.script["chat"] = _reply('{"text": "3 recordings, all transcribed, largest 110MB."}')
+    app = create_app()
+    async with client_for(app) as c:
+        await c.post("/generate_ui_text", json=_ui_text_body())
+    sent = fake_client.calls["chat"]["messages"]
+    assert len(sent) == 1
+    assert sent[0]["role"] == "user"
+    assert sent[0]["content"].startswith(_UI_PROMPT)
+    assert "size_mb" not in sent[0]["content"]  # facts JSON never appears verbatim
+
+
+async def test_generate_ui_text_llm_error_degrades_to_null(fake_client: type[FakeAsyncClient]) -> None:
+    fake_client.script["chat"] = httpx.ConnectError("refused")
+    app = create_app()
+    async with client_for(app) as c:
+        resp = await c.post("/generate_ui_text", json=_ui_text_body())
+    # Never a 500/502 -- an unavailable model renders as "no generated text".
+    assert resp.status_code == 200
+    assert resp.json() == {"text": None}
+
+
+async def test_generate_ui_text_model_missing_degrades_to_null(fake_client: type[FakeAsyncClient]) -> None:
+    fake_client.script["chat"] = ResponseError("model 'x' not found", 404)
+    app = create_app()
+    async with client_for(app) as c:
+        resp = await c.post("/generate_ui_text", json=_ui_text_body(model="x"))
+    assert resp.status_code == 200
+    assert resp.json() == {"text": None}
+
+
+async def test_generate_ui_text_empty_reply_degrades_to_null(fake_client: type[FakeAsyncClient]) -> None:
+    fake_client.script["chat"] = _reply('{"text": "   "}')
+    app = create_app()
+    async with client_for(app) as c:
+        resp = await c.post("/generate_ui_text", json=_ui_text_body())
+    assert resp.status_code == 200
+    assert resp.json() == {"text": None}
+
+
+async def test_generate_ui_text_overlong_reply_degrades_to_null(fake_client: type[FakeAsyncClient]) -> None:
+    # max_words=5 -> the 1.3x slack allows at most 7 words (ceil(5*1.3)); this
+    # reply has 8.
+    rambling = "This is a rather long winded sentence indeed"
+    assert len(rambling.split()) == 8
+    fake_client.script["chat"] = _reply(f'{{"text": "{rambling}"}}')
+    app = create_app()
+    async with client_for(app) as c:
+        resp = await c.post("/generate_ui_text", json=_ui_text_body(max_words=5))
+    # better nothing than a result that overflows its UI slot
+    assert resp.status_code == 200
+    assert resp.json() == {"text": None}
+
+
+async def test_generate_ui_text_numeral_guard_rejects_a_fabricated_number(
+    fake_client: type[FakeAsyncClient],
+) -> None:
+    # 5 never appears anywhere in `facts` ({"count": 3, "size_mb": 110}).
+    fake_client.script["chat"] = _reply('{"text": "There are 5 recordings in this area."}')
+    app = create_app()
+    async with client_for(app) as c:
+        resp = await c.post("/generate_ui_text", json=_ui_text_body())
+    assert resp.status_code == 200
+    assert resp.json() == {"text": None}
+
+
+async def test_generate_ui_text_numeral_guard_accepts_a_real_number(
+    fake_client: type[FakeAsyncClient],
+) -> None:
+    # 3 and 110 both appear in `facts` -- the model didn't invent anything.
+    fake_client.script["chat"] = _reply('{"text": "3 recordings, largest 110MB, all transcribed."}')
+    app = create_app()
+    async with client_for(app) as c:
+        resp = await c.post("/generate_ui_text", json=_ui_text_body())
+    assert resp.status_code == 200
+    assert resp.json() == {"text": "3 recordings, largest 110MB, all transcribed."}
+
+
+async def test_generate_ui_text_prompt_instructs_digits_not_words(
+    fake_client: type[FakeAsyncClient],
+) -> None:
+    # A real local model very often spells small numbers out in ordinary prose
+    # ("Twelve recordings...") rather than using digits, which puts them past a
+    # digit-only guard entirely -- so every caller's prompt gets this nudge.
+    fake_client.script["chat"] = _reply('{"text": "3 recordings, largest 110MB, all transcribed."}')
+    app = create_app()
+    async with client_for(app) as c:
+        await c.post("/generate_ui_text", json=_ui_text_body())
+    sent = fake_client.calls["chat"]["messages"][0]["content"]
+    assert 'Write every number as a digit (e.g. "3", not "three")' in sent
+    # still the caller's own prompt first -- the instruction is appended, not prepended.
+    assert sent.startswith(_UI_PROMPT)
+
+
+async def test_generate_ui_text_numeral_guard_rejects_a_spelled_out_fabrication(
+    fake_client: type[FakeAsyncClient],
+) -> None:
+    # A real qwen3.5:4b-mlx reply to a leading, ungrounded prompt: no digit at
+    # all, so the digit-only guard (bug 1) sailed this straight through
+    # undetected before the word guard existed. "fifteen" never appears
+    # anywhere in `facts` ({"count": 3, "size_mb": 110}).
+    fake_client.script["chat"] = _reply('{"text": "The room holds fifteen files."}')
+    app = create_app()
+    async with client_for(app) as c:
+        resp = await c.post("/generate_ui_text", json=_ui_text_body())
+    assert resp.status_code == 200
+    assert resp.json() == {"text": None}
+
+
+async def test_generate_ui_text_numeral_guard_accepts_a_real_number_word(
+    fake_client: type[FakeAsyncClient],
+) -> None:
+    # The fact itself says "three" (not just the digit 3) -- a spelled-out
+    # restatement of THAT word must not be a false-positive rejection.
+    fake_client.script["chat"] = _reply('{"text": "There are three recordings in this area."}')
+    app = create_app()
+    async with client_for(app) as c:
+        resp = await c.post(
+            "/generate_ui_text",
+            json=_ui_text_body(facts={"count": 3, "count_word": "three"}),
+        )
+    assert resp.status_code == 200
+    assert resp.json() == {"text": "There are three recordings in this area."}
+
+
+async def test_generate_ui_text_numeral_guard_word_match_is_whole_word_only(
+    fake_client: type[FakeAsyncClient],
+) -> None:
+    # "seventeen" contains "seven" but is not it -- a substring match would
+    # wrongly wave a fabricated "seven" through because "seventeen" appears in
+    # the facts text; whole-word matching must catch this.
+    fake_client.script["chat"] = _reply('{"text": "There are seven recordings here."}')
+    app = create_app()
+    async with client_for(app) as c:
+        resp = await c.post(
+            "/generate_ui_text",
+            json=_ui_text_body(facts={"note": "seventeen files archived"}),
+        )
+    assert resp.status_code == 200
+    assert resp.json() == {"text": None}
+
+
+async def test_generate_ui_text_num_predict_floor_for_small_max_words(
+    fake_client: type[FakeAsyncClient],
+) -> None:
+    # Bug 2: max_words=4 -> max_words*2 = 8, too tight once the {"text": "..."}
+    # JSON-schema wrapping is included -- a real model's reply got cut off
+    # mid-string a measurable fraction of the time. A floor of 24 applies.
+    fake_client.script["chat"] = _reply('{"text": "Stock Metrics"}')
+    app = create_app()
+    async with client_for(app) as c:
+        await c.post("/generate_ui_text", json=_ui_text_body(max_words=4))
+    assert fake_client.calls["chat"]["options"]["num_predict"] == 24
+
+
+async def test_generate_ui_text_num_predict_floor_does_not_lower_large_budgets(
+    fake_client: type[FakeAsyncClient],
+) -> None:
+    # The floor only ever RAISES a too-tight budget -- max_words=20 already
+    # clears it (20*2 = 40), so it must pass through unchanged.
+    fake_client.script["chat"] = _reply('{"text": "3 recordings, largest 110MB, all transcribed."}')
+    app = create_app()
+    async with client_for(app) as c:
+        await c.post("/generate_ui_text", json=_ui_text_body(max_words=20))
+    assert fake_client.calls["chat"]["options"]["num_predict"] == 40

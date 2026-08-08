@@ -1,8 +1,9 @@
-import { formatSize, isRecordingFile, type FileMeta } from "../api";
+import { formatSize, isRecordingFile, type FileMeta, type RoomInfo } from "../api";
 import { MicIcon } from "../icons";
 import { displayName, formatWhen } from "./composer";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
+import { useAdaptiveText } from "./adaptiveText";
 
 /** The Recordings landing page.
  *
@@ -25,9 +26,11 @@ import { WSActions } from "./actions";
 export default function RecordingsPage({
   s,
   a,
+  info,
 }: {
   s: WSState;
   a: WSActions;
+  info: RoomInfo;
 }) {
   // Newest first: a shelf is read from the most recent tape backwards, and the
   // library's own sort is a reader preference about browsing, not about this.
@@ -37,6 +40,34 @@ export default function RecordingsPage({
     .sort((x, y) => y.createdAt.localeCompare(x.createdAt));
   const liveId = s.recLive?.fileId ?? null;
   const noteMic = a.micState("note");
+
+  // A1 "living dek": the static subtitle below is always the fallback (RULE
+  // 1/3/8) — this only ever REPLACES it visually when a fresh sentence is
+  // ready. Facts are exactly what the shelf itself already knows: how many
+  // tapes, how many are written up, and the newest one's name — the same
+  // three things `RecordingCard` renders, never anything fetched fresh for
+  // this purpose (RULE 4/10). Gated on having at least one recording — an
+  // empty shelf has nothing true to say beyond the static line.
+  const newest = recs[0] ?? null;
+  const transcribedCount = recs.filter((f) => f.hasText).length;
+  const recDekFacts = newest
+    ? {
+        count: recs.length,
+        transcribedCount,
+        newestName: displayName(newest.name),
+        recordingNow: liveId != null,
+      }
+    : null;
+  const recDek = useAdaptiveText({
+    roomId: info.path,
+    kind: "dek",
+    prompt: recDekFacts
+      ? `Write one plain sentence, max 20 words, for the header of this room's Recordings shelf. Use ONLY these facts: ${JSON.stringify(recDekFacts)}. Match this voice: short, concrete, no hype (existing example: "Captured here, transcribed here"). No preamble, just the sentence.`
+      : "",
+    facts: recDekFacts,
+    maxWords: 20,
+    enabled: recDekFacts !== null,
+  });
 
   return (
     <div className="rec-home">
@@ -51,7 +82,7 @@ export default function RecordingsPage({
           </span>
         )}
         <p className="nb-subtitle rec-home-sub">
-          Captured here, transcribed here
+          {recDek ?? "Captured here, transcribed here"}
         </p>
       </header>
 

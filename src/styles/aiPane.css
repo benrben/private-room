@@ -553,6 +553,23 @@
   font-weight: 400;
 }
 
+/* D4: a collapsed same-day/same-name run group. The expanded runs sit in
+   their own indented well below the summary so "show runs" reads as opening
+   a drawer under the row it belongs to, not as starting a new list. Each run
+   inside keeps its normal `.activity-row.history` look — nothing about a
+   single run's own styling changes just because it's inside a group. */
+.pane-ai .activity-history-group-runs {
+  margin: var(--sp-2) 0 0 var(--sp-3);
+  padding-left: var(--sp-3);
+  border-left: 1px dashed color-mix(in srgb, var(--rule) 70%, transparent);
+  display: flex;
+  flex-direction: column;
+}
+.pane-ai .activity-history-group-runs .activity-row.history {
+  padding-left: 0;
+  box-shadow: none;
+}
+
 /* ----- nothing yet -----
    The one place on this tab the hand takes a whole paragraph: an empty state
    is a direction, and the direction is the notebook talking. */

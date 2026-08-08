@@ -79,7 +79,7 @@ pub const CHUNK_CAP: usize = 20_000;
 /// the row mapper's indices always line up with the SELECT.
 pub(crate) const FILE_META_COLS: &str = "f.id, f.name, f.mime_type, f.size_bytes, f.source, \
      f.extracted_text, f.created_at, f.folder_id, \
-     (SELECT count(*) FROM chunks WHERE file_id = f.id), f.origin_url";
+     (SELECT count(*) FROM chunks WHERE file_id = f.id), f.origin_url, f.ai_summary";
 
 /// Trash: the clause that makes a query mean "files that are in this room".
 /// Written once so the dozens of listing/search/count queries that must exclude
@@ -107,6 +107,8 @@ pub(crate) fn file_meta_row(row: &rusqlite::Row) -> rusqlite::Result<FileMeta> {
         // The column has been written since BROWSE-2 and read by nothing —
         // provenance is only useful if the UI can show it.
         origin_url: row.get(9)?,
+        // The auto-index one-liner — see FileMeta::ai_summary's doc comment.
+        ai_summary: row.get(10)?,
     })
 }
 

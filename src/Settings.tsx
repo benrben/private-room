@@ -207,6 +207,8 @@ export default function Settings({
     changeMemoryAutoSave,
     editApproval,
     changeEditApproval,
+    adaptiveTextEnabled,
+    changeAdaptiveTextEnabled,
   } = useBehaviorSettings(() => setError(""));
 
   // Only the page the user is actually looking at may reach the network: the
@@ -451,6 +453,8 @@ export default function Settings({
                 changeMemoryAutoSave={changeMemoryAutoSave}
                 editApproval={editApproval}
                 changeEditApproval={changeEditApproval}
+                adaptiveTextEnabled={adaptiveTextEnabled}
+                changeAdaptiveTextEnabled={changeAdaptiveTextEnabled}
               />
               <RoleSection
                 roles={roles}

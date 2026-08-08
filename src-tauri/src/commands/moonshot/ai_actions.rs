@@ -420,6 +420,55 @@ pub async fn suggest_file_meta(
     }
 }
 
+// ---- generic adaptive UI text -----------------------------------------------
+
+/// A small, generic "write me a short piece of adaptive UI text from local
+/// facts" pipe, shared by several UI surfaces (an area subtitle, a tab title,
+/// an activity summary, …). This command owns NO per-feature prompt wording —
+/// the frontend caller composes `prompt` itself (and hands over the `facts`
+/// it based that prompt on); Rust and the sidecar are a thin, validated
+/// conduit, not a feature of their own. `kind` is a free-form label used only
+/// for the sidecar's logging. `facts` is never sent to the model as a
+/// separate field — it exists solely so the sidecar's numeral guard can catch
+/// a number the model fabricated that wasn't actually in the facts it saw.
+///
+/// Mirrors `suggest_file_meta`'s degrade contract, only flatter: no local
+/// model resolvable, a dead sidecar, a timeout, or the sidecar's own
+/// post-generation validation rejecting the result are ALL the same outcome
+/// here — `Ok(None)`, never an `Err`. A missing generation must render as "no
+/// generated text" (the caller's static fallback), not as an app error.
+#[tauri::command]
+pub async fn generate_ui_text(
+    state: State<'_, AppState>,
+    kind: String,
+    prompt: String,
+    facts: serde_json::Value,
+    max_words: u32,
+) -> Result<Option<String>, String> {
+    let model = match resolve_structured_model(&state).await {
+        Some(m) => m,
+        None => return Ok(None),
+    };
+    let body = serde_json::json!({
+        "model": model,
+        "base_url": ollama::resolved_base_url(),
+        "kind": kind,
+        "prompt": prompt,
+        "facts": facts,
+        "max_words": max_words,
+    });
+    // The sidecar's response is `{ text: string | null }` — `null` is a fully
+    // valid, expected answer (empty/overflowing/fabricated-number rejections
+    // all degrade to it server-side), not something to distinguish from a
+    // missing field or a non-string value. Any transport/engine failure here
+    // degrades the exact same way; this command must never surface an error
+    // to the frontend for an unavailable or offline model.
+    match crate::sidecar::sidecar_json("/generate_ui_text", &body).await {
+        Ok(v) => Ok(v.get("text").and_then(|t| t.as_str()).map(String::from)),
+        Err(_) => Ok(None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -456,5 +505,35 @@ mod tests {
             assert_eq!(d.needs_question, d.id == "research", "{} needs_question", d.id);
             assert!(!d.default_prompt.trim().is_empty(), "{} needs a default prompt", d.id);
         }
+    }
+
+    /// The command's whole reason to exist: nothing it can hit on the way to an
+    /// answer — no room open, no local model, and (as exercised here) no sidecar
+    /// to ask — may ever surface as an `Err` to the frontend. A `cargo test` run
+    /// configures no sidecar (no bundled binary next to the test binary, no
+    /// `ARCELLE_SIDECAR_PYTHON`), so `sidecar_lifecycle::ensure_up` fails for
+    /// real here rather than through a mock, exercising the exact path a user
+    /// hits when the AI helper hasn't started yet.
+    #[tokio::test]
+    async fn generate_ui_text_degrades_to_ok_none_when_the_sidecar_is_unreachable() {
+        use tauri::Manager;
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        app.manage(AppState::default());
+        let state = app.state::<AppState>();
+        let result = generate_ui_text(
+            state,
+            "dek".into(),
+            "Write one sentence, max 20 words, describing this area.".into(),
+            serde_json::json!({ "count": 3 }),
+            20,
+        )
+        .await;
+        assert_eq!(
+            result,
+            Ok(None),
+            "an unreachable sidecar must degrade to no generated text, never an error"
+        );
     }
 }
