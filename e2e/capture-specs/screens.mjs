@@ -32,21 +32,21 @@ const MANIFEST = path.join(OUT, "_shots.jsonl");
 
 const SMOKE = !!process.env.CAPTURE_SMOKE;
 
-/** The ten product areas, by their stable `data-area` attribute.
+/** The nine product areas, by their stable `data-area` attribute.
  *
  * The Browser was the missing ninth: the mock answered none of its commands,
  * so the area could not be walked at all and the dataset had no picture of it.
  * It contributes its `full` shot like any other area — its start screen is
  * static, so `empty`/`loading`/`error` are reported as unreached below for the
- * same reason the Recordings start screen is. Find is the tenth, added by the
- * notebook pass; it is a search page with nothing typed into it, so it too
- * only ever contributes `full`.
+ * same reason the Recordings start screen is. Find — a tenth, added by the
+ * notebook pass — was retired by P1-2: it was a whole page for a search that
+ * now expands out of ⌘K instead, so there is no standalone area screen of it
+ * left to capture (⌘K itself is a floating overlay, not an area).
  *
  * The labels here are the BREADCRUMB wording (`AREA_CRUMBS` in ViewerPane),
  * which is what names a place now that areas are no longer tabs. */
 const AREAS = [
   ["home", "Home"],
-  ["find", "Find"],
   ["map", "Room Map"],
   ["recordings", "Recordings"],
   ["workflows", "Workflows"],

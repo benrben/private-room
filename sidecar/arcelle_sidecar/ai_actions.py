@@ -28,6 +28,19 @@ Three features land here, faithful to their Rust originals:
   current name), so this degrades to the echo on an engine error. A too-short
   extraction (<80 chars) skips the model entirely, exactly like Rust.
 
+A fourth feature lands here too, but it is NOT a port — there is no Rust original,
+this is a brand-new generic service built once against a fixed cross-layer
+contract (Rust + frontend built their halves in parallel against the same spec):
+
+* :func:`generate_ui_text` — ``POST /generate_ui_text``. A small, generic "write
+  me a short piece of adaptive UI text from local facts" pipe, reused by several
+  features (an area subtitle, a tab title, an activity summary, ...). It owns NO
+  per-feature prompt wording — the caller composes the whole ``prompt`` — so this
+  is validation, not a feature: empty/blank output, an overlong reply, and a
+  fabricated number (one absent from the caller's own ``facts``, as either a
+  digit or a spelled-out word) all degrade to ``text: null`` rather than ever
+  raising or 500ing.
+
 Structured-output recovery (ollama.rs ``recover_json``): the gateway ``/generate``
 returns the model's RAW text, but the Rust ``chat_structured`` these features used
 recovered the JSON first — dropping a ``<think>`` preamble and slicing to the outer
@@ -38,6 +51,9 @@ that here so a ``:cloud`` model (which ignores ``format``) behaves as it did.
 from __future__ import annotations
 
 import json
+import logging
+import math
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -46,9 +62,11 @@ from pydantic import BaseModel, ConfigDict
 
 from . import llm
 from .budget import truncate_bytes
-from .config import KEEP_ALIVE_WARM, ProviderConfig
-from .messages import system_message, user_message
+from .config import KEEP_ALIVE_SHORT, KEEP_ALIVE_WARM, ProviderConfig
+from .messages import compact_json, system_message, user_message
 from .model_text import prime_schema, recover_json, strip_think_spans
+
+_log = logging.getLogger(__name__)
 
 # --- request bodies ---------------------------------------------------------
 #
@@ -107,6 +125,30 @@ class FileMetaRequest(BaseModel):
     current_name: str = ""
     #: The file's extracted text (Rust pulls it; <80 chars skips the model).
     text: str = ""
+    base_url: str = "http://127.0.0.1:11434"
+    #: PRIV-1: room privacy policy payload (config.RunRequest docstring).
+    privacy: dict[str, Any] | None = None
+    provider: ProviderConfig | None = None
+
+
+class UiTextRequest(BaseModel):
+    """Body of ``POST /generate_ui_text`` — the generic adaptive-UI-text pipe.
+
+    ``kind`` is a free-form label ("dek"/"tab_title"/"activity_summary"/...) used
+    ONLY for logging — it plays no role in generation. ``prompt`` is the full
+    instruction text, already composed by the frontend caller; this pipe adds no
+    wording of its own. ``facts`` is the raw structured facts the frontend based
+    ``prompt`` on — used ONLY by the post-generation numeral guard, never sent to
+    the model as a separate payload. ``max_words`` sizes both the output-token
+    budget and the word-count validation below."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    model: str
+    kind: str = ""
+    prompt: str = ""
+    facts: Any = None
+    max_words: int = 20
     base_url: str = "http://127.0.0.1:11434"
     #: PRIV-1: room privacy policy payload (config.RunRequest docstring).
     privacy: dict[str, Any] | None = None
@@ -636,6 +678,181 @@ async def suggest_file_meta(
     }
 
 
+# --- generic adaptive UI text ------------------------------------------------
+#
+# A thin, generic "write me a short piece of adaptive UI text from local facts"
+# pipe, built once and reused by several features (an area subtitle, a tab
+# title, an activity summary, ...). Unlike everything above, this owns NO
+# PER-FEATURE prompt wording of its own — the frontend caller composes the full
+# `prompt` — so what lives here is the model call plus validation, not a
+# feature. The one exception is `_DIGIT_INSTRUCTION` below: it steers every
+# caller's output toward a form the numeral guard can check, so it belongs to
+# the guard, not to any one feature's wording. A model that fabricates a
+# number, rambles past its word budget, or answers with nothing usable all
+# degrade to `None`; the caller shows its static fallback.
+
+_UI_TEXT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {"text": {"type": "string"}},
+    "required": ["text"],
+}
+
+#: Appended to every caller's prompt (never as feature wording — see the module
+#: comment above). A real local model very often spells small numbers out in
+#: ordinary prose ("Twelve recordings are stored.") rather than using digits,
+#: which puts them past the digit-only guard below entirely. This nudges the
+#: model toward digits, which the guard CAN check; `_NUMBER_WORD_RE` below is
+#: the backstop for when a model ignores the nudge (a prompt instruction, not a
+#: guarantee).
+_DIGIT_INSTRUCTION = (
+    "\n\nWrite every number as a digit (e.g. \"3\", not \"three\") — never spell numbers out."
+)
+
+#: A maximal digit run — mirrors what the numeral guard looks for on both sides
+#: (the generated text and the JSON-serialized facts it must stay within).
+_NUMBER_RE = re.compile(r"\d+")
+
+#: Cardinal (and common ordinal) English number words — the digit guard above
+#: only ever sees runs of `\d` and is blind to a model spelling a number out in
+#: prose despite `_DIGIT_INSTRUCTION` ("The room holds fifteen files." has no
+#: digit in it at all). Deliberately blunt, matching the digit guard's own
+#: "hard rule, not a suggestion" philosophy: reject the whole word rather than
+#: trying to parse it into a value and range-check it. Scoped to what UI-text
+#: -sized facts (counts, sizes, tab labels) realistically say — not an
+#: exhaustive English numeral parser.
+_NUMBER_WORDS: frozenset[str] = frozenset(
+    """one two three four five six seven eight nine ten
+    eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen
+    twenty thirty forty fifty sixty seventy eighty ninety hundred thousand million
+    first second third fourth fifth sixth seventh eighth ninth tenth
+    eleventh twelfth""".split()
+)
+
+#: Whole-word, case-insensitive match for any of `_NUMBER_WORDS`.
+_NUMBER_WORD_RE = re.compile(r"\b(" + "|".join(sorted(_NUMBER_WORDS)) + r")\b", re.IGNORECASE)
+
+#: A reply is allowed to run a little long, but not ramble: past this multiple
+#: of the caller's `max_words`, showing nothing beats an overflowing UI slot.
+_WORD_COUNT_SLACK = 1.3
+
+#: Output-token floor for the tab-title-style consumer (`max_words` as low as
+#: 4, so `max_words * 2` alone is 8) — too tight once the `{"text": "..."}`
+#: JSON-schema wrapping is included: a real local model's reply gets cut off
+#: mid-string a measurable fraction of the time (empirically ~10-65% depending
+#: on how many sub-word tokens the natural answer needs — see
+#: generate_ui_text's docstring), silently degrading to `None` even though the
+#: model "knew" the answer. `max_predict` never LOWERS the token budget for a
+#: caller with a bigger `max_words` — it only raises the floor for small ones.
+_MIN_UI_TEXT_PREDICT = 24
+
+
+def _word_count(text: str) -> int:
+    return len(text.split())
+
+
+async def generate_ui_text(
+    kind: str,
+    prompt: str,
+    facts: Any,
+    max_words: int,
+    model: str,
+    base_url: str,
+    privacy: dict[str, Any] | None = None,
+    provider: Any | None = None,
+) -> str | None:
+    """Generate one short piece of adaptive UI text, or ``None`` (``POST /generate_ui_text``).
+
+    ``prompt`` is the full instruction text the frontend already composed — this
+    function adds no PER-FEATURE wording of its own (only ``_DIGIT_INSTRUCTION``,
+    a guard-enabling nudge every caller gets), the low-temperature model call,
+    and the validation below. ``kind`` is a free-form label, logged only.
+    ``facts`` is the raw structured data the frontend based ``prompt`` on; it is
+    used ONLY by the numeral guard (3) below, never sent to the model separately.
+
+    ``None`` is a fully valid, expected result (never an error to the caller):
+
+    * an :class:`.llm.LlmError` (or any other exception) from the model call,
+    * (1) an empty/whitespace-only reply (including one truncated mid-JSON by
+      too tight an output-token budget — see ``_MIN_UI_TEXT_PREDICT``),
+    * (2) a reply longer than ``max_words * 1.3`` words — better nothing than a
+      result that overflows its UI slot,
+    * (3) THE NUMERAL GUARD, in two parts — a fabricated figure the model
+      wasn't given is rejected whether it wrote it as a digit or spelled it
+      out in a word, and BOTH sides check against the facts payload's own
+      serialized text so a fact that already says "three" isn't a false
+      positive:
+        - a number (a maximal digit run) that doesn't appear anywhere in the
+          JSON-serialized ``facts``;
+        - a cardinal/ordinal number WORD (``_NUMBER_WORDS`` — "three",
+          "twelfth", ...) that doesn't appear as that same word, literally, in
+          the JSON-serialized ``facts``. The prompt also instructs the model to
+          write digits, not words (``_DIGIT_INSTRUCTION``), so this is the
+          backstop for when a model spells one out anyway — which local models
+          do often enough in ordinary prose that the digit-only check alone is
+          nearly inert against them.
+      Hard rule, not a suggestion, on both counts: reject outright rather than
+      trying to parse the value and range-check it.
+
+    Each rejection is logged server-side with why, so a "why did this go blank"
+    question is debuggable later even though the caller only ever sees ``None``.
+    """
+    messages = prime_schema([user_message(prompt + _DIGIT_INSTRUCTION)], _UI_TEXT_SCHEMA)
+    try:
+        raw = await llm.generate(
+            model,
+            messages,
+            base_url,
+            temperature=0.3,
+            num_predict=max(max_words * 2, _MIN_UI_TEXT_PREDICT),
+            keep_alive=KEEP_ALIVE_SHORT,
+            format=_UI_TEXT_SCHEMA,
+            privacy=privacy,
+            provider=provider,
+        )
+    except llm.LlmError as exc:
+        _log.debug("generate_ui_text[%s]: engine failure, degrading to null: %s", kind, exc)
+        return None
+    except Exception:
+        _log.exception("generate_ui_text[%s]: unexpected failure, degrading to null", kind)
+        return None
+
+    text = _str_field(_load_obj(raw), "text")
+    if not text:
+        _log.debug("generate_ui_text[%s]: empty/blank (or truncated/unparsable) reply, degrading to null", kind)
+        return None
+
+    words = _word_count(text)
+    limit = math.ceil(max_words * _WORD_COUNT_SLACK)
+    if words > limit:
+        _log.debug(
+            "generate_ui_text[%s]: %d words over the %d-word cap (max_words=%d), degrading to null",
+            kind, words, limit, max_words,
+        )
+        return None
+
+    facts_text = compact_json(facts)
+
+    fabricated_digits = set(_NUMBER_RE.findall(text)) - set(_NUMBER_RE.findall(facts_text))
+    if fabricated_digits:
+        _log.debug(
+            "generate_ui_text[%s]: fabricated number(s) %s not present in facts, degrading to null",
+            kind, sorted(fabricated_digits),
+        )
+        return None
+
+    text_words = {w.lower() for w in _NUMBER_WORD_RE.findall(text)}
+    facts_words = {w.lower() for w in _NUMBER_WORD_RE.findall(facts_text)}
+    fabricated_words = text_words - facts_words
+    if fabricated_words:
+        _log.debug(
+            "generate_ui_text[%s]: fabricated number word(s) %s not present in facts, degrading to null",
+            kind, sorted(fabricated_words),
+        )
+        return None
+
+    return text
+
+
 __all__ = [
     "ACTION_PREDICT",
     "AI_ACTIONS",
@@ -644,7 +861,9 @@ __all__ = [
     "AiActionRequest",
     "MemorySuggestionRequest",
     "FileMetaRequest",
+    "UiTextRequest",
     "run_ai_action",
     "memory_suggestion",
     "suggest_file_meta",
+    "generate_ui_text",
 ]

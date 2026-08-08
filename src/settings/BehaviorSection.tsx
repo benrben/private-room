@@ -19,6 +19,10 @@ interface Props {
   /** Wave 2 (idea 6): ask-before-edit cadence — persists immediately. */
   editApproval: string;
   changeEditApproval: (v: string) => void;
+  /** Master switch for adaptive UI text (area subtitles, tab titles, activity
+   * summaries) — persists immediately. */
+  adaptiveTextEnabled: boolean;
+  changeAdaptiveTextEnabled: (on: boolean) => void;
 }
 
 const EDIT_APPROVAL_OPTIONS: { value: string; label: string }[] = [
@@ -49,6 +53,8 @@ export default function BehaviorSection({
   changeMemoryAutoSave,
   editApproval,
   changeEditApproval,
+  adaptiveTextEnabled,
+  changeAdaptiveTextEnabled,
 }: Props) {
   return (
     <section id="set-behavior">
@@ -121,6 +127,19 @@ export default function BehaviorSection({
               />{" "}
               Save suggested memories automatically
             </label>
+            <label className="settings-label">
+              <input
+                type="checkbox"
+                checked={adaptiveTextEnabled}
+                onChange={(e) => changeAdaptiveTextEnabled(e.target.checked)}
+              />{" "}
+              Let the local AI write small pieces of the interface (area
+              summaries, tab titles, activity summaries)
+            </label>
+            <p className="settings-hint">
+              Generated locally from what's already in the room. Off falls
+              back to the plain static labels everywhere.
+            </p>
             <label className="settings-label" htmlFor="edit-approval-select">
               Ask before the AI edits files
             </label>

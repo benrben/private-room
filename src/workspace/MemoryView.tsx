@@ -13,6 +13,7 @@ import { MEMORY_INTRO_SEEN } from "./constants";
 import DeleteControl from "./DeleteControl";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
+import { useAdaptiveText } from "./adaptiveText";
 
 /** Wave 1b (idea 5): fixed display order for the memory groups; null = the
  * uncategorized bucket every legacy memory lives in. */
@@ -135,6 +136,44 @@ export default function MemoryView({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // A1 "living dek": the mem-lead line below is a privacy PROMISE, not a fact
+  // about content, so the static string stays the permanent fallback (RULE
+  // 1/3/8) and this only swaps in once there is something true and specific
+  // to say instead. Facts are a category breakdown grouped the same way the
+  // list below already groups (`groupKey`/`MEMORY_GROUPS`), plus the newest
+  // entry's category — nothing fetched fresh for this (RULE 4/10). Gated on
+  // 2+ memories: a single memory has no breakdown worth describing.
+  const memGroupCounts = MEMORY_GROUPS.map((g) => ({
+    label: g.label,
+    count: s.memories.filter((m) => groupKey(m) === g.key).length,
+  })).filter((g) => g.count > 0);
+  const newestMemory =
+    s.memories.length > 0
+      ? s.memories.reduce((latest, m) =>
+          m.createdAt.localeCompare(latest.createdAt) > 0 ? m : latest,
+        )
+      : null;
+  const memDekFacts =
+    s.memories.length >= 2
+      ? {
+          total: s.memories.length,
+          byCategory: memGroupCounts,
+          newestCategory: newestMemory
+            ? (MEMORY_GROUPS.find((g) => g.key === groupKey(newestMemory))?.label ?? "Other")
+            : null,
+        }
+      : null;
+  const memDek = useAdaptiveText({
+    roomId: info.path,
+    kind: "dek",
+    prompt: memDekFacts
+      ? `Write one plain sentence, max 20 words, describing what's saved in this room's memory. Use ONLY these facts: ${JSON.stringify(memDekFacts)}. Match this voice: plain, direct (existing example: "Everything the AI remembers about you — visible, editable, and used only when relevant."). No preamble, just the sentence.`
+      : "",
+    facts: memDekFacts,
+    maxWords: 20,
+    enabled: memDekFacts !== null,
+  });
+
   return (
     <div className="mem-view">
       <div className="mem-inner">
@@ -146,8 +185,12 @@ export default function MemoryView({
                 moves into the note below, because that is a setting's
                 behaviour rather than the promise this page opens with. */}
             <p className="mem-lead">
-              Everything the AI remembers about you — visible, editable, and used
-              only when relevant.
+              {memDek ?? (
+                <>
+                  Everything the AI remembers about you — visible, editable, and used
+                  only when relevant.
+                </>
+              )}
             </p>
           </div>
           {s.memories.length > 0 && (

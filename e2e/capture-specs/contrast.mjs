@@ -16,7 +16,6 @@
 
 const AREAS = [
   "home",
-  "find",
   "map",
   "recordings",
   "workflows",

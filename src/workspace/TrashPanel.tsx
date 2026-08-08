@@ -1,3 +1,4 @@
+import { useEffect, useRef } from "react";
 import { TrashActorKind, TrashedFile } from "../api";
 import { displayName } from "./composer";
 import DeleteControl from "./DeleteControl";
@@ -55,18 +56,15 @@ function sizeLabel(bytes: number): string {
 export default function TrashPanel({
   s,
   a,
-  filterQ,
 }: {
   s: WSState;
   a: WSActions;
-  filterQ: string;
 }) {
-  const shown: TrashedFile[] = s.trashed.filter(
-    (f) =>
-      !filterQ ||
-      f.name.toLowerCase().includes(filterQ) ||
-      displayName(f.name).toLowerCase().includes(filterQ),
-  );
+  // No filter box here (see Sidebar.tsx — it's suppressed for this tab), so
+  // this reads the full trash. Filtering it by whatever text happened to be
+  // left in the Library's search field would show a silently-trimmed list
+  // with no visible control to explain or clear it.
+  const shown: TrashedFile[] = s.trashed;
 
   if (s.trashed.length === 0) {
     return (
@@ -93,15 +91,39 @@ export default function TrashPanel({
       return next;
     });
 
+  // Select-all is scoped to the rows actually painted, same discipline as the
+  // library's ⌘A (BrowsePanel's `paintedOrder`): it must never reach for a row
+  // the reader cannot currently see.
+  const allPicked = shown.length > 0 && picked.length === shown.length;
+  const somePicked = picked.length > 0 && !allPicked;
+  const selectAllRef = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    if (selectAllRef.current) selectAllRef.current.indeterminate = somePicked;
+  }, [somePicked]);
+  const toggleAll = () =>
+    s.setSelectedTrashIds((cur) => {
+      const next = new Set(cur);
+      if (allPicked) shown.forEach((f) => next.delete(f.id));
+      else shown.forEach((f) => next.add(f.id));
+      return next;
+    });
+
   return (
     <div className="library-scroll trash-list">
       <p className="trash-note">
         These files are out of the library and out of everything the AI can
         search. Their contents never left this room.
       </p>
-      {shown.length === 0 && (
-        <p className="trash-empty">No deleted file matches that filter.</p>
-      )}
+      <label className="trash-select-all">
+        <input
+          type="checkbox"
+          ref={selectAllRef}
+          checked={allPicked}
+          onChange={toggleAll}
+          aria-label={allPicked ? "Deselect all deleted files" : "Select all deleted files"}
+        />
+        Select all
+      </label>
       {picked.length > 0 && (
         <div className="selection-bar" role="toolbar" aria-label={`${picked.length} deleted files selected`}>
           <span className="selection-count" role="status">

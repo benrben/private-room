@@ -153,7 +153,13 @@ describe("README screenshots", () => {
     // (`Exclude<WorkArea, "files">`) — the three-pane workspace is what the QA
     // page already opens into.
     await openFile("Arcelle UX direction.md");
-    const btn = await $("button=Preview cloud payload");
+    // P1-4: the toggle moved off the toolbar and into the "..." overflow menu,
+    // and its label changed from "Preview cloud payload" to a sentence a
+    // non-developer can parse on sight.
+    const more = await $('.viewer-overflow-wrap button[aria-haspopup="menu"]');
+    await more.waitForExist({ timeout: 10_000 });
+    await more.click();
+    const btn = await $("button=Show me exactly what would be sent");
     await btn.waitForExist({ timeout: 10_000 });
     await btn.click();
     await browser.pause(1200);

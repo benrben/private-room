@@ -1,86 +1,32 @@
-/* ---------- Find: the room's search page ----------
-   workspace/FindPage.tsx. The ⌘K launcher stays a COMMAND — type, jump,
-   gone — and this is the PLACE: a page you stay in, narrow, re-read, and open
-   several hits from in turn.
+/* ---------- Find: the ⌘K launcher's expanded results ----------
+   workspace/SearchExpanded.tsx, rendered by workspace/Overlays.tsx. The
+   launcher used to be a COMMAND — type, jump, gone — with a separate FULL
+   PAGE (the room's "Find" area) as the place you stayed in, narrowed and
+   re-read. That page is gone; these are its filter strip and its rows,
+   folded into the launcher itself so the app only has one search surface
+   that reads room content (the Library's own filter box is a different,
+   narrower thing and keeps its own styling in sidebar.css).
 
-   It reads like the index at the back of a notebook. There is no card grid and
-   no dashboard: a large drawn field, a row of circled filter chips, a counted
-   heading per source, and editorial rows separated by a pencil rule that fades
-   at both ends. The only marker on the page in quantity is the highlighter over
-   the words that matched, which is the one thing the reader came for.
+   It reads like the index at the back of a notebook: a row of circled filter
+   chips, a counted heading per source, and editorial rows separated by a
+   pencil rule that fades at both ends. The only marker in quantity is the
+   highlighter over the words that matched, which is the one thing the reader
+   came for. The launcher's own field and panel frame live in
+   sidebar-search.css — this file starts once a real query has real results.
 
-   Nothing here is opaque. The page frame, the field, the filter strip and every
-   row let the dotted sheet show through — per the direction, only things that
-   genuinely float get a fill, and this page never floats anything.
-
-   .find-view / .find-inner / .find-title / .find-lead are the page frame and
-   live in shell.css (the shell owns the area's reading column, so Find, Home
-   and Memory sit in the same measure). Everything below is this page's own.
+   Nothing here is opaque. The filter strip and every row let the dotted sheet
+   show through — per the direction, only things that genuinely float get a
+   fill, and this file never floats anything.
 
    Both themes come from tokens by construction: no rule here names a colour,
    so there is deliberately no light-mode block at the end of this file. */
 
 /* ==========================================================================
-   1. THE FIELD
+   1. QUERY ACTIONS
+   "Save this search" / "Ask the room instead" — the launcher's own field
+   covers what find-search-* used to (the page's own field was retired with
+   it).
    ========================================================================== */
-
-/* The search field composes .nb-field, so it gets the system's drawn border
-   and the double focus outline for free and only its SIZE is set here — the
-   page's one persistent control should be unmistakably the biggest thing on
-   the page after the title. --radius (not --radius-sm) because a box this
-   large wants the larger drawn corner or the asymmetry stops reading. */
-.find-search {
-  margin-top: var(--sp-6);
-  min-height: 52px;
-  padding: 8px 14px;
-  gap: var(--sp-3);
-  border-radius: var(--radius);
-}
-
-.find-search-ico {
-  display: flex;
-  flex: none;
-  color: var(--muted);
-  line-height: 0;
-}
-
-/* Set from the LEAD size, not the body size: this is the field the page is
-   named after, and a search box you have to lean in to read is a search box
-   that looks like a filter. */
-.find-search-input {
-  font-size: var(--fs-lead);
-  color: var(--text-strong);
-}
-
-/* 24px is the floor for anything clickable, and this button is only 13px of
-   glyph — the padding is what pays the target size, not decoration. */
-.find-search-clear {
-  flex: none;
-  display: grid;
-  place-items: center;
-  min-width: 24px;
-  min-height: 24px;
-  padding: 0;
-  color: var(--muted);
-  background: transparent;
-  border: 0;
-  border-radius: var(--radius-sm);
-}
-.find-search-clear:hover {
-  color: var(--text-strong);
-  background-color: var(--hover);
-  border-color: transparent;
-}
-
-/* What the search actually does, in the interface sans — this explains a
-   behaviour, and the hand is reserved for asides. */
-.find-hint {
-  margin: var(--sp-2) 0 0;
-  max-width: 58ch;
-  color: var(--muted);
-  font-size: var(--fs-meta);
-  line-height: var(--lh-body);
-}
 
 .find-query-actions {
   display: flex;
@@ -220,45 +166,22 @@
 
 /* ==========================================================================
    3. RESULTS HEAD
+   The retired Find page put this count beside a "Sort files" control in one
+   flex row; the launcher's own Sort lives with the rest of the filter strip
+   above instead (SearchExpanded.tsx's `find-filter-selects`), so this is now
+   just the live region and the per-source breakdown under it.
    ========================================================================== */
 
-.find-results-head {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: var(--sp-3);
-  margin-top: var(--sp-6);
-}
-/* Idle: the live region is still in the document (see FindPage.tsx) but empty,
-   so the row has to take no space at all rather than leaving a gap where a
-   count is going to appear. */
-.find-results-head.is-idle {
-  margin-top: 0;
-  gap: 0;
-}
-
 /* The live region. Set at lead size and in the strong ink because the count
-   is the answer to the question the page was opened to ask. */
+   is the answer to the question ⌘K was opened to ask. Mounted only once a
+   query has actually run (SearchExpanded's `expanded` gate in Overlays.tsx),
+   so there is no idle/empty state of this element to size for. */
 .find-count {
-  margin: 0;
+  margin: var(--sp-6) 0 0;
   min-width: 0;
   color: var(--text-strong);
   font-size: var(--fs-lead);
   font-weight: 600;
-}
-
-.find-sort {
-  display: flex;
-  align-items: center;
-  gap: var(--sp-2);
-}
-.find-sort .find-filter-label {
-  min-width: 0;
-}
-.find-sort select {
-  font-size: var(--fs-meta);
-  padding: 5px 8px;
 }
 
 .find-breakdown {
@@ -328,8 +251,15 @@
 /* --rule-strong is 3.01:1 in both themes, which is the floor WCAG 1.4.11 asks
    of a component boundary. This also beats base.css's `button:hover`, which
    would otherwise wash the row in the pen colour and make an ordinary hover
-   read as a selection. */
-.find-row:hover {
+   read as a selection.
+
+   .is-sel is the ⌘K launcher's own arrow-key position (Overlays.tsx moves one
+   index across files/messages/memories AND commands together) — it gets the
+   same drawn box as hover rather than a second visual language, since the
+   launcher already sets the index on hover too and the two are the same fact
+   read from two input devices. */
+.find-row:hover,
+.find-row.is-sel {
   background-color: transparent;
   border-color: var(--rule-strong);
 }
@@ -472,9 +402,6 @@
   flex-direction: column;
   gap: var(--sp-6);
   margin-top: var(--sp-6);
-}
-.find-idle-note {
-  margin: 0;
 }
 
 .find-saved-row {

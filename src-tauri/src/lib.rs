@@ -318,6 +318,7 @@ pub fn run() {
             commands::generate_podcast_script,
             commands::memory_suggestion,
             commands::suggest_file_meta,
+            commands::generate_ui_text,
             commands::room_server_status,
             commands::set_room_server,
             commands::regenerate_leash_token,

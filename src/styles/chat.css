@@ -78,6 +78,9 @@
   background-repeat: no-repeat;
   background-size: 100% 1px;
   background-position: left bottom;
+  /* Toolbar (P0-3): the chat picker and its buttons, not a message. The
+     rename field it can show is still an <input> — see base.css. */
+  user-select: none;
 }
 
 /* The conversation's NAME, in the hand: a chat title is something someone
@@ -213,7 +216,7 @@
   align-self: center;
   flex: 0 0 auto;
   min-height: 24px;
-  padding: 4px 12px;
+  padding: var(--sp-1) var(--sp-3);
   font-size: var(--fs-micro);
   color: var(--muted);
   border: 1px dashed var(--rule-strong);
@@ -278,7 +281,7 @@
 }
 .prompt-chip {
   text-align: start;
-  padding: 8px 12px;
+  padding: var(--sp-2) var(--sp-3);
   font-family: var(--hand);
   font-size: var(--fs-hand);
   line-height: var(--lh-hand);
@@ -316,6 +319,8 @@
   align-items: center;
   gap: 7px;
   margin-bottom: var(--sp-2);
+  /* The speaker/avatar/timestamp row, not the message (P0-3). */
+  user-select: none;
 }
 
 .msg-who {
@@ -423,6 +428,12 @@
   /* UX-1 — each line/paragraph picks its own direction so mixed
      Hebrew/English content reads correctly. */
   unicode-bidi: plaintext;
+  /* The one thing in a message that IS content (P0-3): explicit, not just
+     inherited, since nothing here actually sits under a `none` ancestor —
+     `.msg-label`/`.msg-footer` are siblings, not parents. Stated anyway so
+     the message body's selectability can't be lost to a future ancestor
+     rule without this line contradicting it first. */
+  user-select: text;
 }
 /* User text and streaming placeholders are plain strings — keep their line
    breaks. Assistant markdown brings its own block layout. */
@@ -508,7 +519,7 @@
   display: inline-block;
   width: 13px;
   height: 3px;
-  margin-inline-end: 8px;
+  margin-inline-end: var(--sp-2);
   vertical-align: 0.22em;
   /* The INK track, not the fill: a 3px mark in the light-mode marker fill
      measures 1.45:1 on ivory and would simply not be there. */
@@ -658,7 +669,7 @@
 .msg .annot-chip {
   align-items: flex-start;
   max-width: 100%;
-  padding: 6px 12px;
+  padding: 6px var(--sp-3);
   margin-top: 0;
   font-size: var(--fs-meta);
   line-height: var(--lh-body);
@@ -705,6 +716,9 @@
   margin-top: var(--sp-3);
   padding-top: var(--sp-2);
   font-size: var(--fs-micro);
+  /* The action-button row (Copy, Edit, Regenerate…), not the message
+     (P0-3). */
+  user-select: none;
 }
 /* An answer's actions are ruled off from the answer with the tapered pencil
    stroke, so the group reads as the end of the section rather than as more of
@@ -735,7 +749,12 @@
 .msg-footer > button {
   padding: 3px 8px;
   font-size: var(--fs-micro);
-  color: var(--faint);
+  /* P1-6: was --faint (the smallest-meta-text token, tuned for timestamps),
+     which on a row of actual actions — Play/Copy/Undo/Regenerate/Save — read
+     as disabled rather than present-but-secondary. --muted is the app's
+     normal secondary-text contrast (7.88:1 on --page, 5.70:1 on --hover, the
+     floor) and is what every other secondary label in the product uses. */
+  color: var(--muted);
   opacity: 0;
   transition:
     opacity var(--dur-fast) var(--ease-pen),
@@ -789,7 +808,7 @@
 }
 .save-form input {
   width: 160px;
-  padding: 4px 8px;
+  padding: var(--sp-1) var(--sp-2);
   font-size: var(--fs-micro);
 }
 
@@ -909,7 +928,7 @@
   align-items: center;
   flex-wrap: wrap;
   gap: var(--sp-2);
-  padding: 2px 4px 6px;
+  padding: 2px var(--sp-1) 6px;
   font-size: var(--fs-meta);
 }
 /* A strip of tape carrying the word: the wash is the meaning and the reading

@@ -3,6 +3,7 @@ import { confirm } from "@tauri-apps/plugin-dialog";
 import {
   api,
   formatSize,
+  RoomInfo,
   SkillBundle,
   SkillResourceContent,
   SkillResourceMeta,
@@ -21,8 +22,9 @@ import {
 import { displayName } from "../composer";
 import { WSState } from "../state";
 import { WSActions } from "../actions";
+import { useAdaptiveText } from "../adaptiveText";
 
-type Props = { s: WSState; a: WSActions };
+type Props = { s: WSState; a: WSActions; info: RoomInfo };
 type SkillDraft = {
   name: string;
   description: string;
@@ -173,7 +175,7 @@ function ExampleSkill() {
   );
 }
 
-export default function SkillsView({ s, a }: Props) {
+export default function SkillsView({ s, a, info }: Props) {
   const [bundle, setBundle] = useState<SkillBundle | null>(null);
   const [draft, setDraft] = useState<SkillDraft | null>(null);
   const [isNew, setIsNew] = useState(false);
@@ -249,6 +251,37 @@ export default function SkillsView({ s, a }: Props) {
     [s.skills, selected],
   );
   const enabledCount = useMemo(() => s.skills.filter((x) => x.enabled).length, [s.skills]);
+  // A1 "living dek": the sk-lead line below always renders first (RULE 1/3/8)
+  // — this only replaces it once there's a genuine fact to ground a sentence
+  // in. Facts are exactly what the stamp beside the title already shows
+  // (count, enabled count) plus the most recently added skill's name — read
+  // off the same `s.skills` list, nothing fetched fresh (RULE 4/10). Gated on
+  // 2+ skills: one skill is better introduced by its own card than summarized.
+  const newestSkill = useMemo(
+    () =>
+      s.skills.length > 0
+        ? s.skills.reduce((latest, x) => (x.createdAt.localeCompare(latest.createdAt) > 0 ? x : latest))
+        : null,
+    [s.skills],
+  );
+  const skillDekFacts =
+    s.skills.length >= 2
+      ? {
+          total: s.skills.length,
+          enabledCount,
+          newestName: newestSkill?.name ?? null,
+        }
+      : null;
+  const skillDek = useAdaptiveText({
+    roomId: info.path,
+    kind: "dek",
+    prompt: skillDekFacts
+      ? `Write one plain sentence, max 20 words, describing this room's saved skills. Use ONLY these facts: ${JSON.stringify(skillDekFacts)}. Match this voice: plain, direct (existing example: "Teach the assistant repeatable ways of working."). No preamble, just the sentence.`
+      : "",
+    facts: skillDekFacts,
+    maxWords: 20,
+    enabled: skillDekFacts !== null,
+  });
   const composeSourceFiles = useMemo(
     () => composeSourceIds.flatMap((id) => s.files.find((file) => file.id === id) ?? []),
     [composeSourceIds, s.files],
@@ -508,7 +541,9 @@ export default function SkillsView({ s, a }: Props) {
               </span>
               <div>
                 <h1 className="sk-title">Skills</h1>
-                <p className="sk-lead">Teach the assistant repeatable ways of working.</p>
+                <p className="sk-lead">
+                  {skillDek ?? "Teach the assistant repeatable ways of working."}
+                </p>
               </div>
             </div>
             <div className="sk-stamp">

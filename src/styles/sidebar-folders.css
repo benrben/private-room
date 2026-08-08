@@ -71,7 +71,7 @@
   min-height: 24px;
   background: none;
   border: none;
-  padding: 4px 2px;
+  padding: var(--sp-1) 2px;
   text-align: left;
   font-size: var(--fs-micro);
   font-weight: 600;
@@ -117,8 +117,8 @@
    line rather than a solid border, because the grouping is a drawn aside and
    not a structural edge. */
 .folder-files {
-  padding-left: 16px;
-  margin-left: 12px;
+  padding-left: var(--sp-4);
+  margin-left: var(--sp-3);
   background-image: repeating-linear-gradient(
     to bottom,
     var(--rule) 0 5px,
@@ -133,7 +133,7 @@
   color: var(--muted);
   font-size: var(--fs-micro);
   line-height: var(--lh-body);
-  padding: 6px 8px;
+  padding: 6px var(--sp-2);
 }
 
 /* ----- File-row "Move to…" menu -----
@@ -151,7 +151,7 @@
   z-index: 20;
   min-width: 150px;
   margin-top: 2px;
-  padding: 4px;
+  padding: var(--sp-1);
   background: var(--raised);
   border: 1px solid var(--rule-strong);
   border-radius: var(--radius);

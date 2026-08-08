@@ -435,12 +435,25 @@ export function makeChatActions(
       caret = next.length;
     }
     s.setQuestion(next);
+    // Open the palette in the SAME tick as the text change, exactly the way
+    // typing "#"/"/"/"*" does from the box's own onChange — `refreshAutocomplete`
+    // is pure over `next`/`caret` and needs no DOM read, so it does not have to
+    // wait for a browser round-trip. This used to run only inside the
+    // requestAnimationFrame below, alongside the focus/caret-move — which meant
+    // the popover's appearance depended on that callback actually firing against
+    // a still-mounted `composerRef`. The "*" menu hid the gap: its render gate
+    // stays open on `autocompleteNote()` alone (e.g. "Looking up this room's
+    // specialists…") even with zero items, so a late or dropped rAF was
+    // invisible there. "#" and "/" have no such fallback note — with `s.ac`
+    // still unset, `items.length === 0 && !note` is true and NOTHING renders,
+    // even though the token was inserted and the chip lit up as "on". Button
+    // clicks now reach the same `s.ac` state typing does, unconditionally.
+    refreshAutocomplete(next, caret);
     requestAnimationFrame(() => {
       const el = s.composerRef.current;
       if (el) {
         el.focus();
         el.setSelectionRange(caret, caret);
-        refreshAutocomplete(next, caret);
       }
     });
   }
@@ -461,6 +474,29 @@ export function makeChatActions(
     });
   }
 
+  /** Close the palette AND, with it, an abandoned trigger token — shared by
+   * every way a palette can be dismissed without picking a row (Escape, the
+   * textarea losing focus). A trigger token was only ever there to open the
+   * palette — bare ("*") OR still being filtered ("*fil") — so dismissing it
+   * takes the whole attempt with it, and the chip's "is-on" state (which reads
+   * straight off `s.question` via `openingSigil`) clears along with it.
+   * Checked against the WHOLE current question, not just up to the caret: a
+   * first-token trigger with something typed AFTER it ("*file summarize
+   * this") is a real message the user finished composing, not an abandoned
+   * menu, and must not be swept away. "@" references are different again —
+   * they can sit anywhere in an otherwise-finished sentence ("check
+   * @lease.pdf then summarize"), so only a bare, un-filtered "@" goes with it.
+   * Selecting a row is NOT this path (`acceptAutocomplete` below) — a picked
+   * item is a finished choice, not something to undo. */
+  function dismissAutocomplete() {
+    if (!s.ac) return;
+    s.setAc(null);
+    const wholeToken = tokenAtCaret(s.question, s.question.length);
+    const abandonedTrigger = wholeToken && wholeToken.kind !== "ref";
+    const bareRef = s.question.trim() === "@";
+    if (abandonedTrigger || bareRef) s.setQuestion("");
+  }
+
   function onComposerKeyDown(e: ReactKeyboardEvent<HTMLTextAreaElement>) {
     const items = autocompleteItems();
     // Escape closes an OPEN palette, whether or not it has rows to move
@@ -473,10 +509,7 @@ export function makeChatActions(
       e.preventDefault();
       e.stopPropagation();
       e.nativeEvent.stopImmediatePropagation();
-      s.setAc(null);
-      // A bare trigger token was only there to open the palette; closing
-      // the palette takes it with it so the composer is back where it was.
-      if (["#", "@", "/", "*"].includes(s.question.trim())) s.setQuestion("");
+      dismissAutocomplete();
       s.composerRef.current?.focus();
       return;
     }
@@ -853,7 +886,7 @@ export function makeChatActions(
   return {
     newChat, removeChat, runTurn, askOnce, askAgainWithRealDetails, send, autocompleteItems,
     autocompleteNote, refreshSpecialists,
-    refreshAutocomplete, insertComposerToken, acceptAutocomplete,
+    refreshAutocomplete, insertComposerToken, acceptAutocomplete, dismissAutocomplete,
     onComposerKeyDown, stopAsk, handleLock, regenerate, editAndResend,
     copyMessage, copyConversation,
     copyAllText, openSource, startRename, commitRename, onComposerPaste,

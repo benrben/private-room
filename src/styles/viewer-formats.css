@@ -339,7 +339,7 @@
 .md-body th,
 .md-body td {
   border: 1px solid var(--line);
-  padding: 4px 10px;
+  padding: var(--sp-1) 10px;
 }
 
 .md-body th {
@@ -586,7 +586,7 @@
   color: var(--btn-ink-text);
   font-size: 11px;
   font-weight: 600;
-  padding: 2px 8px;
+  padding: 2px var(--sp-2);
   border-radius: 4px 2px 5px 3px / 3px 5px 2px 4px;
   white-space: nowrap;
   max-width: 240px;
@@ -600,7 +600,7 @@
 .img-ocr {
   flex: 0 0 auto;
   margin: 8px 0 0;
-  padding: 8px 10px;
+  padding: var(--sp-2) 10px;
   border: 1px solid var(--border);
   border-radius: 8px 6px 9px 7px / 7px 9px 6px 8px;
   background: var(--surface-2, transparent);

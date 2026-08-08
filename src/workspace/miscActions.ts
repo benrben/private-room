@@ -390,29 +390,6 @@ export function makeMiscActions(
     s.setConfirmDelete(null);
   }
 
-  // ADD-6: flatten grouped search results for arrow-key navigation.
-  function searchFlat(): FlatResult[] {
-    const flat: FlatResult[] = [];
-    const sr = s.searchResults;
-    if (sr) {
-      sr.files.forEach((f) =>
-        flat.push({ kind: "file", id: f.id, name: f.name, snippet: f.snippet }),
-      );
-      sr.messages.forEach((m) =>
-        flat.push({
-          kind: "message",
-          chatId: m.chatId,
-          messageId: m.messageId,
-          snippet: m.snippet,
-        }),
-      );
-      sr.memories.forEach((m) =>
-        flat.push({ kind: "memory", id: m.id, snippet: m.snippet }),
-      );
-    }
-    return flat;
-  }
-
   return {
     refreshWebAccess, refreshAutolock, refreshPrivacy, refreshMemAutoSave, dismissSyncWarn,
     connectedTools, approveMcp, keepMcpOff, loadFrontPage,
@@ -421,6 +398,6 @@ export function makeMiscActions(
     resolveMcpApproval, resolveEditApproval, resolveBrowseConsent,
     revealMemory, revealBrowser, focusComposer, changeModel, engineLabelOf,
     recordEngineModels,
-    askConfirm, cancelConfirm, searchFlat,
+    askConfirm, cancelConfirm,
   };
 }

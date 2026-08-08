@@ -26,6 +26,10 @@ export function useBehaviorSettings(clearError: () => void) {
   const [memoryAutoSave, setMemoryAutoSave] = useState(false);
   // Wave 2 (idea 6): "off" (default — undo covers mistakes) | "turn" | "edit".
   const [editApproval, setEditApproval] = useState("off");
+  // adaptive_text_enabled: absent = on ("1"); "0" = off. Master switch for the
+  // adaptive-UI-text layer (see workspace/adaptiveText.ts) — same convention
+  // as autoIndex above.
+  const [adaptiveTextEnabled, setAdaptiveTextEnabled] = useState(true);
 
   useEffect(() => {
     api.getSetting("temperature").then((v) => {
@@ -65,6 +69,10 @@ export function useBehaviorSettings(clearError: () => void) {
       .getSetting("memory_auto_save")
       .then((v) => setMemoryAutoSave(v === "1"))
       .catch(() => {});
+    api
+      .getSetting("adaptive_text_enabled")
+      .then((v) => setAdaptiveTextEnabled(v !== "0"))
+      .catch(() => {});
   }, []);
 
   async function saveTuning() {
@@ -101,6 +109,11 @@ export function useBehaviorSettings(clearError: () => void) {
     api.setSetting("edit_approval", v).catch(() => {});
   }
 
+  function changeAdaptiveTextEnabled(on: boolean) {
+    setAdaptiveTextEnabled(on);
+    api.setSetting("adaptive_text_enabled", on ? "1" : "0").catch(() => {});
+  }
+
   return {
     temperature,
     setTemperature,
@@ -121,5 +134,7 @@ export function useBehaviorSettings(clearError: () => void) {
     changeMemoryAutoSave,
     editApproval,
     changeEditApproval,
+    adaptiveTextEnabled,
+    changeAdaptiveTextEnabled,
   };
 }

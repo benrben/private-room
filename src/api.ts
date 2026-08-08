@@ -1283,6 +1283,21 @@ export const memorySuggestion = (chatId: string) =>
 export const suggestFileMeta = (fileId: string) =>
   invoke<FileMetaSuggestion>("suggest_file_meta", { fileId });
 
+/** Generic adaptive-UI-text pipe (not a Dx feature — a small reusable service
+ * several features call): the caller composes the whole `prompt` (and the
+ * `facts` it's based on, used server-side only for the numeral-fabrication
+ * guard); the model returns one short string sized to `maxWords`, or `null`.
+ * `null` is a normal, expected result (offline model, failed validation,
+ * degraded generation) — never an error. See workspace/adaptiveText.ts for
+ * the caching/timing contract wrapped around this call. */
+export const generateUiText = (
+  kind: string,
+  prompt: string,
+  facts: unknown,
+  maxWords: number,
+) =>
+  invoke<string | null>("generate_ui_text", { kind, prompt, facts, maxWords });
+
 /** D9: current state of the Room MCP server (the Leash). */
 export const roomServerStatus = () =>
   invoke<RoomServerStatus>("room_server_status");

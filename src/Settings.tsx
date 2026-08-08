@@ -112,6 +112,10 @@ export default function Settings({
     onClose();
   }
   const { modalRef, onModalKeyDown } = useFocusTrap(requestClose);
+  // The one scrolling container all six pages share (they're all mounted at
+  // once and only toggled via `hidden` — see the module comment). Needed so
+  // a tab switch can reset scroll position; see the effect below.
+  const bodyRef = useRef<HTMLDivElement>(null);
 
   // Which settings page is showing. Deep-links (initialSection) open on the page
   // that owns the section; otherwise start on AI & behavior.
@@ -134,6 +138,23 @@ export default function Settings({
     }, 40);
     return () => window.clearTimeout(t);
   }, [initialSection]);
+
+  // All six pages share one scrolling element (.settings-body), toggled with
+  // `hidden` rather than mounted/unmounted, so without this a page opens
+  // wherever the PREVIOUS page happened to be scrolled to — landing mid-page
+  // with no visible heading. Keyed on activeGroup alone, not initialSection,
+  // so it fires only on a real page change and never races the deep-link
+  // effect above: when a deep-link targets a section on the page that's
+  // already active, GROUP_OF_SECTION resolves to the same key, setActiveGroup
+  // is a no-op (same value), this effect's dependency hasn't changed so it
+  // does not re-run, and el.scrollIntoView is free to scroll within the page
+  // as intended. When a deep-link DOES change pages, this effect's synchronous
+  // reset always lands before the deep-link's own scroll, which is deferred
+  // behind a setTimeout.
+  useEffect(() => {
+    const el = bodyRef.current;
+    if (el) el.scrollTop = 0;
+  }, [activeGroup]);
 
   const {
     pullName,
@@ -186,6 +207,8 @@ export default function Settings({
     changeMemoryAutoSave,
     editApproval,
     changeEditApproval,
+    adaptiveTextEnabled,
+    changeAdaptiveTextEnabled,
   } = useBehaviorSettings(() => setError(""));
 
   // Only the page the user is actually looking at may reach the network: the
@@ -381,7 +404,7 @@ export default function Settings({
               </button>
             ))}
           </nav>
-          <div className="settings-body">
+          <div className="settings-body" ref={bodyRef}>
             <div className="settings-page" hidden={activeGroup !== "ai"}>
               <ModelSection
                 ai={ai}
@@ -430,6 +453,8 @@ export default function Settings({
                 changeMemoryAutoSave={changeMemoryAutoSave}
                 editApproval={editApproval}
                 changeEditApproval={changeEditApproval}
+                adaptiveTextEnabled={adaptiveTextEnabled}
+                changeAdaptiveTextEnabled={changeAdaptiveTextEnabled}
               />
               <RoleSection
                 roles={roles}

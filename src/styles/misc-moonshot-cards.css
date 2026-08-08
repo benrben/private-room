@@ -101,7 +101,7 @@
   background: color-mix(in srgb, var(--page) 60%, transparent);
   border: 1px solid var(--rule-strong);
   border-radius: var(--radius-sm);
-  padding: 10px 12px;
+  padding: 10px var(--sp-3);
 }
 /* The double outline from the spec: the border goes to the pen colour, a
    second hairline goes just inside it — over the line twice — and base.css's
@@ -142,7 +142,7 @@
   align-items: baseline;
   gap: 10px;
   margin-top: var(--sp-3);
-  padding: 8px 10px;
+  padding: var(--sp-2) 10px;
   border-radius: var(--radius-sm);
   border: 1px solid color-mix(in srgb, var(--sem-linked) 34%, transparent);
   background: color-mix(in srgb, var(--sem-linked-fill) 10%, transparent);
@@ -388,7 +388,7 @@ button.primary.running:disabled {
   align-items: center;
   gap: 10px;
   margin-top: var(--sp-3);
-  padding: 8px 12px;
+  padding: var(--sp-2) var(--sp-3);
   font-size: var(--fs-meta);
   background: transparent;
   border: 1px solid var(--line);
@@ -418,7 +418,7 @@ button.primary.running:disabled {
   justify-content: center;
   min-width: 24px;
   min-height: 24px;
-  padding: 4px;
+  padding: var(--sp-1);
   background: none;
   border: none;
   color: var(--faint);
@@ -490,7 +490,7 @@ button.primary.running:disabled {
      someone has to transcribe correctly is not the place to spend contrast on
      decoration — the dashed frame is what says "copy this". */
   color: var(--text-strong);
-  padding: 14px 16px;
+  padding: 14px var(--sp-4);
   background: var(--page);
   border: 1.5px dashed color-mix(in srgb, var(--accent) 52%, transparent);
   border-radius: var(--radius);
@@ -618,7 +618,7 @@ button.primary.running:disabled {
   gap: 10px;
   width: 100%;
   text-align: left;
-  padding: 8px 10px;
+  padding: var(--sp-2) 10px;
   background-color: transparent;
   background-image: repeating-linear-gradient(
     to bottom,
@@ -673,7 +673,7 @@ button.primary.running:disabled {
   display: flex;
   align-items: baseline;
   gap: var(--sp-2);
-  padding: 8px 10px;
+  padding: var(--sp-2) 10px;
   margin-bottom: var(--sp-1);
   background-image: linear-gradient(
     90deg,

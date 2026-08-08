@@ -1,9 +1,10 @@
 import { useEffect, useState } from "react";
-import { api, RoomInfo, formatSize } from "../api";
+import { FileContent, RoomInfo, formatSize } from "../api";
 import {
   ChevronLeftIcon,
   CloseIcon,
   CollapseLeftIcon,
+  DotsIcon,
   DownloadIcon,
   EmptyViewerArt,
   EyeIcon,
@@ -25,6 +26,7 @@ import CloudView from "../viewers/CloudView";
 import FrontPage from "./FrontPage";
 import MemoryView from "./MemoryView";
 import RecordingsPage from "./RecordingsPage";
+import { useTextEncoding } from "../viewers/TextEncoding";
 import {
   DocSourceCard,
   READER_KINDS,
@@ -32,7 +34,6 @@ import {
   useReadingProgress,
 } from "./ReaderShell";
 import ConnectorsView from "./ConnectorsView";
-import FindPage from "./FindPage";
 import { BrowserView } from "./BrowserView";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
@@ -85,6 +86,23 @@ function transcriptHasSpeech(text: string | null | undefined): boolean {
   });
 }
 
+/** A file's-worth of nothing, so `useTextEncoding` below — a hook, which has
+ * to run on every render whether or not a file is open — always has a real
+ * `FileContent` to ask rather than needing a nullable signature of its own.
+ * `kind: "binary"` is never in `RE_DECODABLE_KINDS`, so with no file open
+ * this resolves straight to the hook's idle state. */
+const NO_FILE: FileContent = {
+  kind: "binary",
+  name: "",
+  mime: "",
+  editable: false,
+  text: null,
+  dataB64: null,
+  mediaToken: null,
+  mediaMeta: null,
+  webMeta: null,
+};
+
 /** The center pane: a stable content header (breadcrumb + pane controls)
  * over the active surface — open file (any viewer), Workflows, Scripts,
  * Room Map, Memory, Recordings, the Front Page, or the sealed-room empty
@@ -120,10 +138,28 @@ export default function ViewerPane({
     null,
   );
   useEffect(() => setConfirmDeleteVersion(null), [openFile?.id, s.showHistory]);
+  // P1-4: the "..." overflow popover (History, Copy all text, Duplicate,
+  // Dictate, the cloud-payload preview, the encoding picker). Local, not a
+  // WSState slot, for the same reason confirmDeleteVersion is — it belongs to
+  // this popover's lifetime, not to the file, and must not survive a switch.
+  const [overflowOpen, setOverflowOpen] = useState(false);
+  useEffect(() => setOverflowOpen(false), [openFile?.id]);
   // "Preview cloud payload" only means something for a file that HAS text a
   // cloud model would be handed. Asking the kind was a proxy for that and went
   // stale every time a kind was added; ask the file itself.
   const cloudViewable = openFile != null && !!openFile.content.text;
+  // P1-4: which of Edit/Run/Duplicate applies, computed once rather than
+  // twice (the header used to ask `editModeOf` separately for the Edit
+  // button and for Duplicate's own condition).
+  const mode = openFile ? a.editModeOf(openFile.content) : null;
+  // P1-4: lifted out of ViewerRouter, which used to own this hook entirely,
+  // so the header's overflow menu can draw the same picker — see
+  // TextEncoding.tsx. `enc` (not `encoding`) on purpose: ViewerRouter passes
+  // it straight through to the editors' save banners under that exact name,
+  // and `encoding.test.mjs` reads the literal `enc.decoded` text out of the
+  // source to make sure every in-place editor still warns about a legacy
+  // encoding being converted on save.
+  const enc = useTextEncoding(openFile?.id ?? "", openFile?.content ?? NO_FILE);
   // §14, the research reader: a source card at the head of the column and a
   // reading-progress stroke over it. Reading formats only — see READER_KINDS —
   // and never over the cloud-payload preview, which is a diagnostic of what
@@ -149,13 +185,19 @@ export default function ViewerPane({
     skills: "Skills",
     memory: "Memory & scratch pad",
     connectors: "Connectors",
-    find: "Find",
     browser: "Private browser",
   };
   const folderName = openFile
     ? s.folders.find(
         (fo) => fo.id === s.files.find((f) => f.id === openFile.id)?.folderId,
       )?.name
+    : undefined;
+  // "Describe new files automatically" (Settings > Behavior) — the cached
+  // one-liner, when this file has one. P1-4 removed the viewer's own title
+  // (the breadcrumb's crumb-title carries the name now), so this is the
+  // subtitle line that sits under it; most files won't have one yet.
+  const fileDescription = openFile
+    ? s.files.find((f) => f.id === openFile.id)?.aiSummary
     : undefined;
   // The trail must name what is ON SCREEN. With nothing open the "files" area
   // renders the room's home page (or the sealed-room empty state), so saying
@@ -240,12 +282,28 @@ export default function ViewerPane({
           </button>
         </div>
       </div>
+      {/* The generated one-liner, when this file has one — see fileDescription
+          above. Its own strip rather than something squeezed into the
+          breadcrumb: the breadcrumb line is the room/folder TRAIL (P0-3) and
+          already truncates hard on a narrow pane; this is the file's own
+          content and deserves its own row, not a fight for the same pixels. */}
+      {openFile && fileDescription && (
+        <div className="viewer-file-description" title={fileDescription}>
+          {fileDescription}
+        </div>
+      )}
       {openFile ? (
         <>
           <div className="viewer-head">
             {/* Renaming used to exist ONLY in the library's right-click menu,
                 so the file you were actually looking at could not be renamed
-                without hunting for its row. Same handler, same commit rules. */}
+                without hunting for its row. Same handler, same commit rules.
+                P2-1: this used to sit beside a full-size title repeating the
+                same filename the breadcrumb above it (and the tab above
+                THAT) already carried, with the folder context, and the
+                breadcrumb is the one place that actually earns its keep. No
+                replacement title is drawn here — just the affordance that
+                slot always had, now icon-only like Close beside it. */}
             {s.renamingFile?.id === openFile.id &&
             s.renamingFile.where === "viewer" ? (
               <input
@@ -268,12 +326,10 @@ export default function ViewerPane({
                 }}
               />
             ) : (
-              <span className="viewer-title">{openFile.content.name}</span>
-            )}
-            <span className="viewer-actions">
               <button
-                className="subtle btn-ic"
-                title="Rename this file"
+                className="pane-icon-btn"
+                data-tip="Rename"
+                aria-label="Rename this file"
                 onClick={() =>
                   // `where` keeps this box and the library row's box off the
                   // screen at the same time — they share one state slot, and
@@ -285,38 +341,20 @@ export default function ViewerPane({
                   })
                 }
               >
-                <PencilIcon size={13} /> Rename
+                <PencilIcon size={13} />
               </button>
-              {a.editModeOf(openFile.content) === "editor" && (
-                <button
-                  className="subtle btn-ic"
-                  title="Make a second copy of this file in the room, so you can branch it"
-                  onClick={() => void a.duplicateOpenFile()}
-                >
-                  <PlusIcon size={13} /> Duplicate
-                </button>
-              )}
-              {cloudViewable && (
-                <button
-                  className={`subtle btn-ic${cloudView ? " cloudview-on" : ""}`}
-                  title={
-                    cloudView
-                      ? "Back to the normal view"
-                      : "Preview this file exactly as a cloud model would receive it — nothing is sent"
-                  }
-                  onClick={() => setCloudView(!cloudView)}
-                >
-                  {cloudView ? "Close preview" : "Preview cloud payload"}
-                </button>
-              )}
-              {/* The Edit affordance, named for what it ACTUALLY does. "Edit
-                  as text" used to appear on Word files too, where it produced
-                  a separate Markdown copy and left the document untouched —
-                  the same button word for two opposite outcomes. A .docx now
-                  says "Edit" because it now really is edited. */}
+            )}
+            <span className="viewer-actions">
+              {/* P1-4: the file's own core verbs, given real button weight
+                  (the plain button outline, not .subtle's quiet text) so
+                  they read as the 2-3 things this toolbar is actually FOR.
+                  Which ones apply is the same per-kind condition as before
+                  (a script gets Edit+Run+Export, a recording with a
+                  transcript gets Minutes+Export, most documents get
+                  Edit+Export) — only the drawing changed, and where the
+                  other six-to-eight items went: the overflow menu below. */}
               {!cloudView &&
                 (() => {
-                  const mode = a.editModeOf(openFile.content);
                   if (!mode) return null;
                   const title =
                     mode === "copy"
@@ -326,7 +364,7 @@ export default function ViewerPane({
                         : "Switch between preview and editing";
                   return (
                     <button
-                      className="subtle btn-ic"
+                      className="btn-ic viewer-primary"
                       title={title}
                       onClick={() => s.setEditMode(!s.editMode)}
                     >
@@ -343,7 +381,7 @@ export default function ViewerPane({
                   const running = !!(sc?.lastRun?.jobId && s.jobProgress[sc.lastRun.jobId]);
                   return (
                     <button
-                      className="subtle btn-ic"
+                      className="btn-ic viewer-primary"
                       title="Run this script — outputs are saved into the room"
                       disabled={running}
                       onClick={() => {
@@ -358,10 +396,26 @@ export default function ViewerPane({
                     </button>
                   );
                 })()}
+              {(openFile.content.kind === "audio" ||
+                openFile.content.kind === "video" ||
+                openFile.content.kind === "recording") &&
+                transcriptHasSpeech(openFile.content.text) && (
+                  <button
+                    className="btn-ic viewer-primary"
+                    title="Turn this recording's transcript into timeline-style HTML minutes (summary, decisions, action items)"
+                    disabled={s.asking}
+                    onClick={a.makeMinutes}
+                  >
+                    <SparkIcon size={13} /> Minutes
+                  </button>
+                )}
               {(() => {
                 // Wave 5 shortcuts: OTHER scripts whose declared inputs/outputs
-                // name the open file render as one-click chips (e.g. "▶
-                // update_portfolio" on portfolio.csv). Reuses the shared menu.
+                // name the open file. Used to show the first two as bare
+                // icon-only play-glyph pills beside this menu — exactly the
+                // unlabelled-control problem P1-4 is about — so now every
+                // one of them, not just the overflow, lives behind the one
+                // "Scripts" button.
                 const name = openFile.content.name;
                 const scriptActions: QuickAction[] = s.scripts
                   .filter(
@@ -383,18 +437,161 @@ export default function ViewerPane({
                     onOpenChange={(o) => s.setQaScriptMenuOpen(o)}
                     buttonLabel="Scripts"
                     buttonIcon={<ScriptIcon size={13} />}
-                    inlineMax={2}
                   />
                 );
               })()}
-              <span className="history-wrap">
+              {(() => {
+                // Wave 4a shortcuts: file-scoped ACTIVE workflows matching this
+                // file, run on the open file with one click.
+                const fileActions: QuickAction[] = s.workflows
+                  .filter(
+                    (w) =>
+                      w.status === "active" &&
+                      bindingMatches(
+                        w.binding,
+                        openFile.content.kind,
+                        openFile.content.name,
+                        openFile.id,
+                      ),
+                  )
+                  .map((w) => ({
+                    id: w.id,
+                    label: w.name,
+                    icon: <WorkflowGlyph emoji={w.emoji} size={15} />,
+                    onRun: () =>
+                      void a.runWorkflowOn(w.id, openFile.id, openFile.content.name),
+                  }));
+                return (
+                  <QuickActionsMenu
+                    actions={fileActions}
+                    open={s.qaFileMenuOpen ?? false}
+                    onOpenChange={(o) => s.setQaFileMenuOpen(o)}
+                    buttonLabel="Actions"
+                    buttonIcon={<SparkIcon size={13} />}
+                  />
+                );
+              })()}
+              <button
+                className="btn-ic viewer-primary"
+                title="Export a normal copy out of the room"
+                data-agent-blocked
+                onClick={() => a.exportOne(openFile.id, openFile.content.name)}
+              >
+                <DownloadIcon size={13} /> Export
+              </button>
+              {/* P1-4: everything else — the cloud-payload preview, Duplicate,
+                  Copy all text, Dictate, History and the encoding picker that
+                  used to be its own strip over the document — collapsed into
+                  one popover instead of an eight-wide flat row that clipped
+                  on an HTML file. `viewer-overflow-wrap` also anchors the
+                  History popover, which used to hang off the History button
+                  itself and now hangs off this one instead — same corner of
+                  the toolbar, same `history-pop`, untouched inside. */}
+              <span className="viewer-overflow-wrap">
                 <button
-                  className={`subtle btn-ic ${s.showHistory ? "active" : ""}`}
-                  title="Time Machine — earlier saved versions of this file"
-                  onClick={a.openHistory}
+                  className={`subtle btn-ic${cloudView || s.showHistory ? " cloudview-on" : ""}`}
+                  title="More actions"
+                  aria-label="More actions on this file"
+                  aria-haspopup="menu"
+                  aria-expanded={overflowOpen}
+                  onClick={() => setOverflowOpen((o) => !o)}
                 >
-                  <TimeMachineIcon size={13} /> History
+                  <DotsIcon size={14} />
                 </button>
+                {overflowOpen && (
+                  <>
+                    <div
+                      className="menu-backdrop"
+                      onMouseDown={() => setOverflowOpen(false)}
+                    />
+                    <div
+                      className="pop-menu viewer-overflow-menu"
+                      role="menu"
+                      aria-label="More actions on this file"
+                    >
+                      {cloudViewable && (
+                        <button
+                          role="menuitem"
+                          className="pop-item"
+                          onClick={() => {
+                            setCloudView(!cloudView);
+                            setOverflowOpen(false);
+                          }}
+                        >
+                          {cloudView
+                            ? "Close preview"
+                            : "Show me exactly what would be sent"}
+                        </button>
+                      )}
+                      {mode === "editor" && (
+                        <button
+                          role="menuitem"
+                          className="pop-item"
+                          title="Make a second copy of this file in the room, so you can branch it"
+                          onClick={() => {
+                            setOverflowOpen(false);
+                            void a.duplicateOpenFile();
+                          }}
+                        >
+                          <PlusIcon size={13} /> Duplicate
+                        </button>
+                      )}
+                      {openFile.content.text && (
+                        <button
+                          role="menuitem"
+                          className="pop-item"
+                          title="Copy the whole document's extracted text"
+                          onClick={() => {
+                            setOverflowOpen(false);
+                            a.copyAllText();
+                          }}
+                        >
+                          Copy all text
+                        </button>
+                      )}
+                      {openFile.content.editable && (
+                        <button
+                          role="menuitem"
+                          className={`pop-item mic-btn ${a.micState("file").cls}`}
+                          title={
+                            s.dictOwner === "file" && s.dictState === "recording"
+                              ? "Stop and append the words"
+                              : "Dictate into this file — your words are appended to its saved content"
+                          }
+                          disabled={a.micState("file").disabled}
+                          // Deliberately does NOT close the menu — Dictate is
+                          // a start/stop toggle, and this row's recording dot
+                          // is the only way to see (or stop) it once started.
+                          onClick={a.dictateIntoFile}
+                        >
+                          <MicIcon size={12} /> Dictate
+                        </button>
+                      )}
+                      <button
+                        role="menuitem"
+                        className={`pop-item ${s.showHistory ? "active" : ""}`}
+                        onClick={() => {
+                          setOverflowOpen(false);
+                          a.openHistory();
+                        }}
+                      >
+                        <TimeMachineIcon size={13} /> History
+                      </button>
+                      {/* The encoding picker never shows here while editing:
+                          picking a different encoding re-reads the file's raw
+                          bytes and remounts the editor with that new text (see
+                          TextEncoding.tsx), which would silently throw away
+                          whatever is typed but unsaved. Preview-only, same as
+                          the strip this replaced. */}
+                      {!s.editMode && enc.picker && (
+                        <>
+                          <div className="pop-menu-sep" />
+                          <div className="viewer-enc-row">{enc.picker}</div>
+                        </>
+                      )}
+                    </div>
+                  </>
+                )}
                 {s.showHistory && (
                   <div className="history-pop">
                     {/* ART-1: what made the state on screen right now. Only
@@ -559,91 +756,18 @@ export default function ViewerPane({
                   </div>
                 )}
               </span>
-              {openFile.content.text && (
-                <button
-                  className="subtle"
-                  title="Copy the whole document's extracted text"
-                  onClick={a.copyAllText}
-                >
-                  Copy all text
-                </button>
-              )}
-              {openFile.content.editable && (
-                <button
-                  className={`subtle btn-ic mic-btn ${a.micState("file").cls}`}
-                  title={
-                    s.dictOwner === "file" && s.dictState === "recording"
-                      ? "Stop and append the words"
-                      : "Dictate into this file — your words are appended to its saved content"
-                  }
-                  disabled={a.micState("file").disabled}
-                  onClick={a.dictateIntoFile}
-                >
-                  <MicIcon size={12} /> Dictate
-                </button>
-              )}
-              {(openFile.content.kind === "audio" ||
-                openFile.content.kind === "video" ||
-                openFile.content.kind === "recording") &&
-                transcriptHasSpeech(openFile.content.text) && (
-                  <button
-                    className="subtle"
-                    title="Turn this recording's transcript into timeline-style HTML minutes (summary, decisions, action items)"
-                    disabled={s.asking}
-                    onClick={a.makeMinutes}
-                  >
-                    <SparkIcon size={13} /> Minutes
-                  </button>
-                )}
-              {(() => {
-                // Wave 4a shortcuts: file-scoped ACTIVE workflows matching this
-                // file, run on the open file with one click.
-                const fileActions: QuickAction[] = s.workflows
-                  .filter(
-                    (w) =>
-                      w.status === "active" &&
-                      bindingMatches(
-                        w.binding,
-                        openFile.content.kind,
-                        openFile.content.name,
-                        openFile.id,
-                      ),
-                  )
-                  .map((w) => ({
-                    id: w.id,
-                    label: w.name,
-                    icon: <WorkflowGlyph emoji={w.emoji} size={15} />,
-                    onRun: () =>
-                      void a.runWorkflowOn(w.id, openFile.id, openFile.content.name),
-                  }));
-                return (
-                  <QuickActionsMenu
-                    actions={fileActions}
-                    open={s.qaFileMenuOpen ?? false}
-                    onOpenChange={(o) => s.setQaFileMenuOpen(o)}
-                    buttonLabel="Actions"
-                    buttonIcon={<SparkIcon size={13} />}
-                  />
-                );
-              })()}
-              <button
-                className="subtle btn-ic"
-                title="Export a normal copy out of the room"
-                data-agent-blocked
-                onClick={() => a.exportOne(openFile.id, openFile.content.name)}
-              >
-                <DownloadIcon size={13} /> Export
-              </button>
               {/* Live QA: typing in a .pptx or .docx and pressing Close threw
                   the buffer away and returned to Home, with no dialog and no
                   undo. Every other exit asked; this one didn't. */}
               <button
-                className="subtle btn-ic"
+                className="pane-icon-btn"
+                data-tip="Close"
+                aria-label="Close this file"
                 onClick={() =>
                   a.guardLeave("Closing this file", () => s.setOpenFile(null))
                 }
               >
-                <CloseIcon size={12} /> Close
+                <CloseIcon size={12} />
               </button>
             </span>
           </div>
@@ -710,6 +834,7 @@ export default function ViewerPane({
               viewerRev={s.viewerRev}
               editMode={s.editMode}
               editModeOf={a.editModeOf}
+              enc={enc}
               editCell={a.editCell}
               saveEdit={a.saveEdit}
               saveEditAsCopy={a.saveEditAsCopy}
@@ -752,32 +877,16 @@ export default function ViewerPane({
           onAttach={(file) => a.toggleAttach(file)}
           onAsk={(query) => s.setQuestion(query)}
         />
-      ) : area === "find" ? (
-        // Full-page search. The props are values and callbacks rather than the
-        // `s`/`a` blobs the older pages take — the page is written against a
-        // contract (FindPageProps), and the shell stays the only thing that
-        // knows how a search is actually run or where a hit lives. The query
-        // is the SAME slot the ⌘K launcher writes to, so the two surfaces can
-        // never be searching for different words.
-        <FindPage
-          files={s.files}
-          query={s.searchQuery}
-          onQueryChange={s.setSearchQuery}
-          onSearch={api.searchAll}
-          onOpenResult={a.activateResult}
-          onOpenFile={(id) => void a.viewFile(id)}
-          onAsk={(question) => s.setQuestion(question)}
-        />
       ) : area === "connectors" ? (
         <ConnectorsView />
       ) : area === "skills" ? (
-        <SkillsView s={s} a={a} />
+        <SkillsView s={s} a={a} info={info} />
       ) : area === "memory" ? (
         <MemoryView s={s} a={a} info={info} />
       ) : area === "recordings" ? (
-        <RecordingsPage s={s} a={a} />
+        <RecordingsPage s={s} a={a} info={info} />
       ) : frontPageView ? (
-        <FrontPage page={frontPageView} s={s} a={a} layout={layout} />
+        <FrontPage page={frontPageView} s={s} a={a} layout={layout} info={info} />
       ) : (
         <div className="viewer-empty">
           <div className="viewer-empty-icon">

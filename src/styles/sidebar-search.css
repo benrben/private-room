@@ -4,11 +4,14 @@
 
    The LAUNCHER (.search-*) is a command: it floats, it occludes, it is opaque,
    and it is gone the moment you pick something. It is the only search surface
-   in the app that is allowed a fill — see paper.css section 9. The full Find
-   page (styles/find.css) is the other half of the same feature: a place you
-   stay in, drawn straight onto the sheet. Both read `search_all`, so they can
-   never disagree about what is in the room; they look different because they
-   ARE different, not because two people styled them.
+   in the app that is allowed a fill — see paper.css section 9. It used to have
+   a sibling, the room's full-page "Find" area — a place you stayed in, drawn
+   straight onto the sheet — but the app had to explain three search surfaces
+   to the user in a paragraph before that page was retired (P1-2): its filter
+   strip and its rows now render INSIDE this same launcher, once a query has
+   real results, in find.css (`.search-panel.is-expanded`, sized in shell.css).
+   Both still read the one `search_all` index, so a filtered view can never
+   disagree with a plain one about what is in the room.
 
    The FILE ROW (.file-row and friends) is the library's list line. It is
    transparent, and its states are drawn: a marker spine down the edge for the
@@ -134,7 +137,7 @@
   text-align: left;
   background-color: transparent;
   border: 0;
-  padding: 8px 10px;
+  padding: var(--sp-2) 10px;
   border-radius: var(--radius-sm);
   cursor: pointer;
   transition: background-color var(--dur-fast) var(--ease-pen);
@@ -179,7 +182,7 @@
   color: var(--muted);
   font-size: var(--fs-meta);
   line-height: var(--lh-body);
-  padding: 18px 16px;
+  padding: 18px var(--sp-4);
   text-align: center;
 }
 
@@ -224,7 +227,7 @@
   gap: 2px;
   min-height: 36px;
   border-radius: var(--radius-sm);
-  padding: 0 6px 0 4px;
+  padding: 0 6px 0 var(--sp-1);
   transition: background-color var(--dur-fast) var(--ease-pen);
 }
 
@@ -281,8 +284,8 @@
   align-items: center;
   gap: 8px;
   flex-wrap: wrap;
-  margin: 4px 6px 6px;
-  padding: 6px 8px;
+  margin: var(--sp-1) 6px 6px;
+  padding: 6px var(--sp-2);
   border-radius: var(--radius-sm);
   border: var(--stroke-w) solid var(--sem-linked);
   background-color: color-mix(in srgb, var(--sem-linked-fill) 14%, var(--page));
@@ -320,6 +323,14 @@
   border: none;
   padding: 7px 4px;
   min-width: 0;
+  /* The library pane can end up as the ENTIRE window (both other panes
+     hidden, or the rail collapsed to icons): with no cap here, .file-name and
+     .file-size are the two ends of one `flex: 1` row, so the gap between the
+     name and its size stretches to match the window instead of staying a
+     fixed reading distance apart. Capped, not centred — this is a left-to-right
+     list (icon, name, size), so it stays flush left like every other library
+     row rather than floating a block in the middle of the pane. */
+  max-width: 720px;
   text-align: left;
 }
 
@@ -330,12 +341,36 @@
   line-height: 0;
 }
 
+/* Wraps the name (and, when present, the generated description) into one
+   column so the row can grow to two lines without disturbing the icon/size
+   flex row around it. A file with no description stays exactly the single
+   .file-name span it always was, at the same height as every other row. */
+.file-name-col {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
 /* --fs-meta, not the old 12px: this is the room's content, and the metadata
    floor is the smallest a file name is allowed to be. */
 .file-name {
   flex: 1;
   font-size: var(--fs-meta);
   color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The one-line generated description (Settings > Behavior > "Describe new
+   files automatically"). Sits at the metadata rung, one step quieter than the
+   name above it — it is a hint, not a second name — and truncates the same
+   way; the full sentence is the row's tooltip via `title`. */
+.file-description {
+  font-size: var(--fs-micro);
+  color: var(--faint);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -497,7 +532,7 @@
   flex-shrink: 0;
   max-width: 110px;
   font-size: var(--fs-micro);
-  padding: 4px 6px;
+  padding: var(--sp-1) 6px;
 }
 
 /* ==========================================================================

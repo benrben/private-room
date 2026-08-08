@@ -322,14 +322,14 @@ export default function TopBar({
                 onMouseDown={() => s.setRoomMenuOpen(false)}
               />
               <div className="pop-menu room-menu" role="menu">
-                {/* The two controls that used to sit permanently in the bar.
-                    Same handlers, same outcomes; they are named in full here
-                    because a menu row has the space an icon square never did,
-                    and the visible words now ARE the accessible name rather
-                    than a tooltip standing in for one. Neither was ever only
-                    reachable from the bar — ⌘K carries both (Overlays.tsx
-                    "reset-layout" / "theme"), Settings → App carries the
-                    theme, and double-clicking a splitter still resets. */}
+                {/* Theme is a quick-access convenience, not a second home for
+                    the control — its real home is Settings → Appearance, so
+                    this row stays exactly one word. Same handler as before
+                    (Overlays.tsx "theme" carries the same toggle from ⌘K).
+                    Room settings was removed from this menu entirely (P1-9):
+                    the rail's persistent Settings button is the one entry
+                    point, and a second name for the same modal in a second
+                    menu was redundant chrome, not a convenience. */}
                 <button
                   className="pop-item"
                   role="menuitem"
@@ -338,7 +338,7 @@ export default function TopBar({
                     s.setRoomMenuOpen(false);
                   }}
                 >
-                  Switch between dark and light theme
+                  Theme
                 </button>
                 <button
                   className="pop-item"
@@ -349,16 +349,6 @@ export default function TopBar({
                   }}
                 >
                   Reset the three-pane layout
-                </button>
-                <button
-                  className="pop-item"
-                  role="menuitem"
-                  onClick={() => {
-                    s.setShowSettings(true);
-                    s.setRoomMenuOpen(false);
-                  }}
-                >
-                  Room settings
                 </button>
                 {/* Idea 9: one-click "commit" — a named checkpoint (default
                     name "Checkpoint — {date}") with a toast that names it.

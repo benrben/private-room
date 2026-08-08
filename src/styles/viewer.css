@@ -68,7 +68,7 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 10px 16px;
+  padding: 10px var(--sp-4);
   border-bottom: 1px solid var(--border);
   background: var(--panel);
 }
@@ -86,6 +86,10 @@
   flex: 1;
   overflow: auto;
   padding: var(--sp-6) var(--sp-6) var(--sp-8);
+  /* The document itself (P0-3) — explicit so a file's content stays
+     selectable even though `.viewer-head`/`.editor-breadcrumb-bar` above it
+     (shell.css) are not. */
+  user-select: text;
 }
 
 .viewer-body img {
@@ -369,6 +373,19 @@
   flex-shrink: 0;
 }
 
+/* P1-4: the file's own core verbs (Edit, Run, Export, Minutes) — the plain
+   button default already draws the outlined-pill "real button" look (see
+   base.css), so this only adds the bold label weight that marks them apart
+   from the quiet .subtle text and the icon-only Rename/Close beside them.
+   Never filled ink: two or three of these sit side by side, and a filled
+   button is this system's ONE strong CTA (base.css `button.primary`) — a row
+   of them would compete with itself. Same restraint as `.script-go`, the
+   other place a toolbar-weight action already existed. */
+.viewer-primary {
+  font-weight: 600;
+  font-size: var(--fs-meta);
+}
+
 /* Full-size host for the Room Map in the center pane (RoomMap fills this). */
 .room-map-canvas {
   flex: 1;
@@ -389,10 +406,43 @@
   gap: 6px;
 }
 
-/* ADD-2 — version history popover, anchored under the History button. */
-.history-wrap {
+/* ADD-2 / P1-4 — anchors both popovers this corner of the toolbar owns: the
+   "..." overflow menu itself, and the version-history panel (`.history-pop`)
+   that used to hang off its own History button and now hangs off this one
+   instead — same corner, same panel, nothing inside it changed. Renamed from
+   `.history-wrap`: it was never anyone else's, but naming it for the one
+   thing it held stopped being accurate the day a second thing moved in. */
+.viewer-overflow-wrap {
   position: relative;
   display: inline-flex;
+}
+
+/* The "..." overflow menu's own items reuse `.pop-menu` / `.pop-item`
+   (workspace.css) — the same shell the room menu and model picker already
+   use — plus two rows of its own: a plain divider, and the encoding picker,
+   which holds a <select> rather than being a button itself and so skips the
+   button rows' hover wash. */
+.viewer-overflow-menu .pop-menu-sep {
+  height: 1px;
+  margin: var(--sp-1) 6px;
+  background: var(--line-soft);
+}
+.viewer-overflow-menu .viewer-enc-row {
+  padding: 6px 10px 7px;
+}
+.viewer-overflow-menu .viewer-enc-row .encoding-label {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 5px;
+}
+.viewer-overflow-menu .viewer-enc-row .encoding-lede {
+  font-size: var(--fs-micro);
+  color: var(--muted);
+}
+.viewer-overflow-menu .viewer-enc-row .encoding-select {
+  width: 100%;
+  max-width: none;
 }
 
 /* A popover genuinely floats, so it is one of the few things allowed an
@@ -417,7 +467,7 @@
 }
 
 .history-empty {
-  padding: 12px 10px;
+  padding: var(--sp-3) 10px;
   color: var(--text-dim);
   font-size: var(--fs-meta);
 }
@@ -426,7 +476,7 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
+  gap: var(--sp-2);
   padding: 7px 8px;
   border-radius: 8px 6px 9px 7px / 7px 9px 6px 8px;
 }
@@ -443,7 +493,7 @@
 }
 
 .history-cause {
-  font-size: 13px;
+  font-size: var(--fs-meta);
 }
 
 /* A date is exactly what the hand is for. Set at --fs-meta rather than the
@@ -465,7 +515,7 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 32px;
+  padding: var(--sp-8);
   background: rgba(0, 0, 0, 0.55);
 }
 /* A modal occludes the room, so it is opaque and drawn on --raised — the
@@ -488,8 +538,8 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
-  padding: 12px 16px;
+  gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-4);
   border-bottom: 1px solid var(--border);
 }
 .compare-title {
@@ -499,7 +549,7 @@
   min-width: 0;
 }
 .compare-name {
-  font-size: 14px;
+  font-size: var(--fs-body);
   font-weight: 600;
   color: var(--text);
   overflow: hidden;
@@ -507,13 +557,13 @@
   white-space: nowrap;
 }
 .compare-sub {
-  font-size: 12px;
+  font-size: var(--fs-micro);
   color: var(--text-dim);
 }
 .compare-head-actions {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--sp-2);
   flex-shrink: 0;
 }
 .compare-confirm {
@@ -533,7 +583,7 @@
 .compare-empty {
   margin: auto;
   color: var(--text-dim);
-  font-size: 14px;
+  font-size: var(--fs-body);
 }
 .compare-plain {
   flex: 1;
@@ -545,11 +595,11 @@
 }
 .compare-pane {
   margin: 0;
-  padding: 12px 14px;
+  padding: var(--sp-3) 14px;
   overflow: auto;
   background: var(--panel);
   color: var(--text);
-  font-size: 13px;
+  font-size: var(--fs-meta);
   line-height: 1.5;
   white-space: pre-wrap;
   word-break: break-word;
@@ -591,7 +641,7 @@
 .confirm-q {
   font-size: 11px;
   color: var(--text-dim);
-  padding: 0 4px;
+  padding: 0 var(--sp-1);
 }
 
 .chip-btn.confirm-yes {
@@ -610,7 +660,7 @@
 .viewer-empty {
   margin: auto;
   max-width: 440px;
-  padding: 24px;
+  padding: var(--sp-6);
   text-align: center;
   color: var(--text-dim);
   display: flex;
@@ -756,7 +806,7 @@
 
 .viewer-status {
   color: var(--text-dim);
-  font-size: 12px;
+  font-size: var(--fs-micro);
   padding: 6px 0;
 }
 
@@ -772,7 +822,7 @@
   align-items: center;
   justify-content: space-between;
   gap: 10px;
-  padding: 8px 14px;
+  padding: var(--sp-2) 14px;
   border-bottom: 1px solid var(--line);
   box-shadow: inset 3px 0 0 var(--sem-pending-fill);
   background: color-mix(in srgb, var(--sem-pending-fill) 12%, transparent);
@@ -799,7 +849,7 @@
   align-items: center;
   justify-content: space-between;
   gap: 10px;
-  padding: 8px 14px 0;
+  padding: var(--sp-2) 14px 0;
 }
 /* Both badges are paper.css's taped label: the WORD carries the state and the
    marker only reinforces it, so the text is --ink over a 34% wash rather than
@@ -808,11 +858,11 @@
 .cloudview-badge {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  gap: var(--sp-1);
   font-size: var(--fs-micro);
   font-weight: 600;
   letter-spacing: 0.02em;
-  padding: 2px 8px;
+  padding: 2px var(--sp-2);
   color: var(--ink);
   border-radius: 2px 3px 2px 4px / 4px 2px 3px 2px;
 }
@@ -833,7 +883,7 @@
   color: var(--muted);
 }
 .cloudview-ribbon {
-  padding: 8px 14px;
+  padding: var(--sp-2) 14px;
   font-size: var(--fs-meta);
   line-height: var(--lh-body);
   color: var(--muted);
@@ -866,7 +916,7 @@
   flex: 1;
   overflow: auto;
   margin: 0;
-  padding: 14px 16px;
+  padding: 14px var(--sp-4);
   font-size: var(--fs-body);
   line-height: var(--lh-body);
   white-space: pre-wrap;
@@ -882,9 +932,9 @@
   font-size: 11.5px;
 }
 .cloudview-empty {
-  padding: 24px;
+  padding: var(--sp-6);
   color: var(--muted);
-  font-size: 13px;
+  font-size: var(--fs-meta);
 }
 .viewer-actions .cloudview-on {
   color: var(--accent);

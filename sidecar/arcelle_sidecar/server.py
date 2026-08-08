@@ -999,13 +999,15 @@ def create_app(
         finally:
             registry.release(req.run_id)
 
-    # --- AI actions / memory / file-meta (moonshot/ai_actions.rs) -----------
+    # --- AI actions / memory / file-meta / adaptive UI text ------------------
     #
     # /ai_action        surfaces an engine failure -> 502 (ai_actions.rs `?`), and
     #                   a bad action id / missing language / empty result -> 4xx.
-    # /memory_suggestion and /suggest_file_meta both SWALLOW an engine failure to a
-    #                   quiet default (Rust `unwrap_or_default()`), so their logic
-    #                   never raises LlmError up here.
+    # /memory_suggestion, /suggest_file_meta, and /generate_ui_text all SWALLOW an
+    #                   engine failure to a quiet default (Rust `unwrap_or_default()`
+    #                   for the first two; `generate_ui_text` degrades the same way
+    #                   by design, no Rust original), so their logic never raises
+    #                   LlmError up here.
 
     @app.post("/ai_action")
     async def ai_action(req: ai_actions.AiActionRequest, request: Request) -> Any:
@@ -1048,6 +1050,21 @@ def create_app(
                 privacy=req.privacy, provider=req.provider
             ),
         )
+
+    # /generate_ui_text: the generic adaptive-UI-text pipe. Never raises — an
+    # engine failure or a validation rejection both degrade to `{"text": null}`
+    # inside ai_actions.generate_ui_text, so unlike /ai_action there is nothing
+    # here to catch.
+    @app.post("/generate_ui_text")
+    async def generate_ui_text(req: ai_actions.UiTextRequest, request: Request) -> Any:
+        text = await until_hangup(
+            request,
+            ai_actions.generate_ui_text(
+                req.kind, req.prompt, req.facts, req.max_words, req.model, req.base_url,
+                privacy=req.privacy, provider=req.provider
+            ),
+        )
+        return {"text": text}
 
     # --- privacy scanner (PRIV-2) -------------------------------------------
     #

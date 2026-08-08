@@ -57,6 +57,10 @@
   border-bottom: 1px solid var(--line);
   position: relative;
   z-index: 20;
+  /* Toolbar, not a document (P0-3): the room name still opens for editing
+     via `.room-name-input`, an <input> — base.css opts inputs back into
+     `text` regardless of this. */
+  user-select: none;
 }
 
 .pr-brandmark {
@@ -125,7 +129,7 @@
 
 .command-wrap {
   min-width: 0;
-  padding: 0 12px;
+  padding: 0 var(--sp-3);
   display: flex;
 }
 /* The one control in the bar that grew: ⌘K is the way into everything, and
@@ -139,7 +143,7 @@
   padding: 0 10px;
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--sp-2);
   color: var(--muted);
   background: transparent;
   border: 1px solid var(--rule-strong);
@@ -177,11 +181,11 @@
 
 .top-actions {
   min-width: 0;
-  padding: 0 8px;
+  padding: 0 var(--sp-2);
   display: flex;
   align-items: center;
   justify-content: flex-end;
-  gap: 4px;
+  gap: var(--sp-1);
 }
 
 /* Truthful data-route badge — the same three trust tones as the status-bar
@@ -240,7 +244,7 @@
   min-width: 0;
   max-width: 210px;
   height: 26px;
-  padding: 0 8px;
+  padding: 0 var(--sp-2);
   display: inline-flex;
   align-items: center;
   gap: 6px;
@@ -371,9 +375,14 @@
   min-width: 0;
   display: grid;
   /* The rail width is a variable so it can expand to full labels. Collapsed is
-     84px, not the old 74: the icon-only mode still carries a word under every
-     glyph, and that word is now 12px — the design system's floor — rather than
-     the 9.5px it used to be shrunk to in order to fit. */
+     84px, not the old 74: the pane toggles and Focus/Settings still carry a
+     word under their glyph at this width, at 12px — the design system's
+     floor — rather than the 9.5px it used to be shrunk to in order to fit.
+     The destination buttons (Map/Scripts/Memory/…) dropped their word
+     entirely at this width instead (P1-7) — a shrunken, renamed abbreviation
+     ("Connect") was worse than no visible word at all, so they fall back to
+     a native `title` tooltip and 84px is now just resting width, not a fit
+     constraint for them. */
   grid-template-columns: var(--rail-w, 84px) minmax(0, 1fr);
   transition: grid-template-columns var(--dur-fast) var(--ease-pen);
 }
@@ -395,10 +404,21 @@
   flex-direction: column;
   align-items: center;
   gap: 2px;
-  padding: 8px 6px;
+  /* P1-7: 20px at the bottom, not 8 — the collapsed strip's own scroll
+     content (buttons + dividers, four groups' worth once .is-expanded's
+     `padding` shorthand below stops overriding it) used to run flush to the
+     rail's edge, right against the 26px status bar's hairline underneath.
+     `.activity-rail.is-expanded` replaces this whole `padding` shorthand
+     with its own, so the extra room here is collapsed-only by construction,
+     not by a second rule. */
+  padding: var(--sp-2) 6px 20px;
   background: transparent;
   border-right: 1px solid var(--line);
   position: relative;
+  /* Furniture, not content: ⌘A used to run the browser default and paint
+     the whole rail's icon labels blue along with every other pane's chrome
+     (P0-3). The rail never holds anything a person typed or would copy. */
+  user-select: none;
   z-index: 15;
   overflow: hidden auto;
 }
@@ -435,7 +455,7 @@
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 4px;
+  gap: var(--sp-1);
   color: var(--muted);
   background: transparent;
   border: 0;
@@ -445,12 +465,16 @@
   transition: color var(--dur-fast) var(--ease-pen),
     background var(--dur-fast) var(--ease-pen);
 }
-/* The persistent text label under each rail icon — so a naïve user can tell
-   Map / Scripts / Memory / Connectors apart without hovering. Inherits the
-   button colour, so it brightens with the active/pressed state. Wraps onto a
-   2nd line rather than ellipsis-truncating: a silently clipped word ("Connec…")
-   is worse than a 2-line label, and `.rail-button`'s min-height (not a fixed
-   height) lets the button grow to fit it. */
+/* The persistent text label under a rail icon. Only the pane toggles
+   (Library/Workspace/AI) and Focus/Settings still render one at every rail
+   width — the destination buttons (Map/Scripts/Memory/Connectors/…) drop it
+   entirely once the rail collapses (P1-7: ActivityRail.tsx only renders the
+   `.rail-label` span when `wide`, falling back to a native `title` tooltip
+   instead of a second, shrunken, renamed copy of the same word). Inherits
+   the button colour, so it brightens with the active/pressed state. Wraps
+   onto a 2nd line rather than ellipsis-truncating: a silently clipped word
+   ("Connec…") is worse than a 2-line label, and `.rail-button`'s min-height
+   (not a fixed height) lets the button grow to fit it. */
 .rail-label {
   font-size: var(--fs-micro);
   line-height: 1.2;
@@ -526,10 +550,22 @@
   color: var(--text);
 }
 /* Pane-visibility toggles: restrained neutral pressed state. A pane toggle is
-   not a destination, so it never takes the pen — its spine is pencil. */
+   not a destination, so it never takes the pen — its spine is pencil, not the
+   AREA rows' accent gradient below. The wash is 12%, matching the order of
+   magnitude .icon-btn[aria-pressed="true"] already uses elsewhere in this
+   file (11%) — the previous 5% read as almost nothing next to a hover state
+   that is itself var(--hover), a full opaque tint. */
 .rail-button[data-pane-toggle][aria-pressed="true"] {
   color: var(--text);
-  background: color-mix(in srgb, var(--text) 5%, transparent);
+  background: color-mix(in srgb, var(--text) 12%, transparent);
+}
+/* The panel glyph itself flips from outline to filled — on beats off without
+   requiring the reader to notice a colour shift or find the spine in the
+   gutter. Scoped to the pane toggles' own <rect>, so no other rail icon is
+   touched. */
+.rail-button[data-pane-toggle][aria-pressed="true"] svg rect {
+  fill: var(--rule-strong);
+  fill-opacity: 0.28;
 }
 .rail-button[data-pane-toggle][aria-pressed="true"]::before {
   content: "";
@@ -787,12 +823,15 @@ body.resizing-col * {
 .pane-header {
   height: 39px;
   flex: 0 0 auto;
-  padding: 0 6px 0 12px;
+  padding: 0 6px 0 var(--sp-3);
   border-bottom: 1px solid var(--line-soft);
   display: flex;
   align-items: center;
   gap: 7px;
   min-width: 0;
+  /* Every pane's title bar (Library / Workspace / AI chat) is app-generated
+     label text and icon buttons — furniture, not content (P0-3). */
+  user-select: none;
 }
 .pane-heading {
   min-width: 0;
@@ -800,7 +839,7 @@ body.resizing-col * {
   text-overflow: ellipsis;
   white-space: nowrap;
   color: var(--text-strong);
-  font-size: 13px;
+  font-size: var(--fs-meta);
   font-weight: 500;
   letter-spacing: 0.01em;
 }
@@ -834,11 +873,14 @@ body.resizing-col * {
 .pane-tabs {
   height: 34px;
   flex: 0 0 auto;
-  padding: 0 12px;
+  padding: 0 var(--sp-3);
   display: flex;
   align-items: flex-end;
   gap: 13px;
   border-bottom: 1px solid var(--line-soft);
+  /* A tab strip (P0-3) — the same furniture class as .tab-strip and
+     .assistant-header below. */
+  user-select: none;
 }
 .pane-tab {
   height: 34px;
@@ -848,7 +890,7 @@ body.resizing-col * {
   border: 0;
   border-bottom: 2px solid transparent;
   border-radius: 0;
-  font-size: 12px;
+  font-size: var(--fs-micro);
 }
 .pane-tab:hover {
   color: var(--text);
@@ -894,6 +936,8 @@ body.resizing-col * {
   gap: 2px;
   border-bottom: 1px solid var(--line-soft);
   min-width: 0;
+  /* A tab strip (P0-3). */
+  user-select: none;
 }
 .assistant-tab {
   height: 30px;
@@ -905,7 +949,7 @@ body.resizing-col * {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  font-size: 12px;
+  font-size: var(--fs-micro);
   position: relative;
 }
 .assistant-tab:hover {
@@ -953,6 +997,8 @@ body.resizing-col * {
   border-bottom: 1px solid var(--line-soft);
   font-size: 11px;
   min-width: 0;
+  /* A status readout, not content the user wrote (P0-3). */
+  user-select: none;
 }
 .context-strip .context-label {
   min-width: 0;
@@ -1002,6 +1048,9 @@ body.resizing-col * {
   color: var(--faint);
   font-size: var(--fs-micro);
   min-width: 0;
+  /* Readouts, not content (P0-3): nothing in the status strip is text a
+     person typed or would copy. */
+  user-select: none;
 }
 .status-seal {
   height: 24px;
@@ -1114,7 +1163,7 @@ button.status-trust.danger:hover {
   display: flex;
   align-items: center;
   gap: 7px;
-  padding: 0 8px;
+  padding: 0 var(--sp-2);
   color: var(--muted);
   background: var(--panel-2);
   border: 1px solid var(--line);
@@ -1131,7 +1180,7 @@ button.status-trust.danger:hover {
   background: transparent;
   border: 0;
   outline: 0;
-  font-size: 12px;
+  font-size: var(--fs-micro);
   padding: 0;
 }
 .search-field input::placeholder {
@@ -1212,7 +1261,7 @@ button.status-trust.danger:hover {
   background: var(--panel-2);
   border: 1px solid var(--line);
   border-radius: 6px 4px 7px 5px / 5px 7px 4px 6px;
-  font-size: 12px;
+  font-size: var(--fs-micro);
   padding: 0;
 }
 .add-source-button:hover {
@@ -1323,7 +1372,7 @@ button.status-trust.danger:hover {
   display: inline-block;
   font-size: 11px;
   font-weight: 600;
-  padding: 2px 8px;
+  padding: 2px var(--sp-2);
   border-radius: 999px;
 }
 .scope-tag.auto {
@@ -1400,7 +1449,7 @@ button.status-trust.danger:hover {
 .editor-breadcrumb-bar {
   min-height: 32px;
   flex: 0 0 auto;
-  padding: 2px 8px 2px 14px;
+  padding: 2px var(--sp-2) 2px 14px;
   display: flex;
   align-items: center;
   min-width: 0;
@@ -1409,6 +1458,8 @@ button.status-trust.danger:hover {
   color: var(--muted);
   font-size: var(--fs-meta);
   flex-wrap: wrap;
+  /* The room/folder trail, not the document (P0-3). */
+  user-select: none;
 }
 .editor-breadcrumb {
   min-width: 0;
@@ -1434,9 +1485,9 @@ button.status-trust.danger:hover {
   flex: 0 0 auto;
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  gap: var(--sp-1);
   min-height: 22px;
-  margin-left: 4px;
+  margin-left: var(--sp-1);
   padding: 2px 9px 2px 6px;
   border: 1px solid var(--line);
   /* The same uneven pen-drawn radius the other small paper controls use. */
@@ -1458,6 +1509,25 @@ button.status-trust.danger:hover {
   }
 }
 
+/* The generated one-liner under the breadcrumb (P1-4 left no title of its own
+   in .viewer-head for this to sit under — see ViewerPane.tsx's
+   `fileDescription`). Metadata rung, quieter than the breadcrumb above it:
+   this is a hint about the file, not a heading. Truncates hard to one line;
+   the full sentence is the strip's own tooltip. Only rendered when the file
+   has one, so most rows never pay for this space at all. */
+.viewer-file-description {
+  flex: 0 0 auto;
+  padding: 3px 14px 5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--faint);
+  font-size: var(--fs-micro);
+  font-style: italic;
+  border-bottom: 1px solid var(--line-soft);
+  user-select: none;
+}
+
 /* Container-query adaptations: tight panes shed metadata, not actions. */
 @container (max-width: 260px) {
   .source-meta,
@@ -1466,7 +1536,7 @@ button.status-trust.danger:hover {
     display: none;
   }
   .pane-heading {
-    font-size: 12px;
+    font-size: var(--fs-micro);
   }
 }
 @container (max-width: 390px) {
@@ -1501,7 +1571,7 @@ button.status-trust.danger:hover {
   }
   .command-wrap {
     grid-column: 2;
-    padding-inline: 8px;
+    padding-inline: var(--sp-2);
   }
   .top-actions {
     grid-column: 3;
@@ -1528,7 +1598,7 @@ button.status-trust.danger:hover {
   background: transparent;
   border: 1px solid transparent;
   border-radius: 6px 4px 7px 5px / 5px 7px 4px 6px;
-  font-size: 13px;
+  font-size: var(--fs-meta);
   line-height: 1;
 }
 .qa-pill:hover {
@@ -1586,7 +1656,7 @@ button.status-trust.danger:hover {
   display: flex;
   flex-direction: column;
   gap: 2px;
-  margin: 8px 10px 0;
+  margin: var(--sp-2) 10px 0;
   padding: 7px 9px;
   border: 1px solid var(--line);
   border-radius: 6px 4px 7px 5px / 5px 7px 4px 6px;
@@ -1614,9 +1684,9 @@ button.status-trust.danger:hover {
   padding: 13px 12px 40px;
 }
 .studio-intro {
-  margin: 0 2px 12px;
+  margin: 0 2px var(--sp-3);
   color: var(--muted);
-  font-size: 12px;
+  font-size: var(--fs-micro);
   line-height: 1.5;
 }
 .studio-section-title {
@@ -1629,7 +1699,7 @@ button.status-trust.danger:hover {
 .studio-row {
   width: 100%;
   min-height: 48px;
-  padding: 8px;
+  padding: var(--sp-2);
   display: grid;
   grid-template-columns: 29px minmax(0, 1fr) auto;
   align-items: center;
@@ -1663,7 +1733,7 @@ button.status-trust.danger:hover {
 .studio-row-title {
   display: block;
   color: var(--text-strong);
-  font-size: 12px;
+  font-size: var(--fs-micro);
 }
 .studio-row-copy {
   display: block;
@@ -1696,15 +1766,18 @@ button.status-trust.danger:hover {
 .viewer-head {
   min-height: 42px;
   flex: 0 0 auto;
-  padding: 4px 10px 4px 14px;
+  padding: var(--sp-1) 10px var(--sp-1) 14px;
   gap: 6px;
   border-bottom: 1px solid var(--line-soft);
   background: transparent;
   flex-wrap: wrap;
+  /* Toolbar, not the document (P0-3). The rename field inside it is still an
+     <input>, which base.css opts back into `text`. */
+  user-select: none;
 }
 .viewer-title {
   font-weight: 500;
-  font-size: 13px;
+  font-size: var(--fs-meta);
   color: var(--text-strong);
 }
 .viewer-actions {
@@ -1788,9 +1861,19 @@ button.status-trust.danger:hover {
   border-radius: var(--radius-lg);
   box-shadow: 0 22px 70px var(--shadow);
 }
+/* The launcher's own "expand into a full-page-equivalent view" (P1-2): once a
+   real query has real results, the panel grows to fit the filter strip and
+   the richer rows (find.css) instead of staying the width of a plain command
+   list. Set here, not in find.css, because .search-panel's base size is
+   already this file's — a second file setting the same property on the same
+   selector would just be the next cascade fight waiting to happen. */
+.search-panel.is-expanded {
+  width: min(880px, 94vw);
+  max-height: 82vh;
+}
 .search-input {
   padding: 13px 15px;
-  font-size: 14px;
+  font-size: var(--fs-body);
 }
 .search-result {
   border-radius: 6px 4px 7px 5px / 5px 7px 4px 6px;
@@ -1824,7 +1907,7 @@ button.status-trust.danger:hover {
   flex: 1;
   min-height: 0;
   overflow: auto;
-  padding: 12px 10px 40px;
+  padding: var(--sp-3) 10px 40px;
 }
 .activity-summary {
   margin: 0 2px 11px;
@@ -1851,7 +1934,7 @@ button.status-trust.danger:hover {
   min-width: 0;
   flex: 1;
   color: var(--text);
-  font-size: 12px;
+  font-size: var(--fs-micro);
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
@@ -1862,7 +1945,7 @@ button.status-trust.danger:hover {
   white-space: nowrap;
 }
 .activity-copy {
-  margin: 4px 0 0;
+  margin: var(--sp-1) 0 0;
   color: var(--muted);
   font-size: 10.5px;
   line-height: 1.5;
@@ -1906,7 +1989,7 @@ button.status-trust.danger:hover {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
+  gap: var(--sp-2);
   margin-top: 5px;
 }
 .activity-row-foot .activity-copy {
@@ -1922,7 +2005,7 @@ button.status-trust.danger:hover {
    boundary, not on which card happens to have a button. */
 .activity-history {
   margin-top: 26px;
-  padding-top: 4px;
+  padding-top: var(--sp-1);
   border-top: 1px solid var(--line);
 }
 .activity-history .activity-group-title {
@@ -1971,7 +2054,7 @@ button.status-trust.danger:hover {
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 10px 12px;
+  padding: 10px var(--sp-3);
   border: 1px solid var(--line-soft);
   border-radius: 8px 6px 9px 7px / 7px 9px 6px 8px;
   background: var(--panel-2);
@@ -1997,7 +2080,7 @@ button.status-trust.danger:hover {
   padding: 40px 0 80px;
 }
 .memory-view-head h1 {
-  margin: 0 0 8px;
+  margin: 0 0 var(--sp-2);
   color: var(--text-strong);
   font-size: 24px;
   font-weight: 500;
@@ -2006,7 +2089,7 @@ button.status-trust.danger:hover {
 .memory-view-sub {
   margin: 0 0 22px;
   color: var(--muted);
-  font-size: 13px;
+  font-size: var(--fs-meta);
   line-height: 1.6;
 }
 .memory-view .memory-add {
@@ -2027,7 +2110,7 @@ button.status-trust.danger:hover {
   align-items: flex-start;
   justify-content: space-between;
   gap: 10px;
-  padding: 8px 4px;
+  padding: var(--sp-2) var(--sp-1);
   border-bottom: 1px solid var(--line-soft);
   font-size: 12.5px;
   color: var(--text);
@@ -2067,9 +2150,9 @@ button.status-trust.danger:hover {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 8px;
+  gap: var(--sp-2);
   color: var(--faint);
-  font-size: 12px;
+  font-size: var(--fs-micro);
   text-align: center;
 }
 .memory-scratch-note {
@@ -2077,46 +2160,10 @@ button.status-trust.danger:hover {
   padding-top: 6px;
 }
 .memory-scratch-note p {
-  margin: 4px 0 10px;
+  margin: var(--sp-1) 0 10px;
   color: var(--muted);
-  font-size: 12px;
+  font-size: var(--fs-micro);
   line-height: 1.55;
-}
-
-/* ----- Find area (center) -----
-   Scaffolding for workspace/FindPage.tsx, which renders its heading and its
-   state and nothing else until the search page proper is built against
-   FindPageProps. Set in the same reading column as Room home and Memory, so
-   the areas read as pages of one notebook rather than as three products. */
-.find-view {
-  flex: 1;
-  min-height: 0;
-  overflow: auto;
-}
-.find-inner {
-  width: min(100% - 48px, 680px);
-  margin: 0 auto;
-  padding: 40px 0 80px;
-}
-.find-title {
-  margin: 0 0 6px;
-  color: var(--text-strong);
-  font-size: var(--fs-section);
-  font-weight: 600;
-  letter-spacing: -0.01em;
-  line-height: 1.15;
-}
-/* Instruction copy is never set small and never set in the hand. */
-.find-lead {
-  margin: 22px 0 0;
-  max-width: 62ch;
-  color: var(--muted);
-  font-size: var(--fs-lead);
-  line-height: var(--lh-body);
-}
-.find-lead strong {
-  color: var(--text-strong);
-  font-weight: 600;
 }
 
 /* --- Tabs -----------------------------------------------------------------
@@ -2131,47 +2178,67 @@ button.status-trust.danger:hover {
    wide enough to be a readable title in the body size, which is what a tab is
    FOR. Pages keep the globe, because a web page really is a different kind of
    thing from a room file and the strip mixes the two. */
+.tab-strip-wrap {
+  display: flex;
+  align-items: stretch;
+  min-height: 34px;
+  min-width: 0;
+  background: transparent;
+  border-bottom: 1px solid var(--line);
+  flex: 0 0 auto;
+}
 .tab-strip {
   display: flex;
   align-items: stretch;
   gap: 2px;
-  min-height: 34px;
+  min-width: 0;
   padding: 0 6px;
   background: transparent;
-  border-bottom: 1px solid var(--line);
   overflow-x: auto;
   overflow-y: hidden;
   scrollbar-width: none;
-  flex: 0 0 auto;
+  /* Takes whatever width the two edge columns don't. Without this the
+     scrolling box sized to its content like any other flex child and the
+     wrap grew past the pane instead of the box scrolling inside it. */
+  flex: 1 1 auto;
 }
 .tab-strip::-webkit-scrollbar {
   display: none;
 }
-/* "There are more this way." Sticky rather than a fade over the edge: the
-   strip is transparent so the sheet runs under it, and a gradient to an opaque
-   colour would be a grey block sitting on the paper. A pen arrow says the same
-   thing and stays on the page. Toggled with `visibility`, never mounted and
-   unmounted, so the strip's own scrollWidth — the number that decides whether
-   there IS more — cannot be changed by the mark that reports it. */
+/* "There are more this way." A pen arrow, not a fade over the edge: the
+   strip is transparent so the sheet runs under it, and a gradient to an
+   opaque colour would be a grey block sitting on the paper.
+   A column beside the scrolling box, not a `position: sticky` mark inside
+   it. Sticky was tried first and measurably failed: a sticky child keeps its
+   box at its ORIGINAL, pre-scroll flow position for layout purposes (that's
+   all `.tab-strip[data-more-start]` used to reserve) and only repaints it
+   pinned to the viewport edge once scrolled — so the reserved gutter was
+   only ever correct at scrollLeft 0. One scroll tick past that, whichever
+   tab had scrolled into the same pixels painted right through the arrow, and
+   rendering both versions and sampling pixels showed the sticky mark sitting
+   on top of a tab's own first characters at every scroll offset beyond a
+   few px, growing deeper the further you scrolled. A plain flex column next
+   to the scrolling box can't do that: `.tab-strip`'s own overflow clip ends
+   exactly where this column begins, so no tab pixel can ever land here, at
+   any scroll offset — the gutter is real, not merely reserved-looking at
+   rest. Toggled with `visibility`, never mounted and unmounted, so the
+   scrolling box's own scrollWidth — the number that decides whether there IS
+   more — cannot be changed by the mark that reports it. */
 .tab-edge {
-  position: sticky;
   flex: 0 0 auto;
   align-self: center;
   visibility: hidden;
   --nb-ico-size: 13px;
   width: 13px;
   height: 13px;
+  margin: 0 5px;
   color: var(--muted);
 }
 .tab-edge-start {
-  left: 0;
   transform: scaleX(-1);
 }
-.tab-edge-end {
-  right: 0;
-}
-.tab-strip[data-more-start] .tab-edge-start,
-.tab-strip[data-more-end] .tab-edge-end {
+.tab-strip-wrap[data-more-start] .tab-edge-start,
+.tab-strip-wrap[data-more-end] .tab-edge-end {
   visibility: visible;
 }
 /* Tabs read as clipped paper: the top corners are rounded unevenly, the bottom
@@ -2260,11 +2327,15 @@ button.status-trust.danger:hover {
 .tab.is-current .tab-icon {
   color: var(--accent-2);
 }
-/* Middle truncation: the head takes the ellipsis, the tail is never given up.
-   Two elements rather than `direction: rtl`, which reorders punctuation and
-   would render an RTL filename's own characters in the wrong order. */
+/* End truncation, plain and standard: the head is kept, the tail takes the
+   ellipsis. This used to be two elements (a shrinking head plus a held
+   fixed-length tail) so a name's last few characters would always survive —
+   which backfires on prose titles, where the words that actually tell two
+   tabs apart sit right after a shared opening rather than in a fixed last
+   few characters; the old scheme cut exactly that stretch out of both and
+   left two look-alike fragments standing in for two different files. One
+   element and the platform's own ellipsis keeps the opening intact instead. */
 .tab-title {
-  display: flex;
   /* Takes the free width, so Close is pinned to the tab's right edge. Without
      this the title sized to its text and Close sat wherever the text ended —
      which, once tabs stopped shrinking below 130px, put the close target in
@@ -2272,21 +2343,8 @@ button.status-trust.danger:hover {
   flex: 1 1 auto;
   min-width: 0;
   overflow: hidden;
-}
-/* `pre`, not the inherited `nowrap`. The split between head and tail can land
-   on a space — "Arcelle UX direction" cut nine from the end leaves the head
-   ending in one — and `nowrap` still collapses whitespace at a box boundary,
-   so the two halves rendered as "Arcelle UXdirection". `pre` keeps the spaces
-   exactly as the filename has them; it cannot introduce wrapping, because
-   neither box ever contains a newline. */
-.tab-title-head {
-  overflow: hidden;
   text-overflow: ellipsis;
-  white-space: pre;
-}
-.tab-title-tail {
-  flex: 0 0 auto;
-  white-space: pre;
+  white-space: nowrap;
 }
 /* 24px: closing a tab is a target like any other, and it used to be 16. It
    stays invisible until the tab is hovered or current, so a strip at rest is
@@ -2324,7 +2382,7 @@ button.status-trust.danger:hover {
   align-self: center;
   min-width: 24px;
   min-height: 24px;
-  margin-left: 4px;
+  margin-left: var(--sp-1);
   padding: 3px 7px;
   border: none;
   border-radius: 5px 3px 6px 4px / 4px 6px 3px 5px;
@@ -2348,13 +2406,13 @@ button.status-trust.danger:hover {
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 32px;
+  padding: var(--sp-8);
   background: var(--bg);
   color: var(--text);
 }
 .crash-card {
   max-width: 520px;
-  padding: 24px;
+  padding: var(--sp-6);
   border: 1px solid var(--line);
   border-radius: var(--radius-lg);
   background: var(--panel);
@@ -2366,22 +2424,22 @@ button.status-trust.danger:hover {
 }
 .crash-card p {
   margin: 0 0 14px;
-  font-size: 13px;
+  font-size: var(--fs-meta);
   line-height: 1.5;
   color: var(--muted);
 }
 .crash-actions {
   display: flex;
-  gap: 8px;
+  gap: var(--sp-2);
   margin-top: 14px;
 }
 .crash-pane {
-  margin: 16px;
+  margin: var(--sp-4);
   padding: 14px;
   border: 1px solid var(--line);
   border-radius: var(--radius);
   background: var(--panel);
-  font-size: 13px;
+  font-size: var(--fs-meta);
   color: var(--muted);
   overflow: auto;
 }
@@ -2391,7 +2449,7 @@ button.status-trust.danger:hover {
 .crash-detail {
   max-height: 160px;
   margin: 0;
-  padding: 8px 10px;
+  padding: var(--sp-2) 10px;
   border-radius: var(--radius-sm);
   background: var(--panel-2);
   color: var(--faint);
@@ -2414,7 +2472,7 @@ button.status-trust.danger:hover {
   flex-direction: column;
   gap: 7px;
   width: 260px;
-  padding: 12px 14px;
+  padding: var(--sp-3) 14px;
   border: 1px solid var(--line);
   border-radius: var(--radius);
   background: var(--panel);

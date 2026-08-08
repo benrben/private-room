@@ -13,6 +13,7 @@ import { isCloudRoute, trustState } from "./markup";
 import ChatPane from "./ChatPane";
 import StudioShelf from "./StudioShelf";
 import PodcastPanel from "./PodcastPanel";
+import { useAdaptiveText } from "./adaptiveText";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
 import { WorkArea } from "./types";
@@ -184,7 +185,9 @@ export default function AiPane({
 
       {s.aiTab === "studio" && <StudioView s={s} a={a} area={area} />}
 
-      {s.aiTab === "activity" && <ActivityPanel s={s} a={a} />}
+      {s.aiTab === "activity" && (
+        <ActivityPanel s={s} a={a} roomId={info.path} />
+      )}
     </>
   );
 }
@@ -310,7 +313,15 @@ function StateTape({ word, mark }: { word: string; mark: string }) {
   return <span className={`nb-tape ${mark} activity-flag`}>{word}</span>;
 }
 
-function ActivityPanel({ s, a }: { s: WSState; a: WSActions }) {
+function ActivityPanel({
+  s,
+  a,
+  roomId,
+}: {
+  s: WSState;
+  a: WSActions;
+  roomId: string;
+}) {
   // A once-a-second tick so running cards' elapsed time advances. Armed only
   // while something is actually running.
   const jobActive = runningJobCount(s) > 0;
@@ -558,8 +569,10 @@ function ActivityPanel({ s, a }: { s: WSState; a: WSActions }) {
       {/* The AUDIT half (decision #12). Deliberately a separate section with its
           own heading and its own muted styling, not a run of quieter cards at
           the bottom of one list: the user must be able to tell at a glance what
-          they can still act on from what is only a record. Nothing in here has a
-          button — a finished job is not a thing you resume. */}
+          they can still act on from what is only a record. No job here has an
+          ACTION button — a finished job is not a thing you resume — but a
+          repeated-run group's own "show runs" disclosure toggle is not a job
+          action, it just un-collapses detail already on the screen. */}
       {shownHistory.length > 0 && (
         <section className="activity-history" aria-label="What already happened">
           <div className="activity-group-title">
@@ -570,9 +583,17 @@ function ActivityPanel({ s, a }: { s: WSState; a: WSActions }) {
                 : "a record, nothing to act on"}
             </span>
           </div>
-          {shownHistory.map((j) => (
-            <HistoryRow key={j.id} j={j} />
-          ))}
+          {/* D4: repeated same-day runs of the same workflow/script collapse to
+              one summary row instead of N identical ones — see
+              `groupHistoryRuns`. A single run, or a run of something else in
+              between, breaks the run and renders exactly as it always did. */}
+          {groupHistoryRuns(shownHistory).map((group) =>
+            group.length > 1 ? (
+              <HistoryGroupRow key={group[0].id} jobs={group} roomId={roomId} />
+            ) : (
+              <HistoryRow key={group[0].id} j={group[0]} />
+            ),
+          )}
         </section>
       )}
 
@@ -612,6 +633,139 @@ function HistoryRow({ j }: { j: WSState["jobs"][number] }) {
         Finished
         {j.total > 0 ? ` — ${Math.min(j.cursor, j.total)} of ${j.total} steps` : ""}
       </div>
+    </div>
+  );
+}
+
+type HistoryJob = WSState["jobs"][number];
+
+/** D4: a room that runs the same workflow/script every day fills History with
+ * identical-looking rows — this collapses a same-day run of the same thing
+ * into one group the way a person would read it at a glance.
+ *
+ * `jobs` must already be in the order History renders them (most recent
+ * first — `list_jobs` sorts by `created_at DESC`, and nothing downstream of
+ * it reorders). Grouping only ever merges items that are ALREADY adjacent in
+ * that order and share both a title and a local calendar day — a run of
+ * "stock_metrics.py" on Monday and another on Tuesday stays two separate
+ * rows (and two separate groups) even though the titles match, and a
+ * different job landing in between breaks the run rather than being skipped
+ * over. A group of exactly one job is returned as its own one-element array,
+ * so a caller can render it exactly like today (no grouping UI) just by
+ * checking `.length > 1`. */
+export function groupHistoryRuns(jobs: HistoryJob[]): HistoryJob[][] {
+  const groups: HistoryJob[][] = [];
+  for (const j of jobs) {
+    const current = groups[groups.length - 1];
+    const prev = current?.[current.length - 1];
+    if (prev && prev.title === j.title && sameLocalDay(prev.updatedAt, j.updatedAt)) {
+      current.push(j);
+    } else {
+      groups.push([j]);
+    }
+  }
+  return groups;
+}
+
+function sameLocalDay(a: string, b: string): boolean {
+  const da = new Date(a);
+  const db = new Date(b);
+  if (Number.isNaN(da.getTime()) || Number.isNaN(db.getTime())) return false;
+  return da.toDateString() === db.toDateString();
+}
+
+/** "today" / "yesterday" / a compact date, for one group's shared day — the
+ * same no-year-unless-it-isn't-this-one convention SearchExpanded's
+ * `shortWhen` uses for a margin date. */
+function dayLabelOf(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "that day";
+  const now = new Date();
+  if (d.toDateString() === now.toDateString()) return "today";
+  const yesterday = new Date(now);
+  yesterday.setDate(now.getDate() - 1);
+  if (d.toDateString() === yesterday.toDateString()) return "yesterday";
+  const opts: Intl.DateTimeFormatOptions =
+    d.getFullYear() === now.getFullYear()
+      ? { month: "short", day: "numeric" }
+      : { month: "short", day: "numeric", year: "numeric" };
+  return `on ${d.toLocaleDateString(undefined, opts)}`;
+}
+
+/** One collapsed group of 2+ same-day, same-name finished runs. The header
+ * line is built entirely in code from the runs' own fields (never blank, and
+ * never waits on a model); the harness only ever supplies the second line —
+ * a plain "N runs, all finished" sentence renders until/unless it does (rule
+ * 3: null is common, not an error). Individual runs are collapsed by default
+ * behind "Show runs" — nothing is deleted, `HistoryRow` still renders each
+ * one unchanged once expanded. */
+function HistoryGroupRow({ jobs, roomId }: { jobs: HistoryJob[]; roomId: string }) {
+  const [expanded, setExpanded] = useState(false);
+  const latest = jobs[0]; // most recent first, per `groupHistoryRuns`'s contract
+  const name = latest.title;
+  const runCount = jobs.length;
+  // The only per-run signal History's own data actually carries: did a run's
+  // cursor reach its own total. `status` can't add anything here — only
+  // `done` jobs ever reach History (`groupActivity`), so it is constant
+  // within a group and would be a fact with nothing left to say.
+  const allSucceeded = jobs.every(
+    (j) => j.error == null && (j.total <= 0 || j.cursor >= j.total),
+  );
+  const when = Date.parse(latest.updatedAt);
+
+  const facts = { name, runCount, allSucceeded };
+  const prompt =
+    `Write one line (max 20 words), in the same plain, short style as dashboard ` +
+    `copy like "Finished — 1 of 1 steps": summarize what happened across ` +
+    `${runCount} runs of "${name}". Say whether they went the same way each ` +
+    `time or something changed. Use ONLY the facts given — never state a ` +
+    `number, name, or detail that isn't one of them.`;
+  const generated = useAdaptiveText({
+    roomId,
+    kind: "activity_history_group_summary",
+    prompt,
+    facts,
+    maxWords: 20,
+    enabled: true,
+  });
+  // Rule 1/3: the static line renders first and always exists; a generated
+  // one only ever swaps in on top of it, never instead of a blank.
+  const staticFallback = allSucceeded
+    ? `${runCount} runs, all finished.`
+    : `${runCount} runs — not every one finished all its steps.`;
+  const summary = generated ?? staticFallback;
+
+  const runsId = `history-group-runs-${latest.id}`;
+  return (
+    <div className="activity-row history activity-history-group">
+      <div className="activity-row-head">
+        <span className="activity-row-title">
+          {name} — {runCount} runs {dayLabelOf(latest.updatedAt)}
+          {allSucceeded ? ", all clean" : ", some incomplete"}
+        </span>
+        <StateTape word="Done" mark="nb-sem-done" />
+        <span className="activity-state">
+          {Number.isNaN(when) ? "" : new Date(when).toLocaleString()}
+        </span>
+      </div>
+      <div className="activity-copy ap-hand">{summary}</div>
+      <div className="activity-row-actions">
+        <button
+          className="subtle"
+          aria-expanded={expanded}
+          aria-controls={runsId}
+          onClick={() => setExpanded((v) => !v)}
+        >
+          {expanded ? "Hide runs" : "Show runs"}
+        </button>
+      </div>
+      {expanded && (
+        <div id={runsId} className="activity-history-group-runs">
+          {jobs.map((j) => (
+            <HistoryRow key={j.id} j={j} />
+          ))}
+        </div>
+      )}
     </div>
   );
 }

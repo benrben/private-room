@@ -1,5 +1,6 @@
 import {
   useEffect,
+  useMemo,
   useState,
   type KeyboardEvent as ReactKeyboardEvent,
   type ReactNode,
@@ -23,6 +24,19 @@ import { languageForFile } from "../viewers/languages";
 import { LayoutApi } from "../shell/useLayout";
 import { toggleTheme } from "../theme";
 import { SCRIPT_POWERS, SCRIPT_WORKSPACE_NOTE } from "./scriptTrust";
+import {
+  applyFindFilters,
+  DEFAULT_FILTERS,
+  flattenShown,
+  highlightTerms,
+  kindsPresentOf,
+  SearchFiltersBar,
+  SearchIdlePanel,
+  SearchQueryActions,
+  SearchResultRows,
+  useRecentAndSaved,
+  type FindFilters,
+} from "./SearchExpanded";
 
 /** Human name for whoever owns the shared dictation mic right now. */
 const CAPTURE_OWNER_LABEL: Record<string, string> = {
@@ -387,23 +401,75 @@ export default function Overlays({
   const pendingBrowse = s.browseConsents[0];
   const pendingEdit = s.editApprovals[0];
   const pendingScript = s.scriptApprovals[0];
+
+  // ---- ⌘K: the expanded results (P1-2) ----
+  // The room used to have a second, full-page "Find" area for exactly this —
+  // filters, previews, saved/recent searches. That page is retired; its
+  // internals now live in SearchExpanded.tsx and render here, once a real
+  // query has real results, instead of on a separate pane.
   const searchResults = s.searchResults;
-  const msgOffset = searchResults ? searchResults.files.length : 0;
-  const memOffset = searchResults
-    ? searchResults.files.length + searchResults.messages.length
-    : 0;
-  const searchFlat = a.searchFlat();
+  const trimmedQuery = s.searchQuery.trim();
+  const [filters, setFilters] = useState<FindFilters>(DEFAULT_FILTERS);
+  // A fresh open starts from a clean filter set: carrying "PDFs only, past
+  // week" over from the last time ⌘K was open would silently narrow a search
+  // the reader never asked to narrow.
+  useEffect(() => {
+    if (s.showSearch) setFilters(DEFAULT_FILTERS);
+  }, [s.showSearch]);
+  const fileById = useMemo(() => new Map(s.files.map((f) => [f.id, f])), [s.files]);
+  // The ONE narrowing pass. The keyboard selection below and the rows drawn
+  // near the bottom of this component both read `shown` — never the raw
+  // `searchResults` — so a filtered view and what Enter actually activates
+  // can never disagree about which row is which.
+  const shown = useMemo(
+    () => applyFindFilters(searchResults, filters, fileById),
+    [searchResults, filters, fileById],
+  );
+  const flatShown = useMemo(() => flattenShown(shown), [shown]);
+  const kindsPresent = useMemo(() => kindsPresentOf(searchResults, fileById), [searchResults, fileById]);
+  const terms = useMemo(() => highlightTerms(trimmedQuery), [trimmedQuery]);
+  // Changing a filter is a deliberate act, and the list it points into just
+  // changed shape — the selection resets to the top rather than keep an index
+  // that, once Commands are appended after it, could now land on the WRONG
+  // command entirely.
+  useEffect(() => {
+    s.setSearchSel(0);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filters]);
+
+  const { recent, saved, noteSearch, toggleSaved, removeSaved, clearRecent } = useRecentAndSaved();
+  // Recorded once per COMPLETED search, not once per keystroke: effects.ts
+  // cancels every keystroke's request but the last, so `searchResults`
+  // changing identity is exactly "a search finished".
+  useEffect(() => {
+    if (trimmedQuery && searchResults) noteSearch(trimmedQuery);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchResults]);
+  const isSavedSearch = saved.some((sv) => sv.q === trimmedQuery);
+
   // Commands that match the query (all of them at rest — the palette's
   // resting state lists what the room can do instead of a blank panel).
   const q = s.searchQuery.trim().toLowerCase();
   const actions = buildPaletteActions(s, a, layout).filter(
     (x) => !q || x.label.toLowerCase().includes(q) || x.hint.toLowerCase().includes(q),
   );
-  const actOffset = searchFlat.length;
-  const totalItems = searchFlat.length + actions.length;
+  const actOffset = flatShown.length;
+  const totalItems = flatShown.length + actions.length;
+  // Unfiltered totals, for the ONE question filters must never answer wrong:
+  // "is there really nothing here" vs "these filters are hiding something
+  // that IS here". Swapping the filtered counts into that message would tell
+  // someone their room has nothing matching a word that, in fact, thirty
+  // messages contain — just not the ones the current filters let through.
+  const totalRaw = searchResults
+    ? searchResults.files.length + searchResults.messages.length + searchResults.memories.length
+    : 0;
+  const totalItemsRaw = totalRaw + actions.length;
+  const totalShown = shown.files.length + shown.messages.length + shown.memories.length;
+  const narrowedToZero = totalRaw > 0 && totalShown === 0;
+  const expanded = trimmedQuery !== "" && searchResults != null && !s.searchError;
   const runSel = (idx: number) => {
-    if (idx < searchFlat.length) {
-      a.activateResult(searchFlat[idx]);
+    if (idx < flatShown.length) {
+      a.activateResult(flatShown[idx]);
       return;
     }
     const act = actions[idx - actOffset];
@@ -955,7 +1021,7 @@ export default function Overlays({
             if (e.target === e.currentTarget) s.setShowSearch(false);
           }}
         >
-          <div className="search-panel">
+          <div className={`search-panel${expanded ? " is-expanded" : ""}`}>
             <input
               className="search-input"
               autoFocus
@@ -974,116 +1040,99 @@ export default function Overlays({
                   on screen — the previous query's hits never linger under a
                   query that never ran. */}
               {s.searchError && (
-                <div className="search-empty" role="alert">
-                  This room could not be searched: {s.searchError}
+                <div className="find-error nb-frame nb-sem-urgent nb-edge" role="alert">
+                  <strong className="find-error-head">This room could not be searched</strong>
+                  <span className="find-error-body">{s.searchError}</span>
                 </div>
               )}
-              {s.searchQuery.trim() &&
-                searchResults &&
-                totalItems === 0 && (
-                  <div className="search-empty">
-                    Nothing matches “{s.searchQuery.trim()}” — not in files,
-                    chats, memories, or commands.
-                  </div>
-                )}
-              {s.searchQuery.trim() &&
-                searchResults &&
-                searchFlat.length > 0 && (
-                  <div className="search-summary">
-                    {searchResults.files.length} file
-                    {searchResults.files.length === 1 ? "" : "s"} ·{" "}
-                    {searchResults.messages.length} message
-                    {searchResults.messages.length === 1 ? "" : "s"} ·{" "}
-                    {searchResults.memories.length} memor
-                    {searchResults.memories.length === 1 ? "y" : "ies"}
-                  </div>
-                )}
-              {searchResults && searchResults.files.length > 0 && (
-                <div className="search-group">
-                  <div className="search-group-head">
-                    Files <span className="search-count">{searchResults.files.length}</span>
-                  </div>
-                  {searchResults.files.map((f, i) => (
-                    <button
-                      key={f.id}
-                      ref={keepVisible(i)}
-                      className={`search-result ${s.searchSel === i ? "sel" : ""}`}
-                      onMouseEnter={() => s.setSearchSel(i)}
-                      onClick={() =>
-                        a.activateResult({
-                          kind: "file",
-                          id: f.id,
-                          name: f.name,
-                          snippet: f.snippet,
-                        })
-                      }
-                    >
-                      <span className="search-result-title">{f.name}</span>
-                      <span className="search-result-snippet" dir="auto">
-                        {f.snippet}
-                      </span>
-                    </button>
-                  ))}
+              {/* Genuinely nothing — not a filtered view of something that IS
+                  there. Reads the UNFILTERED total plus commands, same gate
+                  the plain palette always used, so turning a filter on can
+                  never make this message start lying. */}
+              {trimmedQuery !== "" && searchResults && totalItemsRaw === 0 && (
+                <div className="search-empty">
+                  Nothing matches “{trimmedQuery}” — not in files, chats,
+                  memories, or commands.
                 </div>
               )}
-              {searchResults && searchResults.messages.length > 0 && (
-                <div className="search-group">
-                  <div className="search-group-head">
-                    Messages <span className="search-count">{searchResults.messages.length}</span>
-                  </div>
-                  {searchResults.messages.map((m, i) => {
-                    const idx = msgOffset + i;
-                    return (
-                      <button
-                        key={m.messageId}
-                        ref={keepVisible(idx)}
-                        className={`search-result ${s.searchSel === idx ? "sel" : ""}`}
-                        onMouseEnter={() => s.setSearchSel(idx)}
-                        onClick={() =>
-                          a.activateResult({
-                            kind: "message",
-                            chatId: m.chatId,
-                            messageId: m.messageId,
-                            snippet: m.snippet,
-                          })
-                        }
-                      >
-                        <span className="search-result-snippet" dir="auto">
-                          {m.snippet}
-                        </span>
-                      </button>
-                    );
-                  })}
-                </div>
+              {expanded && (
+                <>
+                  <SearchQueryActions
+                    query={trimmedQuery}
+                    isSaved={isSavedSearch}
+                    onToggleSaved={() => toggleSaved(trimmedQuery, filters)}
+                    onAsk={(question) => {
+                      s.setShowSearch(false);
+                      s.setQuestion(question);
+                      a.focusComposer(layout);
+                    }}
+                  />
+                  <SearchFiltersBar
+                    filters={filters}
+                    onChange={setFilters}
+                    results={searchResults}
+                    kindsPresent={kindsPresent}
+                    messagesOrMemoriesShown={shown.messages.length > 0 || shown.memories.length > 0}
+                    showSort={shown.files.length > 0}
+                  />
+                  {/* A live region, mounted for every completed search: a
+                      screen reader hears the count change as the reader
+                      types or narrows a filter — including down to zero,
+                      which a div that simply stopped rendering never would
+                      announce. */}
+                  <p className="find-count" role="status">
+                    {totalShown === 0
+                      ? `No results for “${trimmedQuery}”`
+                      : totalShown !== totalRaw
+                        ? `${totalShown} of ${totalRaw} results for “${trimmedQuery}”`
+                        : `${totalShown} result${totalShown === 1 ? "" : "s"} for “${trimmedQuery}”`}
+                  </p>
+                  {totalShown > 0 && (
+                    <p className="find-breakdown">
+                      {shown.files.length} file{shown.files.length === 1 ? "" : "s"} ·{" "}
+                      {shown.messages.length} message{shown.messages.length === 1 ? "" : "s"} ·{" "}
+                      {shown.memories.length} memor{shown.memories.length === 1 ? "y" : "ies"}
+                    </p>
+                  )}
+                  {narrowedToZero ? (
+                    <div className="find-empty">
+                      <p className="find-empty-line">
+                        Nothing matches “{trimmedQuery}” with these filters — {totalRaw}{" "}
+                        result{totalRaw === 1 ? " is" : "s are"} hidden by them.
+                      </p>
+                      <div className="find-empty-actions">
+                        <button type="button" className="nb-btn" onClick={() => setFilters(DEFAULT_FILTERS)}>
+                          Clear filters
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <SearchResultRows
+                      shown={shown}
+                      files={s.files}
+                      fileById={fileById}
+                      terms={terms}
+                      selectedIndex={s.searchSel}
+                      registerRowRef={keepVisible}
+                      onSelectIndex={(idx) => s.setSearchSel(idx)}
+                      onOpenResult={a.activateResult}
+                      onOpenFile={(id) => void a.viewFile(id)}
+                    />
+                  )}
+                </>
               )}
-              {searchResults && searchResults.memories.length > 0 && (
-                <div className="search-group">
-                  <div className="search-group-head">
-                    Memories <span className="search-count">{searchResults.memories.length}</span>
-                  </div>
-                  {searchResults.memories.map((m, i) => {
-                    const idx = memOffset + i;
-                    return (
-                      <button
-                        key={m.id}
-                        ref={keepVisible(idx)}
-                        className={`search-result ${s.searchSel === idx ? "sel" : ""}`}
-                        onMouseEnter={() => s.setSearchSel(idx)}
-                        onClick={() =>
-                          a.activateResult({
-                            kind: "memory",
-                            id: m.id,
-                            snippet: m.snippet,
-                          })
-                        }
-                      >
-                        <span className="search-result-snippet" dir="auto">
-                          {m.snippet}
-                        </span>
-                      </button>
-                    );
-                  })}
-                </div>
+              {trimmedQuery === "" && (
+                <SearchIdlePanel
+                  recent={recent}
+                  saved={saved}
+                  onRunRecent={(query) => s.setSearchQuery(query)}
+                  onRunSaved={(sv) => {
+                    setFilters(sv.filters);
+                    s.setSearchQuery(sv.q);
+                  }}
+                  onRemoveSaved={removeSaved}
+                  onClearRecent={clearRecent}
+                />
               )}
               {actions.length > 0 && (
                 <div className="search-group">

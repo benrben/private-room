@@ -553,6 +553,23 @@
   font-weight: 400;
 }
 
+/* D4: a collapsed same-day/same-name run group. The expanded runs sit in
+   their own indented well below the summary so "show runs" reads as opening
+   a drawer under the row it belongs to, not as starting a new list. Each run
+   inside keeps its normal `.activity-row.history` look — nothing about a
+   single run's own styling changes just because it's inside a group. */
+.pane-ai .activity-history-group-runs {
+  margin: var(--sp-2) 0 0 var(--sp-3);
+  padding-left: var(--sp-3);
+  border-left: 1px dashed color-mix(in srgb, var(--rule) 70%, transparent);
+  display: flex;
+  flex-direction: column;
+}
+.pane-ai .activity-history-group-runs .activity-row.history {
+  padding-left: 0;
+  box-shadow: none;
+}
+
 /* ----- nothing yet -----
    The one place on this tab the hand takes a whole paragraph: an empty state
    is a direction, and the direction is the notebook talking. */
@@ -656,13 +673,13 @@
 .pane-ai .pod-panel {
   display: flex;
   flex-direction: column;
-  gap: 12px;
-  padding: 0 2px 16px;
+  gap: var(--sp-3);
+  padding: 0 2px var(--sp-4);
 }
 .pane-ai .pod-head {
   display: flex;
   align-items: baseline;
-  gap: 8px;
+  gap: var(--sp-2);
   flex-wrap: wrap;
 }
 .pane-ai .pod-head h3 {
@@ -728,7 +745,7 @@
 .pane-ai .pod-record {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--sp-2);
   flex-wrap: wrap;
 }
 /* The record row sits above its own rule: it is the one irreversible-ish act

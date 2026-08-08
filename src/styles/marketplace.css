@@ -440,7 +440,7 @@
 .mkt-badge-plain {
   display: inline-flex;
   align-items: center;
-  padding: 1px 8px;
+  padding: 1px var(--sp-2);
   font-family: var(--mono);
   font-size: var(--fs-micro);
   color: var(--muted);
@@ -820,7 +820,7 @@
    persistent control. */
 .mkt-search {
   min-height: 44px;
-  padding: 6px 12px;
+  padding: 6px var(--sp-3);
   gap: var(--sp-3);
   border-radius: var(--radius);
 }
@@ -1226,7 +1226,7 @@ img.mkt-mono {
 .mkt-field {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: var(--sp-1);
 }
 .mkt-field span {
   color: var(--muted);
