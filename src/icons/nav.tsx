@@ -3,64 +3,50 @@ import { Stroke } from "./base";
 
 /* ---------- the Arcelle brand mark ----------
 
-   The marker-x-notebook A. A highlighter band swiped across the page first,
-   then the handwritten letter drawn over it in ink — the order things happen
-   in a real notebook. The letter is the signature A: a sail-curve left
-   stroke, a re-inked apex where the pen turned, a bowed descender, and the
-   crossbar with its short leg, the whole glyph tilted 1.8 degrees because
-   handwriting never sits level.
+   The paper fold-A. A cream ribbon bent into the letter A, its bottom edge
+   peeling up to show the underside of the fold, with a small four-point
+   spark resting in the counter. The counter is not a hole in the ribbon
+   alone — the fold's flap closes it from below — so the body is filled
+   even-odd OVER the flap, and where the counter overlaps the flap the flap
+   shows through: the lip along the counter's bottom edge, exactly as the
+   artwork has it.
 
-   The geometry is the 0..100 design space of src-tauri/icons/generate.py
-   (GLYPH / BAND / MICRO_*), mapped here by scale(0.24) into the 24 box.
-   index.html's launch shell carries the same numbers, public/logo.svg
-   carries the micro cut in its tile, and the application icon is the same
-   construction rasterised. Change generate.py FIRST and the other three
-   have to move with it, or the brand stops being one brand.
-
-   Under 18px the letter switches to the MICRO cut — the same object redrawn
-   heavier, not shrunk — so the strokes stop fragmenting into speckle.
+   The geometry is TRACED, not constructed: src-tauri/icons/source.png is
+   the brand artwork and the source of truth, src-tauri/icons/trace.py
+   derives these 0..100 design-space paths from it, mapped here by
+   scale(0.24) into the 24 box. index.html's launch shell carries the same
+   numbers, public/logo.svg the same numbers inside its tile, and the
+   application icon is the artwork itself resampled. Change source.png
+   FIRST, rerun generate.py and trace.py, and carry the new paths into the
+   other two — or the brand stops being one brand.
 
    PALETTE SPLIT — deliberate, please do not "fix" it:
-   the brand lilac (#9A82D1) belongs to the APPLICATION ICON and the
-   standalone marketing mark ONLY. The interface itself has no violet in it —
-   an earlier pass removed every trace of the old brand violet from UI
-   chrome — so the in-app band is drawn with the product's own highlighter
-   track (--mk-yellow) under theme-ink strokes: literally the app's own
-   gesture, a yellow highlight beneath handwriting, instead of importing a
-   second palette into the product. */
+   the brand plum and gold belong to the APPLICATION ICON and the standalone
+   mark (public/logo.svg) ONLY. The interface carries neither, so in-app the
+   fold's underside and the spark are drawn with the product's own
+   highlighter tokens (--mk-yellow / --mk-yellow-ink) under a theme-ink
+   body: the app's own materials rather than a second palette imported into
+   the product. */
 
-const BAND = "M11 73.5C36 71 66 68.6 90 67L89.2 47.5C65 49.2 35 51.6 10.2 54Z";
-const GLYPH: Array<[string, number]> = [
-  ["M20.5 89C25 66 33 42 44 25.5C48.5 18.8 53 13.4 57.5 10.5", 9.4],
-  ["M52.5 14.5C54.5 12.6 56.2 11.2 57.5 10.5", 10.6],
-  ["M57.5 10.5C60 26 63.5 55 66.5 88.5", 9],
-  ["M40 57.5C49 56.6 58 56.4 66.8 57.2", 7],
-  ["M40.6 57.5C40.2 66 40 76 40.2 85.5", 7],
-];
-const MICRO_BAND = "M8 72C36 68.5 68 65.5 94 63.5L92.8 41C66 43.5 34 46.5 7 50Z";
-const MICRO_GLYPH: Array<[string, number]> = [
-  ["M20 89C26 62 38 30 57 10", 12.5],
-  ["M57 10C61 30 65.5 62 68 89", 12.5],
-  ["M39 58L68 57.5", 9.5],
-  ["M39.6 58L39.6 86", 9.5],
-];
+const BODY_OUTER =
+  "M50.7 17.5L52.2 17.7L53.6 18.2L55.2 19.1L57.4 20.9L60 23.9L62.9 28.7L66.1 34.8L69.2 41.4L72 48.4L74.6 55.4L76.8 62L78.2 66.8L78.7 70.1L78.9 72.4L78.7 73.9L78.3 75.3L77.7 76.7L76.9 77.9L75.8 79.1L74.9 79.8L74.1 80.2L73.6 80.3L73.2 80.2L72.9 79.3L72.5 78.2L71.6 77.7L70.1 77.4L67.7 76L64.5 73.8L61 71.9L57.7 70.4L56.3 69.6L56 69.2L55.2 68.9L53.7 68.5L51.6 68.3L49.2 68.2L47.5 68.4L46.1 68.7L44.2 69.4L41.7 70.4L38.3 72.1L34.5 74.1L31.8 75.3L30.1 75.8L28.7 76L27.6 75.9L26.5 75.7L25.3 75.2L24.4 74.6L23.6 73.8L22.8 72.8L22.2 71.6L21.8 70.3L21.5 69L21.3 67.5L21.4 65.7L21.9 63.1L22.9 59.4L24.8 53.9L27.5 47.3L30.2 41.4L32.8 36.1L35 31.9L37 28.5L39 25.4L41 22.8L42.9 20.8L44.8 19.3L46.9 18.3L49 17.6Z";
+const BODY_COUNTER =
+  "M71.3 77.2L70.5 77L68.9 75.9L66.5 74.2L62.8 72.1L58.6 70.1L56.8 69.1L55.7 68.4L50.8 66.1L43.7 62.9L39.6 60.6L37.8 59L36.8 57.6L36.3 56.2L36.1 54.7L36.1 52.8L36.7 50.1L37.8 46.7L39.5 43.1L41.5 39.5L42.9 37.2L44 36L45.3 34.7L46.8 33.6L48 32.8L49.3 32.4L50.7 32.2L52.2 32.2L53.7 32.7L55 33.5L56.4 34.8L57.8 36.6L59.3 39.3L60.9 43.1L63 48.9L65.6 56.2L68.2 64.3L70.6 71.9L71.7 75.8L71.7 76.8Z";
+const FLAP =
+  "M57.6 79.1L40 77.6L32.2 76.8L32.2 76.5L33.6 76.1L35.6 75.5L36.6 75.1L36.9 74.8L38.4 74.3L40.5 73.6L42.4 72.9L44.4 72L47.4 71.2L50.9 70.4L52.4 69.9L52.7 69.6L53.8 69.4L55.7 69.4L58 70L60.7 71.1L63.6 72.6L66.5 74.3L69 76.2L71 78L72.1 79.3L70 79.8Z";
+const STAR =
+  "M56.2 48.4Q56.2 50.7 58.5 50.7Q56.2 50.7 56.2 53Q56.2 50.7 53.9 50.7Q56.2 50.7 56.2 48.4Z";
 
 /**
- * The logomark. Strokes render in theme ink by default; pass `mono` to let
- * the whole mark take `currentColor` from whatever it sits in (the band
- * drops to a translucent wash of the same hue, no yellow).
- *
- * Under 18px it switches to the micro cut: heavier strokes, the band pushed
- * through the letter's waist, no tilt — redrawn for the distance, not shrunk.
+ * The logomark. The body renders in theme ink by default; pass `mono` to
+ * let the whole mark take `currentColor` from whatever it sits in (the
+ * fold's underside drops to a translucent wash of the same hue, no yellow).
  */
 export function Logomark({
   size = 24,
   className,
   mono = false,
 }: IconProps & { mono?: boolean }) {
-  const micro = size < 18;
-  const band = micro ? MICRO_BAND : BAND;
-  const glyph = micro ? MICRO_GLYPH : GLYPH;
   return (
     <svg
       width={size}
@@ -79,24 +65,22 @@ export function Logomark({
       aria-hidden
     >
       <g transform="scale(0.24)">
-        {/* The FILL track, not --mk-yellow-ink: the band is a wash behind
-            ink, so the low-contrast highlighter fill is exactly right — the
-            ink-track yellow would compete with the strokes over it. */}
+        {/* The flap first, the body over it: the ribbon overlaps the fold's
+            top edge, and the counter (even-odd) lets the flap show through
+            as the plum lip in the artwork — here the highlighter FILL track,
+            a surface rather than a wash, so it carries more opacity than the
+            old band did. */}
         <path
-          d={band}
+          d={FLAP}
           fill={mono ? "currentColor" : "var(--mk-yellow)"}
-          fillOpacity={mono ? 0.18 : micro ? 0.66 : 0.5}
+          fillOpacity={mono ? 0.35 : 0.8}
         />
-        <g
-          stroke="currentColor"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          transform={micro ? undefined : "rotate(-1.8 50 50)"}
-        >
-          {glyph.map(([d, w]) => (
-            <path key={d} d={d} strokeWidth={w} />
-          ))}
-        </g>
+        <path
+          d={`${BODY_OUTER}${BODY_COUNTER}`}
+          fill="currentColor"
+          fillRule="evenodd"
+        />
+        <path d={STAR} fill={mono ? "currentColor" : "var(--mk-yellow-ink)"} />
       </g>
     </svg>
   );

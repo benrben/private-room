@@ -8,9 +8,10 @@ import { IconProps } from "./types";
  *
  * There is no violet in this interface. The old brand violet was removed
  * everywhere; the accent is now the PINK PEN, and it means selection and
- * active state — nothing else reaches for it. The logomark is theme ink at
- * three opacity steps with one yellow marker nib (see ./icons/nav.tsx); the
- * brand lilac and gold live only in src-tauri/icons and public/logo.svg.
+ * active state — nothing else reaches for it. The logomark is a theme-ink
+ * fill with the fold's underside in the yellow highlighter tokens (see
+ * ./icons/nav.tsx); the brand plum and gold live only in src-tauri/icons
+ * and public/logo.svg.
  */
 
 export function Stroke({
