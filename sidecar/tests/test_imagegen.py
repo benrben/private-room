@@ -390,3 +390,31 @@ def test_the_request_model_itself_keeps_the_shape_fields() -> None:
     )
     assert req.aspect_ratio == "16:9"
     assert req.resolution == "2K"
+
+
+@pytest.mark.asyncio
+async def test_a_long_prompt_is_sent_whole_not_refused(monkeypatch) -> None:
+    """There is deliberately no prompt length cap on this seam.
+
+    A 4,000-character cap used to live here and refused real work: a story
+    shot's opening frame carries the scene, the cast with their looks, the
+    action and the light, and 4,440 characters is an ordinary size for it
+    (the actual refusal a user hit). The provider enforces its own limits in
+    its own words; this seam sends the prompt whole — neither refused nor
+    truncated.
+    """
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = httpx.Response(200, content=request.content).json()
+        return reply()
+
+    mock_client(monkeypatch, handler)
+    prompt = ("A shot described, not named. " * 160)[:4440]
+    assert len(prompt) == 4440
+    await imagegen.generate(
+        prompt=prompt,
+        model="openrouter::vendor/painter",
+        provider=config(),
+    )
+    assert seen["body"]["prompt"] == prompt

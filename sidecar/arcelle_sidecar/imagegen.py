@@ -56,9 +56,15 @@ import httpx
 #: so the ceiling here only has to stop a wedged socket, not pace the user.
 GENERATE_TIMEOUT_SECS = 600.0
 
-#: Refuse a prompt longer than this before spending a call on it. Providers
-#: reject over-long prompts with an opaque 400; saying so here costs nothing.
-MAX_PROMPT_CHARS = 4_000
+# THERE IS DELIBERATELY NO PROMPT LENGTH LIMIT HERE.
+#
+# There used to be a 4,000-character cap, meant to pre-empt an opaque
+# provider 400. It refused real work instead: a story shot's opening frame
+# carries the scene, the cast with their looks, the action and the light,
+# and runs long as a matter of course. The provider publishes its own
+# limits and enforces them in its own words; a refusal from the model that
+# made the rule is a better error than a refusal from a constant in this
+# file. (videogen.py reached the same conclusion first.)
 
 #: What a generated file may weigh, decoded. A provider that streams back
 #: something enormous is a bug (or a bill), not a picture worth keeping.
@@ -254,11 +260,6 @@ async def generate(
     text = prompt.strip()
     if not text:
         raise ImageGenError("nothing to draw — the prompt is empty")
-    if len(text) > MAX_PROMPT_CHARS:
-        raise ImageGenError(
-            f"that prompt is {len(text)} characters, over the {MAX_PROMPT_CHARS} "
-            "this room sends in one go"
-        )
 
     references = [image for image in (reference_b64 or []) if image and image.strip()]
     # Positional, and padded rather than zipped: a caller that sent five
@@ -349,7 +350,6 @@ __all__ = [
     "GENERATE_TIMEOUT_SECS",
     "KNOWN_MIMES",
     "MAX_ARTWORK_BYTES",
-    "MAX_PROMPT_CHARS",
     "ImageGenError",
     "generate",
     "guard_prompt",
