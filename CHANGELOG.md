@@ -3,6 +3,18 @@
 All notable, user-facing changes to Arcelle. Versions follow
 [semver](https://semver.org); dates are the GitHub release dates.
 
+## 0.20.1 — 2026-08-09
+
+### Long prompts draw pictures now
+
+A detailed picture prompt — the kind a story shot writes for its opening
+frame, with the scene, the cast, the action and the light all spelled out —
+was refused at 4,000 characters with "over the 4,000 this room sends in one
+go". That was Arcelle's own cap, not the model's, and it's gone: the prompt
+is sent whole, and if a provider has a real limit, you hear it from the
+provider in its own words. Video prompts never had this cap; pictures now
+match.
+
 ## 0.20.0 — 2026-08-09
 
 ### A story films as one take
