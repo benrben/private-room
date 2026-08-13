@@ -3,6 +3,71 @@
 All notable, user-facing changes to Arcelle. Versions follow
 [semver](https://semver.org); dates are the GitHub release dates.
 
+## 0.21.0 — 2026-08-13
+
+### A page for drawing
+
+**Sketch** is a new place in the sidebar. Five marker pens, boxes, ellipses,
+arrows, notes and freehand, on a dotted sheet that matches the rest of the
+room. Pinch to zoom, two-finger scroll or hold space to pan, ⌘0 to fit the
+page. Nothing has a Save button — the page saves itself as you work, and ⌘Z
+goes back eighty steps.
+
+A drawing is an ordinary room file, which means it gets everything other
+files get: version history, trash, and search. Search the room for a word you
+wrote inside a box and the drawing comes back. Export it as an SVG and it
+lands in the library like anything else.
+
+### The room can draw with you
+
+Ask for a diagram in chat — "draw my login flow" — and it appears on the
+page, shape by shape, in the pink pen the room uses to mark its own work.
+Ask it to add to a drawing you started and it reads yours first, so your
+shapes are still there afterwards.
+
+What makes this useful rather than approximate: after it draws, it measures.
+Boxes sitting on top of each other, an arrow stopping short of the box it
+was meant to reach, a note lying across something, a box with no words in
+it, anything off the page — it finds these itself and fixes them before
+telling you it's done. That check is real measurement, not the model
+squinting at a picture, so it works the same whether the room is running a
+small model on your Mac or a large one in the cloud. Pictures are only ever
+sent to a model that can see them, and never past the privacy setting.
+
+**`#sketch` a file** turns a whole document into a diagram — read the file,
+find what it's made of and how the parts connect, and lay it out. The layout
+is computed rather than guessed, so a generated diagram can't come out with
+boxes overlapping or arrows pointing at nothing.
+
+### A calmer sidebar
+
+The left column used to hold ten destinations, three pane toggles, search,
+focus and settings. It now holds **four places** — Home, Recordings, Private
+browser and Sketch — with the rest one click away under **More tools**. You
+choose which four: **Customize sidebar** pins, unpins and reorders, and your
+choice follows you between rooms. ⌘K still lists every place, pinned or not.
+
+Showing and hiding panes moved out of navigation and into the toolbar. A new
+**Layout** menu holds Library (⌘1), Assistant (⌘2), Focus, three presets and
+Reset, each with its shortcut printed on the row rather than hidden in a
+tooltip. The **Assistant** button carries its own news: how many approvals
+are waiting, and whether anything is running — but only while the pane is
+shut, because a count next to an open pane isn't news. The workspace itself
+can no longer be hidden by anything, and a room that had somehow been left
+with it hidden opens with it back.
+
+**Settings → App → Interface** is new: the same sidebar list, the layout
+presets, a **Compact** density for the whole app, and a switch to turn off
+the dotted canvas texture. Everything applies as you touch it.
+
+### Fixed
+
+The eraser could freeze the canvas — one swipe and nothing responded again
+until you reopened the file. Drawing also stuttered, because every stroke
+was being filed as a new version of the whole document and re-indexed for
+search; a page now keeps one version per editing session, which is what
+version history was for. And zoom, which the drawing page shipped without.
+
 ## 0.20.1 — 2026-08-09
 
 ### Long prompts draw pictures now
