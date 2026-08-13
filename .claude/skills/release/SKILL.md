@@ -44,16 +44,31 @@ Download the DMG below — macOS 12+, Apple Silicon. The build is ad-hoc signed 
 - Minor (`0.5.0 → 0.6.0`): new user-facing features.
 - Check current: `node -p "require('./src-tauri/tauri.conf.json').version"`.
 
-### 2. Bump the version in ALL FIVE files (must stay in sync)
+### 2. Bump the version in ALL SIX files (must stay in sync)
 - `package.json` → `version`
 - `src-tauri/tauri.conf.json` → `version`
 - `src-tauri/Cargo.toml` → `[package] version`
 - `sidecar/pyproject.toml` → `version` (the sidecar's `/health` reports it)
 - `sidecar/arcelle_sidecar/__init__.py` → `__version__`
+- **`sidecar/uv.lock`** → the `version` under `name = "arcelle-sidecar"`.
+  This one is easy to miss — it went stale in v0.14.0 and blocked the first
+  v0.17.0 attempt. `(cd sidecar && uv lock)` regenerates it from the
+  already-bumped `pyproject.toml`; if you edit by hand, anchor the regex to
+  the `arcelle-sidecar` stanza, never a bare version replace.
 
 Then refresh the lockfile so the build doesn't rebuild it dirty:
 `(cd src-tauri && cargo update -p arcelle --precise <NEW_VERSION>)`
 (use the repo's cargo, e.g. `/opt/homebrew/bin/cargo` — rustup shims are broken).
+
+**Do not rewrite `tauri.conf.json` through a JSON parser** — `json.dumps`
+reformats the whole file (arrays explode onto one line each). Use a targeted
+`sed` on the version line.
+
+### 2a. Run preflight BEFORE tagging
+`scripts/preflight.sh --checks` gates all six version files, the changelog
+entry, the bundled model weights and frontend↔host↔qa-mock command drift.
+Running it before the tag is what keeps a bad version off a pushed tag.
+`npm test` is `preflight.sh --suites`; a plain `scripts/preflight.sh` is both.
 
 ### 3. Write the CHANGELOG
 Add a `## <version> — <YYYY-MM-DD>` section at the top of `CHANGELOG.md` (below
