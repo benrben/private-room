@@ -41,6 +41,7 @@ const AREAS = [
   ["memory", "Memory & scratch pad"],
   ["connectors", "Connectors"],
   ["create", "Create"],
+  ["sketch", "Sketch"],
   // The Browser area is here because it USED to be the one screen this list
   // could not include: `qa/qa-mock.js` answered none of the browser's
   // mutations, so the pane reached `browser_set_bounds` on mount and the
@@ -81,9 +82,25 @@ async function paneDrewSomething(what) {
 describe("every area opens and every viewer draws", () => {
   for (const [area, crumb] of AREAS) {
     it(`opens ${crumb}`, async () => {
+/** Reveal every destination, pinned or not.
+ *
+ * The sidebar shows a short pinned set and keeps the rest behind a "More
+ * tools" disclosure, so a `data-area` button for an unpinned place does not
+ * exist in the DOM until that is opened. Harnesses walk ALL the areas, so
+ * they open it once up front rather than guessing which tier a place is in.
+ * Safe to call repeatedly: it only clicks a disclosure that is closed. */
+async function revealAllTools() {
+  const more = await $('[data-testid="more-tools"]');
+  if (!(await more.isExisting())) return;
+  if ((await more.getAttribute("aria-expanded")) === "true") return;
+  await more.click();
+  await browser.pause(200);
+}
+
       await openApp();
       const before = await unhandled();
 
+      await revealAllTools();
       await (await $(`.rail-button[data-area="${area}"]`)).click();
       const current = await $(".editor-breadcrumb .crumb-title");
       await browser.waitUntil(async () => (await current.getText()) === crumb, {

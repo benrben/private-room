@@ -816,8 +816,10 @@ export function useWorkspaceEffects(
         s.setShowSettings(true);
       } else if (k === "j") {
         // Wave 4a: toggle the top-bar pinned-workflows menu (no-op if none).
+        // One slot holds whichever toolbar popover is open, so this both opens
+        // the workflows menu and closes anything else the bar had raised.
         e.preventDefault();
-        s.setQaMenuOpen((o) => !o);
+        s.setOpenMenu((m) => (m === "workflows" ? null : "workflows"));
       } else if (k === "/") {
         // The shortcuts sheet — the app's own list of these keys.
         e.preventDefault();

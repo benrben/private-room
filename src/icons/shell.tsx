@@ -51,6 +51,21 @@ export function FocusIcon(p: IconProps) {
   );
 }
 
+/** The sidebar's "More tools" disclosure: three pinned squares and a fourth
+ * slot drawn as a plus, so the glyph says "there are more of these, and which
+ * ones is up to you" rather than the generic grid-of-nine every app uses for
+ * an app launcher. */
+export function ToolsIcon(p: IconProps) {
+  return (
+    <Stroke {...p}>
+      <rect x="3.5" y="3.5" width="7" height="7" rx="1.5" />
+      <rect x="13.5" y="3.5" width="7" height="7" rx="1.5" />
+      <rect x="3.5" y="13.5" width="7" height="7" rx="1.5" />
+      <path d="M17 13.5v7M13.5 17h7" />
+    </Stroke>
+  );
+}
+
 export function CollapseLeftIcon(p: IconProps) {
   return (
     <Stroke {...p}>

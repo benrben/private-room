@@ -353,6 +353,60 @@
   color-scheme: light;
 }
 
+/* ---------- density: Comfortable (default) / Compact ----------
+   Settings → Interface. Stamped as `data-density="compact"` on <html> by
+   settings/useInterfaceSettings.ts, exactly the way `data-theme` works.
+
+   COMFORTABLE CARRIES NO ATTRIBUTE. The rules above ARE comfortable, and
+   compact is the only override — the alternative is every token defined
+   twice, which is two definitions to keep in step and one of them wrong.
+
+   It moves the SCALES, not individual components: spacing, the type ladder,
+   and line height. Roughly 500 rules resolve through these, so the whole app
+   tightens from one place and nothing has to be hand-fixed to benefit.
+
+   WHAT THIS DOES NOT REACH, said plainly because the Settings copy says it
+   too: rules with hard-coded pixel padding, fixed control heights, and fixed
+   grid tracks. Those are concentrated in the dense pages built before this
+   existed — Settings, the connector marketplace, Workflows, the browser — so
+   those give back less room than the rest of the app. That is the known edge
+   of the setting, not a bug to be surprised by later.
+
+   The metadata floor does NOT move. --fs-micro is 12px in both modes and is
+   the smallest size allowed anywhere; a density preference is permission to
+   fit more on screen, never permission to go below the floor the rest of the
+   type scale was solved against. --fs-meta stops at that floor for the same
+   reason. */
+:root[data-density="compact"] {
+  --sp-1: 3px;
+  --sp-2: 6px;
+  --sp-3: 9px;
+  --sp-4: 12px;
+  --sp-6: 18px;
+  --sp-8: 24px;
+
+  --fs-page: 36px;
+  --fs-section: 22px;
+  --fs-lead: 15px;
+  --fs-card: 15px;
+  --fs-body: 13px;
+  --fs-meta: 12px;
+  /* --fs-micro deliberately unchanged: it is the floor. */
+
+  --lh-body: 1.45;
+  --lh-hand: 1.35;
+}
+
+/* ---------- canvas texture: Subtle (default) / Off ----------
+   The dotted sheet and its two hatches are painted on <html> in paper.css.
+   Turning the texture off zeroes the dot rather than removing the layer, so
+   the grain rules keep their shape and there is exactly one place — here —
+   where "off" is expressed. Surfaces and ink are untouched: this is the
+   paper's tooth, not the palette. */
+:root[data-texture="off"] {
+  --grid-dot: transparent;
+}
+
 /* Quiet, theme-matched scrollbars everywhere. */
 * {
   scrollbar-width: thin;

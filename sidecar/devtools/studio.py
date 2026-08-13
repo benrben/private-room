@@ -126,6 +126,7 @@ CONNECTORS_ADMIN = _bind(_graphs.GRAPH_CONNECTORS_ADMIN)
 MEDIA_TRANSCRIBE = _bind(_graphs.GRAPH_MEDIA_TRANSCRIBE)
 MEDIA_VIDEO = _bind(_graphs.GRAPH_MEDIA_VIDEO)
 CREATOR_STUDIO = _bind(_graphs.GRAPH_CREATOR_STUDIO)
+CREATOR_DRAW = _bind(_graphs.GRAPH_CREATOR_DRAW)
 
 # --- the shapes, for looking at a template without picking an agent ---------- #
 

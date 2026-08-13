@@ -4,6 +4,7 @@ import { CloseIcon, LinkIcon, LockIcon } from "../icons";
 import Settings from "../Settings";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
+import { LayoutApi } from "../shell/useLayout";
 
 /** ADD-26: is this a YouTube page URL? Checked against the URL with its
  * scheme stripped, so "https://youtu.be/…" matches too. */
@@ -18,10 +19,12 @@ export default function SettingsModals({
   s,
   a,
   info,
+  layout,
 }: {
   s: WSState;
   a: WSActions;
   info: RoomInfo;
+  layout: LayoutApi;
 }) {
   return (
     <>
@@ -41,6 +44,9 @@ export default function SettingsModals({
             s.asking
           }
           initialSection={s.settingsSection}
+          // Settings → Interface offers the same three presets the toolbar's
+          // Layout menu does, applied to the room sitting behind this modal.
+          onApplyPreset={layout.applyPreset}
           onClose={() => {
             s.setShowSettings(false);
             s.setSettingsSection(null);

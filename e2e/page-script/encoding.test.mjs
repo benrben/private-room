@@ -32,6 +32,16 @@ const FILES_RS = readFileSync(join(root, "src-tauri/src/commands/files.rs"), "ut
 
 /** Every kind in the Rust table whose text is the file's own bytes, including
  * the fallback `CODE` row (which is chosen by extension, not by the table). */
+/* Raw-text kinds that deliberately have NO encoding to argue about.
+ *
+ * `.sketch` holds a JSON document this app wrote itself, always as UTF-8. It
+ * is `text: Raw` because its VIEWER needs the document (the drawing editor
+ * parses it), not because its bytes came from somewhere with a charset —
+ * offering to re-decode a drawing as windows-1255 would be a control that
+ * cannot do anything but corrupt it.
+ */
+const NOT_DECODABLE = new Set(["sketch"]);
+
 function rustRawKinds() {
   const kinds = new Set();
   for (const m of RUST.matchAll(/Row \{[^}]*\}/g)) {
@@ -42,7 +52,7 @@ function rustRawKinds() {
   for (const m of RUST.matchAll(/const (\w+): FileView =\s*FileView \{([^}]*)\}/g)) {
     if (/text:\s*Raw\b/.test(m[2])) kinds.add(m[2].match(/kind:\s*"([a-z]+)"/)[1]);
   }
-  return [...kinds].sort();
+  return [...kinds].filter((k) => !NOT_DECODABLE.has(k)).sort();
 }
 
 /** The members of `RE_DECODABLE_KINDS` in TextEncoding.tsx. */

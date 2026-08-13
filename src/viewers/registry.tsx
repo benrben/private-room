@@ -48,6 +48,7 @@ export const makeLazyViewers = () => ({
   NotebookView: lazy(() => import("./NotebookView")),
   PdfView: lazy(() => import("./PdfView")),
   RecordingView: lazy(() => import("./RecordingView")),
+  SketchView: lazy(() => import("./SketchView")),
   SheetView: lazy(() => import("./SheetView")),
   SlidesView: lazy(() => import("./SlidesView")),
 });
@@ -250,6 +251,16 @@ export const FORMATS: Record<ViewerKind, FormatEntry> = {
     label: "drawing",
     edit: editableText,
     render: ({ content: c }) => <SvgView text={c.text ?? ""} />,
+  },
+  // A sketch is edited by its own viewer and saved continuously, so there is
+  // no Edit mode to offer: `editableText` would hand the raw document to the
+  // code editor, where one malformed save makes the drawing unopenable.
+  sketch: {
+    label: "sketch",
+    edit: notEditable,
+    render: ({ content: c, fileId, lazy }) => (
+      <lazy.SketchView fileId={fileId} text={c.text ?? ""} />
+    ),
   },
   notebook: {
     label: "notebook",

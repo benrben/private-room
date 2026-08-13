@@ -34,6 +34,7 @@ from dataclasses import dataclass
 
 from .prompts import (
     BROWSE_PROMPT,
+    DRAW_PROMPT,
     CONNECTORS_ADMIN_PROMPT,
     CONNECTORS_USE_PROMPT,
     FILE_PASS_PROMPT,
@@ -54,6 +55,7 @@ from .prompts import (
 )
 from .routing import (
     BROWSE_TOOL_NAMES,
+    DRAW_TOOL_NAMES,
     DOWNLOAD_TOOL_NAMES,
     JOB_TOOL_NAMES,
     MCP_MANAGEMENT_TOOL_NAMES,
@@ -1045,6 +1047,47 @@ REGISTRY: tuple[AgentSpec, ...] = (
             "כרטיסי", "מפת חשיבה",
         ),
     ),
+    AgentSpec(
+        id="creator.draw",
+        # A SIBLING in the file domain rather than a seventh domain of its own.
+        # The hub's domain list is capped at six because a 4B picks reliably
+        # among no more (see MAX_DOMAINS below), and a drawing is a document
+        # this room holds — the same place `creator.studio` already sits.
+        #
+        # `react_verify`, not `react`: `draw` is a write, and the write-claim
+        # gate should audit "I drew it" exactly as it audits "I saved it".
+        template="react_verify",
+        # probe_unless keeps the read off a turn that is starting a NEW
+        # drawing: reading a page that does not exist yet costs a round trip
+        # and returns an error the model then has to reason past.
+        flow=Flow(
+            probe="read_drawing",
+            probe_unless=("new ", "start a", "from scratch", "blank", "empty"),
+        ),
+        label="Drawing agent",
+        tag="sketch",
+        area="drawings on the room's sketch pages",
+        summary=(
+            "Draws on this room's sketches — diagrams, flows and maps — then "
+            "measures its own work and corrects it."
+        ),
+        # No `requires`: both tools are served by the same Rust gate, so a
+        # tier either has the whole box or none of it, and the box-intersection
+        # check `worker_reachable` already does says everything a `requires`
+        # would. `requires` stays what app.ui needs it for — a box whose tools
+        # can arrive PARTLY.
+        tools=DRAW_TOOL_NAMES,
+        prompt=DRAW_PROMPT,
+        # Anchored to the ARTIFACT, not to the verb. "draw" alone is an
+        # ordinary English word for describing anything ("draw a conclusion",
+        # "that draws on chapter 3"), and a bare hint would pull ordinary
+        # reading work onto an agent that can only draw.
+        hints=(
+            "sketch", "draw a", "draw me", "draw the", "drawing", "diagram",
+            "flow chart", "flowchart", "whiteboard", "wireframe", "canvas",
+            "boxes and arrows", "מפה", "שרטוט",
+        ),
+    ),
 )
 
 #: Every agent by id. Defined HERE rather than beside the other lookups at the
@@ -1097,12 +1140,20 @@ assert set(GROUPS) <= set(TOOL_GROUP_LABELS), (
 AGENT_TOOL_DOMAINS: tuple[tuple[str, tuple[str, ...], str], ...] = (
     (
         "ask_file_agent",
-        ("files.read", "scripts.run", "media.transcribe", "media.video", "creator.studio"),
+        (
+            "files.read",
+            "scripts.run",
+            "media.transcribe",
+            "media.video",
+            "creator.studio",
+            "creator.draw",
+        ),
         "Ask the File agent to work with this room's content: list, search, "
         "read, open, summarize, create or edit files and notes, run this "
         "room's .py/.js scripts, transcribe its audio and video on-device, "
-        "WATCH a video and report what is on screen at any moment, and "
-        "turn its material into flashcards, a mind map or a podcast script. "
+        "WATCH a video and report what is on screen at any moment, "
+        "turn its material into flashcards, a mind map or a podcast script, "
+        "and DRAW on its sketch pages — diagrams, flows and maps. "
         "Use it for ANY question about what is in this room — never answer "
         "those from memory.",
     ),

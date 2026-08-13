@@ -104,6 +104,145 @@
 .pop-item:has(.pop-item-sub) svg {
   margin-top: 2px;
 }
+/* ----- menu furniture: labels, separators, ticks, keys -----
+   Shared by the Layout menu and available to any popover that needs to group
+   or check its rows. */
+.pop-label {
+  padding: 6px 10px 3px;
+  font-size: var(--fs-micro);
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+.pop-sep {
+  height: 1px;
+  margin: 4px 6px;
+  /* The same lifted-pencil taper the rail dividers use, so a rule inside a
+     menu and a rule inside the sidebar are recognisably the same mark. */
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--rule) 18%,
+    var(--rule) 82%,
+    transparent 100%
+  );
+}
+/* A fixed gutter every row reserves, checkable or not, so one left edge runs
+   down the whole menu instead of the presets sitting half a glyph to the left
+   of the panes above them. */
+.pop-tick {
+  width: 14px;
+  flex: 0 0 14px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--accent);
+}
+.pop-glyph {
+  display: inline-flex;
+  flex: 0 0 auto;
+  color: var(--text-dim);
+}
+.pop-text {
+  min-width: 0;
+  flex: 1;
+}
+/* The shortcut, printed where a shortcut belongs. ⌘1 and ⌘2 were previously
+   learnable only from a tooltip on a sidebar button that no longer exists. */
+.pop-key {
+  margin-left: auto;
+  padding-left: 14px;
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  color: var(--faint);
+  flex: 0 0 auto;
+}
+.pop-item-preset .pop-text {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.pop-title {
+  font-size: var(--fs-meta);
+  color: var(--text);
+}
+.pop-hint {
+  font-size: var(--fs-micro);
+  color: var(--faint);
+  white-space: normal;
+  line-height: 1.35;
+}
+.layout-menu {
+  min-width: 246px;
+}
+.layout-menu-wrap {
+  position: relative;
+  display: inline-flex;
+}
+
+/* ----- toolbar pill buttons (Layout, Assistant) -----
+   Deliberately the same shape and weight as .model-pill beside them: these
+   three are the bar's stateful controls and should read as one family, not as
+   three different kinds of button that happen to sit together. */
+.pill-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 10px;
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  color: var(--text-dim);
+  background: transparent;
+  border: 1.5px solid var(--rule);
+  border-radius: var(--radius-sm);
+  white-space: nowrap;
+  transition:
+    color var(--dur-fast) var(--ease-pen),
+    background var(--dur-fast) var(--ease-pen),
+    border-color var(--dur-fast) var(--ease-pen);
+}
+.pill-btn:hover {
+  color: var(--text);
+  background: var(--hover);
+}
+.pill-btn[aria-expanded="true"],
+.pill-btn[aria-pressed="true"] {
+  color: var(--text-strong);
+  background: var(--accent-ghost);
+  border-color: var(--accent-fill);
+}
+.pill-caret {
+  color: var(--faint);
+  flex-shrink: 0;
+}
+@media (prefers-reduced-motion: reduce) {
+  .pill-btn {
+    transition: none;
+  }
+}
+
+/* ----- the Assistant button's two marks -----
+   Both only render while the pane is SHUT — see TopBar. They are the same two
+   facts, in the same two shapes and colours, that the rail's AI toggle used to
+   carry: a hand-circled number for what is WAITING ON YOU, and a quiet dot for
+   work running by itself. Different shapes because they are different claims
+   and can be true at once; never summed, because one number would say "N
+   things need you" when N-1 of them did not. */
+.pill-count {
+  flex: 0 0 auto;
+  margin-left: 1px;
+}
+.pill-live {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 auto;
+  margin-left: 1px;
+  border-radius: 999px;
+  background: var(--mk-ink, var(--sem-linked));
+}
+
 .model-menu {
   min-width: 240px;
 }

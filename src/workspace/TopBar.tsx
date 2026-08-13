@@ -10,8 +10,10 @@ import {
   PlayIcon,
   ScriptIcon,
   SearchIcon,
+  SparkIcon,
   WorkflowsIcon,
 } from "../icons";
+import LayoutMenu from "./LayoutMenu";
 import { WorkflowGlyph } from "./workflows/workflowGlyph";
 import { isCloudRoute, isExternalEngine, isModelReady, trustState } from "./markup";
 import { WSState } from "./state";
@@ -23,35 +25,48 @@ import { toggleTheme } from "../theme";
 
 /** The room toolbar: brand seal, room name, the ⌘K command entry, pinned
  * workflow/script shortcuts, the engine pill with its truthful local/cloud
- * route badge, the room menu, and Lock.
+ * route badge, Layout, Assistant, the room menu, and Lock.
  *
- * Shorter and quieter than it was, because a title bar is not where the work
- * happens. Three things went:
+ * Two things arrived here in the navigation redesign, both from the sidebar:
+ * LAYOUT, which owns showing and hiding the two side panes (they were three
+ * buttons at the top of a list of destinations, which is not what they are),
+ * and ASSISTANT, which is that pane's own toggle plus the two marks that say
+ * whether anything is waiting on you.
  *
- *   • the "ARCELLE" kicker over the room name — the seal to its left already
- *     says which app this is, twice was once too often, and the room's own
- *     name is what the line is for;
- *   • the theme switch and Reset layout, which are settings you touch twice a
- *     year sitting permanently beside the two controls you touch constantly.
- *     Both moved into the room menu, keeping their exact behaviour;
- *   • the pinned-workflows pill when nothing is pinned to it — it used to draw
- *     itself anyway for the sake of its "All workflows…" footer, which is a
- *     second, quieter route to a place the rail already lists by name.
+ * WHICH MAKES THIS BAR THE CROWDED SURFACE NOW, and it is worth saying so
+ * plainly rather than discovering it later. Counting conditionals, it can
+ * carry eleven controls at once: seal, room name, ⌘K, recording chip, pinned
+ * workflows, pinned scripts, engine, privacy, Layout, Assistant, ⋯, Lock. The
+ * sidebar got calmer partly by pushing density up here. Nothing in this pass
+ * addresses that; the next one should.
  *
- * What stayed is what is true right now and cannot wait: a live recording, the
- * engine, where this room's content goes, and the lock. */
+ * Every popover this bar can raise shares ONE open slot (`s.openMenu`), so
+ * opening any of them closes the rest and Escape closes whichever is up. That
+ * used to be a convention enforced by hand at each open site — and the scripts
+ * menu never joined it, so it stacked over the model picker.
+ *
+ * What has always stayed is what is true right now and cannot wait: a live
+ * recording, the engine, where this room's content goes, and the lock. */
 export default function TopBar({
   s,
   a,
   info,
   layout,
   onRenamed,
+  approvals = 0,
+  running = 0,
 }: {
   s: WSState;
   a: WSActions;
   info: RoomInfo;
   layout: LayoutApi;
   onRenamed?: (info: RoomInfo) => void;
+  /** How many things are WAITING ON THE READER. Drawn on the Assistant button
+   * as a hand-circled number, because that is where answering them happens. */
+  approvals?: number;
+  /** How many jobs are running BY THEMSELVES. A quiet dot: news, not a
+   * request. */
+  running?: number;
 }) {
   const { ai, model } = s;
   // The room name, while it is being typed. `null` = not renaming. Local to
@@ -69,24 +84,23 @@ export default function TopBar({
       s.pushToast("error", `Could not rename this room: ${String(e)}`);
     }
   }
-  // Wave 5 (Idea 13): the global-scripts shortcut menu open flag (local — it
-  // sits beside the pinned-workflows menu in the top bar).
-  const [scriptMenuOpen, setScriptMenuOpen] = useState(false);
-  // One dismissal grammar for the header popovers: Escape closes whichever
-  // is open (and never leaks to deeper layers while one is).
-  const anyMenuOpen = s.modelMenuOpen || s.roomMenuOpen || s.qaMenuOpen;
+  // One dismissal grammar for the toolbar popovers: Escape closes whichever
+  // is open (and never leaks to deeper layers while one is). One slot, so
+  // this closes the open menu whatever it is — including the two the
+  // navigation redesign added, which under the old flag-per-menu scheme would
+  // each have needed remembering here and at every other menu's open site.
+  const menuOpen = s.openMenu !== null;
+  const { setOpenMenu } = s;
   useEffect(() => {
-    if (!anyMenuOpen) return;
+    if (!menuOpen) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Escape") return;
       e.stopPropagation();
-      s.setModelMenuOpen(false);
-      s.setRoomMenuOpen(false);
-      s.setQaMenuOpen(false);
+      setOpenMenu(null);
     };
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
-  }, [anyMenuOpen, s]);
+  }, [menuOpen, setOpenMenu]);
   // Wave 4a: pinned general-purpose workflows as one-click top-bar shortcuts.
   const pinnedActions: QuickAction[] = s.workflows
     .filter((w) => w.pinned && w.status === "active" && w.binding.scope === "general")
@@ -109,6 +123,10 @@ export default function TopBar({
     }));
   const modelReady = isModelReady(ai, model);
   const cloud = isCloudRoute(model, ai);
+  // What is ON SCREEN, not what is stored. In a narrow window one pane shows
+  // at a time, so the assistant can be "not hidden" and still not visible —
+  // and a pressed-looking button beside a pane you cannot see is a lie.
+  const aiShowing = layout.visible.includes("ai");
   return (
     <header className="pr-topbar">
       <div className="pr-brandmark" aria-label="Arcelle" title={info.path}>
@@ -183,14 +201,8 @@ export default function TopBar({
         {pinnedActions.length > 0 && (
           <QuickActionsMenu
             actions={pinnedActions}
-            open={s.qaMenuOpen}
-            onOpenChange={(o) => {
-              if (o) {
-                s.setModelMenuOpen(false);
-                s.setRoomMenuOpen(false);
-              }
-              s.setQaMenuOpen(o);
-            }}
+            open={s.openMenu === "workflows"}
+            onOpenChange={(o) => setOpenMenu(o ? "workflows" : null)}
             buttonLabel="Workflows"
             buttonIcon={<WorkflowsIcon size={15} />}
             inlineMax={3}
@@ -203,8 +215,11 @@ export default function TopBar({
         {globalScriptActions.length > 0 && (
           <QuickActionsMenu
             actions={globalScriptActions}
-            open={scriptMenuOpen}
-            onOpenChange={setScriptMenuOpen}
+            /* This menu used to own a LOCAL open flag, so it was the one
+               toolbar popover outside the "only one at a time" rule and could
+               stack over the model picker. One slot, no exception. */
+            open={s.openMenu === "scripts"}
+            onOpenChange={(o) => setOpenMenu(o ? "scripts" : null)}
             buttonLabel="Scripts"
             buttonIcon={<ScriptIcon size={14} />}
             inlineMax={2}
@@ -216,13 +231,11 @@ export default function TopBar({
           <div className="model-pill-wrap">
             <button
               className="model-pill"
-              onClick={() => {
-                // One popover at a time — never a menu stacked over a menu.
-                s.setRoomMenuOpen(false);
-                s.setModelMenuOpen((o) => !o);
-              }}
+              onClick={() =>
+                setOpenMenu(s.openMenu === "model" ? null : "model")
+              }
               aria-haspopup="menu"
-              aria-expanded={s.modelMenuOpen}
+              aria-expanded={s.openMenu === "model"}
               title={
                 ai?.running
                   ? modelReady || cloud
@@ -247,11 +260,11 @@ export default function TopBar({
               <span className="model-pill-name">{a.engineLabelOf(model)}</span>
               <ChevronDownIcon size={12} className="model-pill-caret" />
             </button>
-            {s.modelMenuOpen && (
+            {s.openMenu === "model" && (
               <>
                 <div
                   className="menu-backdrop"
-                  onMouseDown={() => s.setModelMenuOpen(false)}
+                  onMouseDown={() => setOpenMenu(null)}
                 />
                 <div className="pop-menu model-menu">
                   <EngineModelPicker
@@ -270,7 +283,7 @@ export default function TopBar({
                         !!sub &&
                         !effort &&
                         (s.engineModels[engine]?.find((x) => x.slug === sub)?.efforts.length ?? 0) > 0;
-                      if (!hasEfforts) s.setModelMenuOpen(false);
+                      if (!hasEfforts) setOpenMenu(null);
                     }}
                   />
                 </div>
@@ -301,25 +314,74 @@ export default function TopBar({
             </div>
           );
         })()}
+        {/* The window's arrangement — the three pane buttons that used to sit
+            at the top of the sidebar's list of destinations. See LayoutMenu
+            for why they are not places and never were. */}
+        <LayoutMenu
+          layout={layout}
+          open={s.openMenu === "layout"}
+          onOpenChange={(o) => setOpenMenu(o ? "layout" : null)}
+        />
+
+        {/* The assistant, and the two facts that used to live on the rail's AI
+            pane toggle.
+            They belong on THIS button now for one reason: the toggle they were
+            attached to is gone, and a count that only appears while the pane
+            is already open is a count nobody needs. Here they are visible
+            precisely when the pane is shut — which is the only time "two
+            things are waiting on you" is news.
+            Two facts, two shapes, and they can both be true at once: an
+            approval is a REQUEST and gets the hand-circled number in the
+            pending yellow; a running job is the software working on its own
+            and gets the quiet dot in the linked blue Room Home already uses
+            for it. Summing them into one number claimed N things needed you
+            when N-1 did not. Both stay aria-hidden — the button's own label
+            carries the words, and a control whose accessible name changed
+            every time a job finished would be worse, not better. */}
+        <button
+          className="pill-btn assistant-toggle"
+          type="button"
+          data-testid="assistant-toggle"
+          aria-pressed={aiShowing}
+          aria-label={
+            aiShowing
+              ? "Hide the assistant (⌘2)"
+              : approvals > 0
+                ? `Show the assistant (⌘2) — ${approvals} ${approvals === 1 ? "thing needs" : "things need"} your approval`
+                : running > 0
+                  ? "Show the assistant (⌘2) — background work is running"
+                  : "Show the assistant (⌘2)"
+          }
+          onClick={() => layout.togglePane("ai")}
+        >
+          <SparkIcon size={14} />
+          <span>Assistant</span>
+          {!aiShowing && approvals > 0 && (
+            <span className="pill-count nb-circled nb-sem-pending" aria-hidden>
+              {approvals > 99 ? "99+" : approvals}
+            </span>
+          )}
+          {!aiShowing && approvals === 0 && running > 0 && (
+            <span className="pill-live nb-sem-linked" aria-hidden />
+          )}
+        </button>
+
         <div className="room-menu-wrap">
           <button
             className="icon-btn"
             data-tip="Room actions"
             aria-label="Open the room actions menu"
             aria-haspopup="menu"
-            aria-expanded={s.roomMenuOpen}
-            onClick={() => {
-              s.setModelMenuOpen(false);
-              s.setRoomMenuOpen((o) => !o);
-            }}
+            aria-expanded={s.openMenu === "room"}
+            onClick={() => setOpenMenu(s.openMenu === "room" ? null : "room")}
           >
             <DotsIcon size={16} />
           </button>
-          {s.roomMenuOpen && (
+          {s.openMenu === "room" && (
             <>
               <div
                 className="menu-backdrop"
-                onMouseDown={() => s.setRoomMenuOpen(false)}
+                onMouseDown={() => setOpenMenu(null)}
               />
               <div className="pop-menu room-menu" role="menu">
                 {/* Theme is a quick-access convenience, not a second home for
@@ -335,7 +397,7 @@ export default function TopBar({
                   role="menuitem"
                   onClick={() => {
                     toggleTheme();
-                    s.setRoomMenuOpen(false);
+                    setOpenMenu(null);
                   }}
                 >
                   Theme
@@ -345,7 +407,7 @@ export default function TopBar({
                   role="menuitem"
                   onClick={() => {
                     layout.resetLayout();
-                    s.setRoomMenuOpen(false);
+                    setOpenMenu(null);
                   }}
                 >
                   Reset the three-pane layout
@@ -357,7 +419,7 @@ export default function TopBar({
                   className="pop-item"
                   role="menuitem"
                   onClick={() => {
-                    s.setRoomMenuOpen(false);
+                    setOpenMenu(null);
                     api
                       .createRoomCheckpoint("")
                       .then((meta) =>
@@ -377,7 +439,7 @@ export default function TopBar({
                     role="menuitem"
                     onClick={() => {
                       a.exportAllFiles();
-                      s.setRoomMenuOpen(false);
+                      setOpenMenu(null);
                     }}
                   >
                     Export all files…
@@ -388,7 +450,7 @@ export default function TopBar({
                   role="menuitem"
                   onClick={() => {
                     revealItemInDir(info.path).catch(() => {});
-                    s.setRoomMenuOpen(false);
+                    setOpenMenu(null);
                   }}
                 >
                   Reveal in Finder
@@ -400,7 +462,7 @@ export default function TopBar({
                   role="menuitem"
                   onClick={() => {
                     s.setShowShortcuts(true);
-                    s.setRoomMenuOpen(false);
+                    setOpenMenu(null);
                   }}
                 >
                   Keyboard shortcuts (⌘/)
@@ -411,7 +473,7 @@ export default function TopBar({
                   role="menuitem"
                   onClick={() => {
                     s.setShowFeedback(true);
-                    s.setRoomMenuOpen(false);
+                    setOpenMenu(null);
                   }}
                 >
                   Send feedback…

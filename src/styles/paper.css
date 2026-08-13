@@ -98,6 +98,16 @@ html {
     var(--grid-gap) var(--grid-gap);
 }
 
+/* Settings → Interface → Canvas texture: Off.
+   The dot is already transparent via --grid-dot (tokens.css), so this only
+   has to take out the two hatches — and it does so by replacing the whole
+   background-image stack rather than by trying to null individual layers,
+   which cannot be done in CSS. The page COLOUR is untouched: "off" means no
+   tooth, not a different paper. */
+:root[data-texture="off"] {
+  background-image: none;
+}
+
 /* Transparent, so the sheet on <html> shows through. */
 body {
   background-color: transparent;

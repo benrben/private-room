@@ -30,7 +30,23 @@ async function open(theme) {
   await browser.pause(500);
 }
 
+/** Reveal every destination, pinned or not.
+ *
+ * The sidebar shows a short pinned set and keeps the rest behind a "More
+ * tools" disclosure, so a `data-area` button for an unpinned place does not
+ * exist in the DOM until that is opened. Harnesses walk ALL the areas, so
+ * they open it once up front rather than guessing which tier a place is in.
+ * Safe to call repeatedly: it only clicks a disclosure that is closed. */
+async function revealAllTools() {
+  const more = await $('[data-testid="more-tools"]');
+  if (!(await more.isExisting())) return;
+  if ((await more.getAttribute("aria-expanded")) === "true") return;
+  await more.click();
+  await browser.pause(200);
+}
+
 async function goArea(area) {
+  await revealAllTools();
   const btn = await $(`.rail-button[data-area="${area}"]`);
   await btn.waitForExist({ timeout: 10_000 });
   await btn.click();

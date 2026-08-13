@@ -21,6 +21,7 @@ import SupportMatrixSection from "./settings/SupportMatrixSection";
 import RecoverySection from "./settings/RecoverySection";
 import AboutSection from "./settings/AboutSection";
 import AppearanceSection from "./settings/AppearanceSection";
+import InterfaceSection from "./settings/InterfaceSection";
 import AiProvidersSection from "./settings/AiProvidersSection";
 import { useFocusTrap } from "./settings/useFocusTrap";
 import { useModelManagement } from "./settings/useModelManagement";
@@ -72,7 +73,11 @@ const SETTINGS_GROUPS: { key: string; label: string; sections: string[] }[] = [
     sections: ["set-ai-providers", "set-online", "set-closet", "set-leash"],
   },
   { key: "history", label: "History & storage", sections: ["set-checkpoints"] },
-  { key: "app", label: "App", sections: ["set-appearance", "set-about"] },
+  {
+    key: "app",
+    label: "App",
+    sections: ["set-appearance", "set-interface", "set-about"],
+  },
 ];
 
 /** section id → the page it lives on, so a deep-link opens the right page. */
@@ -88,6 +93,7 @@ export default function Settings({
   onClose,
   busy,
   initialSection,
+  onApplyPreset,
 }: Props) {
   // Each section owns its state + handlers via a per-concern hook. The shell
   // only threads those returns to the presentational section components and
@@ -616,6 +622,7 @@ export default function Settings({
 
             <div className="settings-page" hidden={activeGroup !== "app"}>
               <AppearanceSection />
+              <InterfaceSection onApplyPreset={onApplyPreset} />
               <AboutSection />
             </div>
 

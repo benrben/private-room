@@ -1351,6 +1351,39 @@
     },
     story_reorder_shots: () => null,
     // The five-minute-episode path: a script cut into fixed-length shots.
+    // The Sketch page. `create_sketch` hands back a file row the Library will
+    // list; the drawing itself is loaded and saved through the ordinary file
+    // commands, which the harness already fakes.
+    create_sketch: (a2) => {
+      const name = String((a2 && a2.name) || "Sketch").replace(/\.sketch$/i, "");
+      return {
+        id: `sketch-${name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`,
+        name: `${name}.sketch`,
+        mimeType: "application/json",
+        sizeBytes: 96,
+        source: "upload",
+        hasText: false,
+        createdAt: new Date().toISOString(),
+        folderId: null,
+        partiallyIndexed: false,
+        originUrl: null,
+        aiSummary: null,
+      };
+    },
+    save_sketch: () => null,
+    export_sketch_svg: () => ({
+      id: "sketch-export-svg",
+      name: "Sketch.svg",
+      mimeType: "image/svg+xml",
+      sizeBytes: 1200,
+      source: "generated",
+      hasText: true,
+      createdAt: new Date().toISOString(),
+      folderId: null,
+      partiallyIndexed: false,
+      originUrl: null,
+      aiSummary: null,
+    }),
     story_plan_split: (a2) => {
       const script = String((a2 && a2.script) || "");
       // A script that marks its own chunks is taken at its word — the same

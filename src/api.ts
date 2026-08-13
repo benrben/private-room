@@ -116,6 +116,7 @@ import type {
   StudioStep,
   PrivacyStatus,
   BrowserTab,
+  SketchDrawn,
 } from "./apiTypes";
 
 /** The wire shape of every `ask-*` event: the payload the listener wants, in
@@ -1054,6 +1055,23 @@ export const api = {
   // step can be attributed to the agent that ran it, while the many other
   // emitters (chat commands, ai_actions, the native agent paths) send a bare
   // string. Normalised here so no consumer has to know which one fired.
+  // The Sketch page. Loading and saving a drawing ride updateFileContent, so
+  // starting one and flattening one to SVG are all the page needs of its own.
+  createSketch: (name: string): Promise<FileMeta> =>
+    invoke<FileMeta>("create_sketch", { name }),
+  // Drawings autosave several times a minute, so they do NOT go through
+  // updateFileContent: that snapshots a version, reindexes and broadcasts
+  // room-files-changed on every call. `snapshot` is true once per editing
+  // session, which is where version history actually belongs.
+  saveSketch: (id: string, doc: string, snapshot: boolean): Promise<void> =>
+    invoke<void>("save_sketch", { id, doc, snapshot }),
+  exportSketchSvg: (id: string): Promise<FileMeta> =>
+    invoke<FileMeta>("export_sketch_svg", { id }),
+  // The drawing agent finished a `draw` call. Carries the WHOLE document, so
+  // an open editor can fold it in without a re-read — the window between a
+  // write and a read is exactly when a user's un-autosaved stroke goes missing.
+  onSketchDrawn: (cb: (e: SketchDrawn) => void): Promise<UnlistenFn> =>
+    listen<SketchDrawn>("sketch-drawn", (e) => cb(e.payload)),
   onAskStep: (
     cb: (step: AskStep, turn: AskTurn) => void,
   ): Promise<UnlistenFn> =>

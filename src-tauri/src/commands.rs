@@ -53,6 +53,12 @@ mod castparse;
 /// What each picture/video model will actually accept: legal lengths, sizes,
 /// frame slots. Read from the provider, never guessed.
 pub(crate) mod media_limits;
+/// The Sketch page's document: the drawing format, the line-based script both
+/// the page and the agent write it with, the renderer, and the geometric
+/// layout checker that lets the agent find its own mistakes without pixels.
+pub(crate) mod sketchdoc;
+/// The Sketch page's commands, and the drawing tools the agent holds.
+mod sketch;
 mod chat;
 mod retrieval;
 mod agent;
@@ -105,6 +111,7 @@ pub use models::*;
 pub use capabilities::*;
 pub use vision::*;
 pub use create::*;
+pub use sketch::*;
 pub use story::*;
 pub use chat::*;
 pub(crate) use retrieval::*;

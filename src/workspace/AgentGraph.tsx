@@ -54,6 +54,8 @@ const AGENT_DESCRIPTIONS: Record<string, string> = {
     "Watch a room video: look at what is on screen at a moment.",
   "creator.studio":
     "Generate flashcards, mind maps or podcast scripts from room content.",
+  "creator.draw":
+    "Draws on this room's sketches, then measures its own work and corrects it",
 };
 
 const GLYPH: Record<AgentNodeStatus, string> = {

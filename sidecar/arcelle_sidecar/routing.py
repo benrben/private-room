@@ -86,6 +86,14 @@ ORGANIZE_TOOL_NAMES: tuple[str, ...] = (
     "merge_files",
 )
 
+#: The Sketch page's drawing box. Two tools, because `draw` takes a WHOLE
+#: script — every shape in one call — rather than one call per shape, and
+#: `read_drawing` both reads the page and measures what is wrong with it.
+DRAW_TOOL_NAMES: tuple[str, ...] = (
+    "draw",
+    "read_drawing",
+)
+
 #: Agent Skills are a distinct administrative surface. They are withheld until
 #: the user asks about a skill, so ordinary chat does not carry their CRUD,
 #: resource, or script schemas.

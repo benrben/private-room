@@ -1273,6 +1273,10 @@ LEDGER_TOOLS: frozenset[str] = frozenset(
         "start_file_pass",
         "save_workflow",
         "run_mcp_tool",
+        # LEDGER_TOOLS must stay a SUPERSET of graphs.WRITE_TOOLS, or
+        # verify_claims fires a guaranteed false accusation at the one tool
+        # that did the work.
+        "draw",
     }
 )
 
@@ -1295,6 +1299,12 @@ def _referent_names(tool: str, args: dict[str, Any] | None) -> list[str]:
     which is the old behaviour, never an exception inside the tool loop.
     """
     args = args or {}
+    if tool == "draw":
+        # The artifact is the SKETCH, which `draw` names directly — and a name
+        # that did not exist yet is still the right referent, because the tool
+        # creates it.
+        name = args.get("name")
+        return [str(name)[:80]] if name else []
     if tool == "edit_files":
         edits = args.get("edits")
         # A 4B sometimes flattens `edits` to a bare string; take it rather than

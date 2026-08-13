@@ -1650,3 +1650,230 @@
     animation: none;
   }
 }
+
+/* ==========================================================================
+   16. CUSTOMIZE SIDEBAR
+   Rendered twice from one component (shell/CustomizeSidebar.tsx): as a sheet
+   over the workspace, and inline inside Settings → Interface. These rules are
+   deliberately layout-only and inherit their surface from whichever of those
+   two frames they land in, so the inline copy does not draw a second card
+   inside the settings card it is already sitting in.
+   ========================================================================== */
+
+.cz-modal {
+  max-width: 620px;
+}
+.cz-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-6);
+}
+.cz-group-label {
+  margin: 0 0 2px;
+  font-size: var(--fs-micro);
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+.cz-group-hint {
+  margin: 0 0 var(--sp-3);
+  font-size: var(--fs-meta);
+  color: var(--muted);
+}
+.cz-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+}
+.cz-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-2) var(--sp-1);
+  border-bottom: 1px solid var(--line-soft);
+}
+.cz-row:last-child {
+  border-bottom: 0;
+}
+.cz-glyph {
+  display: inline-flex;
+  flex: 0 0 auto;
+  color: var(--muted);
+}
+.cz-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.cz-name {
+  font-size: var(--fs-body);
+  color: var(--text);
+}
+.cz-blurb {
+  font-size: var(--fs-micro);
+  color: var(--faint);
+  line-height: 1.35;
+}
+.cz-move {
+  display: inline-flex;
+  gap: 2px;
+  flex: 0 0 auto;
+}
+.cz-arrow {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+}
+.cz-arrow:hover:not(:disabled) {
+  color: var(--text);
+  background: var(--hover);
+  border-color: var(--rule);
+}
+/* Disabled rather than hidden: a row that loses its up-arrow at the top of a
+   list makes every row below it shift by 24px as you move things, which reads
+   as the list jumping around under your hand. */
+.cz-arrow:disabled {
+  opacity: 0.32;
+  cursor: default;
+}
+/* The switch. `role="switch"`, so it announces on/off rather than
+   checked/unchecked — this pins a tool to the sidebar, it does not select it
+   for some later action. */
+.cz-switch {
+  position: relative;
+  flex: 0 0 auto;
+  width: 40px;
+  height: 22px;
+  padding: 0;
+  border-radius: 999px;
+  border: 1.5px solid var(--rule-strong);
+  background: transparent;
+  transition:
+    background var(--dur-fast) var(--ease-pen),
+    border-color var(--dur-fast) var(--ease-pen);
+}
+.cz-switch::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 15px;
+  height: 15px;
+  border-radius: 50%;
+  background: var(--rule-strong);
+  transition:
+    transform var(--dur-fast) var(--ease-pen),
+    background var(--dur-fast) var(--ease-pen);
+}
+.cz-switch[aria-checked="true"] {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.cz-switch[aria-checked="true"]::after {
+  transform: translateX(17px);
+  background: var(--page);
+}
+.cz-empty {
+  margin: 0;
+  padding: var(--sp-3) var(--sp-1);
+  font-size: var(--fs-meta);
+  color: var(--faint);
+}
+/* Why there is no Library row. Someone who remembers it in that column comes
+   looking here first, and silence reads as "removed" rather than "moved". */
+.cz-note {
+  margin: 0;
+  padding: var(--sp-3);
+  font-size: var(--fs-meta);
+  line-height: 1.5;
+  color: var(--muted);
+  border: 1px solid var(--line-soft);
+  border-left: 3px solid var(--accent-fill);
+  border-radius: var(--radius-sm);
+  background: var(--panel);
+}
+.cz-note kbd {
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  border: 1px solid var(--rule);
+  border-radius: 4px;
+  padding: 0 4px;
+}
+.cz-reset {
+  align-self: flex-start;
+  font-size: var(--fs-meta);
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid var(--rule);
+  border-radius: var(--radius-sm);
+  padding: 6px 12px;
+}
+.cz-reset:hover {
+  color: var(--text);
+  background: var(--hover);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cz-switch,
+  .cz-switch::after {
+    transition: none;
+  }
+}
+
+/* ----- Settings → Interface: the three layout presets ----- */
+.iface-presets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  margin-bottom: var(--sp-2);
+}
+.iface-preset {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+  min-width: 150px;
+  padding: var(--sp-2) var(--sp-3);
+  text-align: left;
+  color: var(--text);
+  background: transparent;
+  border: 1px solid var(--rule);
+  border-radius: var(--radius-sm);
+}
+.iface-preset:hover:not(:disabled) {
+  background: var(--hover);
+  border-color: var(--rule-strong);
+}
+.iface-preset:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.iface-preset-name {
+  font-size: var(--fs-body);
+  font-weight: 600;
+}
+.iface-preset-hint {
+  font-size: var(--fs-micro);
+  color: var(--faint);
+}
+/* Inside Settings the sidebar list is already within a settings card, so it
+   drops the sheet's outer rhythm and sits as one more labelled block. */
+#set-interface .cz-body {
+  gap: var(--sp-4);
+  margin-bottom: var(--sp-4);
+}
+#set-interface .cz-reset {
+  align-self: flex-start;
+}

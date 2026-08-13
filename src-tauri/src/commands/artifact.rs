@@ -25,6 +25,14 @@ pub(crate) struct Artifact<'a> {
     name: String,
     mime: String,
     content: &'a str,
+    /// What gets INDEXED, when that is not the content itself.
+    ///
+    /// A drawing is the case that needs it: a `.sketch` is a JSON document,
+    /// and indexing that source would put coordinates and colour names into
+    /// search results and into the model's retrieved context. `extract_text`
+    /// already knows how to read one — this just lets a caller that has
+    /// already computed the answer hand it over instead of re-deriving it.
+    indexed: Option<String>,
     prov: db::Provenance,
     cancel: Option<&'a AtomicBool>,
 }
@@ -45,9 +53,16 @@ impl<'a> Artifact<'a> {
             name: name.to_string(),
             mime: mime.to_string(),
             content,
+            indexed: None,
             prov: db::Provenance::default(),
             cancel: None,
         }
+    }
+
+    /// Index this artifact as `text` rather than as its own bytes.
+    pub(crate) fn indexed_as(mut self, text: &str) -> Self {
+        self.indexed = Some(text.to_string());
+        self
     }
 
     /// A generated note — Markdown by default, mime derived from the name. The
@@ -114,7 +129,7 @@ impl<'a> Artifact<'a> {
             &self.name,
             &self.mime,
             bytes,
-            Some(self.content),
+            Some(self.indexed.as_deref().unwrap_or(self.content)),
             &self.prov,
         )?;
         if self.cancel.map(|c| c.load(Ordering::SeqCst)).unwrap_or(false) {

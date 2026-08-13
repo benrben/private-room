@@ -584,6 +584,13 @@ REPLIES: dict[str, Any] = {
     "— 24 question/answer pairs, saved to the room.",
     "generate_podcast_script": lambda a: f"wrote podcast.md from {_a(a, 'refs', default=ROOM_MATERIAL)} "
     "— a two-voice script, about 9 minutes read aloud.",
+    # --- drawing -----------------------------------------------------------
+    "draw": lambda a: f"drew on \"{_a(a, 'name', default='Sketch')}\" — added e1, e2, e3. "
+    "The page now holds 3 thing(s).",
+    "read_drawing": lambda a: f"Drawing \"{_a(a, 'name', default='Sketch')}\":\n"
+    "canvas 1600 1000\ne1 rect 150 150 380 160 blue \"Login form\"\n"
+    "e2 rect 1050 150 380 160 green \"Auth service\"\n"
+    "e3 arrow 530 230 1050 230 blue \"credentials\"",
     # --- external ----------------------------------------------------------
     "local_generate": "(local model output)",
 }
@@ -602,7 +609,13 @@ GROUPS: dict[str, tuple[str, ...]] = {
     "knowledge": ("chat.answer", "chat.web", "chat.browse", "files.read"),
     "automation": ("jobs.run", "jobs.workflows", "scripts.run"),
     "extend": ("skills.use", "skills.author", "connectors.admin", "connectors.use"),
-    "media_app": ("media.transcribe", "media.video", "creator.studio", "app.ui"),
+    "media_app": (
+        "media.transcribe",
+        "media.video",
+        "creator.studio",
+        "creator.draw",
+        "app.ui",
+    ),
 }
 
 CATALOG_PATH = Path(__file__).resolve().parent / "tool_catalog.json"

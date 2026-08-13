@@ -55,7 +55,21 @@ const INTERACTIVE_SELECTOR = [
 ].join(", ");
 
 /** Ordered most-specific-first: the shell's three panes plus chrome. The
- * legacy selectors stay as fallbacks so older markup keeps labeling. */
+ * legacy selectors stay as fallbacks so older markup keeps labeling.
+ *
+ * `.activity-rail` is a CONTRACT, not an implementation detail. The
+ * navigation redesign rebuilt everything inside that element — the pane
+ * toggles left, the destinations split into a pinned tier and a "More tools"
+ * disclosure — and deliberately kept the class, because it is the only thing
+ * telling the model that a control it can see is navigation.
+ *
+ * ONE THING THE MODEL MUST KNOW, and cannot learn from a snapshot: the
+ * unpinned destinations are not in the DOM until the disclosure is opened, so
+ * `ui_snapshot` genuinely does not list them. The reliable route to any place
+ * is the ⌘K palette, which enumerates every area whether pinned or not (see
+ * `buildPaletteActions` in workspace/Overlays.tsx). Hence the "More tools"
+ * region name below: when the model does see that row, it should read as a
+ * container of more controls rather than as a destination it can navigate to. */
 const REGION_MAP: Array<[selector: string, name: string]> = [
   [".viewer, .viewer-pane, .pane-center", "viewer"],
   [".pane-library, .sidebar", "sidebar"],

@@ -246,18 +246,38 @@ function buildPaletteActions(
     { id: "live-rec", label: "Start a live recording", hint: "Mic + Mac audio with a live transcript", disabled: s.recLive != null, run: () => void a.startLiveRecording() },
     { id: "voice-note", label: "Record a voice note", hint: "Starts the mic — audio saved in this room", disabled: a.micState("note").disabled, run: () => a.recordVoiceNote() },
     { id: "summarize", label: "Summarize the room", hint: "A cited overview, in the background", disabled: s.files.length === 0, run: () => void a.startDeepSummary() },
+    // ----- every destination, pinned or not -----
+    //
+    // THIS LIST IS LOad-BEARING NOW, in a way it was not before. The sidebar
+    // shows a short pinned set and keeps the rest behind a "More tools"
+    // disclosure, so for anything unpinned this palette is the only route that
+    // is always one keystroke away — and it is the ONLY route the embodiment
+    // loop can take, since a collapsed disclosure is invisible to
+    // `uiSnapshot()`. An area that exists and is missing here is an area the
+    // agent cannot reach and a reader has to go hunting for.
+    //
+    // It had already fallen behind by three: Recordings, Create and Sketch
+    // were all navigable from the old rail and absent from this list, so
+    // anyone who navigated by ⌘K concluded the app did not have them.
     { id: "go-home", label: "Go to Room home", hint: "Recent work and capabilities", run: () => { leaveAreas(); s.setArea("home"); } },
+    { id: "go-recordings", label: "Open Recordings", hint: "Mic and Mac audio, transcribed here", run: () => { leaveAreas(); s.setArea("recordings"); } },
+    { id: "go-browser", label: "Open the private browser", hint: "Read the web with no history kept", run: () => a.revealBrowser() },
+    { id: "go-sketch", label: "Open Sketch", hint: "Draw by hand, or ask the room to draw", run: () => { leaveAreas(); s.setArea("sketch"); } },
+    { id: "go-create", label: "Open Create", hint: "Pictures and video from a connected model", run: () => { leaveAreas(); s.setArea("create"); } },
     { id: "go-map", label: "Open the Room Map", hint: "How files and notes connect", disabled: s.files.length < 2, run: () => { leaveAreas(); s.setShowMap(true); } },
     { id: "go-workflows", label: "Open Workflows", hint: "Pipelines, schedules, run history", run: () => a.openWorkflows() },
     { id: "go-scripts", label: "Open Scripts", hint: "Runnable .py/.js room files", run: () => a.openScripts() },
-    { id: "go-memory", label: "Open Memory & scratch pad", hint: "Durable context, visible and editable", run: () => a.revealMemory() },
-    // The palette used to omit three whole areas the rail shows, so anyone who
-    // navigated this way concluded the app didn't have them.
     { id: "go-skills", label: "Open Skills", hint: "Reusable instructions the AI can load", run: () => { leaveAreas(); s.setArea("skills"); } },
     { id: "go-connectors", label: "Open Connectors", hint: "MCP tools this room may use", run: () => { leaveAreas(); s.setArea("connectors"); } },
-    { id: "go-browser", label: "Open the private browser", hint: "Read the web with no history kept", run: () => a.revealBrowser() },
-    { id: "focus-editor", label: "Focus the editor", hint: "Hide both side panes", run: () => layout?.toggleFocus("center") },
-    { id: "reset-layout", label: "Reset the three-pane layout", hint: "Restore the balanced default", run: () => layout?.resetLayout() },
+    { id: "go-memory", label: "Open Memory & scratch pad", hint: "Durable context, visible and editable", run: () => a.revealMemory() },
+    // ----- the window's arrangement (same handlers the Layout menu uses) -----
+    { id: "toggle-library", label: "Show or hide the Library", hint: "The left pane (⌘1)", run: () => layout?.togglePane("library") },
+    { id: "toggle-assistant", label: "Show or hide the Assistant", hint: "Chat, Studio, and Activity (⌘2)", run: () => layout?.togglePane("ai") },
+    { id: "focus-editor", label: "Focus the workspace", hint: "Hide both side panes", run: () => layout?.toggleFocus("center") },
+    { id: "preset-focus", label: "Layout: Focus", hint: "The workspace alone", run: () => layout?.applyPreset("focus") },
+    { id: "preset-research", label: "Layout: Research", hint: "Library, workspace, and the assistant", run: () => layout?.applyPreset("research") },
+    { id: "preset-review", label: "Layout: Review", hint: "Library and workspace, no assistant", run: () => layout?.applyPreset("review") },
+    { id: "reset-layout", label: "Reset the layout", hint: "Restore the balanced default", run: () => layout?.resetLayout() },
     { id: "theme", label: "Switch theme", hint: "Dark ⇄ light", run: () => toggleTheme() },
     { id: "checkpoint", label: "Save a checkpoint", hint: "A room-wide recovery point", run: () => { api.createRoomCheckpoint("").then((m) => s.pushToast("success", `Saved checkpoint “${m.name}”.`)).catch((e) => s.pushToast("error", String(e))); } },
     { id: "export-all", label: "Export all files…", hint: "Plain copies outside the room", disabled: s.files.length === 0, run: () => a.exportAllFiles() },
@@ -266,7 +286,12 @@ function buildPaletteActions(
     { id: "feedback", label: "Send feedback…", hint: "Draft locally, then open GitHub", run: () => s.setShowFeedback(true) },
     { id: "lock", label: "Lock this room", hint: "Close and return to the gate (⌘L)", run: () => void a.handleLock() },
   ];
-  if (!layout) return acts.filter((x) => x.id !== "focus-editor" && x.id !== "reset-layout");
+  // Without a layout there is no window to arrange, so every row that would
+  // call into one is dropped rather than offered as a no-op. Matched on a
+  // prefix set instead of by name so a preset added above cannot be forgotten
+  // here and silently become a row that does nothing.
+  const LAYOUT_ROWS = /^(toggle-library|toggle-assistant|focus-editor|preset-|reset-layout)/;
+  if (!layout) return acts.filter((x) => !LAYOUT_ROWS.test(x.id));
   return acts;
 }
 
@@ -300,7 +325,13 @@ const SHORTCUTS: { group: string; rows: [string, string][] }[] = [
   {
     group: "Panes",
     rows: [
-      ["⌘1 / ⌘2 / ⌘3", "Show or hide the Library, workspace, and AI panes"],
+      ["⌘1", "Show or hide the Library"],
+      ["⌘2", "Show or hide the Assistant"],
+      // Named as an alias rather than quietly listed as an equal: ⌘3 has meant
+      // the assistant since the shell had three panes, and it keeps meaning it
+      // so nobody's hands have to relearn anything this release. ⌘2 is what it
+      // will be called from here on.
+      ["⌘3", "Show or hide the Assistant (the older shortcut, still works)"],
       ["Esc", "Leave a focused pane"],
     ],
   },
@@ -469,7 +500,7 @@ export default function Overlays({
   const expanded = trimmedQuery !== "" && searchResults != null && !s.searchError;
   const runSel = (idx: number) => {
     if (idx < flatShown.length) {
-      a.activateResult(flatShown[idx]);
+      a.activateResult(flatShown[idx], layout);
       return;
     }
     const act = actions[idx - actOffset];
@@ -1115,7 +1146,7 @@ export default function Overlays({
                       selectedIndex={s.searchSel}
                       registerRowRef={keepVisible}
                       onSelectIndex={(idx) => s.setSearchSel(idx)}
-                      onOpenResult={a.activateResult}
+                      onOpenResult={(r) => a.activateResult(r, layout)}
                       onOpenFile={(id) => void a.viewFile(id)}
                     />
                   )}

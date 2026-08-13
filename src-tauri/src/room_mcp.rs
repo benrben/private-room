@@ -870,6 +870,9 @@ fn arcelle_tool_annotations(name: &str) -> Option<serde_json::Value> {
         | "view_media_frame"
         | "local_generate"
         | "list_mcps"
+        // Reading a drawing. Stays read-only despite rendering a picture:
+        // the picture is derived from the document and nothing changes.
+        | "read_drawing"
         | "read_mcp" => (true, false, true, false),
         // Reads that may contact the public web. Arcelle only advertises them
         // when the room's Online features setting is enabled.
@@ -921,6 +924,11 @@ fn arcelle_tool_annotations(name: &str) -> Option<serde_json::Value> {
         | "studio_flashcards"
         | "studio_mindmap"
         | "generate_podcast_script"
+        // Drawing on a sketch: a versioned write to a room file, exactly like
+        // `edit_file`. `clear` inside a script wipes the page, but the previous
+        // document is snapshotted first and restorable, so it is recoverable
+        // rather than destructive.
+        | "draw"
         | "retranscribe_file"
         | "read_recording"
         | "test_workflow"
@@ -1187,6 +1195,13 @@ fn scoped_specs(web_enabled: bool, scope: ToolScope) -> Vec<serde_json::Value> {
         // trust class (minutes of work, results land as reviewable room files).
         extras.extend(commands::studio_tools_specs());
         extras.extend(commands::transcribe_tools_specs());
+        // The Sketch page's drawing tools. Same trust class as the studio
+        // generators for the same reason: local compute whose whole output is
+        // a room file the user can see, version, and undo by restoring. A
+        // merely CONSULTED advisor still gets none of them — drawing on the
+        // user's page is an action, not advice, which is why these specs are
+        // here rather than in `tools_catalog`.
+        extras.extend(commands::draw_tools_specs());
     }
     if scope.include_organize_tools() {
         extras.extend(commands::organize_tools_specs());
@@ -2128,11 +2143,30 @@ mod tests {
         // in words — "make chapters for this meeting", "what did we decide".
         // Its description is already cut to one sentence plus its precondition;
         // the remaining cost is the tool existing at all, which is the point.
+        // RE-MEASURED 2026-08-13, after the Sketch page's drawing box (`draw`,
+        // `read_drawing` — see `include_job_tools`):
+        //   CloudAdvisor  4,473    CloudEngine  10,964
+        //   ExternalAgent 10,674   LocalEngine  10,811
+        //
+        // Two tools, ~300 tokens across the three engine tiers, and the three
+        // budgets go up by exactly that. The shrink-first advice above WAS
+        // followed and is most of why the number is 300 rather than 900:
+        //  - the script grammar was cut to seven lines and its worked example
+        //    deleted, because the full grammar is returned by
+        //    `sketchdoc::SCRIPT_HELP` the first time a script fails to parse
+        //    and is repeated in the drawing agent's own prompt — both of which
+        //    cost nothing on a turn that never draws;
+        //  - a third tool was removed outright. `see_drawing` returned the same
+        //    text as `read_drawing` with a picture attached, which is both ~150
+        //    tokens and the kind of near-duplicate a 4B picks between wrongly.
+        //    Reading a drawing and looking at one are now one act.
+        // What is left is the cost of the capability existing, which is the
+        // point. CloudAdvisor is untouched: an advisor cannot draw.
         let measured: Vec<(ToolScope, usize, usize)> = [
             (ToolScope::CloudAdvisor { include_mcp: true }, 5_300usize),
-            (ToolScope::CloudEngine, 10_650),
-            (ToolScope::LocalEngine, 10_450),
-            (ToolScope::ExternalAgent, 10_350),
+            (ToolScope::CloudEngine, 10_975),
+            (ToolScope::LocalEngine, 10_820),
+            (ToolScope::ExternalAgent, 10_685),
         ]
         .into_iter()
         .map(|(scope, budget)| (scope, approx_tokens(&scoped_specs(true, scope)), budget))

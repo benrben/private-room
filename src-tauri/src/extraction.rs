@@ -344,6 +344,13 @@ pub fn extract_text(name: &str, bytes: &[u8]) -> Option<String> {
         "eml" => extract_eml(&String::from_utf8_lossy(bytes)),
         "srt" | "vtt" => extract_subtitles(&String::from_utf8_lossy(bytes)),
         "svg" => extract_svg(&String::from_utf8_lossy(bytes)),
+        // A drawing is indexed by what it SAYS — its labels and notes. Letting
+        // the document source in would put coordinates and colour names into
+        // search results and into the model's retrieved context, which is the
+        // same mistake `extract_svg` exists to avoid for path data.
+        "sketch" => crate::commands::sketchdoc::Sketch::from_json(&String::from_utf8_lossy(bytes))
+            .ok()
+            .map(|d| d.extracted_text()),
         "zip" => extract_zip_listing(bytes),
         _ => None,
     })

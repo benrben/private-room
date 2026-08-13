@@ -140,6 +140,8 @@ _LABELS: dict[str, str] = {
     # the user will find there rather than the generator that made it.
     "studio_flashcards": "Made flashcards",
     "studio_mindmap": "Made a mind map",
+    "draw": "Drew on the sketch",
+    "read_drawing": "Looked at the sketch",
     "generate_podcast_script": "Wrote a podcast script",
     # ADD-21: name the exfiltration plainly.
     "consult_advisor": "Consulting a cloud advisor (content leaves this Mac)",

@@ -366,6 +366,12 @@ pub fn run() {
             // A five-minute script -> twenty 15-second shots, joined end to end.
             commands::story_plan_split,
             commands::story_apply_split,
+            // The Sketch page. Loading and saving a drawing ride the ordinary
+            // file commands (`update_file_content` re-extracts its labels), so
+            // starting one and flattening one to SVG are all it needs.
+            commands::create_sketch,
+            commands::save_sketch,
+            commands::export_sketch_svg,
             // ADD-27: live Recording file (streaming transcription, editing,
             // translate). ADD-28: feedback → GitHub issue.
             commands::rec_start,

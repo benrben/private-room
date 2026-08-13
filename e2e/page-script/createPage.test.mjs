@@ -165,12 +165,15 @@ test("the create area is registered everywhere a rail area must be", () => {
   assert.match(types, /\|\s*"create"/, "missing from the WorkArea union");
   assert.match(types, /"create",/, "missing from WORK_AREAS (the runtime list)");
 
-  // areaDef() THROWS for a union member with no AREAS row — a runtime crash,
-  // not a type error, so the compiler cannot catch this one.
+  // areaDef() THROWS for a union member with no catalog row — a runtime crash,
+  // not a type error, so the compiler cannot catch this one. The catalog moved
+  // out of ActivityRail into shell/navPrefs when the sidebar gained its pinned
+  // and More-tools tiers; both surfaces that draw destinations read it from
+  // there, so there is one list to be absent from rather than two.
   assert.match(
-    read("src/shell/ActivityRail.tsx"),
+    read("src/shell/navPrefs.tsx"),
     /key:\s*"create"/,
-    "missing from ActivityRail's AREAS — areaDef would throw",
+    "missing from NAV_AREAS — areaDef would throw",
   );
   assert.match(
     read("src/workspace/ViewerPane.tsx"),

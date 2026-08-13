@@ -118,6 +118,12 @@ const FORMATS: &[Row] = &[
     Row { exts: &["html", "htm"], kind: "html", text: Raw, editable: true, delivery: NoBytes, max_bytes: Some(MAX_RAW_TEXT_BYTES) },
     // NEW: an SVG used to render as a flat picture with its source unreachable.
     Row { exts: &["svg"], kind: "svg", text: Raw, editable: true, delivery: NoBytes, max_bytes: Some(MAX_RAW_TEXT_BYTES) },
+    // The Sketch page's drawings. `Raw` because the VIEWER needs the document
+    // itself — the editor parses this JSON — while `extract_text` separately
+    // derives the labels for the index, the same split `.svg` uses. Not
+    // `editable`: hand-editing the document as text in the code editor would
+    // let a malformed save reach a file the drawing editor then cannot open.
+    Row { exts: &["sketch"], kind: "sketch", text: Raw, editable: false, delivery: NoBytes, max_bytes: Some(MAX_RAW_TEXT_BYTES) },
     // NEW: notebooks are JSON, so they opened in the CODE editor as a wall of
     // escaped source — in an app that already runs .py scripts.
     Row { exts: &["ipynb"], kind: "notebook", text: Raw, editable: true, delivery: NoBytes, max_bytes: Some(MAX_RAW_TEXT_BYTES) },

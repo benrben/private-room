@@ -535,6 +535,7 @@ export type ViewerKind =
   | "markdown"
   | "html"
   | "svg"
+  | "sketch"
   | "notebook"
   | "json"
   | "subtitle"
@@ -1852,4 +1853,17 @@ export interface BrowseJournalRow {
 export interface StopReport {
   stopped: string[];
   known: boolean;
+}
+
+/** The payload of the `sketch-drawn` event (see `api.onSketchDrawn`). */
+export interface SketchDrawn {
+  fileId: string;
+  name: string;
+  added: string[];
+  changed: string[];
+  removed: string[];
+  /** One line per statement the script ran, in order. */
+  steps: string[];
+  /** The whole document after the write, as JSON. */
+  doc: string;
 }

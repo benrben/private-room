@@ -38,4 +38,5 @@
 @import "./styles/marketplace.css";
 @import "./styles/find.css";
 @import "./styles/create.css";
+@import "./viewers/sketch.css";
 @import "./styles/shell.css";

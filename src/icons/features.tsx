@@ -165,3 +165,18 @@ export function CreateIcon(p: IconProps) {
     </Stroke>
   );
 }
+
+/** The Sketch area: a pen laid across a sheet.
+ *
+ * Not a paintbrush and not a palette — this page draws diagrams and flows in
+ * five marker pens, and a painter's icon would promise colour mixing and
+ * texture the format cannot do. */
+export function SketchIcon(p: IconProps) {
+  return (
+    <Stroke {...p}>
+      <path d="M5 19c4.5-1 .5-4.5 5-6.5" />
+      <path d="M14.8 4.9l4.3 4.3L9.6 18.7l-5 .7.7-5z" />
+      <path d="M13.2 6.5l4.3 4.3" />
+    </Stroke>
+  );
+}

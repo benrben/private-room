@@ -1,4 +1,5 @@
 import type { ComponentType } from "react";
+import type { PresetName } from "../shell/useLayout";
 import type {
   AiStatus,
   McpServerStatus,
@@ -50,6 +51,11 @@ export interface Props {
    * streaming — CheckpointsSection disables Roll back (it can't reach WSState
    * itself). The backend refuses regardless; this is UX. */
   busy: boolean;
+  /** Apply a layout preset to the room behind this modal (Settings →
+   * Interface). Optional because Settings can be opened from surfaces with no
+   * live workspace to arrange; the preset buttons disable themselves and say
+   * where the presets live instead of pretending to work. */
+  onApplyPreset?: (name: PresetName) => void;
 }
 
 export interface PullProgress {

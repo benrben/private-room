@@ -58,7 +58,8 @@ Shapes
                      rejects room tools. The Main agent only.
 ``react_verify``     ...-> verify -> {restate | synthesize}
                      A ground-truth gate that ROUTES. files.read,
-                     connectors.use (a failed SEND must not read as sent).
+                     connectors.use (a failed SEND must not read as sent),
+                     creator.draw (nor a drawing that was never drawn).
 ``route_act``        prepare -> route_action -> call_model <-> execute_tools
                      Deterministic verb pick (the Router pattern's rule-based
                      arm), then a bounded cycle for its arguments.
@@ -154,6 +155,9 @@ WRITE_TOOLS: frozenset[str] = frozenset(
         "set_cells",
         "rename_file",
         "move_file",
+        # A drawing is a versioned write to a room file, so "I drew it" is
+        # audited exactly like "I saved it".
+        "draw",
         # OUTBOUND effects, 2026-07-27. `run_mcp_tool` is how the Connector
         # agent sends email and Slack messages — the least reversible thing any
         # agent here does — and it ran under plain `react` with no gate of any
@@ -1302,6 +1306,7 @@ GRAPH_CONNECTORS_ADMIN = graph_for("connectors.admin")
 GRAPH_MEDIA_TRANSCRIBE = graph_for("media.transcribe")
 GRAPH_MEDIA_VIDEO = graph_for("media.video")
 GRAPH_CREATOR_STUDIO = graph_for("creator.studio")
+GRAPH_CREATOR_DRAW = graph_for("creator.draw")
 
 #: One per SHAPE, for looking at a template without picking an agent that runs it.
 TEMPLATE_REACT = _COMPILED["react"]

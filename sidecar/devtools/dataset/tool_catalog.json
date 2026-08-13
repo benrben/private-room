@@ -410,6 +410,33 @@
       "openWorldHint": false,
       "readOnlyHint": false
     },
+    "description": "Draw on a room sketch. Put EVERY shape in one call's script — never one call per shape. Starts a new sketch if the name is new. Read it first when changing existing work, and see_drawing after to check.",
+    "inputSchema": {
+      "properties": {
+        "name": {
+          "description": "Sketch to draw on; a new name starts one",
+          "type": "string"
+        },
+        "script": {
+          "description": "Commands, ONE PER LINE. Page 1600x1000, whole numbers, colours pink/yellow/green/blue/red.\nrect|ellipse X Y W H [colour] [fill] \"label\"\ntext X Y [colour] [size] \"words\"\narrow|line X1 Y1 X2 Y2 [colour] [\"label\"]\nlink A B [colour] [\"label\"] = arrow BETWEEN two shapes; prefer over arrow\nmove ID DX DY | label ID \"new\" | ink ID colour | delete ID | clear\nA/B/ID = an id on the page (e3), or #1/#2 = 1st/2nd shape this script draws.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "script"
+      ],
+      "type": "object"
+    },
+    "name": "draw"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
     "description": "Change ONE place in ONE file (text, code, notes, csv, html, or docx) by replacing exact text. Copy old_text exactly as it appears — curly quotes/spacing/dashes are matched tolerantly, but old_text must be a UNIQUE spot: a repeat gives an error with the count, then use prefix_context/suffix_context/occurrence/section to narrow it, or all: true to replace every one. On HTML, quote the readable text — it may span inline markup (bold, a link) but never crosses into a different paragraph/heading/list item/table cell. To change several places or files at once, use edit_files. Example: {\"name\": \"notes.md\", \"old_text\": \"Q3 revenue was $4M\", \"new_text\": \"Q3 revenue was $5M\"}",
     "inputSchema": {
       "properties": {
@@ -891,6 +918,25 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
+    "description": "Look at a sketch: every shape with its id, position and label in draw's own commands, plus measured problems — overlaps, shapes off the page, unlabelled shapes, arrows that stop short. Use it before changing existing work, and again after drawing to check yourself.",
+    "inputSchema": {
+      "properties": {
+        "name": {
+          "description": "Which sketch; omit if the room has one",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "name": "read_drawing"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
     "description": "Read one connector's configuration for editing. Secret header, environment, and OAuth values are redacted and never shown to the agent.",
     "inputSchema": {
       "properties": {
@@ -1191,7 +1237,7 @@
     "inputSchema": {
       "properties": {
         "agent": {
-          "description": "Optional: the sub-agent this procedure belongs to, so only that specialist is offered it — files.read (room files), scripts.run (this room's scripts), chat.web (internet search/fetch), chat.browse (driving web pages in the private browser), app.ui (this app's interface), jobs.run (whole-file passes), jobs.workflows (automation), skills.use (running skills), skills.author (writing skills), connectors.use (connected services), connectors.admin (connector setup), media.transcribe (transcripts), media.video (watching room videos), creator.studio (flashcards, mind maps, podcast scripts). Omit for a skill any agent may use.",
+          "description": "Optional: the sub-agent this procedure belongs to, so only that specialist is offered it — files.read (room files), scripts.run (this room's scripts), chat.web (internet search/fetch), chat.browse (driving web pages in the private browser), app.ui (this app's interface), jobs.run (whole-file passes), jobs.workflows (automation), skills.use (running skills), skills.author (writing skills), connectors.use (connected services), connectors.admin (connector setup), media.transcribe (transcripts), media.video (watching room videos), creator.studio (flashcards, mind maps, podcast scripts), creator.draw (drawing on the room's sketches). Omit for a skill any agent may use.",
           "enum": [
             "files.read",
             "scripts.run",
@@ -1206,7 +1252,8 @@
             "connectors.use",
             "media.transcribe",
             "media.video",
-            "creator.studio"
+            "creator.studio",
+            "creator.draw"
           ],
           "type": "string"
         },

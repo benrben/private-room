@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { confirm } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { exit } from "@tauri-apps/plugin-process";
@@ -25,6 +25,7 @@ import AiPane from "./workspace/AiPane";
 import Toasts from "./workspace/Toasts";
 import { useLayout } from "./shell/useLayout";
 import ActivityRail from "./shell/ActivityRail";
+import CustomizeSidebar from "./shell/CustomizeSidebar";
 import Splitter from "./shell/Splitter";
 import StatusBar from "./shell/StatusBar";
 import ErrorBoundary from "./shell/ErrorBoundary";
@@ -94,6 +95,10 @@ export default function Workspace({ info, onLock, onRenamed }: Props) {
   // name lands in plain browser storage and two same-named rooms in different
   // folders stop sharing (and overwriting) one layout.
   const layout = useLayout(info.path);
+  // The "Customize sidebar" sheet. Local to the shell rather than in
+  // `useWorkspaceState`: nothing outside this component raises it, and the
+  // preferences it edits are their own device-wide store (shell/navPrefs).
+  const [showCustomize, setShowCustomize] = useState(false);
 
   // ...and the same question on the way out of the app. Closing the window is
   // the one exit that never passes through the lock path, so it asks here.
@@ -680,7 +685,19 @@ export default function Workspace({ info, onLock, onRenamed }: Props) {
     <div className="workspace">
       <Overlays s={s} a={a} layout={layout} />
       <Toasts toasts={s.toasts} dismissToast={s.dismissToast} />
-      <TopBar s={s} a={a} info={info} layout={layout} onRenamed={onRenamed} />
+      <TopBar
+        s={s}
+        a={a}
+        info={info}
+        layout={layout}
+        onRenamed={onRenamed}
+        // These two used to ride on the sidebar's AI pane toggle, which no
+        // longer exists — the Assistant's control is in the toolbar now, and
+        // so is its news. Same two definitions as the status bar (shell/
+        // activity.ts), so the three surfaces can never disagree.
+        approvals={pendingApprovals}
+        running={runningJobs}
+      />
 
       <StudioModal s={s} a={a} />
       {/* Every exit that unmounts the editor asks this before it happens. */}
@@ -692,8 +709,16 @@ export default function Workspace({ info, onLock, onRenamed }: Props) {
       {s.showFeedback && <FeedbackModal s={s} />}
       {/* A settings screen that throws must not take the room down with it. */}
       <ErrorBoundary scope="Settings">
-        <SettingsModals s={s} a={a} info={info} />
+        <SettingsModals s={s} a={a} info={info} layout={layout} />
       </ErrorBoundary>
+      {/* Mounted only while open, like every other sheet here: the sidebar
+          preferences live in their own store, so there is no draft state to
+          preserve across a close. */}
+      {showCustomize && (
+        <ErrorBoundary scope="The sidebar settings">
+          <CustomizeSidebar onClose={() => setShowCustomize(false)} />
+        </ErrorBoundary>
+      )}
 
       <main className="pr-main">
         <ActivityRail
@@ -701,8 +726,7 @@ export default function Workspace({ info, onLock, onRenamed }: Props) {
           area={area}
           onArea={openArea}
           onSettings={() => s.setShowSettings(true)}
-          approvals={pendingApprovals}
-          running={runningJobs}
+          onCustomize={() => setShowCustomize(true)}
         />
         <div
           className={`pane-grid${layout.dragging ? " is-dragging" : ""}`}

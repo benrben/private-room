@@ -124,6 +124,7 @@ dom_smoothie = { version = "0.18", default-features = false }
 # prose — correct CommonMark, unreadable as text, and that text is what search
 # indexes and the model reads.
 dom_query = "0.28"
+resvg = { version = "0.48.1", default-features = false, features = ["text", "system-fonts"] }
 
 # macOS-only native deps: ADD-14 OCR (Apple Vision) + ADD-11 Touch ID (Keychain)
 # + ADD-27 system-audio capture (ScreenCaptureKit) for recording meetings.

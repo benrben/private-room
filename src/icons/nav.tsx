@@ -167,6 +167,14 @@ export function ChevronDownIcon(p: IconProps) {
   );
 }
 
+export function ChevronUpIcon(p: IconProps) {
+  return (
+    <Stroke {...p}>
+      <path d="M6 14.5l6-6 6 6" />
+    </Stroke>
+  );
+}
+
 export function ChevronLeftIcon(p: IconProps) {
   return (
     <Stroke {...p}>

@@ -255,14 +255,27 @@ export function makeMiscActions(
     }, 2600);
   }
 
-  function activateResult(r: FlatResult) {
+  /** Open whatever a ⌘K result points at.
+   *
+   * `layout` is optional only because the flat-result list is reachable from
+   * surfaces that have no window to arrange; every caller inside the workspace
+   * passes it, and a MESSAGE hit genuinely needs it — see below. */
+  function activateResult(r: FlatResult, layout?: LayoutApi) {
     if (r.kind === "file") {
       viewFile(r.id, { find: r.snippet });
     } else if (r.kind === "message") {
       s.setActiveChatId(r.chatId);
       // The message lives in the chat tab — a hit picked while Studio or
-      // Activity is showing must bring the conversation forward first.
+      // Activity is showing must bring the conversation forward first...
       s.setAiTab("chat");
+      // ...and the PANE has to come forward too. Switching the tab alone was
+      // the one path in the app that changed which tab was selected without
+      // making sure that tab could be seen: with the assistant collapsed,
+      // picking a message out of ⌘K selected a chat behind a closed column and
+      // looked, from the outside, exactly like the click doing nothing. Every
+      // other `setAiTab` caller already pairs the two (see `focusComposer`
+      // just below, and Room Home's chat and activity rows); this one did not.
+      layout?.showPane("ai");
       // The transcript paints only its newest page, so a hit on an older
       // message has no element to scroll to — ask the pane to widen its page
       // first, or `revealMessage` polls for two seconds and gives up silently.

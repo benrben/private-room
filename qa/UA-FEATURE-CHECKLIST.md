@@ -79,17 +79,26 @@
 - [ ] "Forgot password? Use a recovery code" appears only when a recovery key exists → recovery mode (`UnlockScreen.tsx`).
 - [ ] Recovery mode: code input (placeholder `XXXX-XXXX-…`, auto-capitalize), "Unlock with code" (disabled when empty), bad code → "That recovery code didn't work…", "Use password instead" returns, footer "The recovery code was shown once…" (`UnlockScreen.tsx`).
 
-## 6. Activity rail (left edge, top-level navigation)
+## 6. Sidebar (left edge, top-level navigation)
 
-- [ ] Pane toggles with pressed state: Library (⌘1), Workspace (⌘2), AI (⌘3) (`ActivityRail.tsx`).
-- [ ] AI toggle shows an amber attention dot when a job is running or an approval is waiting (`ActivityRail.tsx`, `Workspace.tsx`).
-- [ ] Area buttons with current-state highlight — **exactly nine**, in this order: Room home · Room Map · Recordings · Workflows · Scripts · **Skills** · Memory & scratch pad · **Connectors** · **Private browser** (`ActivityRail.tsx`). Every one must open its area; a rail entry that lands on an empty pane is a failure, not an empty room. (P1-2: the rail's own "Find" destination — a tenth entry, a second full-page search surface — is retired; ⌘K is the room's one search surface now and is reached only from the top bar / ⌘K itself, never from the rail.)
-- [ ] Each area button carries a stable `data-area` attribute (`home`/`map`/`recordings`/`workflows`/`scripts`/`skills`/`memory`/`connectors`/`browser`) — the capture harness and the GH #2 e2e both select on it (`ActivityRail.tsx`).
+Navigation only. The pane toggles and Focus moved to the toolbar's **Layout**
+menu (§7); the AI toggle and its attention marks moved to the toolbar's
+**Assistant** button (§7). Nothing in this column shows or hides anything.
+
+- [ ] **Pinned destinations — exactly four by default**, in this order: Home · Recordings · Private browser · Sketch (`navPrefs.tsx` `DEFAULT_PINNED`). Every one must open its area; a sidebar entry that lands on an empty pane is a failure, not an empty room.
+- [ ] **"More tools" disclosure** holds the other seven, collapsed at rest: Create · Room Map · Workflows · Scripts · Skills · Connectors · Memory. Expanding reveals them indented; the row itself is chrome and never takes the accent (`ActivityRail.tsx`).
+- [ ] Unpinned destinations are **absent from the DOM** while the disclosure is closed — check the palette covers them (next item), because `ui_snapshot` cannot see them either.
+- [ ] **⌘K lists every area, pinned or not** (`Overlays.tsx` `buildPaletteActions`). This is the completeness guarantee behind the disclosure and the only route the embodiment loop has to an unpinned place. Adding an area to the sidebar and not to the palette is a defect.
+- [ ] **Where you are is always on screen.** Arrive at an unpinned place from outside the sidebar (⌘K, a toast's "Scripts" action, a Home row), then shut the disclosure: that one row stays, marked current, and its siblings go. The toggle must still visibly work — forcing the whole group open instead would make "hide these" do nothing while you stand in one of them (`ActivityRail.tsx`).
+- [ ] **The Library is NOT in this list** — it is a pane. It is shown/hidden from Layout or ⌘1 only, and the Customize sheet says so in as many words (`navPrefs.tsx`, `CustomizeSidebar.tsx`).
+- [ ] Each destination button carries a stable `data-area` attribute (`home`/`recordings`/`browser`/`sketch`/`create`/`map`/`workflows`/`scripts`/`skills`/`connectors`/`memory`) — the capture harness and the GH #2 e2e both select on it (`ActivityRail.tsx`).
+- [ ] `.activity-rail` remains the class on the `<nav>` — `src/agent/driver.ts` maps it to the region name the embodiment loop reports.
+- [ ] **Customize sidebar** row opens the sheet: pin/unpin switches, up/down reorder within a group (never across it), a Reset, and the note explaining the Library's absence (`CustomizeSidebar.tsx`). Changes apply live to the sidebar behind it and persist device-wide in `prNav:v1` — they follow you between rooms, unlike the pane layout.
+- [ ] The same list renders inside **Settings → App → Interface** from the same component — check the two cannot disagree (`InterfaceSection.tsx`).
 - [ ] Collapsed rail is icon-only (P1-7: the old ≤9-char abbreviation under each icon — "Record", "Connect" — is gone, it clipped against the status bar); the full name is a native `title` tooltip on hover plus the existing `aria-label`, not the rail's own `[data-tip]` pattern. Expanded rail shows the full label as visible text next to each icon (`ActivityRail.tsx`).
-- [ ] "Search room (⌘K)" button opens the search/command palette (`ActivityRail.tsx`).
-- [ ] "Focus the editor" (zen) hides both side panes; click again restores; label flips Focus/Unfocus (`ActivityRail.tsx`).
 - [ ] "Room settings (⌘,)" opens Settings (`ActivityRail.tsx`).
-- [ ] **GH #2** Expand/Collapse toggle at the top widens the rail to ~184 px, revealing each area's full label as visible text beside its icon (collapsed rail is icon-only, name via `title` tooltip — see §6 above); collapses back; persists per room (`ActivityRail.tsx`, `useLayout.ts` railExpanded). *e2e: `gh2-sidebar-expand.e2e.mjs`*
+- [ ] **GH #2** Expand/Collapse toggle at the top widens the rail to ~192 px, revealing each destination's full label as visible text beside its icon; collapses back; persists per room (`ActivityRail.tsx`, `useLayout.ts` `railExpanded`). *e2e: `gh2-sidebar-expand.e2e.mjs`*
+- [ ] **Narrow window (≤1180 px): the rail drops its labels by itself**, and the Expand/Collapse toggle disappears while it does (it could not change anything). **The stored `railExpanded` must NOT change** — widen the window again and the labels come back. Verify in devtools: `localStorage` `prLayout:*` still reads `railExpanded: true`. *This is the single most important regression in this area: the layout record is rewritten on every change, so a collapse written to storage would cost the reader their labels permanently.* (`useLayout.ts` `railAutoCollapsed`) *e2e: `gh2-sidebar-expand.e2e.mjs`*
 
 ## 7. Three-pane layout
 
@@ -97,9 +106,20 @@
 - [ ] **GH #2** The splitter grip is visible WITHOUT hovering, and the two panes either side of it trade — the ratios stay summed to 1 and the center floor holds at both extremes. *e2e: `gh2-sidebar-expand.e2e.mjs`*
 - [ ] Splitter keyboard: focus + ArrowLeft/Right (Shift = bigger steps); `aria-valuenow` updates (`useLayout.ts`).
 - [ ] Double-click (or Enter) a splitter → reset layout, unhide all, exit focus (`Splitter.tsx`).
-- [ ] ⌘1/⌘2/⌘3 toggle panes; hiding all auto-restores center; Escape exits focus mode (ignored while typing) (`useLayout.ts`).
-- [ ] Narrow window (< 1080 px): exactly one pane; rail buttons *switch* instead of toggle; priority center > ai > library (`useLayout.ts`).
+- [ ] **⌘1 = Library, ⌘2 = Assistant, ⌘3 = Assistant (back-compat alias).** All three must work; ⌘3 keeps the meaning it has always had so nobody's hands relearn anything this release. There is NO key that hides the workspace — see the next item (`useLayout.ts` `PANE_KEYS`). The shortcuts sheet (⌘/) lists all three, with ⌘3 named as the older shortcut.
+- [ ] **The workspace cannot be hidden.** No control anywhere offers it: not the sidebar, not Layout, not a key. Focus (Layout → Focus the workspace) is what gives it the full width, and Escape leaves focus (ignored while typing) (`useLayout.ts` `togglePane` takes `SidePane`, not `PaneKey`).
+- [ ] **Migration:** a room whose saved layout has `hidden.center: true` (possible in any record written before this release) must open with the workspace VISIBLE. Verify by hand-editing a `prLayout:*` record in devtools, reloading, and confirming the centre pane is there — a room that opened centre-less would have no control able to bring it back (`useLayout.ts`, the `hidden` initialiser).
+- [ ] Narrow window (< 1080 px): exactly one pane; the Layout rows and the Assistant button *switch* the single slot instead of toggling — and asking for the pane that is already showing hands the window back to the workspace, so a narrow window can never get stuck in the assistant (`useLayout.ts` `togglePane`).
 - [ ] Per-room persistence: resize/collapse, relock + reopen same room → restored; another room has its own layout (`localStorage["prLayout:{room}"]`, `useLayout.ts`).
+
+### 7a. Layout menu + Assistant button (toolbar)
+
+- [ ] **Layout menu** (`LayoutMenu.tsx`): Library (⌘1) and Assistant (⌘2) as checked rows whose tick tracks what is ON SCREEN (so it stays honest in narrow mode), Focus the workspace, the three presets, Reset layout. The shortcut is printed on the row — it used to be learnable only from a tooltip.
+- [ ] **Presets are idempotent**: Focus / Research / Review each restate their ratios, so applying the same one twice — with splitter drags in between — lands in exactly the same place (`useLayout.ts` `PRESETS`).
+- [ ] Applying a preset settles the assistant step-aside: choose **Research**, then open a PDF — the assistant column must NOT collapse out from under the preset that just asked for it (`useLayout.ts` `applyPreset` → `noteAiChoice`).
+- [ ] **Assistant button** shows the pane and carries its news: a hand-circled count when approvals are waiting, a quiet blue dot when jobs are running, **only while the pane is shut** (a count beside an open pane is not news). Never summed into one number. Both `aria-hidden`; the words are in the button's own label (`TopBar.tsx`).
+- [ ] **Only one toolbar popover at a time.** Open the model picker, then Layout, then the room ⋯ menu, then the pinned-workflows pill (⌘J) and the pinned-scripts pill — each must close the last. Escape closes whichever is open. (The scripts menu used to hold a local flag and stack over the model picker.) (`state.ts` `openMenu`)
+- [ ] Every `setAiTab` path reveals the pane: **pick a chat message out of ⌘K with the Assistant collapsed** — the conversation must come forward, not switch a tab behind a shut column (`miscActions.ts` `activateResult`). Also check Home's chat rows, Home's Studio card, and the status bar's activity chip.
 
 ## 7b. Workspace tab strip (`TabStrip.tsx`, `workspace/tabs.ts`)
 
@@ -623,7 +643,7 @@ Connectors moved OUT of Settings in 0.13.0 and are a first-class product area �
 **Shell**
 - [ ] Opens from rail ⌘, / room menu / palette; backdrop + Esc close (Esc swallowed inside Custom-instructions and MCP JSON textareas); X close; focus trap; whole backdrop `data-agent-blocked` — the UI-driving agent can never operate Settings (`Settings.tsx`, `useFocusTrap.ts`).
 - [ ] Nav is a **page picker, not a jump list**: exactly **6 buttons**, one per group, `aria-current="page"` on the open one; only that page's sections are rendered (`Settings.tsx`).
-- [ ] The 6 pages hold **18 sections**, all reachable: **AI & behavior** (Model · Behavior · Room role · AI helpers · What each AI can do · AI advisors) · **Voice** (Spoken voice · Microphone) · **Privacy & recovery** (Cloud privacy · Lock & password · Recovery key) · **Connections** (AI providers · Online search · Remote AI · Room server) · **History & storage** (Checkpoints) · **App** (Appearance · Updates & version) — count them against `SETTINGS_GROUPS` in `Settings.tsx`, not against this sentence.
+- [ ] The 6 pages hold **18 sections**, all reachable: **AI & behavior** (Model · Behavior · Room role · AI helpers · What each AI can do · AI advisors) · **Voice** (Spoken voice · Microphone) · **Privacy & recovery** (Cloud privacy · Lock & password · Recovery key) · **Connections** (AI providers · Online search · Remote AI · Room server) · **History & storage** (Checkpoints) · **App** (Appearance · **Interface** · Updates & version) — count them against `SETTINGS_GROUPS` in `Settings.tsx`, not against this sentence.
 - [ ] Nav label ≠ section heading in four places — verify both strings: "Online search"→**Online features**, "Room server"→**Room as a tool (MCP server)**, "Lock & password"→**Privacy**, "AI advisors"→**AI advisors (advanced)**.
 - [ ] Deep-link: the status-bar trust chip opens Settings on the *Privacy & recovery* page scrolled to Cloud privacy — a section id resolves to its own page, never a blank one (`Settings.tsx`).
 - [ ] Reachability: with the room offline, Settings → Online features is still the ONLY place internet access is configured — no second search-engine setting exists anywhere (the provider dropdown was removed 2026-07-30).
@@ -743,6 +763,15 @@ Connectors moved OUT of Settings in 0.13.0 and are a first-class product area �
 - [ ] Switch macOS between light and dark with "Follow the Mac" selected and Settings open → the app follows live, with no relaunch (`theme.ts` `initTheme` listener).
 - [ ] The choice survives: pick Light, quit, relaunch → still Light, and no dark flash before first paint (`localStorage["prTheme"]`).
 - [ ] Selecting the option already in force is a no-op, and the top bar's flip and this radio group never disagree — flip from the top bar, reopen Settings → the radio shows what is actually in force.
+
+**Interface (App)**
+- [ ] Nav group "App" holds an **Interface** section between Appearance and Updates (`InterfaceSection.tsx`, `set-interface` in `SETTINGS_GROUPS`). Everything on it applies instantly — there is no Save.
+- [ ] **Sidebar**: the same pin/reorder list the Customize sheet shows, from the same component. Toggle something here, close Settings, and confirm the sidebar behind it changed.
+- [ ] **Layout presets**: the same three as the Layout menu, applied to the room behind the modal.
+- [ ] **Density** (Comfortable · Compact) writes `data-density` on `<html>` and moves the spacing and type scales app-wide. Compact must NOT go below the metadata floor — `--fs-micro` stays 12px in both modes. Expect the densest pages (Settings, Connectors, Workflows, the browser) to give back less room; the section's own copy says so, so a tester should not file that as a bug.
+- [ ] **Canvas texture** (Subtle · Off) writes `data-texture`; Off removes the dotted sheet and the two hatches and changes nothing else — surfaces and ink identical.
+- [ ] Both survive a relaunch and are applied **before first paint** (no flash of comfortable-and-dotted) (`main.tsx` `initInterface`).
+- [ ] **Reset to Arcelle defaults** clears all three stores at once: the customized sidebar (`prNav:v1`), density and texture, and **every room's** saved pane layout (`prLayout:*`, not just the open room's). It must touch nothing inside any room — no file, note, chat or room setting. It is deliberately NOT styled as a destructive button; red in this app means "this destroys something".
 
 **Updates & version (App)**
 - [ ] Nav group "App" → "Updates & version" jumps to the section; shows the running version (v0.15.0 at the time of writing — compare against `package.json`, never against this sheet) from `getVersion()` (`AboutSection.tsx`).
@@ -1013,6 +1042,42 @@ pass on a cloud engine does not prove the local tier serves the box.
 - [ ] Re-casting and recording again KEEPS the old episode, and the new one has a different name (`… episode 2.m4a`)
 - [ ] Reopening the script later still shows the chosen voices
 - [ ] Stopping mid-record lands no half file in the room
+
+## 32. Sketch — drawing (rail → Sketch)
+
+- [ ] The rail shows "Sketch" between Create and the private browser; opening it shows the gallery, and the Library heading on the left reads "Library"
+- [ ] "New sketch" makes a file called `Sketch.sketch`, opens it, and it appears in the Library like any other file
+- [ ] A second "New sketch" does NOT overwrite the first — it lands as `Sketch 2.sketch`
+- [ ] Pen draws a smooth line that follows the cursor; a fast scribble does not come out as straight segments
+- [ ] Box, Ellipse, Arrow and Note each draw; each is drawn in the CHOSEN pen colour
+- [ ] Only five pens are offered (pink, yellow, green, blue, red) — there is no free colour picker
+- [ ] Select (V) picks the shape on top when two overlap; dragging moves it; Backspace deletes it
+- [ ] Clicking a long diagonal arrow only selects it NEAR the line, not anywhere in its bounding box
+- [ ] Selecting a shape shows a Label field; typing in it names the shape and the name appears inside it
+- [ ] ⌘Z undoes the last thing drawn and ⇧⌘Z redoes it; undo works at least 20 steps back
+- [ ] The status line says "Saving…" then "Saved" without a Save button being pressed
+- [ ] Closing the tab mid-draw and reopening the file shows everything that was drawn (nothing is lost to the autosave debounce)
+- [ ] "Export SVG" puts a `.svg` in the Library that opens in the SVG viewer and LOOKS like the sketch
+- [ ] Searching the room for a word that only appears as a shape's LABEL finds the sketch
+- [ ] Searching for a coordinate number (e.g. "320") does NOT find the sketch — coordinates must not be indexed
+
+## 32b. The drawing agent (chat-invocable)
+
+- [ ] "draw my login flow as a diagram" reaches the drawing agent and produces a sketch with boxes AND connecting arrows
+- [ ] `*sketch draw three boxes in a row` goes straight to the drawing agent with no hub round trip
+- [ ] The step chips read "Drew on the sketch" / "Looked at the sketch" — never "Ran the draw tool"
+- [ ] Shapes the agent draws appear ONE AT A TIME on an open sketch, not all at once
+- [ ] Work the agent draws is briefly marked in the pink attribution pen
+- [ ] Ask it to draw while YOU are mid-stroke: your stroke survives and so does its drawing
+- [ ] Ask it to add to an existing sketch: it reads first, and the existing shapes are still there afterwards
+- [ ] Ask for something that would overlap ("put three big boxes at the same spot"): it reports the overlap and fixes it rather than leaving it
+- [ ] Arrows the agent draws TOUCH the boxes they connect — no arrow stopping in empty space
+- [ ] Every box the agent draws has a word in it
+- [ ] With a cloud model + privacy door ON, asking it to look at the sketch says plainly that the picture stays on this Mac, and still reports the measurements
+- [ ] A drawing the agent made can be undone by the user with ⌘Z, and recovered from version history
+- [ ] The agent cannot destroy a drawing: after "clear it and start again", the previous version is still in version history
+
+**Known gap, not a defect of this feature:** §32/§32b are the Sketch page's own section. The **Create** page (v0.20.0) still has no section in this list — it was shipped without one. That is an outstanding debt to close, not a template to copy.
 
 ---
 

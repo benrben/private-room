@@ -21,6 +21,7 @@
     "agent.media.transcribe": "devtools.studio:MEDIA_TRANSCRIBE",
     "agent.media.video": "devtools.studio:MEDIA_VIDEO",
     "agent.creator.studio": "devtools.studio:CREATOR_STUDIO",
+    "agent.creator.draw": "devtools.studio:CREATOR_DRAW",
     "template.react": "devtools.studio:TEMPLATE_REACT",
     "template.supervisor": "devtools.studio:TEMPLATE_SUPERVISOR",
     "template.react_verify": "devtools.studio:TEMPLATE_REACT_VERIFY",

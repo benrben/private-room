@@ -12,7 +12,29 @@ import {
  * "center" = the primary work surface, "ai" = chat/studio/activity. */
 export type PaneKey = "library" | "center" | "ai";
 
+/** The panes that can be shown and hidden. The centre cannot: it is the one
+ * pane the room is always for, and the Layout menu offers Focus instead —
+ * see `togglePane`. */
+export type SidePane = Exclude<PaneKey, "center">;
+
 export const PANE_ORDER: PaneKey[] = ["library", "center", "ai"];
+
+/** ⌘-number → the pane it shows or hides.
+ *
+ * This used to be `PANE_ORDER[n - 1]`, which quietly meant ⌘2 was "hide the
+ * workspace" purely because the centre sat second in a rendering order. Two
+ * of the three keys keep exactly the meaning they have always had — ⌘1 was
+ * already the library and ⌘3 was already the assistant — so the remap costs
+ * a user nothing but the one key whose old job no longer exists.
+ *
+ * ⌘3 stays as an alias for at least one release. It is not a compatibility
+ * shim anyone has to maintain: it is the binding this app has always had,
+ * left alone. */
+export const PANE_KEYS: Record<string, SidePane> = {
+  "1": "library",
+  "2": "ai",
+  "3": "ai",
+};
 
 /** Default proportions (16 / 61 / 23): ONE dominant workspace, with the library
  * a navigable strip and the AI pane a slim contextual column you widen or
@@ -54,8 +76,64 @@ const CLAMP = {
 };
 
 /** Below this the three-pane grid stops being readable; the shell shows ONE
- * pane at a time and the rail buttons switch instead of toggle. */
+ * pane at a time and the pane controls switch instead of toggle. */
 const NARROW_QUERY = "(max-width: 1080px)";
+
+/** Below this the sidebar drops its labels on its own.
+ *
+ * Deliberately NOT the same breakpoint as NARROW_QUERY. Firing both at one
+ * width would take the labels and two of the three panes away in the same
+ * frame, which reads as the window breaking rather than as the shell adapting;
+ * 1180 gives the rail a step of its own on the way down. */
+const RAIL_NARROW_QUERY = "(max-width: 1180px)";
+
+/** The three shipped layout presets, and what each is FOR.
+ *
+ * A preset is not a fourth kind of state — it is a named set of the choices
+ * the Layout menu already offers one at a time, applied together. That is the
+ * whole reason they exist: "get out of the way so I can read this" is three
+ * clicks (hide library, hide assistant, widen) that nobody performs, so the
+ * layout stays wrong instead.
+ *
+ * Ratios are re-stated per preset rather than inherited, so applying one is
+ * idempotent — running Review twice lands in exactly the same place, whatever
+ * the panes had been dragged to in between. */
+export type PresetName = "focus" | "research" | "review";
+
+export const PRESETS: Record<
+  PresetName,
+  { label: string; hint: string; hidden: Record<PaneKey, boolean>; ratios: Record<PaneKey, number> }
+> = {
+  focus: {
+    label: "Focus",
+    hint: "The workspace alone",
+    hidden: { library: true, center: false, ai: true },
+    ratios: { library: 0.16, center: 0.61, ai: 0.23 },
+  },
+  research: {
+    label: "Research",
+    hint: "Library, workspace, and the assistant",
+    hidden: { library: false, center: false, ai: false },
+    ratios: { library: 0.16, center: 0.61, ai: 0.23 },
+  },
+  review: {
+    label: "Review",
+    hint: "Library and workspace, no assistant",
+    hidden: { library: false, center: false, ai: true },
+    // A wider library than the default (26% of the visible width once the
+    // assistant is out, against 21%), because reviewing means moving between
+    // files rather than staying in one.
+    //
+    // THE THREE MUST SUM TO 1, including the pane this preset hides. A hidden
+    // pane's track is 0px, so its ratio looks free — but `applyResize` holds
+    // the SUM of a splitter's two panes constant and compares a pointer
+    // position (a fraction of the whole grid) against a pane's ratio directly.
+    // Both stop being true if the ratios drift off 1, and the drift only shows
+    // up later: apply Review, reopen the assistant, and every pane is the
+    // wrong width with the centre floor silently breached.
+    ratios: { library: 0.2, center: 0.57, ai: 0.23 },
+  },
+};
 
 type Persisted = {
   ratios?: Partial<Record<PaneKey, number>>;
@@ -170,7 +248,19 @@ export function useLayout(roomPath: string) {
   }));
   const [hidden, setHidden] = useState<Record<PaneKey, boolean>>(() => ({
     library: persisted.hidden?.library === true,
-    center: persisted.hidden?.center === true,
+    // ALWAYS false, and it is a migration rather than a simplification.
+    //
+    // The workspace used to be hideable — the rail carried a toggle for it —
+    // so `hidden.center: true` is a value real rooms have on disk right now.
+    // It is not hideable any more (it is the one pane the room is always FOR;
+    // see `togglePane`), which means a record saved that way would reopen with
+    // an empty middle column and no control anywhere that could bring it back.
+    // Reading it as false retires those records on the next write.
+    //
+    // This needs no LAYOUT_VERSION bump, and deliberately does not get one: a
+    // bump would also discard the library and assistant flags, and those are
+    // real choices the reader made and expects to find where they left them.
+    center: false,
     ai: persisted.hidden?.ai === true,
   }));
   const [focusPane, setFocusPane] = useState<PaneKey | null>(null);
@@ -185,11 +275,42 @@ export function useLayout(roomPath: string) {
   const [isNarrow, setIsNarrow] = useState(
     () => window.matchMedia(NARROW_QUERY).matches,
   );
+  /** The window is too narrow to carry the sidebar's words, so it is drawing
+   * icons whatever the reader prefers.
+   *
+   * SEPARATE STATE, AND NEVER PERSISTED — this is the whole trap. The effect
+   * below writes `railExpanded` on every layout change, so an auto-collapse
+   * that set `railExpanded` directly would be indistinguishable from the user
+   * choosing the icon strip: one narrow window, one write, and the labels
+   * never come back on any window at any width. Whoever widens the window
+   * again must find their labels where they left them.
+   *
+   * This is the same shape as `aiSteppedAside` below, and for the same reason:
+   * a suggestion the SOFTWARE makes must not outlive the condition that
+   * prompted it, and only a choice the USER actually made gets written down. */
+  const [railAutoCollapsed, setRailAutoCollapsed] = useState(
+    () => window.matchMedia(RAIL_NARROW_QUERY).matches,
+  );
+  /** Whether the sidebar's "More tools" disclosure is open right now.
+   *
+   * Deliberately NOT persisted, and not in `Persisted` above. Which tools a
+   * reader wants at hand is a real preference and lives in shell/navPrefs; a
+   * drawer that reopened itself on every launch would make pinning pointless,
+   * because the pinned list would only ever be the top of a list that is
+   * always fully expanded anyway. */
+  const [moreToolsOpen, setMoreToolsOpen] = useState(false);
   const gridRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     const mq = window.matchMedia(NARROW_QUERY);
     const onChange = () => setIsNarrow(mq.matches);
+    mq.addEventListener("change", onChange);
+    return () => mq.removeEventListener("change", onChange);
+  }, []);
+
+  useEffect(() => {
+    const mq = window.matchMedia(RAIL_NARROW_QUERY);
+    const onChange = () => setRailAutoCollapsed(mq.matches);
     mq.addEventListener("change", onChange);
     return () => mq.removeEventListener("change", onChange);
   }, []);
@@ -298,28 +419,60 @@ export function useLayout(roomPath: string) {
     setAiSteppedAside(false);
   }, []);
 
-  /** Rail pane button: toggle visibility (or, in focus/narrow mode, move the
-   * single visible slot to that pane). Never leaves zero panes. */
+  /** Show or hide one of the two SIDE panes.
+   *
+   * The centre is not in this signature, and that is the redesign's second
+   * decision expressed as a type. The workspace is what the room is for; it
+   * used to sit in a row of three identical toggles as though hiding it were
+   * an equivalent move to hiding a sidebar, and hiding it left a window with
+   * nothing in it. Focus mode (below) still gets the workspace the full width
+   * — by taking the SIDES away, which is the outcome anyone reaching for
+   * "hide the workspace" actually wanted.
+   *
+   * In narrow mode there is only ever one pane on screen, so this MOVES the
+   * single slot: asking for the assistant shows it, asking again hands the
+   * window back to the workspace. Without that second half a narrow window
+   * could reach the assistant and never leave it, now that no control exists
+   * to ask for the centre by name. */
   const togglePane = useCallback(
-    (key: PaneKey) => {
+    (key: SidePane) => {
       if (key === "ai") noteAiChoice();
       if (isNarrow) {
-        setFocusPane((f) => (f === key ? f : key));
         setHidden((h) => ({ ...h, [key]: false }));
+        setFocusPane((f) => (f === key ? "center" : key));
         return;
       }
       if (focusPane) {
-        setFocusPane(focusPane === key ? null : key);
+        // Asking for a side pane while focused means "come out of focus and
+        // give me this" — not "focus this instead", which would swap one
+        // single-pane view for another and read as the click doing nothing.
+        setFocusPane(null);
         setHidden((h) => ({ ...h, [key]: false }));
         return;
       }
-      setHidden((h) => {
-        const next = { ...h, [key]: !h[key] };
-        if (next.library && next.center && next.ai) next.center = false;
-        return next;
-      });
+      setHidden((h) => ({ ...h, [key]: !h[key] }));
     },
     [isNarrow, focusPane, noteAiChoice],
+  );
+
+  /** Apply a named preset — the Layout menu's three one-click layouts and the
+   * default new rooms open in. Idempotent: ratios are restated, not nudged,
+   * so applying the same preset twice lands in exactly the same place however
+   * the splitters had been dragged in between. */
+  const applyPreset = useCallback(
+    (name: PresetName) => {
+      const p = PRESETS[name];
+      setRatios({ ...p.ratios });
+      setHidden({ ...p.hidden });
+      setFocusPane(null);
+      // A preset is the user stating what they want on screen, so it settles
+      // the step-aside question the same way clicking the pane would — else
+      // choosing Research and then opening a PDF would immediately undo the
+      // assistant column the preset had just asked for.
+      noteAiChoice();
+      if (p.hidden.ai) setAiSteppedAside(false);
+    },
+    [noteAiChoice],
   );
 
   /** Focus/maximize a pane; activating again restores the prior layout.
@@ -361,6 +514,9 @@ export function useLayout(roomPath: string) {
     setRatios({ ...DEFAULT_RATIOS });
     setHidden({ library: false, center: false, ai: false });
     setFocusPane(null);
+    // The PREFERENCE goes back to labels. Whether they actually appear is
+    // still the window's business (`railAutoCollapsed`) — Reset must not be
+    // able to force words into a rail too narrow to hold them.
     setRailExpanded(true);
     // Reset means "start again from the defaults", and the focused-page
     // suggestion is one of them — so it is re-armed rather than left disabled
@@ -371,6 +527,7 @@ export function useLayout(roomPath: string) {
   }, []);
 
   const toggleRail = useCallback(() => setRailExpanded((v) => !v), []);
+  const toggleMoreTools = useCallback(() => setMoreToolsOpen((v) => !v), []);
 
   /** Shared resize math (pointer + keyboard). Side "a" sizes the library
    * against whichever neighbour is visible; side "b" sizes the AI pane
@@ -385,23 +542,23 @@ export function useLayout(roomPath: string) {
    * before, let the sum drift above 1 and quietly pushed the center under
    * `centerMin`.) */
   const applyResize = useCallback(
-    (side: "a" | "b", nextEdge: number, centerHidden: boolean) => {
+    (side: "a" | "b", nextEdge: number) => {
       setRatios((r) => {
         const next = { ...r };
         if (side === "a") {
-          // The library trades with the center, or with the AI pane when the
-          // center is collapsed.
-          const withAi = centerHidden;
-          const pair = next.library + (withAi ? next.ai : next.center);
-          const floor = withAi ? CLAMP.ai.min : CLAMP.centerMin;
+          // The library always trades with the centre. It used to have a
+          // second branch for trading with the AI pane instead, for when the
+          // centre was collapsed — a state that can no longer exist, and that
+          // a splitter could never have been dragged in anyway: a splitter is
+          // only drawn between two VISIBLE panes.
+          const pair = next.library + next.center;
           const lib = bound(
             nextEdge,
             CLAMP.library.min,
-            Math.min(CLAMP.library.max, pair - floor),
+            Math.min(CLAMP.library.max, pair - CLAMP.centerMin),
           );
           next.library = lib;
-          if (withAi) next.ai = pair - lib;
-          else next.center = pair - lib;
+          next.center = pair - lib;
         } else {
           const pair = next.center + next.ai;
           const ai = bound(
@@ -427,9 +584,6 @@ export function useLayout(roomPath: string) {
       el.setPointerCapture(e.pointerId);
       setDragging(side);
       document.body.classList.add("resizing-col");
-      const centerHidden = !grid.querySelector(
-        ".pane-center:not(.is-hidden)",
-      );
       const move = (ev: globalThis.PointerEvent) => {
         const rect = grid.getBoundingClientRect();
         if (rect.width <= 0) return;
@@ -437,7 +591,7 @@ export function useLayout(roomPath: string) {
           side === "a"
             ? (ev.clientX - rect.left) / rect.width
             : (rect.right - ev.clientX) / rect.width;
-        applyResize(side, edge, centerHidden);
+        applyResize(side, edge);
       };
       const up = (ev: globalThis.PointerEvent) => {
         setDragging(null);
@@ -464,33 +618,30 @@ export function useLayout(roomPath: string) {
   const keyResize = useCallback(
     (side: "a" | "b", direction: 1 | -1, big: boolean) => {
       const amount = (big ? 0.04 : 0.015) * direction;
-      applyResize(
-        side,
-        side === "a" ? ratios.library + amount : ratios.ai - amount,
-        !visible.includes("center"),
-      );
+      applyResize(side, side === "a" ? ratios.library + amount : ratios.ai - amount);
     },
-    [applyResize, ratios, visible],
+    [applyResize, ratios],
   );
 
-  // ⌘/Ctrl+1/2/3 toggle panes; Escape leaves focus mode. Capture phase so
-  // the focus-Escape wins over the workspace's close-file Escape.
+  // ⌘/Ctrl+1/2/3 show and hide the side panes; Escape leaves focus mode.
+  // Capture phase so the focus-Escape wins over the workspace's close-file
+  // Escape.
   //
-  // These three keys have exactly ONE meaning in this app — the one the rail's
-  // own labels promise. The claim is settled here (capture + stopPropagation)
-  // so a second handler can never also act on the same press; tab-by-position
-  // lives on ⌥⌘1–⌥⌘9, which is why Option is excluded below.
+  // These three keys have exactly ONE meaning in this app — the one the Layout
+  // menu prints beside each row. The claim is settled here (capture +
+  // stopPropagation) so a second handler can never also act on the same press;
+  // tab-by-position lives on ⌥⌘1–⌥⌘9, which is why Option is excluded below.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (
         (e.metaKey || e.ctrlKey) &&
         !e.altKey &&
         !e.shiftKey &&
-        ["1", "2", "3"].includes(e.key)
+        PANE_KEYS[e.key] !== undefined
       ) {
         e.preventDefault();
         e.stopPropagation();
-        togglePane(PANE_ORDER[Number(e.key) - 1]);
+        togglePane(PANE_KEYS[e.key]);
         return;
       }
       if (e.key === "Escape" && focusPane) {
@@ -507,9 +658,20 @@ export function useLayout(roomPath: string) {
     return () => window.removeEventListener("keydown", onKey, true);
   }, [togglePane, focusPane]);
 
-  const layoutLabel = focusPane
-    ? `${focusPane === "ai" ? "AI" : focusPane === "library" ? "Library" : "Editor"} focus`
-    : `${visible.length} pane${visible.length === 1 ? "" : "s"}`;
+  /** What the status bar says the layout is.
+   *
+   * Narrow mode is called out separately because `focusPane` does double duty
+   * there — it holds WHICH single pane is showing, not a mode the reader chose
+   * — so the plain branch below announced "Editor focus" to someone who had
+   * simply pressed Assistant and pressed it again. Nobody focused anything;
+   * the window is only wide enough for one pane. */
+  const paneName =
+    focusPane === "ai" ? "Assistant" : focusPane === "library" ? "Library" : "Workspace";
+  const layoutLabel = isNarrow
+    ? paneName
+    : focusPane
+      ? `${paneName} focus`
+      : `${visible.length} pane${visible.length === 1 ? "" : "s"}`;
 
   return {
     ratios,
@@ -521,14 +683,28 @@ export function useLayout(roomPath: string) {
     visible,
     isNarrow,
     dragging,
-    railExpanded,
+    /** What the sidebar SHOWS. The stored preference, less any collapse the
+     * window width is imposing — every consumer reads this and no consumer
+     * reads the preference, so the two can never be confused. */
+    railExpanded: railExpanded && !railAutoCollapsed,
+    /** What the reader CHOSE, which is what storage holds. Only the two
+     * surfaces that describe the preference itself (the rail's own expander,
+     * and Settings → Interface) have any business with this. */
+    railExpandedPref: railExpanded,
+    /** Whether the window — not the reader — is what took the labels away.
+     * The expander hides while this is true: a control that cannot change
+     * anything is worse than no control. */
+    railAutoCollapsed,
     toggleRail,
+    moreToolsOpen,
+    toggleMoreTools,
     gridRef,
     gridStyle,
     showSplitA,
     showSplitB,
     layoutLabel,
     togglePane,
+    applyPreset,
     toggleFocus,
     showPane,
     collapsePane,

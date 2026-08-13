@@ -31,7 +31,15 @@ import { openApp, widthOf } from "./helpers.mjs";
 
 const RAIL = ".activity-rail";
 const EXPANDER = '[data-testid="rail-expander"]';
+const MORE_TOOLS = '[data-testid="more-tools"]';
 const SPLIT_A = '[aria-label="Resize the Library pane"]';
+
+/** The shipped sidebar: four destinations at rest, seven behind More tools.
+ * Kept in step with shell/navPrefs.tsx — if a destination is added to the
+ * catalog and to neither of these, the "every destination reachable" test
+ * below stops covering it. */
+const PINNED = ["home", "recordings", "browser", "sketch"];
+const MORE = ["create", "map", "workflows", "scripts", "skills", "connectors", "memory"];
 
 /** The persisted per-room layout the shell writes to localStorage. */
 const saved = () =>
@@ -61,9 +69,12 @@ describe("GH #2a — the activity rail expands", () => {
   });
 
   it("narrows to icons and back", async () => {
-    // A new room opens with the readable labels.
+    // A new room opens with the readable labels. Asserted on PINNED
+    // destinations: the navigation redesign moved Connectors (which this test
+    // used to name) behind the More tools disclosure, so it is not rendered
+    // at all until that is opened — a different fact from the one under test.
     await expect(await widthOf(RAIL)).toBeGreaterThan(150);
-    await expect(await $(RAIL).$('[data-area="connectors"]').getText()).toBe("Connectors");
+    await expect(await $(RAIL).$('[data-area="home"]').getText()).toBe("Home");
     await expect(await $(RAIL).$('[data-area="recordings"]').getText()).toBe("Recordings");
 
     await (await $(EXPANDER)).click();
@@ -73,10 +84,10 @@ describe("GH #2a — the activity rail expands", () => {
     });
     // Icon-only while narrow — no shrunken abbreviation, the full name only
     // survives as a `title` tooltip.
-    await expect(await $(RAIL).$('[data-area="connectors"]').getText()).toBe("");
+    await expect(await $(RAIL).$('[data-area="recordings"]').getText()).toBe("");
     await expect(
-      await $(RAIL).$('[data-area="connectors"]').getAttribute("title"),
-    ).toBe("Connectors");
+      await $(RAIL).$('[data-area="recordings"]').getAttribute("title"),
+    ).toBe("Recordings");
 
     await (await $(EXPANDER)).click();
     await browser.waitUntil(async () => (await widthOf(RAIL)) > 150, {
@@ -100,10 +111,84 @@ describe("GH #2a — the activity rail expands", () => {
 
   it("keeps every rail destination reachable while expanded", async () => {
     await browser.waitUntil(async () => (await widthOf(RAIL)) > 150);
-    // A wider rail must not push its own buttons out of the viewport.
-    for (const area of ["map", "recordings", "workflows", "memory", "connectors", "create"]) {
+    // A wider rail must not push its own buttons out of the viewport. Every
+    // destination the app has, pinned or not — so the disclosure is opened
+    // first and the check covers both tiers rather than only the short one.
+    await (await $(MORE_TOOLS)).click();
+    for (const area of PINNED.concat(MORE)) {
       await expect(await $(RAIL).$(`[data-area="${area}"]`)).toBeDisplayed();
     }
+  });
+
+  it("hides the unpinned tools until More tools is opened", async () => {
+    await browser.waitUntil(async () => (await widthOf(RAIL)) > 150);
+    // Collapsed by default, and genuinely absent rather than merely hidden —
+    // the point of the disclosure is that the resting sidebar is short.
+    await expect(await $(MORE_TOOLS).getAttribute("aria-expanded")).toBe("false");
+    for (const area of MORE) {
+      await expect(await $(RAIL).$(`[data-area="${area}"]`)).not.toBeExisting();
+    }
+    for (const area of PINNED) {
+      await expect(await $(RAIL).$(`[data-area="${area}"]`)).toBeDisplayed();
+    }
+
+    await (await $(MORE_TOOLS)).click();
+    await expect(await $(MORE_TOOLS).getAttribute("aria-expanded")).toBe("true");
+    for (const area of MORE) {
+      await expect(await $(RAIL).$(`[data-area="${area}"]`)).toBeDisplayed();
+    }
+  });
+
+  it("keeps the place you are in on screen even with the disclosure shut", async () => {
+    // Going to an unpinned place from anywhere that is not the sidebar (⌘K, a
+    // toast action, a Home row) must not leave the sidebar marking nothing as
+    // current — the highlight would be drawn on a row that is not rendered.
+    await (await $(MORE_TOOLS)).click();
+    await (await $(RAIL).$('[data-area="workflows"]')).click();
+
+    // Shut it again while standing inside it. The toggle still WORKS — its
+    // siblings go — and the current place stays, alone.
+    await (await $(MORE_TOOLS)).click();
+    await expect(await $(MORE_TOOLS).getAttribute("aria-expanded")).toBe("false");
+    await expect(await $(RAIL).$('[data-area="workflows"]')).toBeDisplayed();
+    await expect(
+      await $(RAIL).$('[data-area="workflows"]').getAttribute("aria-current"),
+    ).toBe("true");
+    for (const area of MORE.filter((k) => k !== "workflows")) {
+      await expect(await $(RAIL).$(`[data-area="${area}"]`)).not.toBeExisting();
+    }
+  });
+
+  it("never writes the automatic narrow-window collapse to storage", async () => {
+    // THE TRAP THIS GUARDS: the layout record is rewritten on every change, so
+    // an auto-collapse that set `railExpanded` would be indistinguishable from
+    // the reader choosing the icon strip — one narrow window and the labels
+    // never come back at any width. Only a real choice may be stored.
+    await browser.waitUntil(async () => (await widthOf(RAIL)) > 150);
+    await expect((await saved())?.railExpanded).not.toBe(false);
+
+    const { width, height } = await browser.getWindowSize();
+    try {
+      await browser.setWindowSize(1000, height);
+      await browser.waitUntil(async () => (await widthOf(RAIL)) < 100, {
+        timeout: 5_000,
+        timeoutMsg: "the rail never collapsed on a narrow window",
+      });
+      // Drawing icons...
+      await expect(await $(RAIL).$('[data-area="recordings"]').getText()).toBe("");
+      // ...while the stored PREFERENCE still says labels, and the expander is
+      // gone because there is nothing it could usefully change.
+      await expect((await saved())?.railExpanded).not.toBe(false);
+      await expect(await $(EXPANDER)).not.toBeExisting();
+    } finally {
+      await browser.setWindowSize(width, height);
+    }
+
+    // Widened again: the labels the reader never gave up come back.
+    await browser.waitUntil(async () => (await widthOf(RAIL)) > 150, {
+      timeout: 5_000,
+      timeoutMsg: "the labels never came back",
+    });
   });
 });
 

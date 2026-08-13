@@ -48,6 +48,7 @@ const AREA_HEADINGS: Record<WorkArea, string> = {
   // The library stays the heading here: a generation lands as an ordinary
   // room file, so the pane beside Create is showing files, not "Create".
   create: "Library",
+  sketch: "Library",
   browser: "Private browser",
 };
 

@@ -1611,6 +1611,7 @@ pub(crate) const SKILL_AGENT_IDS: &[&str] = &[
     "media.transcribe",
     "media.video",
     "creator.studio",
+    "creator.draw",
 ];
 
 /// Every built-in agent tool name — also the reserved set MCP tools may not
@@ -1692,6 +1693,8 @@ pub(crate) const BUILTIN_TOOL_NAMES: &[&str] = &[
     "delete_workflow",
     "run_workflow",
     "test_workflow",
+    "draw",
+    "read_drawing",
     // Reserved even though they are never in the room bridge's own catalog:
     // an MCP route sanitizing to one of these names would shadow the built-in
     // exec_tool arm and skip the SEC-1b consent gate (e.g. server "consult" +
@@ -2322,7 +2325,7 @@ pub(crate) fn tools_catalog(web_enabled: bool) -> serde_json::Value {
                 // and the codebase already uses enums where the value set is
                 // closed (add_memory.category, ask_agents.agent). Same list
                 // validates the call — see SKILL_AGENT_IDS.
-                "agent": {"type": "string", "enum": SKILL_AGENT_IDS, "description": "Optional: the sub-agent this procedure belongs to, so only that specialist is offered it — files.read (room files), scripts.run (this room's scripts), chat.web (internet search/fetch), chat.browse (driving web pages in the private browser), app.ui (this app's interface), jobs.run (whole-file passes), jobs.workflows (automation), skills.use (running skills), skills.author (writing skills), connectors.use (connected services), connectors.admin (connector setup), media.transcribe (transcripts), media.video (watching room videos), creator.studio (flashcards, mind maps, podcast scripts). Omit for a skill any agent may use."}},
+                "agent": {"type": "string", "enum": SKILL_AGENT_IDS, "description": "Optional: the sub-agent this procedure belongs to, so only that specialist is offered it — files.read (room files), scripts.run (this room's scripts), chat.web (internet search/fetch), chat.browse (driving web pages in the private browser), app.ui (this app's interface), jobs.run (whole-file passes), jobs.workflows (automation), skills.use (running skills), skills.author (writing skills), connectors.use (connected services), connectors.admin (connector setup), media.transcribe (transcripts), media.video (watching room videos), creator.studio (flashcards, mind maps, podcast scripts), creator.draw (drawing on the room's sketches). Omit for a skill any agent may use."}},
                 "required": ["name", "description", "instructions"]}}}
         ,{"type": "function", "function": {"name": "write_skill_resource",
             "description": "Add or replace a text resource in a skill draft under scripts/, references/, assets/, agents/, or another relative folder. The skill is disabled again for review.",
@@ -4019,6 +4022,20 @@ pub(crate) async fn exec_tool(
             super::agent_list_scripts(window.app_handle(), state)
         }
         "run_script" => super::agent_run_script(window, state, args, cancel.as_ref()).await,
+        // The Sketch page's drawing tools. Two, and deliberately
+        // flat-argumented: `draw` takes a whole script so a diagram costs ONE
+        // round trip instead of one per shape, and `read_drawing` closes the
+        // loop by MEASURING the result — overlaps, off-page shapes, arrows that
+        // stop short — so the model can correct itself without needing to be
+        // able to read a picture.
+        "read_drawing" => super::sketch::tool_read_drawing(state.inner(), effects, args),
+        "draw" => {
+            let out = super::sketch::tool_draw(state.inner(), window, args)?;
+            // A drawing is an artifact the user can see and the write-claim
+            // gate must know about, exactly like create_file.
+            effects.wrote = true;
+            Ok(out)
+        }
         "studio_flashcards" | "studio_mindmap" | "generate_podcast_script" => {
             use tauri::Manager;
             let app = window.app_handle().clone();

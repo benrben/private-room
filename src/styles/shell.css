@@ -549,34 +549,49 @@
 .rail-expander:hover {
   color: var(--text);
 }
-/* Pane-visibility toggles: restrained neutral pressed state. A pane toggle is
-   not a destination, so it never takes the pen — its spine is pencil, not the
-   AREA rows' accent gradient below. The wash is 12%, matching the order of
-   magnitude .icon-btn[aria-pressed="true"] already uses elsewhere in this
-   file (11%) — the previous 5% read as almost nothing next to a hover state
-   that is itself var(--hover), a full opaque tint. */
-.rail-button[data-pane-toggle][aria-pressed="true"] {
+/* ----- More tools -----
+   The disclosure that holds every destination the reader has not pinned. It
+   is chrome, not a place, so it never takes the pen: no accent wash, no
+   spine, and the caret is the only thing that changes when it opens. A row
+   that looked like the destinations above it would put us straight back into
+   the wall of equivalent-looking icons this redesign exists to undo. */
+.rail-more {
+  color: var(--faint);
+}
+.rail-more:hover,
+.rail-more[aria-expanded="true"] {
   color: var(--text);
-  background: color-mix(in srgb, var(--text) 12%, transparent);
 }
-/* The panel glyph itself flips from outline to filled — on beats off without
-   requiring the reader to notice a colour shift or find the spine in the
-   gutter. Scoped to the pane toggles' own <rect>, so no other rail icon is
-   touched. */
-.rail-button[data-pane-toggle][aria-pressed="true"] svg rect {
-  fill: var(--rule-strong);
-  fill-opacity: 0.28;
+.rail-chev {
+  margin-left: auto;
+  flex-shrink: 0;
+  transition: transform var(--dur-fast) var(--ease-pen);
 }
-.rail-button[data-pane-toggle][aria-pressed="true"]::before {
-  content: "";
-  position: absolute;
-  left: -6px;
-  top: 7px;
-  bottom: 7px;
-  width: 2px;
-  border-radius: 4px 2px 5px 3px / 3px 5px 2px 4px;
-  background: var(--rule-strong);
+.rail-chev.is-open {
+  transform: rotate(180deg);
 }
+@media (prefers-reduced-motion: reduce) {
+  .rail-chev {
+    transition: none;
+  }
+}
+/* Destinations revealed by the disclosure, indented so the two tiers read as
+   tiers. Only in the expanded rail: at 84px there is no width to spend on an
+   indent, and the group is already bounded by its own divider. */
+.activity-rail.is-expanded .rail-button.is-nested {
+  padding-left: 22px;
+}
+.activity-rail.is-expanded .rail-button.is-nested[aria-current="true"]::before {
+  left: 8px;
+}
+/* Every tool unpinned — a real state, and one the sheet lets you reach. */
+.rail-empty {
+  margin: 2px 4px 6px;
+  font-size: var(--fs-micro);
+  line-height: 1.4;
+  color: var(--faint);
+}
+
 /* Product-area navigation: the current area is marked with a marker stroke
    drawn down its edge plus a wash behind it. The rail is vertical, so the
    swipe runs vertically; horizontal, text-led tabs take the same pen as an
@@ -611,45 +626,11 @@
   );
   pointer-events: none;
 }
-.rail-button[aria-pressed="true"].zen {
-  color: var(--accent-2);
-  background: var(--accent-ghost);
-}
-/* A small dot for work RUNNING BY ITSELF — news, not a request. It sits at
-   the opposite corner from the count, because the two are different facts and
-   can be true at the same time: three jobs can be running while one approval
-   waits on you. Colour comes from whatever .nb-sem-* class the markup carries
-   (linked blue today), so the rail agrees with Room Home's stamp and the
-   status bar about what "running" looks like.
-   Paired with the AI pane's Activity tab, which is where the readable list of
-   what is happening actually lives. */
-.rail-badge {
-  position: absolute;
-  bottom: 5px;
-  right: 5px;
-  min-width: 8px;
-  height: 8px;
-  border-radius: 999px;
-  background: var(--mk-ink, var(--sem-linked));
-  border: 1px solid var(--page);
-}
-.activity-rail.is-expanded .rail-badge {
-  bottom: 50%;
-  transform: translateY(50%);
-  right: 8px;
-}
-/* A count, circled by hand (paper.css .nb-circled). Pinned to the corner in
-   the icon rail, where there is no room for it in the row; carried at the end
-   of the row once the rail is expanded and there is. */
-.rail-count {
-  position: absolute;
-  top: 3px;
-  right: 3px;
-}
-.activity-rail.is-expanded .rail-count {
-  position: static;
-  margin-left: auto;
-}
+/* The rail's own approval count and running dot used to live here, on the AI
+   pane toggle. Both moved to the toolbar's Assistant button (see .pill-count
+   and .pill-live in workspace.css) along with the toggle itself — a count is
+   only news while the pane it belongs to is shut, and the rail no longer has
+   anything to attach one to. */
 
 /* CSS tooltips for icon-only controls. */
 [data-tip] {

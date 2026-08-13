@@ -58,6 +58,11 @@ pub const CHAT_COMMANDS: &[ChatCommandInfo] = &[
         usage: "#transcribe @recording",
     },
     ChatCommandInfo {
+        name: "sketch",
+        summary: "Draw an @file as a diagram, with a note explaining each part",
+        usage: "#sketch @plan.md   ·   #sketch how our login flow works",
+    },
+    ChatCommandInfo {
         name: "minutes",
         summary: "Turn a meeting transcript or notes into timeline-style HTML minutes",
         usage: "#minutes @recording   ·   #minutes @notes.md",
@@ -605,6 +610,7 @@ pub async fn run_command(
         "compare" => cmd_compare(&ctx).await,
         "transcribe" => cmd_transcribe(&ctx).await,
         "minutes" => cmd_minutes(&ctx).await,
+        "sketch" => cmd_sketch(&ctx).await,
         "to-sheet" => cmd_to_sheet(&ctx).await,
         "translate" => cmd_translate(&ctx).await,
         "research" => cmd_research(&ctx).await,

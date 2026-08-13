@@ -33,6 +33,8 @@ def _no_native_context_lookup(monkeypatch: pytest.MonkeyPatch):
 
 #: The built-in catalog the room bridge serves in LocalEngine scope (SPEC §2.1).
 BUILTIN_TOOL_NAMES = [
+    "draw",
+    "read_drawing",
     "list_room_files",
     "search_room",
     "open_file",

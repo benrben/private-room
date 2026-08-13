@@ -56,6 +56,20 @@ const MAX_TOASTS = 5;
  * to be able to READ what they are attaching before they attach it. */
 const MAX_ERROR_LOG = 10;
 
+/** The popovers the ROOM TOOLBAR can raise. At most one is open at a time and
+ * `openMenu` holds which — see the field's own comment in the hook below.
+ *
+ * Menus that belong to some other surface (the library's Add menu, the file
+ * header's Actions and Scripts menus) are deliberately absent: they are not in
+ * competition with these for the same corner of the screen, and folding them
+ * in would mean opening a file-header menu closed the toolbar's. */
+export type TopMenu =
+  | "model"
+  | "room"
+  | "workflows"
+  | "scripts"
+  | "layout"
+  | "assistant";
 
 /** All of Workspace's state + refs, plus the toast primitives that nearly every
  * handler needs. Split out of Workspace.tsx verbatim; the shell threads this to
@@ -344,8 +358,17 @@ export function useWorkspaceState(_info: RoomInfo) {
     saveFileSort(next);
   }, []);
   const [addMenuOpen, setAddMenuOpen] = useState(false);
-  const [roomMenuOpen, setRoomMenuOpen] = useState(false);
-  const [modelMenuOpen, setModelMenuOpen] = useState(false);
+  /** WHICH top-bar popover is open, or null. One value, not one boolean each.
+   *
+   * The bar used to carry a separate flag per menu (model / room / pinned
+   * workflows / global scripts) and enforce "only one popover at a time" by
+   * hand: every open site had to remember to clear the other flags, and the
+   * Escape handler had to clear all of them. That is a rule nothing checked —
+   * the scripts menu never joined it at all, so it stacked over the model
+   * picker — and the navigation redesign adds two more menus to the same bar.
+   * A single slot makes the exclusion structural: opening one IS closing the
+   * others, and Escape sets it to null. */
+  const [openMenu, setOpenMenu] = useState<TopMenu | null>(null);
   const [mcpApprovals, setMcpApprovals] = useState<McpApproveRequest[]>([]);
   // BROWSE-1: queued outbound-typing consent cards (room content about to be
   // typed into a web page), mirroring mcpApprovals.
@@ -461,8 +484,8 @@ export function useWorkspaceState(_info: RoomInfo) {
   const [wfNodeStatus, setWfNodeStatus] = useState<
     Record<string, Record<string, WorkflowNodeEvent>>
   >({});
-  // The top-bar pinned-workflows popover (⌘J) and the file-header Actions menu.
-  const [qaMenuOpen, setQaMenuOpen] = useState(false);
+  // The file-header Actions menu. (The top bar's own pinned-workflows popover
+  // moved into `openMenu` above, with every other menu that bar can raise.)
   const [qaFileMenuOpen, setQaFileMenuOpen] = useState(false);
   // Wave 5 (Idea 13): the file-header "Scripts" shortcut menu open flag.
   const [qaScriptMenuOpen, setQaScriptMenuOpen] = useState(false);
@@ -654,8 +677,8 @@ export function useWorkspaceState(_info: RoomInfo) {
     ctxMenu, setCtxMenu, ctxMenuRef, ctxMenuElRef, moveMenuElRef,
     renamingFile, setRenamingFile, fileFilter, setFileFilter,
     fileSort, setFileSort,
-    addMenuOpen, setAddMenuOpen, roomMenuOpen, setRoomMenuOpen,
-    modelMenuOpen, setModelMenuOpen, mcpApprovals, setMcpApprovals,
+    addMenuOpen, setAddMenuOpen, openMenu, setOpenMenu,
+    mcpApprovals, setMcpApprovals,
     browseConsents, setBrowseConsents,
     editApprovals, setEditApprovals,
     dragOverFolder, setDragOverFolder, internalDragRef,
@@ -675,7 +698,7 @@ export function useWorkspaceState(_info: RoomInfo) {
     showScripts, setShowScripts, showScriptsRef, scripts, setScripts,
     skills, setSkills, selectedSkillId, setSelectedSkillId,
     scriptApprovals, setScriptApprovals,
-    qaMenuOpen, setQaMenuOpen, qaFileMenuOpen, setQaFileMenuOpen,
+    qaFileMenuOpen, setQaFileMenuOpen,
     qaScriptMenuOpen, setQaScriptMenuOpen,
     fp, setFp, fpSuggestions, setFpSuggestions,
     importProgress, setImportProgress,

@@ -1,298 +1,247 @@
-import type { ReactElement } from "react";
 import {
   ChevronLeftIcon,
   ChevronRightIcon,
-  CreateIcon,
-  FocusIcon,
-  GlobeIcon,
-  GraphIcon,
-  HomeIcon,
-  LinkIcon,
-  MemoryIcon,
-  MicIcon,
-  PanelCenterIcon,
-  PanelLeftIcon,
-  PanelRightIcon,
-  ScriptIcon,
-  BookOpenIcon,
+  ChevronDownIcon,
+  ListFilterIcon,
   SettingsIcon,
-  WorkflowsIcon,
+  ToolsIcon,
 } from "../icons";
 import { LayoutApi } from "./useLayout";
+import { areaDef, useNavPrefs, type NavArea } from "./navPrefs";
 import type { WorkArea } from "../workspace/types";
 
 export type { WorkArea };
 
-/** The rail's own label for an area, reused by anything that has to name a
- * place, so two surfaces can never disagree about what somewhere is called. */
-export function areaLabel(key: WorkArea): string {
-  return AREAS.find((a) => a.key === key)?.label ?? "Files";
-}
-
-const AREAS: {
-  key: Exclude<WorkArea, "files">;
-  label: string;
-  icon: (size: number) => ReactElement;
-}[] = [
-  { key: "home", label: "Room home", icon: (s) => <HomeIcon size={s} /> },
-  { key: "map", label: "Room Map", icon: (s) => <GraphIcon size={s} /> },
-  { key: "recordings", label: "Recordings", icon: (s) => <MicIcon size={s} /> },
-  { key: "workflows", label: "Workflows", icon: (s) => <WorkflowsIcon size={s} /> },
-  { key: "scripts", label: "Scripts", icon: (s) => <ScriptIcon size={s} /> },
-  { key: "skills", label: "Skills", icon: (s) => <BookOpenIcon size={s} /> },
-  { key: "memory", label: "Memory & scratch pad", icon: (s) => <MemoryIcon size={s} /> },
-  { key: "connectors", label: "Connectors", icon: (s) => <LinkIcon size={s} /> },
-  { key: "create", label: "Create", icon: (s) => <CreateIcon size={s} /> },
-  { key: "browser", label: "Private browser", icon: (s) => <GlobeIcon size={s} /> },
-];
-
-/** Look an area up by key. AREAS is small and this is only ever called a
- * handful of times per render, so a linear scan beats carrying a second Map
- * in sync with it. */
-function areaDef(key: Exclude<WorkArea, "files">) {
-  const def = AREAS.find((a) => a.key === key);
-  if (!def) throw new Error(`no rail area registered for "${key}"`);
-  return def;
-}
-
-/** The activity rail: the app's ONE primary navigation.
+/** The sidebar: the app's ONE primary navigation, and now ONLY that.
  *
- * It used to share that job with the tab strip — every rail click also opened
- * an "area" tab, so Home / Map / Recordings / Workflows / Scripts / Skills /
- * Memory / Connectors / Browser were listed twice, in two different visual
- * languages, and the strip filled up with places rather than with the
- * documents the user was actually working on. The rail wins that argument for
- * three reasons: it is always visible, it can carry a readable label for every
- * destination, and its order is stable — a tab strip's is not, because it
- * reorders itself as you work. So: the rail navigates to PLACES, the strip
- * holds the DOCUMENTS you have open, and neither draws the other's job. (The
- * strip's side of that split lives in shell/TabStrip.tsx and Workspace.tsx.)
+ * ----- what it used to be -----
  *
- * Labels are shown by default and in full. Collapsing to the 84px icon strip
- * is still one click away and still persists per room, but a first-time reader
- * should never have to hover a column of glyphs to find out where they lead —
- * that is why full labels are what a new room opens with, not the collapsed
- * strip.
+ * A column of seventeen buttons in four visual languages. Three PANE TOGGLES
+ * at the top (Library / Workspace / AI), then eleven DESTINATIONS in four
+ * labelled groups, then Focus and Settings. The toggles and the destinations
+ * looked identical and did categorically different things: one pair of them
+ * showed and hid columns, the rest went somewhere. A reader arriving at that
+ * column could not tell which was which without clicking, and the fastest
+ * available reading — "ten icons, all equivalent, all mine to learn" — was
+ * the wrong one.
  *
- * The collapsed strip itself (P1-7) is icon-only: it used to carry a renamed,
- * shortened label under each glyph ("Connectors" → "Connect") shrunk small
- * enough to clip against the status bar, which both mis-named the
- * destination and was unreadable. A hover name now comes from a plain native
- * `title` attribute rather than the rail's own `[data-tip]` CSS tooltip
- * pattern used elsewhere in the shell — that pattern is positioned relative
- * to its own button and would be clipped by the rail's `overflow: hidden
- * auto`, same as a label would.
+ * ----- what it is now -----
  *
- * The ⌘K command launcher deliberately has NO entry here: it is a command,
- * not a place, and it already owns the widest control in the top bar. The
- * rail used to also carry a "Find" destination — a second, full-page search
- * surface the app had to explain alongside ⌘K and the Library's own filter
- * box (P1-2). Find is retired and its useful parts (filters, previews, saved
- * and recent searches) now render inside ⌘K itself — see
- * workspace/SearchExpanded.tsx — so this rail has one fewer destination and
- * the room has one fewer thing to explain. */
+ * Places, in two tiers. A short pinned list the room is actually used from,
+ * then everything else behind ONE disclosure that remembers nothing and hides
+ * nothing permanently. The pane toggles moved to the toolbar's Layout menu
+ * (workspace/LayoutMenu.tsx), which is where a control that arranges the
+ * window belongs and where its keyboard shortcut can finally be printed
+ * beside it. Focus went with them: it is a mode, not a place.
+ *
+ * THE LIBRARY IS DELIBERATELY NOT IN THIS LIST. It is a pane — see
+ * shell/navPrefs.tsx, which owns the catalog and says so at length.
+ *
+ * ----- the three things that survived unchanged, on purpose -----
+ *
+ *   • `data-area` on every destination button. Four capture specs and two QA
+ *     specs select on it, and qa/UA-FEATURE-CHECKLIST.md documents it as a
+ *     contract. The structure around it changed; the hook did not.
+ *   • The `.activity-rail` class, which src/agent/driver.ts maps to the region
+ *     name the embodiment loop reports. Renaming it would silently stop the
+ *     agent from being able to say where a control is.
+ *   • Labels by default, in full. A destination a first-time reader has to
+ *     hover to identify is not navigation. The icon-only strip is still
+ *     reachable — and is now also applied automatically on a narrow window,
+ *     which is the one case where the words genuinely do not fit.
+ *
+ * ----- what the disclosure costs, and what pays for it -----
+ *
+ * Six destinations behind a collapsed row are invisible to `uiSnapshot()` in
+ * the embodiment loop until it is expanded, which would quietly cost the agent
+ * six places it can navigate to. ⌘K is what pays for it: `buildPaletteActions`
+ * in workspace/Overlays.tsx lists EVERY area by name whether or not it is
+ * pinned, so the palette — not this column — is the complete route. Keep it
+ * that way; a destination added here and not there is a destination the agent
+ * cannot reach. */
 export default function ActivityRail({
   layout,
   area,
   onArea,
   onSettings,
-  approvals = 0,
-  running = 0,
+  onCustomize,
 }: {
   layout: LayoutApi;
   area: WorkArea;
-  onArea: (area: Exclude<WorkArea, "files">) => void;
+  onArea: (area: NavArea) => void;
   onSettings: () => void;
-  /** How many things are WAITING ON THE READER — approvals that cannot
-   * proceed until someone answers. Drawn as a hand-circled number. */
-  approvals?: number;
-  /** How many jobs are running BY THEMSELVES. Drawn as a quiet dot: it is
-   * news, not a request. */
-  running?: number;
+  onCustomize: () => void;
 }) {
-  const paneVisible = (k: "library" | "center" | "ai") =>
-    layout.visible.includes(k);
+  const nav = useNavPrefs();
   const wide = layout.railExpanded;
+  // The disclosure is transient by design — it is not persisted anywhere.
+  // "Which tools do I want at hand" is a real preference and lives in
+  // `navPrefs`; "is the drawer open right now" is not one, and a drawer that
+  // reopened itself every launch would make pinning pointless.
+  //
+  // WHERE YOU ARE IS ALWAYS ON SCREEN. Arriving at Workflows from ⌘K, a
+  // toast's "Scripts" action or a Home row must not leave the sidebar marking
+  // nothing as current — the highlight would be drawn on a row that is not
+  // rendered, so the column would claim the room is nowhere.
+  //
+  // The closed disclosure therefore shows exactly ONE row when the current
+  // place lives inside it: that place. Forcing the whole group open instead
+  // would be simpler and would make the toggle a dead control — pressing
+  // "hide these" while standing in one of them would do nothing visible, which
+  // is worse than the problem it solves. This way the toggle always works and
+  // the sidebar never loses you.
+  const current = nav.more.includes(area as NavArea) ? (area as NavArea) : null;
+  const moreRows = layout.moreToolsOpen ? nav.more : current ? [current] : [];
+
   return (
     <nav
       className={`activity-rail${wide ? " is-expanded" : ""}`}
-      aria-label="Workspace panes and areas"
+      aria-label="Destinations"
     >
-      <button
-        className="rail-button rail-expander"
-        type="button"
-        data-testid="rail-expander"
-        aria-expanded={wide}
-        aria-label={wide ? "Collapse the sidebar to icons" : "Expand the sidebar to show full labels"}
-        onClick={layout.toggleRail}
-      >
-        {wide ? <ChevronLeftIcon size={17} /> : <ChevronRightIcon size={17} />}
-        <span className="rail-label">{wide ? "Collapse" : "Expand"}</span>
-      </button>
-
-      {/* Panes and destinations do different jobs — one shows and hides
-          columns, the rest go somewhere (and are now grouped into four
-          smaller headings of their own below, P1-1) — and the headings say
-          so out loud in the expanded rail. aria-hidden because the <nav>'s
-          own name already tells a screen reader this is "Workspace panes and
-          areas" and every button below carries its full purpose in its
-          label; a repeated heading would only add noise to the tab order's
-          read-out. Every rail-group-label in this file, not just this one,
-          relies on that same reasoning. */}
-      <div className="rail-group-label" aria-hidden>
-        Panes
-      </div>
-      <div className="rail-divider" aria-hidden />
-
-      <button
-        className="rail-button"
-        type="button"
-        data-pane-toggle="library"
-        aria-pressed={paneVisible("library")}
-        aria-label="Toggle the Library pane (⌘1)"
-        onClick={() => layout.togglePane("library")}
-      >
-        <PanelLeftIcon size={17} />
-        <span className="rail-label">Library</span>
-      </button>
-      <button
-        className="rail-button"
-        type="button"
-        data-pane-toggle="center"
-        aria-pressed={paneVisible("center")}
-        aria-label="Toggle the workspace pane (⌘2)"
-        onClick={() => layout.togglePane("center")}
-      >
-        <PanelCenterIcon size={17} />
-        <span className="rail-label">Workspace</span>
-      </button>
-      <button
-        className="rail-button"
-        type="button"
-        data-pane-toggle="ai"
-        aria-pressed={paneVisible("ai")}
-        aria-label="Toggle the AI and Studio pane (⌘3)"
-        onClick={() => layout.togglePane("ai")}
-      >
-        <PanelRightIcon size={17} />
-        <span className="rail-label">AI</span>
-        {/* Two different facts, so two different marks — and they can appear
-            together. An approval is WAITING ON YOU, so it gets the count,
-            circled by hand, in the pending yellow the token map reserves for
-            "needs review". A running job is the software working on its own,
-            which is news rather than a request, so it gets the quiet dot in
-            the linked blue that Room Home's stamp already uses for the same
-            fact. Summing them into one yellow number said "N things need you"
-            when N-1 of them did not, and it made the dot branch unreachable:
-            the count was the sum, so it was non-zero whenever the dot would
-            have been.
-
-            Both stay aria-hidden. The AI pane's Activity tab is where the
-            real, readable list lives, and a toggle whose accessible name
-            changed under the reader every time a job finished would be worse,
-            not better. */}
-        {approvals > 0 && (
-          <span className="rail-count nb-circled nb-sem-pending" aria-hidden>
-            {approvals > 99 ? "99+" : approvals}
-          </span>
-        )}
-        {running > 0 && (
-          <span className="rail-badge nb-sem-linked" aria-hidden />
-        )}
-      </button>
-
-      {/* P1-1: the flat area list, in four labeled sections instead of one
-          undifferentiated run — each section opens with the same
-          rail-group-label + rail-divider pair "Panes" does above, so the
-          single "Areas" heading this replaces is now four headings that
-          each name a smaller, truer group instead of the whole list at
-          once. */}
-      <div className="rail-group-label" aria-hidden>
-        Room
-      </div>
-      <div className="rail-divider" aria-hidden />
-      <RailAreaButton def={areaDef("home")} area={area} onArea={onArea} wide={wide} />
-      <RailAreaButton def={areaDef("map")} area={area} onArea={onArea} wide={wide} />
+      {/* Hidden entirely while the WINDOW is what collapsed the rail: a
+          control that cannot change what you are looking at is worse than no
+          control. The preference underneath is untouched and comes back with
+          the width. */}
+      {!layout.railAutoCollapsed && (
+        <button
+          className="rail-button rail-expander"
+          type="button"
+          data-testid="rail-expander"
+          aria-expanded={wide}
+          aria-label={
+            wide
+              ? "Collapse the sidebar to icons"
+              : "Expand the sidebar to show full labels"
+          }
+          /* Icon-only when the rail is, like every other row. It used to keep
+             a visible word at both widths, which left it as the single
+             labelled control in an otherwise wordless column — the one place
+             a label was least needed, since a chevron pointing out of the rail
+             is the most self-evident glyph in it. */
+          title={wide ? undefined : "Expand the sidebar"}
+          onClick={layout.toggleRail}
+        >
+          {wide ? <ChevronLeftIcon size={17} /> : <ChevronRightIcon size={17} />}
+          {wide && <span className="rail-label">Collapse</span>}
+        </button>
+      )}
 
       <div className="rail-group-label" aria-hidden>
-        Capture
+        Core
       </div>
       <div className="rail-divider" aria-hidden />
-      <RailAreaButton def={areaDef("recordings")} area={area} onArea={onArea} wide={wide} />
-      {/* Create sits with the other two ways content ARRIVES in the room —
-          recorded, browsed, or made — rather than under Automate, which is
-          about work the room does on material it already has. */}
-      <RailAreaButton def={areaDef("create")} area={area} onArea={onArea} wide={wide} />
-      <RailAreaButton def={areaDef("browser")} area={area} onArea={onArea} wide={wide} />
+      {nav.pinned.map((key) => (
+        <RailAreaButton key={key} areaKey={key} area={area} onArea={onArea} wide={wide} />
+      ))}
+      {nav.pinned.length === 0 && wide && (
+        <p className="rail-empty">
+          Nothing pinned. Everything is under More tools.
+        </p>
+      )}
 
-      <div className="rail-group-label" aria-hidden>
-        Automate
-      </div>
-      <div className="rail-divider" aria-hidden />
-      <RailAreaButton def={areaDef("workflows")} area={area} onArea={onArea} wide={wide} />
-      <RailAreaButton def={areaDef("scripts")} area={area} onArea={onArea} wide={wide} />
-      <RailAreaButton def={areaDef("skills")} area={area} onArea={onArea} wide={wide} />
-      <RailAreaButton def={areaDef("connectors")} area={area} onArea={onArea} wide={wide} />
-
-      <div className="rail-group-label" aria-hidden>
-        Context
-      </div>
-      <div className="rail-divider" aria-hidden />
-      <RailAreaButton def={areaDef("memory")} area={area} onArea={onArea} wide={wide} />
+      {nav.more.length > 0 && (
+        <>
+          <div className="rail-group-label" aria-hidden>
+            On demand
+          </div>
+          <div className="rail-divider" aria-hidden />
+          <button
+            className="rail-button rail-more"
+            type="button"
+            data-testid="more-tools"
+            aria-expanded={layout.moreToolsOpen}
+            aria-label={
+              layout.moreToolsOpen
+                ? `Hide the other ${nav.more.length} tools`
+                : `Show ${nav.more.length} more tools`
+            }
+            title={wide ? undefined : "More tools"}
+            onClick={layout.toggleMoreTools}
+          >
+            <ToolsIcon size={17} />
+            {wide && <span className="rail-label">More tools</span>}
+            {wide && (
+              <ChevronDownIcon
+                size={13}
+                className={`rail-chev${layout.moreToolsOpen ? " is-open" : ""}`}
+              />
+            )}
+          </button>
+          {moreRows.map((key) => (
+            <RailAreaButton
+              key={key}
+              areaKey={key}
+              area={area}
+              onArea={onArea}
+              wide={wide}
+              nested
+            />
+          ))}
+        </>
+      )}
 
       <div className="rail-spacer" />
 
       <div className="rail-divider" aria-hidden />
       <button
-        className={`rail-button zen`}
+        className="rail-button"
         type="button"
-        aria-pressed={layout.focusPane === "center"}
-        aria-label="Focus the editor — hide both side panes"
-        onClick={() => layout.toggleFocus("center")}
+        data-testid="customize-sidebar"
+        aria-label="Customize the sidebar — pin, hide, and reorder tools"
+        title={wide ? undefined : "Customize sidebar"}
+        onClick={onCustomize}
       >
-        <FocusIcon size={17} />
-        <span className="rail-label">
-          {layout.focusPane === "center" ? "Unfocus" : "Focus"}
-        </span>
+        <ListFilterIcon size={17} />
+        {wide && <span className="rail-label">Customize sidebar</span>}
       </button>
       <button
         className="rail-button"
         type="button"
         aria-label="Open room settings (⌘,)"
+        title={wide ? undefined : "Settings"}
         onClick={onSettings}
       >
         <SettingsIcon size={17} />
-        <span className="rail-label">Settings</span>
+        {wide && <span className="rail-label">Settings</span>}
       </button>
     </nav>
   );
 }
 
 function RailAreaButton({
-  def,
+  areaKey,
   area,
   onArea,
   wide,
+  nested,
 }: {
-  def: (typeof AREAS)[number];
+  areaKey: NavArea;
   area: WorkArea;
-  onArea: (area: Exclude<WorkArea, "files">) => void;
+  onArea: (area: NavArea) => void;
   /** Expanded rail: room for the full label. Collapsed: icon only, with the
-   * same full label (P1-7) carried as a native `title` tooltip instead — see
-   * the ActivityRail doc comment above for why `title` and not the rail's
-   * own `[data-tip]` pattern. */
+   * same full label carried as a native `title` tooltip — deliberately not
+   * the rail's own `[data-tip]` CSS pattern, which is positioned against its
+   * own button and would be clipped by the rail's `overflow: hidden auto`,
+   * exactly as a label would be. Never a shortened or renamed label: an
+   * abbreviation ("Connect") mis-names the destination, and a clipped one is
+   * unreadable. */
   wide: boolean;
+  /** Under the More tools disclosure — indented, so the two tiers are legible
+   * as tiers rather than as one longer list that happens to have a button in
+   * the middle of it. */
+  nested?: boolean;
 }) {
-  const current = area === def.key;
+  const def = areaDef(areaKey);
+  const current = area === areaKey;
   return (
     <button
-      className="rail-button"
+      className={`rail-button${nested ? " is-nested" : ""}`}
       type="button"
-      data-area={def.key}
+      data-area={areaKey}
       aria-current={current ? "true" : undefined}
       aria-label={`Open ${def.label}`}
       title={wide ? undefined : def.label}
-      onClick={() => onArea(def.key)}
+      onClick={() => onArea(areaKey)}
     >
       {def.icon(17)}
       {wide && <span className="rail-label">{def.label}</span>}

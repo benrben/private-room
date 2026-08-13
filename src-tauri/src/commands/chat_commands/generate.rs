@@ -304,6 +304,232 @@ pub(crate) async fn cmd_minutes(ctx: &CmdCtx<'_>) -> Result<CommandResult, Strin
     })
 }
 
+/// `#sketch @file` — read a document and DRAW it.
+///
+/// The division of labour here is the whole point, and it is the opposite of
+/// how a model is usually asked to draw. The model reads the source and says
+/// what the diagram MEANS — the boxes, what connects to what, one line of
+/// explanation each. It is never asked where anything goes. `layout_graph`
+/// computes the geometry, so a `#sketch` cannot come out overlapping, cannot
+/// have an arrow that stops in empty space, and needs no correction pass.
+///
+/// Full ops, like every other `#command`: the source is read in windows and
+/// the parts are merged, so a long document is diagrammed whole rather than
+/// from its first few thousand characters.
+pub(crate) async fn cmd_sketch(ctx: &CmdCtx<'_>) -> Result<CommandResult, String> {
+    use tauri::Emitter;
+    let (refctx, ref_names) = ctx.state.with_room(|room| Ok(refs_context(&room.conn, ctx.refs)))?;
+    let source = if !refctx.trim().is_empty() {
+        refctx
+    } else if !ctx.history.trim().is_empty() {
+        format!("Conversation:\n{}", ctx.history)
+    } else if !ctx.args.trim().is_empty() {
+        // `#sketch how a login flow works` — nothing pinned, so the topic IS
+        // the source and the model draws from what it knows.
+        format!("Topic: {}", ctx.args)
+    } else {
+        return Err(
+            "Give me something to draw — e.g. #sketch @plan.md, or #sketch how our login flow \
+             works."
+                .into(),
+        );
+    };
+
+    const SKETCH_SYS: &str =
+        "You turn a document into a DIAGRAM. Identify the handful of things it describes and \
+         how they connect. Return nodes — each with a short id, a LABEL of at most four words, \
+         and a `note` of one short sentence explaining it — and edges between those ids, each \
+         with a two or three word label saying what the connection IS. Mark an obvious \
+         beginning or ending with kind \"start\" or \"end\". Aim for 4 to 9 nodes: a diagram is \
+         a picture of the shape of something, not a copy of it. Use ONLY what the source says. \
+         Also give a `title` for the diagram and a short `explanation` of what it shows.";
+
+    let windows = cmd_windows(&source);
+    let total = windows.len();
+    let mut parts: Vec<serde_json::Value> = Vec::new();
+    for (i, w) in windows.iter().enumerate() {
+        if ctx.cancelled() {
+            break;
+        }
+        ctx.step(if total > 1 {
+            format!("Working out what to draw — part {}/{}…", i + 1, total)
+        } else {
+            "Working out what to draw…".to_string()
+        });
+        let user = if total > 1 {
+            format!(
+                "This is part {} of {} of ONE source, in order. Describe the diagram for THIS \
+                 part; the other parts are handled separately and merged.\n\nSource:\n{w}",
+                i + 1,
+                total
+            )
+        } else {
+            format!("Source:\n{w}")
+        };
+        let Ok(raw) = ctx.ask_structured(SKETCH_SYS, user, Some(0.2), &sketch_schema()).await
+        else {
+            ctx.note_unread();
+            continue;
+        };
+        match serde_json::from_str::<serde_json::Value>(raw.trim()) {
+            Ok(v) => parts.push(v),
+            Err(_) => ctx.note_unread(),
+        }
+    }
+
+    let (title, explanation, nodes, edges) = merge_sketch(&parts);
+    if nodes.is_empty() {
+        return Err(
+            "Couldn't find anything to draw in that source. Point #sketch at a document with \
+             some structure to it — a plan, a process, a design — or describe what to draw."
+                .into(),
+        );
+    }
+    ctx.step("Drawing it…".to_string());
+    let doc = crate::commands::sketchdoc::layout_graph(&nodes, &edges);
+
+    // A re-run over the same source becomes a new VERSION of the same drawing,
+    // so the earlier one stays in History — the rule every other #command that
+    // writes a file follows.
+    let name = format!("{title}.sketch");
+    let meta = ctx.state.with_room(|room| {
+        Artifact::note(&name, &doc.to_json())
+            // Its labels, never its coordinates — see `indexed_as`.
+            .indexed_as(&doc.extracted_text())
+            .by("#sketch")
+            .during_run(Some(ctx.turn.run_id()))
+            .from_files(ctx.refs)
+            .cancel_with(&ctx.cancel)
+            .commit(&room.conn)
+            .map(|w| w.meta)
+    })?;
+    let _ = ctx.window.emit("room-files-changed", ());
+    let _ = ctx.window.emit("agent-open-file", serde_json::json!({ "id": meta.id }));
+
+    let boxes = nodes.len();
+    let arrows = edges.len();
+    let coverage = if total > 1 { format!(", read in {total} passes over the whole source") } else { String::new() };
+    let mut content = format!(
+        "Drew **{}** — {boxes} box(es) and {arrows} connection(s){coverage}.",
+        meta.name
+    );
+    if !explanation.trim().is_empty() {
+        content.push_str("\n\n");
+        content.push_str(explanation.trim());
+    }
+    // The follow-up is the point of drawing it in the app rather than handing
+    // over a picture: the drawing agent is already able to change this one.
+    content.push_str(
+        "\n\nAsk for changes in your own words — \"add a box for the retry path\", \"mark the \
+         payment step red\", \"drop the last two\" — and I will redraw it.",
+    );
+    Ok(CommandResult { content, sources: ref_names, ..Default::default() })
+}
+
+/// What the model is asked for: meaning, never geometry. There is no x or y
+/// anywhere in this schema, which is what makes the result reliable.
+fn sketch_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "title": {"type": "string"},
+            "explanation": {"type": "string"},
+            "nodes": {"type": "array", "items": {"type": "object", "properties": {
+                "id": {"type": "string"},
+                "label": {"type": "string"},
+                "note": {"type": "string"},
+                "kind": {"type": "string", "enum": ["start", "step", "end"]}
+            }, "required": ["id", "label"]}},
+            "edges": {"type": "array", "items": {"type": "object", "properties": {
+                "from": {"type": "string"},
+                "to": {"type": "string"},
+                "label": {"type": "string"}
+            }, "required": ["from", "to"]}}
+        },
+        "required": ["title", "nodes"]
+    })
+}
+
+/// Fold the per-window descriptions into one diagram.
+///
+/// Nodes are merged by id, first description winning, because a later window
+/// mentioning something in passing should not overwrite the pass that actually
+/// described it. Edges are de-duplicated for the same reason a repeated add is
+/// a mistake: the same connection drawn twice is two arrows on one line.
+fn merge_sketch(
+    parts: &[serde_json::Value],
+) -> (
+    String,
+    String,
+    Vec<crate::commands::sketchdoc::GraphNode>,
+    Vec<crate::commands::sketchdoc::GraphEdge>,
+) {
+    use crate::commands::sketchdoc::{GraphEdge, GraphNode};
+    let mut title = String::new();
+    let mut explanation = String::new();
+    let mut nodes: Vec<GraphNode> = Vec::new();
+    let mut edges: Vec<GraphEdge> = Vec::new();
+    let mut have: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut wired: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+
+    for p in parts {
+        if title.is_empty() {
+            title = p["title"].as_str().unwrap_or_default().trim().to_string();
+        }
+        if let Some(e) = p["explanation"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+            if !explanation.is_empty() {
+                explanation.push(' ');
+            }
+            explanation.push_str(e);
+        }
+        for n in p["nodes"].as_array().into_iter().flatten() {
+            let Some(id) = n["id"].as_str().map(str::trim).filter(|s| !s.is_empty()) else {
+                continue;
+            };
+            let label = n["label"].as_str().unwrap_or(id).trim().to_string();
+            if label.is_empty() || !have.insert(id.to_string()) {
+                continue;
+            }
+            nodes.push(GraphNode {
+                id: id.to_string(),
+                label,
+                note: n["note"].as_str().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+                kind: n["kind"].as_str().map(str::to_string),
+            });
+        }
+        for e in p["edges"].as_array().into_iter().flatten() {
+            let (Some(from), Some(to)) = (e["from"].as_str(), e["to"].as_str()) else { continue };
+            if !wired.insert((from.to_string(), to.to_string())) {
+                continue;
+            }
+            edges.push(GraphEdge {
+                from: from.to_string(),
+                to: to.to_string(),
+                label: e["label"].as_str().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+            });
+        }
+    }
+    let title = if title.is_empty() { "Sketch".to_string() } else { safe_file_stem(&title) };
+    (title, explanation, nodes, edges)
+}
+
+/// A title a file can be called. `#minutes` learned this the same way: a model
+/// asked for a title returns "Q3 plan: what's next?", and a slash or a colon in
+/// a file name is a folder path or a nothing.
+fn safe_file_stem(title: &str) -> String {
+    let cleaned: String = title
+        .chars()
+        .map(|c| if c.is_alphanumeric() || " -_&+()".contains(c) { c } else { ' ' })
+        .collect();
+    let squashed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    let out = squashed.trim().trim_matches('-').trim();
+    if out.is_empty() {
+        "Sketch".to_string()
+    } else {
+        out.chars().take(60).collect()
+    }
+}
+
 pub(crate) async fn cmd_to_sheet(ctx: &CmdCtx<'_>) -> Result<CommandResult, String> {
     use tauri::Emitter;
     // The most recent table anywhere in the conversation (extract_md_table
@@ -672,5 +898,92 @@ mod chunked_pass_tests {
             assert!(!f.note("boom".into()), "a success resets the run");
         }
         assert!(f.note("boom".into()), "an unbroken run means the engine is gone");
+    }
+
+    // ---- #sketch -------------------------------------------------------
+
+    fn part(json: &str) -> serde_json::Value {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn a_title_a_model_wrote_becomes_a_name_a_file_can_have() {
+        assert_eq!(safe_file_stem("Q3 plan: what's next?"), "Q3 plan what s next");
+        assert_eq!(safe_file_stem("auth/session flow"), "auth session flow");
+        assert_eq!(safe_file_stem("   "), "Sketch");
+        assert!(safe_file_stem(&"long ".repeat(40)).chars().count() <= 60);
+    }
+
+    #[test]
+    fn windows_of_one_document_merge_into_one_diagram() {
+        let parts = vec![
+            part(r#"{"title":"Flow","explanation":"First half.",
+                    "nodes":[{"id":"a","label":"Draft","note":"Where it starts"}],
+                    "edges":[{"from":"a","to":"b","label":"sent to"}]}"#),
+            part(r#"{"title":"Ignored","explanation":"Second half.",
+                    "nodes":[{"id":"b","label":"Review"}],"edges":[]}"#),
+        ];
+        let (title, explanation, nodes, edges) = merge_sketch(&parts);
+        assert_eq!(title, "Flow", "the first window names the diagram");
+        assert!(explanation.contains("First half.") && explanation.contains("Second half."));
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(edges.len(), 1);
+        // The edge from the first window finds its target in the second.
+        let doc = crate::commands::sketchdoc::layout_graph(&nodes, &edges);
+        assert_eq!(
+            doc.elements.iter().filter(|e| matches!(e.shape, super::super::sketchdoc::Shape::Arrow { .. })).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_node_described_twice_keeps_the_description_that_said_something() {
+        // A later window mentioning something in passing must not overwrite
+        // the pass that actually explained it.
+        let parts = vec![
+            part(r#"{"title":"T","nodes":[{"id":"a","label":"Auth","note":"The real one"}]}"#),
+            part(r#"{"title":"T","nodes":[{"id":"a","label":"Auth"}]}"#),
+        ];
+        let (_, _, nodes, _) = merge_sketch(&parts);
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].note.as_deref(), Some("The real one"));
+    }
+
+    #[test]
+    fn the_same_connection_described_twice_is_drawn_once() {
+        let parts = vec![
+            part(r#"{"title":"T","nodes":[{"id":"a","label":"A"},{"id":"b","label":"B"}],
+                    "edges":[{"from":"a","to":"b"}]}"#),
+            part(r#"{"title":"T","nodes":[],"edges":[{"from":"a","to":"b"}]}"#),
+        ];
+        let (_, _, _, edges) = merge_sketch(&parts);
+        assert_eq!(edges.len(), 1, "two arrows on one line is a defect, not a diagram");
+    }
+
+    #[test]
+    fn a_nameless_or_empty_description_still_produces_something_usable() {
+        let (title, _, nodes, _) = merge_sketch(&[]);
+        assert_eq!(title, "Sketch");
+        assert!(nodes.is_empty(), "and the caller refuses rather than drawing a blank");
+    }
+
+    #[test]
+    fn a_node_with_no_label_is_dropped_rather_than_drawn_blank() {
+        let parts = vec![part(
+            r#"{"title":"T","nodes":[{"id":"a","label":""},{"id":"b","label":"Real"}]}"#,
+        )];
+        let (_, _, nodes, _) = merge_sketch(&parts);
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].label, "Real");
+    }
+
+    #[test]
+    fn the_schema_never_asks_the_model_where_anything_goes() {
+        // The reason #sketch is reliable. If a coordinate ever appears in this
+        // schema, the model is being asked to do arithmetic it cannot do.
+        let s = serde_json::to_string(&sketch_schema()).unwrap();
+        for banned in ["\"x\"", "\"y\"", "\"width\"", "\"height\"", "position", "coordinate"] {
+            assert!(!s.contains(banned), "the schema must not mention {banned}: {s}");
+        }
     }
 }
