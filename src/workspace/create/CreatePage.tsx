@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   api,
   formatSize,
@@ -90,6 +90,24 @@ export function CreatePage({ s, a }: { s: WSState; a: WSActions }) {
       live = false;
     };
   }, []);
+
+  // "New creation" — the Creations sidebar header and ⌘T in this destination.
+  // A creation is COMPOSED rather than created, so "new" means an empty bench:
+  // no prompt, no starting frame, no references. Keyed on the counter rather
+  // than a flag so pressing it twice clears twice (see `newCreationSeq`), and
+  // skipped on the first render so arriving at Create never wipes a draft the
+  // reader had left in the box.
+  const firstRender = useRef(true);
+  useEffect(() => {
+    if (firstRender.current) {
+      firstRender.current = false;
+      return;
+    }
+    setPrompt("");
+    setFrame(null);
+    setRefs([]);
+    setHandoff(null);
+  }, [s.newCreationSeq]);
 
   const models = catalog?.models ?? [];
   const counts = tallies(catalog);

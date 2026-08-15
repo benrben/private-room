@@ -289,5 +289,8 @@ export function areaDef(key: NavArea) {
 /** The sidebar's own name for a place, reused by anything that has to name
  * one, so two surfaces can never disagree about what somewhere is called. */
 export function areaLabel(key: WorkArea): string {
-  return NAV_AREAS.find((a) => a.key === key)?.label ?? "Library";
+  // "files" is Home's other name and the only key not on the rail; anything
+  // else is a destination this build does not know. Both land on the place the
+  // app opens in — never on "Library", which is the name of a COLUMN.
+  return NAV_AREAS.find((a) => a.key === key)?.label ?? "Home";
 }

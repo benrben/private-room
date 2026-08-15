@@ -851,6 +851,34 @@ body.resizing-col * {
   gap: 1px;
 }
 
+/* THE CONTEXTUAL SIDEBAR'S PRIMARY ACTION — New page / New sketch / New
+   creation, in the same slot in every destination that has one, so it is the
+   same control rather than three that happen to look alike. Pushed to the right
+   of the title by `margin-left: auto`, with `.pane-actions` losing its own auto
+   margin in that case so the two groups stay adjacent at the end of the row. */
+.pane-new-btn {
+  margin-left: auto;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-xs);
+  background: var(--raised);
+  color: var(--text);
+  font-size: 11px;
+  white-space: nowrap;
+}
+.pane-new-btn:hover {
+  color: var(--text-strong);
+  background: var(--hover);
+  border-color: var(--accent);
+}
+.pane-new-btn + .pane-actions {
+  margin-left: 4px;
+}
+
 .pane-tabs {
   height: 34px;
   flex: 0 0 auto;
@@ -1421,6 +1449,108 @@ button.status-trust.danger:hover {
   white-space: nowrap;
 }
 
+/* ----- the private browser's pages, in the contextual sidebar ----- */
+
+/* A page row is an `area-nav-row` that can be selected and closed. The close
+   control appears on hover AND on focus — a control only reachable with a
+   pointer is not a control everyone has, and the row's own Backspace/Delete is
+   the other half of that promise (see PagesNav). */
+.page-row {
+  cursor: default;
+}
+.page-close {
+  width: 20px;
+  height: 20px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-xs);
+  background: transparent;
+  color: var(--faint);
+  opacity: 0;
+}
+.page-row:hover .page-close,
+.page-row:focus-within .page-close,
+.page-row.is-current .page-close {
+  opacity: 1;
+}
+.page-close:hover {
+  color: var(--text-strong);
+  background: var(--hover);
+}
+/* Visible focus, always: the close button is reachable by Tab from the row. */
+.page-close:focus-visible {
+  opacity: 1;
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.page-row.is-dragging {
+  opacity: 0.5;
+}
+
+/* ----- "Section only" / "In Library", on the object's own toolbar ----- */
+
+.library-chip-wrap {
+  position: relative;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+/* Quiet by design: this is a STATUS, and a loud badge beside a document title
+   competes with the title. It earns attention by being the exception — only
+   objects made inside a destination carry one at all. */
+.library-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 7px;
+  border: 1px solid var(--line-soft);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--faint);
+  font-size: 10px;
+  white-space: nowrap;
+}
+.library-chip.is-linked {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+}
+.library-chip.is-linked:hover {
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+.library-chip-btn {
+  font-size: 11px;
+}
+.library-chip-pop {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 60;
+  min-width: 250px;
+  max-width: 300px;
+}
+.library-chip-q {
+  margin: 0;
+  padding: var(--sp-3);
+  display: grid;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+.library-chip-q strong {
+  color: var(--text-strong);
+  font-size: 12.5px;
+}
+.library-chip-actions {
+  padding: 0 var(--sp-3) var(--sp-3);
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
 /* ----- center pane chrome ----- */
 
 /* The trail is SECONDARY, which is a matter of weight and colour rather than
@@ -1987,12 +2117,16 @@ button.status-trust.danger:hover {
    to be visible without reading a single row. The log gets a rule across the
    pane, its own indent and a lower contrast — so the eye lands on the section
    boundary, not on which card happens to have a button. */
-.activity-history {
+/* …and the assistant's Library changes are a record too: same fold, same
+   lower contrast, its own heading because a promotion is not a run. */
+.activity-history,
+.activity-organized {
   margin-top: 26px;
   padding-top: var(--sp-1);
   border-top: 1px solid var(--line);
 }
-.activity-history .activity-group-title {
+.activity-history .activity-group-title,
+.activity-organized .activity-group-title {
   display: flex;
   align-items: baseline;
   gap: 7px;

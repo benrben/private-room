@@ -1738,6 +1738,7 @@ pub(crate) const BUILTIN_TOOL_NAMES: &[&str] = &[
     "test_workflow",
     "draw",
     "read_drawing",
+    "set_in_library",
     // Reserved even though they are never in the room bridge's own catalog:
     // an MCP route sanitizing to one of these names would shadow the built-in
     // exec_tool arm and skip the SEC-1b consent gate (e.g. server "consult" +
@@ -1829,6 +1830,12 @@ pub(crate) fn organize_tools_specs() -> Vec<serde_json::Value> {
                 "names": {"type": "array", "items": {"type": "string"},
                     "description": "File names or parts of them"}},
                 "required": ["names"]}}},
+        {"type": "function", "function": {"name": "set_in_library",
+            "description": "Add a section-only object (a sketch, a generated picture or clip) to this room's Library, or remove it from the Library. Room-local: nothing is exported or copied, and the object stays in its own section either way. Only when the user asks or approves — never automatically.",
+            "parameters": {"type": "object", "properties": {
+                "name": {"type": "string", "description": "File name or part of it"},
+                "in_library": {"type": "boolean", "description": "true = add, false = remove"}},
+                "required": ["name", "in_library"]}}},
         {"type": "function", "function": {"name": "merge_files",
             "description": "Join text files into ONE new file, in order. A mechanical join of their FULL contents — nothing summarized, no length limit — for combining notes/chapters/transcripts. To have the material rewritten or summarized instead, use start_file_pass. Example: {\"names\": [\"ch1.md\", \"ch2.md\"], \"into\": \"Book draft.md\"}",
             "parameters": {"type": "object", "properties": {
@@ -2942,11 +2949,15 @@ pub(crate) async fn exec_tool(
             let mut rows: Vec<String> = all
                 .into_iter()
                 .take(100)
-                .map(|(name, mime, size, summary)| match summary {
-                    Some(s) if !s.trim().is_empty() => {
-                        format!("- {name} ({mime}, {size} bytes) — {}", clamp_words(s.trim(), 120))
+                .map(|(name, mime, size, summary, (origin, visibility))| {
+                    let placed = db::placement_note(&origin, &visibility);
+                    match summary {
+                        Some(s) if !s.trim().is_empty() => format!(
+                            "- {name} ({mime}, {size} bytes){placed} — {}",
+                            clamp_words(s.trim(), 120)
+                        ),
+                        _ => format!("- {name} ({mime}, {size} bytes){placed}"),
                     }
-                    _ => format!("- {name} ({mime}, {size} bytes)"),
                 })
                 .collect();
             if total > 100 {
@@ -3875,6 +3886,39 @@ pub(crate) async fn exec_tool(
             let _ = window.emit("file-updated", &id);
             effects.wrote = true;
             Ok(format!("Renamed \"{real_name}\" to \"{final_name}\"."))
+        }
+        // Promotion is an ACT the agent reports, not a side effect it performs.
+        // `effects.wrote` marks the room changed, which is what the honesty gate
+        // reads before it lets a reply claim to have organised anything; the
+        // returned sentence says what actually changed — including that the
+        // object stayed where it was, because "added to Library" alone reads
+        // like a move.
+        //
+        // `assistant-organized` is the other half, and it is a SEPARATE event
+        // from `room-files-changed` on purpose. That one says the list is
+        // stale; this one says who changed what, which is the only form in
+        // which Activity can carry it. Without it the change was recoverable
+        // from the chat transcript alone — findable if you know which turn to
+        // scroll back to, and invisible in the panel the room offers as its
+        // record of what has been done to it.
+        "set_in_library" => {
+            let name = args["name"].as_str().unwrap_or_default();
+            let linked = args["in_library"].as_bool().unwrap_or(true);
+            let guard = state.room.lock().unwrap();
+            let room = guard.as_ref().ok_or("No room is open.")?;
+            let (id, real_name) = db::find_file_like_qualified(&room.conn, name)?;
+            db::set_library_visibility(&room.conn, &id, linked)?;
+            let _ = window.emit("room-files-changed", ());
+            let _ = window.emit(
+                "assistant-organized",
+                serde_json::json!({ "id": id, "name": real_name, "linked": linked }),
+            );
+            effects.wrote = true;
+            Ok(if linked {
+                format!("Added \"{real_name}\" to the Library. It is still in its own section, and no copy was made.")
+            } else {
+                format!("Removed \"{real_name}\" from the Library. The object itself is untouched and still in its own section.")
+            })
         }
         "move_file" => {
             let name = args["name"].as_str().unwrap_or_default();

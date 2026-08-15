@@ -619,6 +619,16 @@ pub struct FileMeta {
     /// This column existed and was populated long before any UI read it —
     /// same shape as `origin_url` above.
     pub ai_summary: Option<String>,
+    /// Which destination MADE this file: `"library"`, `"sketch"`, `"create"`,
+    /// `"recordings"`. Ownership — where the object lives and is managed.
+    pub origin_destination: String,
+    /// Whether Home's Library shows it: `"linked"` or `"sectionOnly"`.
+    ///
+    /// Deliberately a SECOND field rather than something inferred from
+    /// `origin_destination`: a sketch that has been added to the Library is
+    /// still a sketch, and a Library file opened in the sketch editor is still
+    /// a Library file. One object, two independent facts about it.
+    pub library_visibility: String,
 }
 
 /// Trash: one deleted file, as the trash view shows it. Deliberately NOT a

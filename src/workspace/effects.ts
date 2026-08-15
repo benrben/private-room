@@ -13,6 +13,11 @@ import { WSActions } from "./actions";
 import { ownerOf as ownsEvent } from "./runIdentity";
 import { applyRecState } from "./recSession";
 
+/** How many of the assistant's organization changes Activity keeps. A record of
+ * this session, not an archive — the transcript is where every one of them is
+ * written down in full. */
+const MAX_ORGANIZED = 25;
+
 /** All of Workspace's effects: the mount-time backend-event wiring (which
  * dispatches agent-open-file → viewFile, agent-annotate → the open viewer, MCP
  * approvals, sync warning), plus the smaller orchestration effects. Kept in one
@@ -558,6 +563,19 @@ export function useWorkspaceEffects(
         s.setViewerRev((r) => r + 1);
       }
     });
+    // The assistant changed what the Library shows. Recorded rather than
+    // toasted: the user asked for it, so it is not news — it is a line in the
+    // record of what has been done to this room, next to the jobs.
+    const unlistenOrganized = api.onAssistantOrganized((change) => {
+      // Numbered off the head, so the counter survives the cap dropping the
+      // tail and two identical acts on one object stay two rows.
+      s.setOrganized((prev) =>
+        [{ ...change, seq: (prev[0]?.seq ?? 0) + 1 }, ...prev].slice(
+          0,
+          MAX_ORGANIZED,
+        ),
+      );
+    });
     const unlistenFiles = api.onRoomFilesChanged(() => {
       api.listFiles().then(s.setFiles).catch(readFailed("files"));
       api.listFolders().then(s.setFolders).catch(readFailed("folders"));
@@ -703,6 +721,7 @@ export function useWorkspaceEffects(
       unlistenOpen.then((fn) => fn());
       unlistenAnnotate.then((fn) => fn());
       unlistenUpdated.then((fn) => fn());
+      unlistenOrganized.then((fn) => fn());
       unlistenFiles.then((fn) => fn());
       unlistenMcp.then((fn) => fn());
       unlistenBrowserNav.then((fn) => fn());

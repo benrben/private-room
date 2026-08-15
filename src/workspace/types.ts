@@ -28,6 +28,23 @@ export interface Toast {
   /** Optional remediation button (e.g. "Open Ollama", "Download"). Runs, then
    * the toast dismisses itself. */
   action?: { label: string; run: () => void };
+  /** WHAT THIS MESSAGE IS ABOUT — an object id, when the message confirms a
+   * change to something that is still on screen.
+   *
+   * Two things follow from it, and both exist because of the same live report:
+   * adding and removing one sketch from the Library five times left five
+   * undismissed confirmations covering the workspace, across destinations,
+   * with nothing expiring them.
+   *
+   *   • REPEATS REPLACE. A second message about the same object supersedes the
+   *     first rather than stacking under it. Only the latest is true anyway —
+   *     the earlier one's Undo would put back a state two acts ago.
+   *   • IT CLEARS ITSELF, action or not. The usual rule is that a toast
+   *     carrying an action waits forever, because the action is the only route
+   *     to something the app deliberately did not do for you. That is not this:
+   *     the object is right there, its own chip offers the exact inverse, and
+   *     the change is reversible from the object at any time. */
+  about?: string;
 }
 
 export interface Props {
@@ -101,18 +118,22 @@ export function isWorkArea(value: string): value is Exclude<WorkArea, "files"> {
  *
  * An open file always wins the centre pane — that is deliberate, so a citation
  * or an agent open is never swallowed by whichever area page happens to be
- * showing (see ViewerPane). But most areas hold no room files at all, and the
- * two contextual surfaces — the breadcrumb trail and the library pane — were
- * naming the area regardless. Open a .docx while the private browser is the
- * current area and the trail read `Room / Private browser / report.docx` with
- * the browser's own controls still in the left pane: an ordinary room document
- * announced as browser content.
+ * showing (see ViewerPane). This answers the other half: is the destination on
+ * the rail the one that OWNS this document?
  *
- * Only three answers are true. The file-centric areas browse the library, so
- * they contain everything. Recordings and Scripts each list a subset and their
- * navigators highlight the very row that was opened, so they contain a file
- * when it is one of theirs. Nothing else contains files, so nothing else may
- * put its name on one. */
+ * It is now the router for the whole two-level IA. A file its destination
+ * holds stays there, with that destination's own list beside it and the row
+ * highlighted; a file its destination does NOT hold moves the app to Home,
+ * atomically, rather than leaving a document on screen with an unrelated
+ * sidebar next to it (see `Workspace.tsx`'s `showFileHere` effect). Open a
+ * .docx from the private browser and you arrive in Home, where that document
+ * lives — not in a browser that has quietly started listing room files.
+ *
+ * Five destinations hold files. Home browses the library, so it holds
+ * everything; the map draws the whole room, so it holds everything it can open.
+ * Recordings, Scripts, Sketches and Creations each hold their own kind, and
+ * each highlights the very row that was opened. Nothing else holds files, so
+ * nothing else may put its name on one. */
 export function areaHoldsFile(
   area: WorkArea,
   fileId: string,
@@ -120,12 +141,29 @@ export function areaHoldsFile(
   scripts: ScriptInfo[],
 ): boolean {
   if (area === "files" || area === "home" || area === "map") return true;
-  if (area === "recordings") {
-    const meta = files.find((f) => f.id === fileId);
-    return meta != null && isRecordingFile(meta);
-  }
+  const meta = files.find((f) => f.id === fileId);
+  if (area === "recordings") return meta != null && isRecordingFile(meta);
   if (area === "scripts") return scripts.some((sc) => sc.fileId === fileId);
+  if (area === "sketch") return meta != null && isSketchFile(meta);
+  if (area === "create") return meta != null && isCreationFile(meta);
   return false;
+}
+
+/** A drawing. The extension is the format's own marker (`commands/sketch.rs`
+ * mints `<name>.sketch`), so it is the honest test — a sketch imported into an
+ * older room predates `originDestination` and is still a sketch. */
+export function isSketchFile(f: FileMeta): boolean {
+  return f.name.toLowerCase().endsWith(".sketch");
+}
+
+/** A picture or clip the Create page made.
+ *
+ * Asks the file where it CAME FROM, never what it looks like. Matching on mime
+ * type would sweep in every photo the user imported and every screenshot the
+ * browser saved, which are not creations and do not belong in a list whose
+ * rows offer to re-render or re-charge for their subject. */
+export function isCreationFile(f: FileMeta): boolean {
+  return f.originDestination === "create";
 }
 
 /** The areas that name themselves in a file's breadcrumb trail.

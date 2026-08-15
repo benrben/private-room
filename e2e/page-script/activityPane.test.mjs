@@ -156,8 +156,11 @@ const job = (id, status, title, extra = {}) => ({
   ...extra,
 });
 
-const paneState = (jobs) => ({
+const paneState = (jobs, organized = []) => ({
   jobs,
+  // Library changes the assistant made. Not jobs — no duration, no steps, and
+  // nothing to resume — so they are their own group and are counted as none.
+  organized,
   jobProgress: {},
   scriptApprovals: [],
   mcpApprovals: [],
@@ -277,6 +280,76 @@ test("a room with only live jobs renders no history section at all", () => {
     "an empty log must read as empty — no heading claiming a record exists",
   );
   assert.ok(sectionHtml(html, "activity-live").includes("IN-FLIGHT"));
+});
+
+/* ---------- the assistant's Library changes are part of the record ------- */
+
+const promoted = (over = {}) => ({
+  seq: 1,
+  id: "f1",
+  name: "Portfolio map.sketch",
+  linked: true,
+  ...over,
+});
+
+test("a Library change the assistant made is recorded, not only chatted", () => {
+  // It used to exist solely inside the turn that made it: findable by
+  // scrolling the transcript back to the right message, and absent from the
+  // panel that offers itself as the room's record of what has been done to it.
+  const html = render(paneState([], [promoted()]));
+  const section = sectionHtml(html, "activity-organized");
+  assert.ok(section, "the change must have a section of its own");
+  assert.ok(section.includes("Portfolio map"), "it must name the object");
+  assert.ok(section.includes("Added"), "and say which way it went");
+  assert.ok(!section.includes("<button"), "a record carries no controls");
+});
+
+test("a demotion is recorded as what it is, and says nothing was deleted", () => {
+  const section = sectionHtml(
+    render(paneState([], [promoted({ linked: false })])),
+    "activity-organized",
+  );
+  assert.ok(section.includes("Removed"));
+  assert.ok(
+    /untouched/.test(section),
+    "the record must not read as a deletion — that is the whole fear it answers",
+  );
+});
+
+test("Library changes are recorded beside jobs, never counted as one", () => {
+  const html = render(paneState([], [promoted()]));
+  assert.equal(
+    sectionHtml(html, "activity-history"),
+    null,
+    "a promotion is not a finished job and must not conjure a job log",
+  );
+  const live = sectionHtml(html, "activity-live");
+  assert.ok(!live.includes("activity-row"), "nor is it work in flight");
+});
+
+test("doing the same thing twice to one object is two rows, not one", () => {
+  // Add, remove, add is three acts and two of them are identical — the record
+  // has to keep them apart, which is what the arrival counter is for.
+  const html = render(
+    paneState([], [
+      promoted({ seq: 3 }),
+      promoted({ seq: 2, linked: false }),
+      promoted({ seq: 1 }),
+    ]),
+  );
+  const section = sectionHtml(html, "activity-organized");
+  assert.equal(section.split("Portfolio map").length - 1, 3);
+  assert.equal(section.split("Added").length - 1, 2);
+  assert.equal(section.split("Removed").length - 1, 1);
+});
+
+test("a room whose only event was a promotion does not claim to be idle", () => {
+  const html = render(paneState([], [promoted()]));
+  assert.ok(
+    !html.includes("The room is idle"),
+    "something happened, and the pane's own empty state would deny it",
+  );
+  assert.ok(render(paneState([], [])).includes("The room is idle"));
 });
 
 test("the history section says how many of how many it is showing", () => {

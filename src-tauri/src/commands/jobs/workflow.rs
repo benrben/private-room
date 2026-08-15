@@ -1117,7 +1117,7 @@ fn interpolate<R: tauri::Runtime>(
                 .and_then(|r| db::list_files_brief(&r.conn).ok())
                 .map(|rows| {
                     rows.iter()
-                        .map(|(name, _mime, _size, liner)| match liner {
+                        .map(|(name, _mime, _size, liner, _placed)| match liner {
                             Some(l) if !l.trim().is_empty() => format!("- {name}: {l}"),
                             _ => format!("- {name}"),
                         })

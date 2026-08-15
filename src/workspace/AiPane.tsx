@@ -11,6 +11,7 @@ import {
   SparkIcon,
 } from "../icons";
 import { isCloudRoute, trustState } from "./markup";
+import { displayName } from "./composer";
 import ChatPane from "./ChatPane";
 import StudioShelf from "./StudioShelf";
 import PodcastPanel from "./PodcastPanel";
@@ -350,6 +351,11 @@ function ActivityPanel({
   // can never disagree about which side a job is on.
   const { active: running, parked, history } = groupActivity(s.jobs);
   const shownHistory = history.slice(0, HISTORY_LIMIT);
+  // The assistant's organization changes belong in the same half as finished
+  // jobs — something happened, there is nothing to act on — but they are not
+  // jobs and are not grouped or counted as any. They have no duration, no
+  // progress and no run to resume.
+  const organized = s.organized.slice(0, HISTORY_LIMIT);
   // A recording is "being written out" while EITHER signal is up — the two
   // arrive a beat apart, and the counters use the same rule.
   const savingRec = s.recSave != null || s.recLive?.status === "saving";
@@ -358,6 +364,7 @@ function ActivityPanel({
     runningJobCount(s) === 0 &&
     parked.length === 0 &&
     history.length === 0 &&
+    organized.length === 0 &&
     !s.importProgress &&
     // The privacy scanner has no job row, so nothing above can see it — and
     // "The room is idle" is a flat claim this pane would otherwise make while
@@ -580,6 +587,39 @@ function ActivityPanel({
           ACTION button — a finished job is not a thing you resume — but a
           repeated-run group's own "show runs" disclosure toggle is not a job
           action, it just un-collapses detail already on the screen. */}
+      {/* What the assistant changed about how the room is ORGANISED. Its own
+          group above the job log, because a promotion is not a run: it took no
+          time, it has no steps, and the only thing worth saying about it is
+          which object went which way. Before this it existed solely inside the
+          turn that made it — findable by scrolling the transcript back to the
+          right message, and absent from the panel that offers itself as the
+          room's record of what has been done to it. */}
+      {organized.length > 0 && (
+        <section className="activity-organized" aria-label="Organised by the assistant">
+          <div className="activity-group-title">
+            Library changes
+            <span className="activity-history-note">
+              made by the assistant, at your request
+            </span>
+          </div>
+          {organized.map((c) => (
+            <div key={c.seq} className="activity-row history">
+              <div className="activity-row-head">
+                <span className="activity-row-title">
+                  {c.linked ? "Added" : "Removed"} “{displayName(c.name)}”
+                </span>
+                <StateTape word="Done" mark="nb-sem-done" />
+              </div>
+              <div className="activity-copy ap-note">
+                {c.linked
+                  ? "Home’s Library now lists it too. It stayed in its own section, and nothing was copied."
+                  : "Home’s Library no longer lists it. The object itself is untouched, in its own section."}
+              </div>
+            </div>
+          ))}
+        </section>
+      )}
+
       {shownHistory.length > 0 && (
         <section className="activity-history" aria-label="What already happened">
           <div className="activity-group-title">

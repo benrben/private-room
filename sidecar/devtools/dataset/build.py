@@ -428,6 +428,15 @@ REPLIES: dict[str, Any] = {
     # should always name the way back, since the user did not press this.
     "trash_files": lambda a: f"{len(a.get('names') or [1])} file(s) moved to the trash. "
     "They are recoverable from Library → Trash.",
+    # Names what changed AND what did not: the trained answer must never leave
+    # the user thinking a copy was made or the object moved out of its section.
+    "set_in_library": lambda a: (
+        f"Added \"{_a(a, 'name', default='Portfolio map.sketch')}\" to the Library. "
+        "It is still in its own section, and no copy was made."
+        if a.get("in_library", True)
+        else f"Removed \"{_a(a, 'name', default='Portfolio map.sketch')}\" from the "
+        "Library. The object itself is untouched and still in its own section."
+    ),
     "merge_files": lambda a: f"merged {len(a.get('names') or [2])} files into "
     f"{_a(a, 'into', default='Merged notes.md')} (18,402 characters)"
     + (

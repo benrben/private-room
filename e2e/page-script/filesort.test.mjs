@@ -113,9 +113,14 @@ test("a stored order that is not one of ours falls back to the old behaviour", (
 
 test("the sidebar sorts the one list every file surface reads", () => {
   const sidebar = readFileSync(join(root, "src/workspace/Sidebar.tsx"), "utf8");
+  // Home's population is now `libraryFiles(s.files)` rather than `s.files` —
+  // a section-only object is a full room file that Home simply does not list.
+  // The invariant this test exists for is unchanged: ONE sorted list feeds the
+  // folder tree, the AI-sources checkboxes and the count badge, so the three
+  // can never disagree about the order the reader chose.
   assert.match(
     sidebar,
-    /const shownFiles = sortFiles\(s\.files\.filter\(matchesFilter\), s\.fileSort\)/,
+    /const shownFiles = sortFiles\(libraryFiles\(s\.files\)\.filter\(matchesFilter\), s\.fileSort\)/,
   );
   assert.match(sidebar, /aria-label="Sort files"/, "the control must exist");
   assert.match(sidebar, /s\.setFileSort\(/, "…and be wired to the setter");

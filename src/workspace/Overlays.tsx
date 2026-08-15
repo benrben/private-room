@@ -271,12 +271,12 @@ function buildPaletteActions(
     { id: "go-connectors", label: "Open Connectors", hint: "MCP tools this room may use", run: () => { leaveAreas(); s.setArea("connectors"); } },
     { id: "go-memory", label: "Open Memory & scratch pad", hint: "Durable context, visible and editable", run: () => a.revealMemory() },
     // ----- the window's arrangement (same handlers the Layout menu uses) -----
-    { id: "toggle-library", label: "Show or hide the Library", hint: "The left pane (⌘1)", run: () => layout?.togglePane("library") },
+    { id: "toggle-library", label: "Show or hide the sidebar", hint: "The left pane (⌘1)", run: () => layout?.togglePane("library") },
     { id: "toggle-assistant", label: "Show or hide the Assistant", hint: "Chat, Studio, and Activity (⌘2)", run: () => layout?.togglePane("ai") },
     { id: "focus-editor", label: "Focus the workspace", hint: "Hide both side panes", run: () => layout?.toggleFocus("center") },
     { id: "preset-focus", label: "Layout: Focus", hint: "The workspace alone", run: () => layout?.applyPreset("focus") },
-    { id: "preset-research", label: "Layout: Research", hint: "Library, workspace, and the assistant", run: () => layout?.applyPreset("research") },
-    { id: "preset-review", label: "Layout: Review", hint: "Library and workspace, no assistant", run: () => layout?.applyPreset("review") },
+    { id: "preset-research", label: "Layout: Research", hint: "Sidebar, workspace, and the assistant", run: () => layout?.applyPreset("research") },
+    { id: "preset-review", label: "Layout: Review", hint: "Sidebar and workspace, no assistant", run: () => layout?.applyPreset("review") },
     { id: "reset-layout", label: "Reset the layout", hint: "Restore the balanced default", run: () => layout?.resetLayout() },
     { id: "theme", label: "Switch theme", hint: "Dark ⇄ light", run: () => toggleTheme() },
     { id: "checkpoint", label: "Save a checkpoint", hint: "A room-wide recovery point", run: () => { api.createRoomCheckpoint("").then((m) => s.pushToast("success", `Saved checkpoint “${m.name}”.`)).catch((e) => s.pushToast("error", String(e))); } },
@@ -325,7 +325,7 @@ const SHORTCUTS: { group: string; rows: [string, string][] }[] = [
   {
     group: "Panes",
     rows: [
-      ["⌘1", "Show or hide the Library"],
+      ["⌘1", "Show or hide the sidebar"],
       ["⌘2", "Show or hide the Assistant"],
       // Named as an alias rather than quietly listed as an equal: ⌘3 has meant
       // the assistant since the shell had three panes, and it keeps meaning it

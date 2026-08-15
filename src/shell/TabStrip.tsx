@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
-import { CloseIcon, GlobeIcon, PlusIcon } from "../icons";
+import { CloseIcon } from "../icons";
 import type { Tab, TabsApi } from "../workspace/tabs";
 import { useAdaptiveText } from "../workspace/adaptiveText";
 
@@ -62,24 +62,26 @@ function TabTitleText({
   return <>{generated ?? fallback}</>;
 }
 
-/** The workspace's open DOCUMENTS.
+/** HOME'S OPEN ROOM DOCUMENTS, and nothing else.
  *
- * Not its navigation: places live in the activity rail, which is always
- * visible and can name them in full (see shell/ActivityRail.tsx). What is left
- * here is the short, honest list of things you have actually opened — files
- * and private-browser pages — so a tab can be a readable title rather than one
- * of two glyphs repeated eight times.
+ * Not the app's navigation: places live in the activity rail, which is always
+ * visible and can name them in full (see shell/ActivityRail.tsx). Not the
+ * browser's pages either, any more — those are a different kind of thing with a
+ * different lifetime, and mixing them into this list is what made one strip
+ * carry a spreadsheet, a recording, a sketch and three web pages side by side
+ * above every surface in the app. They have their own vertical list in the one
+ * destination that shows them (see workspace/browserPages.ts).
  *
- * Lives ABOVE the pane's measured rect on purpose: the private browser is a
- * native child webview positioned from that rect, and nothing can be drawn
- * over a native webview — so a strip that overlapped it would simply vanish
- * behind the page. Same reason the address bar sits where it does. */
+ * What is left is homogeneous: room documents Home has opened, which is why a
+ * tab can be a readable title with no glyph in front of it.
+ *
+ * The shell renders this only in Home (see `showsDocumentTabs`), so every
+ * other destination reclaims the height for the surface the reader chose. */
 export default function TabStrip({
   tabs,
   icons,
   roomId,
   titleFacts,
-  onNewPage,
 }: {
   tabs: TabsApi;
   /** Per-tab glyph, supplied by the shell — the strip owns no file-type or
@@ -93,8 +95,6 @@ export default function TabStrip({
   /** Facts for a tab's model-written title, or `null` when there's too
    * little to generate from — see `TabTitleFacts`. */
   titleFacts: (tab: Tab) => TabTitleFacts | null;
-  /** Opens another private-browser page. Absent when the browser is off. */
-  onNewPage: (() => void) | null;
 }) {
   const [dragging, setDragging] = useState<string>("");
   const stripRef = useRef<HTMLDivElement>(null);
@@ -195,7 +195,7 @@ export default function TabStrip({
       <div
         className="tab-strip"
         role="tablist"
-        aria-label="Open tabs"
+        aria-label="Open documents"
         ref={stripRef}
         onScroll={measure}
       >
@@ -291,17 +291,6 @@ export default function TabStrip({
             </div>
           );
         })}
-        {onNewPage && (
-          <button
-            className="tab-new"
-            aria-label="New browser page"
-            title="New browser page (⌘T)"
-            onClick={onNewPage}
-          >
-            <PlusIcon size={12} />
-            <GlobeIcon size={12} />
-          </button>
-        )}
       </div>
       {/* Same reserved-column fix as the start arrow, on the other end. It
           still reads as "scrolled to the end" once the ＋ button is the

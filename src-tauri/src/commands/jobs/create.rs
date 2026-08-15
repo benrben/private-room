@@ -709,6 +709,11 @@ async fn run_create(
                 .ok_or("The room was closed before the picture could be saved.")?;
             let meta =
                 db::insert_file(&room.conn, &name, mime, &bytes, Some(&described), "generated")?;
+            // Section-only: a finished picture or clip belongs to Creations, and
+            // reaches Home when the person who made it chooses "Add to Library".
+            // It is the same room file either way — this only decides which
+            // lists show it.
+            db::mark_section_only(&room.conn, &meta.id, "create");
             // Record it against the shot it belongs to, so the list shows the
             // frame and the clip beside the line that asked for them. Only the
             // FIRST variation is filed: a shot has one still and one clip, and
@@ -1041,14 +1046,19 @@ async fn opening_from_prev_clip(
             if let Ok(name) =
                 db::available_name(&room.conn, &format!("{stem} — end frame.png"))
             {
-                let _ = db::insert_file(
+                // Section-only like every other Create output — and this one
+                // most of all: an end frame is continuity machinery for the
+                // next shot, not a picture anyone asked Home to list.
+                if let Ok(meta) = db::insert_file(
                     &room.conn,
                     &name,
                     "image/png",
                     &png,
                     Some("The exact frame the previous shot's clip ends on. This shot's clip starts on this picture, which is what joins the two."),
                     "generated",
-                );
+                ) {
+                    db::mark_section_only(&room.conn, &meta.id, "create");
+                }
             }
         }
     }

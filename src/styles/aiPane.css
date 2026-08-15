@@ -507,7 +507,8 @@
    boundary has to be readable without reading a row. A dashed pencil rule is
    the notebook's own mark for "the fold in a truncated list", and every entry
    below it is indented behind a pencil spine. */
-.pane-ai .activity-history {
+.pane-ai .activity-history,
+.pane-ai .activity-organized {
   margin-top: var(--sp-8);
   padding-top: var(--sp-2);
   border-top: 0;
@@ -520,7 +521,8 @@
   background-size: 100% 1px;
   background-position: left top;
 }
-.pane-ai .activity-history .activity-group-title {
+.pane-ai .activity-history .activity-group-title,
+.pane-ai .activity-organized .activity-group-title {
   display: flex;
   align-items: baseline;
   gap: var(--sp-2);
@@ -529,7 +531,8 @@
 }
 /* In the flex heading the tick becomes a flex item, so the row's own gap
    already spaces it and its inline margin would double up. */
-.pane-ai .activity-history .activity-group-title::before {
+.pane-ai .activity-history .activity-group-title::before,
+.pane-ai .activity-organized .activity-group-title::before {
   margin-inline-end: 0;
 }
 /* The "showing 25 of 30" aside — a count the list worked out, so the sans.

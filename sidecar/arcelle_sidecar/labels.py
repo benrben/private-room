@@ -142,6 +142,10 @@ _LABELS: dict[str, str] = {
     "studio_mindmap": "Made a mind map",
     "draw": "Drew on the sketch",
     "read_drawing": "Looked at the sketch",
+    # Names the change, not the verb: this only decides whether Home lists an
+    # object that is already in the room, and the chip has to be readable as
+    # "nothing was sent anywhere".
+    "set_in_library": "Changed what the Library shows",
     "generate_podcast_script": "Wrote a podcast script",
     # ADD-21: name the exfiltration plainly.
     "consult_advisor": "Consulting a cloud advisor (content leaves this Mac)",

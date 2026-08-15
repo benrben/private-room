@@ -61,9 +61,19 @@ test("every native menu row has a handler, and every handler a row", () => {
 test("⌘1 and ⌘2 have exactly one owner, and it is the menu", () => {
   assert.match(
     MENU_RS,
-    /id: "view\.library",\s*label: "Library",\s*accel: Some\("CmdOrCtrl\+1"\)/,
+    /id: "view\.library",\s*label: "(\w| )+",\s*accel: Some\("CmdOrCtrl\+1"\)/,
     "the View menu must declare ⌘1",
   );
+  // …and it must not be born calling the column by Home's name for it. The row
+  // shows and hides the SECOND COLUMN, which is Sketches in Sketch and Private
+  // pages in the browser; `menu_sync` retitles it per destination, and the
+  // static label is what stands there with no room open.
+  assert.doesNotMatch(
+    MENU_RS,
+    /id: "view\.library",\s*label: "Library"/,
+    "the ⌘1 row named Home's contents wherever it stood — see sidebar_label",
+  );
+  assert.match(MENU_RS, /item\.set_text\(sidebar_label\(&view\.sidebar\)\)/);
   assert.match(
     MENU_RS,
     /id: "view\.assistant",\s*label: "Assistant",\s*accel: Some\("CmdOrCtrl\+2"\)/,
@@ -103,12 +113,31 @@ test("the menu is greyed out while no room is open", () => {
 test("the room's state reaches the menu bar on every change", () => {
   // The menu bar is not part of this window, so no render can correct a drifted
   // tick. The dependency list is the whole guarantee.
+  // Read the payload and the dependency list out of the hook rather than
+  // pinning one formatting of them: what matters is that every value the menu
+  // is told about is a value the effect re-runs for, and a new field is exactly
+  // the case a pinned string would let through with a reformat.
+  const sync = HOOK.slice(HOOK.indexOf("syncViewMenu({\n        enabled: true"));
+  const payload = sync.slice(0, sync.indexOf("})"));
+  const deps = sync.slice(sync.indexOf("}, ["), sync.indexOf("]);"));
+  // The VALUE each field is built from — `library,` is its own value, and
+  // `sidebar: sidebarTitle,` is watched under the name on the right.
+  const sent = [...payload.matchAll(/^\s{8}(\w+)(?::\s*(\w+))?,$/gm)]
+    .filter(([, key]) => key !== "enabled")
+    .map((m) => m[2] ?? m[1]);
+  assert.ok(sent.length >= 6, `only found ${sent.length} synced values`);
+  for (const name of sent) {
+    assert.match(
+      deps,
+      new RegExp(`\\b${name}\\b`),
+      `the menu is told about \`${name}\` but the effect does not re-run for it`,
+    );
+  }
   assert.match(
-    HOOK,
-    /\}, \[library, assistant, focus, railLabels, railLabelsSettable, pressed\]\);/,
-    "the sync effect must depend on every value it sends — and on `pressed`, " +
-      "because muda ticks a check row itself on click and a press that changed " +
-      "nothing would otherwise leave that tick lying",
+    deps,
+    /\bpressed\b/,
+    "muda ticks a check row itself on click, so a press that changed nothing " +
+      "would otherwise leave that tick lying",
   );
   // …and the labels row ticks from the PREFERENCE, not from what the sidebar
   // currently shows: the row writes the preference, and a tick that describes

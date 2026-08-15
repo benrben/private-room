@@ -82,7 +82,8 @@ pub const CHUNK_CAP: usize = 20_000;
 /// the row mapper's indices always line up with the SELECT.
 pub(crate) const FILE_META_COLS: &str = "f.id, f.name, f.mime_type, f.size_bytes, f.source, \
      f.extracted_text, f.created_at, f.folder_id, \
-     (SELECT count(*) FROM chunks WHERE file_id = f.id), f.origin_url, f.ai_summary";
+     (SELECT count(*) FROM chunks WHERE file_id = f.id), f.origin_url, f.ai_summary, \
+     f.origin_destination, f.library_visibility";
 
 /// Trash: the clause that makes a query mean "files that are in this room".
 /// Written once so the dozens of listing/search/count queries that must exclude
@@ -112,6 +113,11 @@ pub(crate) fn file_meta_row(row: &rusqlite::Row) -> rusqlite::Result<FileMeta> {
         origin_url: row.get(9)?,
         // The auto-index one-liner — see FileMeta::ai_summary's doc comment.
         ai_summary: row.get(10)?,
+        // Which destination owns this file, and whether Home also shows it.
+        // Two separate answers on purpose — see the columns' own comments in
+        // schema.rs, and `FileMeta` in commands.rs.
+        origin_destination: row.get(11)?,
+        library_visibility: row.get(12)?,
     })
 }
 

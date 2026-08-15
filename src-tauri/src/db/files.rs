@@ -66,6 +66,54 @@ pub fn insert_file_from_url(
     get_file_meta(conn, &id)
 }
 
+/// The two visibility values a file can carry, spelled once so the Rust side,
+/// the commands and the UI can never drift into three spellings of one word.
+pub const LINKED: &str = "linked";
+pub const SECTION_ONLY: &str = "sectionOnly";
+
+/// File this object under the destination that made it, visible only there.
+///
+/// Called straight after the insert by the tool-native creation paths (a new
+/// sketch, a finished generation) — never by import, never by the browser's
+/// Save, never by a generator writing an ordinary artifact. Those all belong to
+/// the room at large and stay in the Library, which is what the column defaults
+/// already say.
+///
+/// Best-effort by design: the file itself is already safely in the room, and a
+/// failure here means it shows up in Home as well as in its section. That is a
+/// tidiness fault, not a data one, so it must not fail the creation that just
+/// succeeded.
+pub fn mark_section_only(conn: &Connection, id: &str, origin: &'static str) {
+    if let Err(e) = conn.execute(
+        "UPDATE files SET origin_destination = ?2, library_visibility = ?3 WHERE id = ?1",
+        params![id, origin, SECTION_ONLY],
+    ) {
+        crate::obs::warn(
+            "file.section_only.failed",
+            &[
+                ("origin", crate::obs::state(origin)),
+                ("err", crate::obs::err_kind(&e.to_string())),
+            ],
+        );
+    }
+}
+
+/// Show (or stop showing) this file in Home's Library.
+///
+/// Idempotent in both directions — it states the value rather than toggling it,
+/// so pressing "Add to Library" twice cannot mint anything and pressing
+/// "Remove" on a file that was never linked is simply a no-op. Nothing about
+/// the object itself moves: same row, same id, same bytes, same history, same
+/// name, same origin destination. Only whether Home lists it.
+pub fn set_library_visibility(conn: &Connection, id: &str, linked: bool) -> Result<(), String> {
+    execute_existing(
+        conn,
+        "UPDATE files SET library_visibility = ?2 WHERE id = ?1 AND trashed_at IS NULL",
+        params![id, if linked { LINKED } else { SECTION_ONLY }],
+        "That file is not in this room any more.",
+    )
+}
+
 /// The id and name of a file already holding EXACTLY these bytes, if any.
 /// `size_bytes` is checked first so the blob comparison only ever runs against
 /// same-sized rows.
@@ -144,20 +192,36 @@ pub fn new_source_file_count(conn: &Connection, since: &str) -> Result<i64, Stri
 /// agent's list_room_files tool. ADD-16: files inside a folder read as
 /// "Folder/name". CHG-23: the cached ai_summary rides along so the tool can show
 /// what each file is without a search round-trip.
-/// (display name, mime, size bytes, cached one-liner) for one file row.
-pub type FileBriefRow = (String, String, i64, Option<String>);
+/// (display name, mime, size bytes, cached one-liner, where it shows) for one
+/// file row. The last field is `origin_destination` and `library_visibility`
+/// together, because the agent has to be able to tell a section-only object
+/// from a Library one before it offers to promote either.
+pub type FileBriefRow = (String, String, i64, Option<String>, (String, String));
 
 pub fn list_files_brief(conn: &Connection) -> Result<Vec<FileBriefRow>, String> {
     query_rows(
         conn,
         "SELECT CASE WHEN fo.name IS NOT NULL THEN fo.name || '/' || f.name ELSE f.name END,
-                coalesce(f.mime_type,''), f.size_bytes, f.ai_summary
+                coalesce(f.mime_type,''), f.size_bytes, f.ai_summary,
+                f.origin_destination, f.library_visibility
          FROM files f LEFT JOIN folders fo ON fo.id = f.folder_id
          WHERE f.trashed_at IS NULL
          ORDER BY f.created_at",
         [],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, (r.get(4)?, r.get(5)?))),
     )
+}
+
+/// How a file's placement reads in a tool result: nothing at all for an
+/// ordinary Library file (the overwhelming majority — a note on every row
+/// would be noise the model pays for on every listing), and an explicit
+/// "section only in X" for one that Home is not showing.
+pub fn placement_note(origin: &str, visibility: &str) -> String {
+    if visibility == SECTION_ONLY {
+        format!(" [section only — in {origin}, not in the Library]")
+    } else {
+        String::new()
+    }
 }
 
 /// (display name, mime type, one-liner) for the 100 NEWEST files — feeds the

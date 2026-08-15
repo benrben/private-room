@@ -919,6 +919,34 @@ pub fn restore_file(
     Ok(meta)
 }
 
+/// Show this object in Home's Library as well as in the destination that made
+/// it — the "Add to Library" action.
+///
+/// ROOM-LOCAL ORGANIZATION, AND NOTHING ELSE. Nothing is exported, uploaded,
+/// shared or copied: one row is updated in place, so the object keeps its id,
+/// its bytes, its version history, its title and its metadata, and both views
+/// go on reading the same file. `linked = false` is the "Remove from Library"
+/// half — it hides the Home reference and leaves the object exactly where it
+/// has always lived. Deleting is a different command entirely (`remove_file`),
+/// which is the whole point of these two being separate verbs.
+///
+/// Idempotent in both directions: the value is stated, never toggled.
+#[tauri::command]
+pub fn set_file_in_library(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+    linked: bool,
+) -> Result<FileMeta, String> {
+    let meta = state.with_room(|room| {
+        db::set_library_visibility(&room.conn, &id, linked)?;
+        db::get_file_meta(&room.conn, &id)
+    })?;
+    use tauri::Emitter;
+    let _ = app.emit("room-files-changed", ());
+    Ok(meta)
+}
+
 /// Destroy one trashed file for good. Named for what it does: no caller reaches
 /// this by way of an ordinary "delete".
 ///

@@ -129,7 +129,8 @@ they cover the way this feature breaks the app somewhere it does not appear.
 
 - [ ] **⌘C / ⌘V / ⌘X / ⌘A still work in the password gate.** Copy a passphrase out of a password manager and paste it into Unlock; then Select-All and Cut it. These are key equivalents owned by the **Edit** submenu, so a menu that forgot to re-declare them takes them out of every text field in the app — and the gate is where a user is most likely to paste. Check a chat message, the Settings fields, and the browser address bar too. *(spec-level guard: `menu.rs` `spec_declares_the_clipboard_keys`; the key equivalents themselves are AppKit's and cannot be driven by webdriver, so this row is a real manual check, not a duplicate of the test.)*
 - [ ] **Every View item still works with a private-browser page open.** Open Private browser, load a page, then drive all eight rows: Library, Assistant, Focus the Workspace, Layout ▸ Focus/Research/Review, Layout ▸ Reset Layout, Show Sidebar Labels. Once a page is open the main window hosts two webviews and any `get_webview_window("main")` lookup returns `None` — a View menu wired that way works perfectly until this exact moment and then goes silently dead (BROWSE-1). *(guard: `browser.rs` `the_browser_is_a_second_webview_so_the_window_lookup_must_not_be_scoped`, crate-wide.)*
-- [ ] **⌘1 / ⌘2 are the menu's now, and there is exactly one of each.** Press ⌘1 — the Library toggles ONCE. A pane that flickers and lands back where it started means both the menu and `useLayout`'s keydown listener acted on the same press. **⌘3 still toggles the Assistant** — it is the alias no menu row can carry, and it is deliberately still handled in `useLayout` (`PANE_KEYS`).
+- [ ] **The ⌘1 row is named after the column it toggles.** Stand in Memory and open View (and the toolbar's Layout menu): the row reads **Memory ⌘1**, not Library. Check Sketch (Sketches), Private browser (Private pages) and Home (Library, which is Home's own word for it). With no room open it reads **Sidebar**. Nothing outside Home may call the second column the Library — including the ⌘K palette, the shortcuts sheet and the status bar's pane name.
+- [ ] **⌘1 / ⌘2 are the menu's now, and there is exactly one of each.** Press ⌘1 — the second column toggles ONCE. A pane that flickers and lands back where it started means both the menu and `useLayout`'s keydown listener acted on the same press. **⌘3 still toggles the Assistant** — it is the alias no menu row can carry, and it is deliberately still handled in `useLayout` (`PANE_KEYS`).
 - [ ] **The ticks follow the window.** Toggle Library from the sidebar, the Layout menu and ⌘1 in turn; the View menu's tick must agree every time. Apply a preset and check Library/Assistant/Focus all update together.
 - [ ] **Show Sidebar Labels greys out below 1180px.** Narrow the window until the rail drops its labels on its own — the row must go dim rather than tick off and refuse to tick back on. Widen again: it comes back with the reader's own preference intact (never overwritten by the automatic collapse).
 - [ ] **The room's rows are dim with no room open — but the menu still OPENS.** At the Start screen and the password gate, Library, Assistant, Focus the Workspace, Show Sidebar Labels and the four under Layout are all dim, while **Toggle Full Screen stays live**. They come alive when a room opens and go dim again on Lock. Check this AFTER opening and locking a room, not only on a fresh launch: the rows are *born* disabled but the submenu is born enabled, so a just-launched app looks correct either way and only the synced state tells you anything. Gating the section as a unit greyed the menu bar item itself, and macOS will not open a disabled submenu, so full screen was unreachable exactly where someone sizing the window reaches for it.
@@ -147,19 +148,70 @@ they cover the way this feature breaks the app somewhere it does not appear.
 - [ ] **Settings has no paper texture.** The sheet floats above the notebook; the dotted grain belongs to the page under it, not to a modal on top of it.
 - [ ] Settings → Interface → Canvas texture: Off removes the grain everywhere at once — the page, the Room Map canvas and the Sketch grid all read `--grid-dot`.
 
-## 7b. Workspace tab strip (`TabStrip.tsx`, `workspace/tabs.ts`)
+## 7b. Home's document strip (`TabStrip.tsx`, `workspace/tabs.ts`)
 
-- [ ] The strip is hidden with nothing open and appears above the center pane on the first open; it sits ABOVE the pane's measured rect, so a private-browser page never covers it (`TabStrip.tsx`).
-- [ ] Opening the same file or area twice FOCUSES the existing tab instead of stacking a duplicate (identity is `kind:ref`) (`tabs.ts`).
-- [ ] Each tab shows a type icon + title, `title=` tooltip, and a per-tab close button labelled "Close {title}"; middle-click also closes (`TabStrip.tsx`).
+**Revised 2026-08-15 (contextual navigation).** The strip holds HOME'S OPEN ROOM
+DOCUMENTS and is drawn in Home only. Private-browser pages moved out of it
+entirely — they have their own vertical list in the Browser destination (§7c) —
+and places have not been tabs since the navigation redesign.
+
+- [ ] The strip is hidden with nothing open, and appears above the center pane on the first open (`TabStrip.tsx`).
+- [ ] It is drawn in **Home only**. Go to Recordings, Sketch, Create, Browser, Workflows, Scripts, Skills, Connectors, Memory, Room Map with a document open in Home: no strip anywhere, and the height goes to the content (`destinations.ts` `showsDocumentTabs`).
+- [ ] Opening the same file twice FOCUSES the existing tab instead of stacking a duplicate (identity is `kind:ref`) (`tabs.ts`).
+- [ ] Each tab shows its title, a `title=` tooltip, and a close button labelled "Close {title}"; middle-click also closes (`TabStrip.tsx`).
 - [ ] Drag a tab onto another → the order changes and survives the drop; the dragged tab is visibly marked while dragging (`TabStrip.tsx`).
-- [ ] Keyboard, with a tab focused: ←/→ move AND switch (wrapping at both ends), Home/End jump to first/last, Enter or Space activates. `role="tablist"` with `aria-label="Open tabs"`, `aria-selected` on the current tab, and only the current tab in the tab order (`TabStrip.tsx`).
-- [ ] Shortcuts: ⌥⌘1–⌥⌘9 pick by position (⌘1/⌘2/⌘3 must still toggle PANES, not tabs — one press may not do both), ⌘⇧] / ⌘⇧[ step forward/back, ⌘W closes the current tab, ⌘T opens a new private-browser page (web on only) (`Workspace.tsx`, the "Tab keys" `onKey` effect).
-- [ ] The `＋` globe button appears only when the browser is available; tooltip "New browser page (⌘T)" (`TabStrip.tsx`).
-- [ ] Every switch respects the unsaved-edits door (§14): with a dirty editor, clicking a tab, ⌥⌘n, ⌘⇧[/] and ⌘W each raise "Save your changes?" and Cancel leaves you where you were.
-- [ ] Persistence: file/area tabs and the active one come back after relock + reopen of the SAME room; another room has its own set (room setting `workspace_tabs`, `tabs.ts`).
-- [ ] **Browser pages are NEVER persisted** — open two private-browser pages, relock, reopen: the file/area tabs return and the pages do not. A restored list of visited URLs would be a history file under another name (`tabs.ts`).
-- [ ] A tab whose target is gone (file deleted, page closed) is pruned rather than left pointing at nothing (`tabs.ts`).
+- [ ] Keyboard, with a tab focused: ←/→ move AND switch (wrapping at both ends), Home/End jump to first/last, Enter or Space activates. `role="tablist"` with `aria-label="Open documents"`, `aria-selected` on the current tab, and only the current tab in the tab order (`TabStrip.tsx`).
+- [ ] Shortcuts: ⌥⌘1–⌥⌘9 pick by position (⌘1/⌘2/⌘3 must still toggle PANES, not tabs), ⌘⇧] / ⌘⇧[ step forward/back, ⇧⌘T reopens the last closed document (`Workspace.tsx`, the "Tab keys" `onKey` effect).
+- [ ] Every switch respects the unsaved-edits door (§14): with a dirty editor, clicking a tab, ⌥⌘n and ⌘⇧[/] each raise "Save your changes?" and Cancel leaves you where you were.
+- [ ] Persistence: file tabs and the active one come back after relock + reopen of the SAME room; another room has its own set (room setting `workspace_tabs`, `tabs.ts`).
+- [ ] **A section-only object never earns a tab** — make a sketch, open it, go Home: it is not in the strip and not in the Library. Add it to the Library, and only then does it belong to both (`Workspace.tsx` `tabbedFileRef` effect).
+- [ ] A tab whose target is gone — file deleted, or removed from the Library — is pruned rather than left pointing at nothing (`tabs.ts`, `fileVisibility.ts`).
+
+## 7c. The contextual sidebar (`workspace/Sidebar.tsx`, `workspace/destinations.ts`)
+
+**New 2026-08-15.** The second column belongs to the ACTIVE DESTINATION: its
+title, contents, primary action, selection and empty state all come from it, and
+"Library" is Home's name for it rather than the column's.
+
+- [ ] Walk every rail destination and read the column's heading: Home/Files → **Library**, Recordings → **Recordings**, Private browser → **Private pages**, Sketch → **Sketches**, Create → **Creations**, Room Map → **Map**, Workflows/Scripts/Skills/Connectors/Memory → their own names. No destination shows a blank column titled Library (`destinations.ts` `SIDEBAR_TITLES`).
+- [ ] VoiceOver: the region is named after what is in it. Only Home announces "Library and sources" (`destinations.ts` `sidebarRegionLabel`).
+- [ ] Switching destinations never shows the previous one's rows, including after collapsing and re-expanding the column, and in focus/full-width modes (`Workspace.tsx`, `<LibraryPane key={area}>`).
+- [ ] Each destination remembers its OWN selection: open a sketch, go to Home and open a document, go back to Sketch → the same sketch; back Home → the same document (`Workspace.tsx` `lastFileRef`).
+- [ ] A document its destination does not hold moves the app Home in one commit — rail, column, breadcrumb and workspace all change together. Open a saved page from the Browser: you land in Home (`types.ts` `areaHoldsFile`).
+- [ ] Narrow the window under 1080px: the workspace keeps the width and the sidebar gives way, never the reverse (`useLayout.ts`).
+
+### Private pages (Browser)
+
+- [ ] Two pages open → two vertical rows in the column, and **no browser tabs anywhere across the workspace top**.
+- [ ] Each row: active state, title, globe icon, host as a second line when it says something the title does not, close on hover/focus, middle-click close, Backspace/Delete close, ↑/↓ move, drag to reorder (`Sidebar.tsx` `PagesNav`).
+- [ ] Two pages with the same title are still tellable apart — the accessible name carries the host (`browserPages.ts` `pageAccessibleName`).
+- [ ] Leave the Browser: the pages vanish from the column and stay ALIVE. Return: the same page is selected and showing (`browserPages.ts`).
+- [ ] Close the last page → the Browser's own empty state, one sentence about what it keeps (nothing), and a New page action. The room stays open.
+- [ ] **Still never persisted** — two pages open, relock, reopen: no pages come back (`browserPages.ts`; the module writes to no store).
+- [ ] File → New (⌘T) makes a page here; File → Close (⌘W) closes the page on screen and does NOT quit Arcelle (`menu.rs`, `useNativeMenu.ts`).
+
+### Sketches, Creations, Map
+
+- [ ] Sketch: the column lists the room's sketches with filter + sort, a New sketch action in the header, rename and an armed delete per row; selecting one opens its canvas. The centre shows the landing, not a second copy of the list.
+- [ ] Create: the column shows generations in flight (with their real reported step, never an invented percentage), runs that failed with their reason, and finished outputs, with All/Images/Video filters. New creation clears the composer.
+- [ ] Room Map: the column shows what the map is drawing (files, folders, made-in-a-section) plus search and Summarize — never the room's file list.
+
+## 7d. Section-only and Add to Library (`fileVisibility.ts`, `commands/files.rs`)
+
+**New 2026-08-15.** One object, two independent facts: which destination owns it,
+and whether Home also lists it.
+
+- [ ] Make a sketch → its toolbar reads **Section only** with **Add to Library**. Home's Library does not list it and its count does not move.
+- [ ] Press Add to Library → the dialog states that it will also appear in Home, stays in Sketches, and keeps ONE file with no duplicate. Add → the chip becomes **In Library**, a confirmation appears with Undo, and Home's Library count goes up by one.
+- [ ] The same object, not a copy: rename it from Sketches → Home shows the new name. Rename it from Home → Sketches shows it. One id, one history, one size.
+- [ ] The chip's menu offers **View in Library** and **Remove from Library**, and says in words that removing does not delete. Remove → Home stops listing it, Sketches still has it, and its content is untouched.
+- [ ] Press Add twice, or Undo then Add: no duplicates, no second row, no error (`db/files.rs` states the value rather than toggling it).
+- [ ] An ordinary Library file (an import, a saved page, a generated artifact) shows NO chip at all.
+- [ ] Ask the assistant to add a sketch to the Library → it uses `set_in_library`, says what changed and that no copy was made. Ask it to make something → it does NOT promote on its own.
+- [ ] **The assistant's promotion is in Activity, not only in the chat.** After the turn above, open Assistant → Activity: a **Library changes** group names the object and which way it went, with no buttons on it. Session-only by design — it is gone after a lock/unlock, and the transcript remains the durable record. (`assistant-organized` → `state.organized` → `AiPane.tsx`.)
+- [ ] **Demoting does not change what you are looking at.** Open a promoted sketch in Sketches, with other documents open in Home, and press **Remove from Library** — the same sketch must stay on the canvas. It used to elect the next open document and switch to it, so removing a Home reference read as closing the drawing (`tabs.ts` `unlist`, not `prune`).
+- [ ] **Confirmations do not pile up.** Add and remove the same object four or five times: at most ONE message about it is on screen, it says the latest truth, and it clears itself within about twelve seconds even with **Undo** on it. Different objects still stack, and an error must never be pushed off by a run of them (`toastStack.ts`).
+- [ ] **Upgrade check:** open a room made before this version → every file that was in the Library is still in it, in the same folders, with the same counts.
 
 ## 8. Status bar (bottom strip)
 

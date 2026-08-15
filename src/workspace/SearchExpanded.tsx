@@ -362,6 +362,11 @@ function placeholderMeta(id: string, name: string): FileMeta {
     folderId: null,
     partiallyIndexed: false,
     aiSummary: null,
+  // A search hit stands in for a real row only long enough to be attached;
+  // "linked" is the honest default because the hit came out of the room's own
+  // index, and nothing downstream of an attachment reads placement anyway.
+  originDestination: "library",
+  libraryVisibility: "linked",
   };
 }
 

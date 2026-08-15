@@ -98,7 +98,12 @@ def test_management_tool_names_are_gated_in_their_own_lanes() -> None:
         "write_skill_resource", "delete_skill_resource", "delete_skill", "run_skill_script",
     )
     assert MCP_MANAGEMENT_TOOL_NAMES == ("list_mcps", "read_mcp", "save_mcp", "delete_mcp")
-    assert ORGANIZE_TOOL_NAMES == ("organize_files", "trash_files", "merge_files")
+    assert ORGANIZE_TOOL_NAMES == (
+        "organize_files",
+        "trash_files",
+        "set_in_library",
+        "merge_files",
+    )
 
 
 @pytest.mark.skipif(not _AGENT_RS.exists(), reason="Rust source not present in this checkout")

@@ -30,10 +30,15 @@ import { LayoutApi, PRESETS, type PresetName } from "../shell/useLayout";
  * honest in both modes. */
 export default function LayoutMenu({
   layout,
+  sidebarTitle,
   open,
   onOpenChange,
 }: {
   layout: LayoutApi;
+  /** What the second column is called HERE — `sidebarMenuLabel(area)`. The row
+   * used to say "Library" in every destination, which is Home's word for it and
+   * nobody else's. */
+  sidebarTitle: string;
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }) {
@@ -63,7 +68,7 @@ export default function LayoutMenu({
               Panes
             </div>
             <MenuCheck
-              label="Library"
+              label={sidebarTitle}
               hint="⌘1"
               icon={<PanelLeftIcon size={14} />}
               checked={shows("library")}

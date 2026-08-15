@@ -3,18 +3,25 @@ import { api } from "../api";
 
 /** What a tab points at.
  *
- * `page` is a private-browser page and is deliberately NEVER persisted: the
- * browser's whole claim is that it writes no history to disk, and a restored
- * list of visited URLs is a history file wearing a different hat (owner
- * decision 2026-07-31). */
-export type TabKind = "file" | "area" | "page";
+ * ROOM DOCUMENTS, and only room documents. This list used to hold three kinds
+ * at once — files, places and private-browser pages — which is what made one
+ * strip show a spreadsheet, a sketch, a recording and three web pages side by
+ * side above every surface in the app. Places became the rail's business; pages
+ * became the Browser destination's own typed state (workspace/browserPages.ts),
+ * where they can be listed vertically, in one destination, and never written
+ * down.
+ *
+ * `area` survives as a LEGACY value only: rooms saved before places stopped
+ * being tabs still have `area:*` rows in their settings, and they are pruned on
+ * the tick after they are read back. Nothing mints one. */
+export type TabKind = "file" | "area";
 
 export interface Tab {
   /** `kind:ref`. Identity IS the pair, so opening the same thing twice focuses
    * the existing tab instead of stacking duplicates. */
   id: string;
   kind: TabKind;
-  /** File id, `WorkArea` key, or private-browser page id. */
+  /** File id, or (legacy) a `WorkArea` key. */
   ref: string;
   title: string;
 }
@@ -25,7 +32,11 @@ export const tabId = (kind: TabKind, ref: string): string => `${kind}:${ref}`;
  * own encryption and never leaks between rooms. */
 const TABS_SETTING = "workspace_tabs";
 
-const isDurable = (tab: Tab): boolean => tab.kind !== "page";
+/** What is worth writing into the room's settings. Every remaining kind is —
+ * the one kind that never was (a private page) is not in this list any more.
+ * Kept as a named predicate because it is the persistence boundary, and a
+ * boundary with a name is one a reader can check. */
+const isDurable = (tab: Tab): boolean => tab.kind === "file" || tab.kind === "area";
 
 export interface TabsApi {
   tabs: Tab[];
@@ -48,9 +59,45 @@ export interface TabsApi {
   step: (delta: number) => void;
   /** ⌘1–⌘8 pick by position; ⌘9 is last, as every browser does it. */
   activateIndex: (index: number) => void;
-  /** Drop tabs whose target no longer exists (a deleted file, a closed page). */
+  /** Drop tabs whose target no longer EXISTS — a trashed file. What the reader
+   * was looking at is gone, so the neighbour takes the empty pane. */
   prune: (keep: (tab: Tab) => boolean) => void;
+  /** Drop tabs the strip should no longer LIST, without touching what is on
+   * screen. Different act, different name: a file removed from the Library is
+   * still open, still fine, and still the thing the reader is working on —
+   * only Home has stopped listing it. Electing a neighbour here navigated the
+   * workspace to an unrelated document at the exact moment the user said "stop
+   * showing this one in Home", which reads as the demotion having closed it. */
+  unlist: (keep: (tab: Tab) => boolean) => void;
 }
+
+/** Where the selection lands when tabs are dropped.
+ *
+ * `heirOf` is the whole difference between the two drops above, so it is a
+ * named rule passed in rather than a flag read inside — the caller states which
+ * act it is performing and the consequence follows from that. */
+export function selectionAfterDrop(
+  remaining: Tab[],
+  current: string,
+  heirOf: (remaining: Tab[]) => string,
+): string {
+  if (remaining.some((t) => t.id === current)) return current;
+  // Nothing was selected to begin with — the reader is on an area, not a file.
+  // Dropping a tab they were not looking at must not yank them into one. This
+  // is how the legacy `area:*` tabs used to hijack the restore: dropping them
+  // fell through to the last file tab and the apply effect navigated there,
+  // overwriting the restored area in the same tick.
+  if (!current) return "";
+  return heirOf(remaining);
+}
+
+/** The last surviving tab — what a trashed document hands the pane to. */
+export const heirOfLast = (remaining: Tab[]): string =>
+  remaining[remaining.length - 1]?.id ?? "";
+
+/** Nothing at all. The strip stops pointing anywhere and the workspace keeps
+ * showing whatever it was showing. */
+export const heirOfNothing = (): string => "";
 
 /** The workspace's open tabs: an ordered list and which one is showing.
  *
@@ -173,23 +220,26 @@ export function useTabs(roomName: string): TabsApi {
     });
   }, []);
 
-  const prune = useCallback((keep: (tab: Tab) => boolean) => {
-    setTabs((prev) => {
-      const next = prev.filter(keep);
-      if (next.length === prev.length) return prev;
-      setActiveId((current) => {
-        if (next.some((t) => t.id === current)) return current;
-        // Nothing was selected to begin with — the reader is on an area, not a
-        // file. Pruning a tab they were not looking at must not yank them into
-        // one. This is how the legacy `area:*` tabs used to hijack the restore:
-        // dropping them fell through to the last file tab and the apply effect
-        // navigated there, overwriting the restored area in the same tick.
-        if (!current) return "";
-        return next[next.length - 1]?.id ?? "";
+  const drop = useCallback(
+    (keep: (tab: Tab) => boolean, heirOf: (remaining: Tab[]) => string) => {
+      setTabs((prev) => {
+        const next = prev.filter(keep);
+        if (next.length === prev.length) return prev;
+        setActiveId((current) => selectionAfterDrop(next, current, heirOf));
+        return next;
       });
-      return next;
-    });
-  }, []);
+    },
+    [],
+  );
+
+  const prune = useCallback(
+    (keep: (tab: Tab) => boolean) => drop(keep, heirOfLast),
+    [drop],
+  );
+  const unlist = useCallback(
+    (keep: (tab: Tab) => boolean) => drop(keep, heirOfNothing),
+    [drop],
+  );
 
   return {
     tabs,
@@ -204,6 +254,7 @@ export function useTabs(roomName: string): TabsApi {
     step,
     activateIndex,
     prune,
+    unlist,
   };
 }
 
@@ -241,6 +292,6 @@ function isTab(value: unknown): value is Tab {
     typeof t.id === "string" &&
     typeof t.ref === "string" &&
     typeof t.title === "string" &&
-    (t.kind === "file" || t.kind === "area" || t.kind === "page")
+    (t.kind === "file" || t.kind === "area")
   );
 }

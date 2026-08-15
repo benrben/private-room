@@ -83,6 +83,14 @@ WRITE_TOOL_NAMES: tuple[str, ...] = (
 ORGANIZE_TOOL_NAMES: tuple[str, ...] = (
     "organize_files",
     "trash_files",
+    # Whether Home's Library also lists an object the user made inside a
+    # destination. Organization, exactly like a move: it changes where a thing
+    # is FOUND and nothing about the thing. Boxed here rather than added to
+    # WRITE_TOOL_NAMES because those are taught by name in the base prompt every
+    # turn — and a verb the model is reminded of on every turn is a verb it will
+    # eventually apply to every output, which is precisely what the tool's own
+    # description forbids.
+    "set_in_library",
     "merge_files",
 )
 

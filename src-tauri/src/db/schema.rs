@@ -74,6 +74,19 @@ CREATE TABLE IF NOT EXISTS files (
   -- WHICH actor, as an id: the agent/tool name for an 'agent' delete, the
   -- command for an 'app' one. NULL when the kind alone is the whole answer.
   trashed_by_id TEXT,
+  -- Which destination MADE this file: 'library' (imported, generated, saved
+  -- from the browser — anything that belongs to the room at large), 'sketch',
+  -- 'create', 'recordings'. Ownership, and deliberately not the same question
+  -- as `library_visibility` below: a sketch stays a sketch whether or not Home
+  -- is also showing it, so promotion never has to rewrite where a thing lives.
+  origin_destination TEXT NOT NULL DEFAULT 'library',
+  -- Whether Home's Library shows this file: 'linked' or 'sectionOnly'. A
+  -- section-only file is a full room file — encrypted, versioned, searchable,
+  -- attachable — that simply does not appear in Home; it appears in the
+  -- destination that made it. 'linked' is the default so that everything the
+  -- room already holds keeps being visible exactly where it was, and only the
+  -- tool-native creation paths opt their own new objects out.
+  library_visibility TEXT NOT NULL DEFAULT 'linked',
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
 );
 CREATE TABLE IF NOT EXISTS chunks (
@@ -1081,6 +1094,31 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), String> {
             }
         }
     }
+    // Section-only visibility. Guarded ALTERs like the trash columns above, and
+    // — the schema.rs rule — both also live in `SCHEMA`, because `create_room`
+    // never runs `migrate`.
+    //
+    // THE DEFAULTS ARE THE MIGRATION. Every row an existing room already holds
+    // takes 'library' / 'linked', which is precisely what those rooms mean: the
+    // files are in Home's Library today and must still be there after the
+    // upgrade. Nothing is hidden, moved, copied or rewritten — only new objects
+    // made inside a tool opt themselves out, from the moment they are created.
+    if table_exists(conn, "files")? {
+        for (column, decl) in [
+            (
+                "origin_destination",
+                "ALTER TABLE files ADD COLUMN origin_destination TEXT NOT NULL DEFAULT 'library'",
+            ),
+            (
+                "library_visibility",
+                "ALTER TABLE files ADD COLUMN library_visibility TEXT NOT NULL DEFAULT 'linked'",
+            ),
+        ] {
+            if !column_exists(conn, "files", column)? {
+                conn.execute(decl, []).map_err(|e| e.to_string())?;
+            }
+        }
+    }
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS trashed_chunks (
            id TEXT PRIMARY KEY,
@@ -1528,6 +1566,106 @@ mod tests {
             })
             .unwrap();
         assert_eq!(shape, "");
+    }
+
+    /// EVERY FILE A ROOM ALREADY HOLDS STAYS IN HOME'S LIBRARY.
+    ///
+    /// The section-only model decides which lists show a file, and it decides
+    /// it from two columns that did not exist until now. A migration that got
+    /// this wrong would not error, would not lose a byte, and would empty the
+    /// Library of every room in the field — the file is still there, Home has
+    /// simply stopped listing it, which is indistinguishable from data loss at
+    /// the only place a user looks.
+    ///
+    /// So this rebuilds `files` WITHOUT the two columns — the state every
+    /// existing room is actually in — and asserts what they come back as. The
+    /// sketch row is in here deliberately: a `.sketch` file that predates the
+    /// column is one somebody made before Sketches was a place of its own, and
+    /// it must stay a Library file rather than being retro-filed by its name.
+    #[test]
+    fn an_older_rooms_files_all_stay_in_the_library() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        conn.execute_batch(
+            "DROP TABLE files;
+             CREATE TABLE files (
+               id TEXT PRIMARY KEY,
+               name TEXT NOT NULL,
+               mime_type TEXT,
+               size_bytes INTEGER NOT NULL DEFAULT 0,
+               source TEXT NOT NULL DEFAULT 'upload',
+               original_bytes BLOB,
+               extracted_text TEXT,
+               trashed_at TEXT,
+               created_at TEXT NOT NULL DEFAULT ''
+             );
+             INSERT INTO files (id, name) VALUES ('f1', 'lease.pdf');
+             INSERT INTO files (id, name) VALUES ('f2', 'Portfolio map.sketch');
+             INSERT INTO files (id, name) VALUES ('f3', 'render.png');",
+        )
+        .unwrap();
+        assert!(!column_exists(&conn, "files", "library_visibility").unwrap());
+
+        migrate(&conn).unwrap();
+
+        for id in ["f1", "f2", "f3"] {
+            let (origin, visibility): (String, String) = conn
+                .query_row(
+                    // The trash clause is not decoration even here: every
+                    // by-id read of a file carries it (see
+                    // `no_by_id_read_of_a_file_may_skip_the_trash_clause`), and
+                    // a test that quietly reads deleted rows is a test that
+                    // would keep passing after that invariant broke.
+                    "SELECT origin_destination, library_visibility FROM files
+                     WHERE id = ?1 AND trashed_at IS NULL",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(origin, "library", "{id} was re-filed by the migration");
+            assert_eq!(visibility, "linked", "{id} vanished from Home's Library");
+        }
+    }
+
+    /// …and a NEW drawing is the exception the model exists for: it belongs to
+    /// Sketches, and reaches Home only when someone says so.
+    #[test]
+    fn a_new_drawing_is_section_only_until_it_is_promoted() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        let meta =
+            super::super::insert_file(&conn, "Sketch.sketch", "application/json", b"{}", None, "upload")
+                .unwrap();
+        // Straight out of the ordinary insert it is a Library file, exactly
+        // like an import — which is what makes `mark_section_only` an explicit
+        // act by the creation path rather than something a file kind implies.
+        assert_eq!(meta.library_visibility, "linked");
+
+        super::super::mark_section_only(&conn, &meta.id, "sketch");
+        let filed = super::super::get_file_meta(&conn, &meta.id).unwrap();
+        assert_eq!(filed.origin_destination, "sketch");
+        assert_eq!(filed.library_visibility, "sectionOnly");
+
+        // Promotion and demotion are idempotent, and neither touches the
+        // object: same id, same name, same origin destination throughout.
+        for _ in 0..2 {
+            super::super::set_library_visibility(&conn, &meta.id, true).unwrap();
+        }
+        let promoted = super::super::get_file_meta(&conn, &meta.id).unwrap();
+        assert_eq!(promoted.library_visibility, "linked");
+        assert_eq!(promoted.origin_destination, "sketch", "it is still a sketch");
+        assert_eq!(promoted.id, meta.id);
+        assert_eq!(promoted.name, meta.name);
+
+        for _ in 0..2 {
+            super::super::set_library_visibility(&conn, &meta.id, false).unwrap();
+        }
+        let removed = super::super::get_file_meta(&conn, &meta.id).unwrap();
+        assert_eq!(removed.library_visibility, "sectionOnly");
+        // Removing from the Library is NOT deleting: the object is still in the
+        // room, still listed by its own destination.
+        assert_eq!(removed.name, "Sketch.sketch");
+        assert_eq!(super::super::list_files(&conn).unwrap().len(), 1);
     }
 
     /// `roomai verify` promises to look, not touch. It used to go through

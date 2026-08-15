@@ -1,10 +1,12 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import {
   CloseIcon,
   CollapseLeftIcon,
+  CreateIcon,
   DownloadIcon,
   FocusIcon,
   FolderIcon,
+  GlobeIcon,
   LinkIcon,
   MemoryIcon,
   MicIcon,
@@ -25,7 +27,20 @@ import FileRow from "./FileRow";
 import TrashPanel from "./TrashPanel";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
-import { WorkArea } from "./types";
+import { WorkArea, isCreationFile, isSketchFile } from "./types";
+import {
+  SIDEBAR_TITLES,
+  newItemLabel,
+  newItemOf,
+  type NewItemKind,
+} from "./destinations";
+import { libraryFiles, libraryStatus } from "./fileVisibility";
+import {
+  pageAccessibleName,
+  pageLabel,
+  pageSubtitle,
+  type BrowserPagesApi,
+} from "./browserPages";
 import { LayoutApi } from "../shell/useLayout";
 import { visibleWorkflows } from "./workflows/selectors";
 import {
@@ -35,50 +50,59 @@ import {
   type FileSort,
 } from "./fileSort";
 
-const AREA_HEADINGS: Record<WorkArea, string> = {
-  files: "Library",
-  home: "Library",
-  map: "Library",
-  recordings: "Recordings",
-  workflows: "Workflows",
-  scripts: "Scripts",
-  skills: "Skills",
-  memory: "Memory",
-  connectors: "Connectors",
-  // The library stays the heading here: a generation lands as an ordinary
-  // room file, so the pane beside Create is showing files, not "Create".
-  create: "Library",
-  sketch: "Library",
-  browser: "Private browser",
-};
-
-/** The left pane. In the file-centric areas it unifies browsing (the real
- * folder tree with every existing row action) with the AI evidence set
- * (checkboxes = files attached to the next answer). In the Workflows /
- * Scripts / Recordings / Memory areas it becomes that area's navigator. */
+/** THE CONTEXTUAL SIDEBAR — the second column, whose title, contents, primary
+ * action, selection and empty state all come from the ACTIVE DESTINATION.
+ *
+ * It used to be the Library with a few exceptions bolted on: three
+ * destinations rendered an empty column still headed "Library", the browser
+ * rendered a paragraph explaining that its pages lived somewhere else, and the
+ * room map rendered the whole file list because it happens to draw files. The
+ * headings map below is now total over `WorkArea` and lives in
+ * workspace/destinations.ts, so a destination added to the union cannot
+ * silently inherit Home's column.
+ *
+ * In Home it is still exactly what it was: browsing (the real folder tree with
+ * every row action) plus the AI evidence set plus the trash. */
 export default function LibraryPane({
   s,
   a,
   layout,
   area,
+  pages,
+  onNewItem,
 }: {
   s: WSState;
   a: WSActions;
   layout: LayoutApi;
   area: WorkArea;
+  /** The private browser's open pages — read by the Browser destination only.
+   * Threaded rather than re-derived here because there is one list and the
+   * shell owns it; a second reconciliation would be a second answer. */
+  pages: BrowserPagesApi;
+  /** The destination's new-item verb (⌘T's other half). */
+  onNewItem: (kind: NewItemKind) => void;
 }) {
   const filterQ = s.fileFilter.trim().toLowerCase();
   const matchesFilter = (f: import("../api").FileMeta) =>
     !filterQ ||
     f.name.toLowerCase().includes(filterQ) ||
     displayName(f.name).toLowerCase().includes(filterQ);
-  // One sorted list feeds every file surface below (the folder tree, the
-  // evidence checkboxes, the recordings list), so they can never disagree
-  // about the order the reader chose.
-  const shownFiles = sortFiles(s.files.filter(matchesFilter), s.fileSort);
+  // HOME'S POPULATION, once, for every surface Home draws: the folder tree, the
+  // evidence checkboxes, the count badge. A section-only object is a full room
+  // file and simply is not one of the things Home lists — see fileVisibility.ts.
+  // Recordings and the map read `s.files` directly further down, because they
+  // are not Home and are not making a claim about what Home shows.
+  const shownFiles = sortFiles(libraryFiles(s.files).filter(matchesFilter), s.fileSort);
   const looseFiles = shownFiles.filter((f) => f.folderId === null);
   const attachedIds = new Set(s.attachments.map((f) => f.id));
-  const fileArea = area === "files" || area === "home" || area === "map";
+  // "files" and "home" are the same destination under two names (the rail says
+  // Home; "files" is the default lens the room opens in). The map is NOT one of
+  // them any more: it draws room content, which never made the room's file list
+  // its navigator — it has map controls of its own now.
+  const fileArea = area === "files" || area === "home";
+  const heading = SIDEBAR_TITLES[area];
+  const newItem = newItemOf(area);
+  const newLabel = newItemLabel(area);
 
   // Same dismissal grammar as the header popovers: Escape closes the Add menu.
   useEffect(() => {
@@ -92,37 +116,65 @@ export default function LibraryPane({
     return () => window.removeEventListener("keydown", onKey, true);
   }, [s.addMenuOpen, s]);
 
-  // null = this area has no list to count, so no badge is drawn. A hard "0"
-  // beside an area that never lists anything (the browser) reads as "empty",
-  // which is a different and untrue claim.
+  // null = this destination has no list to count, so no badge is drawn. A hard
+  // "0" beside a destination that never lists anything reads as "empty", which
+  // is a different and untrue claim.
   const headerCount: number | null = fileArea
-    ? s.files.length
+    ? libraryFiles(s.files).length
     : area === "workflows"
       ? visibleWorkflows(s.workflows).length
       : area === "scripts"
         ? s.scripts.length
         : area === "skills"
           ? s.skills.length
-        : area === "recordings"
-          ? s.files.filter(isRecordingFile).length
-          : area === "memory"
-            ? s.memories.length
-            : area === "connectors"
-              ? s.mcpStatuses.length
-              : null;
+          : area === "recordings"
+            ? s.files.filter(isRecordingFile).length
+            : area === "memory"
+              ? s.memories.length
+              : area === "connectors"
+                ? s.mcpStatuses.length
+                : area === "sketch"
+                  ? s.files.filter(isSketchFile).length
+                  : area === "browser"
+                    ? pages.pages.length
+                    : null;
+
+  // A destination that declares no second column gives its width to the
+  // workspace rather than drawing an empty one. Nothing does today; the branch
+  // exists so that adding such a destination is a one-line declaration in
+  // destinations.ts rather than a layout fork here.
+  if (heading === null) return null;
 
   return (
     <>
+      {/* ONE HEADER SHAPE FOR EVERY DESTINATION: title, count when there is a
+          list to count, primary action when the destination has one, then the
+          two pane controls. */}
       <div className="pane-header">
-        <div className="pane-heading">{AREA_HEADINGS[area]}</div>
+        <div className="pane-heading">{heading}</div>
         {headerCount !== null && (
           <span className="count-badge">{headerCount}</span>
+        )}
+        {/* The destination's primary action, in the one place every
+            destination puts it. Home keeps its richer "Add page or source"
+            menu in the footer — it adds six different kinds of thing, which is
+            a menu, not a button. */}
+        {newItem && newItem !== "note" && (
+          <button
+            className="pane-new-btn"
+            type="button"
+            title={`${newLabel} (⌘T)`}
+            aria-label={`${newLabel} (Command T)`}
+            onClick={() => onNewItem(newItem)}
+          >
+            <PlusIcon size={12} /> {newLabel}
+          </button>
         )}
         <div className="pane-actions">
           <button
             className="pane-icon-btn"
             data-tip="Focus this pane"
-            aria-label="Give the Library pane the full width"
+            aria-label={`Give ${heading} the full width`}
             onClick={() => layout.toggleFocus("library")}
           >
             <FocusIcon size={14} />
@@ -130,7 +182,7 @@ export default function LibraryPane({
           <button
             className="pane-icon-btn"
             data-tip="Collapse"
-            aria-label="Collapse the Library pane"
+            aria-label={`Collapse ${heading}`}
             onClick={() => layout.collapsePane("library")}
           >
             <CollapseLeftIcon size={14} />
@@ -194,16 +246,28 @@ export default function LibraryPane({
           filter box and a "Newest first" sort control that don't move the
           trash at all (it composes its own, unrelated order) don't belong
           here. Suppressed for that tab only; Browse/AI sources keep both. */}
-      {((fileArea && s.libraryTab !== "trash") || area === "recordings") && (
+      {((fileArea && s.libraryTab !== "trash") ||
+        area === "recordings" ||
+        area === "sketch") && (
         <div className="source-tools">
           <label className="search-field">
             <SearchIcon size={14} />
             <input
               type="search"
               placeholder={
-                area === "recordings" ? "Filter recordings" : "Filter files and pages"
+                area === "recordings"
+                  ? "Filter recordings"
+                  : area === "sketch"
+                    ? "Filter sketches"
+                    : "Filter files and pages"
               }
-              aria-label="Filter files and pages"
+              aria-label={
+                area === "recordings"
+                  ? "Filter recordings"
+                  : area === "sketch"
+                    ? "Filter sketches"
+                    : "Filter files and pages"
+              }
               value={s.fileFilter}
               onChange={(e) => s.setFileFilter(e.target.value)}
             />
@@ -254,13 +318,16 @@ export default function LibraryPane({
         <SourcesPanel s={s} a={a} shownFiles={shownFiles} attachedIds={attachedIds} />
       )}
       {fileArea && s.libraryTab === "trash" && <TrashPanel s={s} a={a} />}
-      {area === "recordings" && <RecordingsNav s={s} a={a} shownFiles={shownFiles} />}
+      {area === "recordings" && <RecordingsNav s={s} a={a} />}
       {area === "workflows" && <WorkflowsNav s={s} a={a} />}
       {area === "scripts" && <ScriptsNav s={s} a={a} />}
       {area === "skills" && <SkillsNav s={s} a={a} />}
       {area === "memory" && <MemoryNav s={s} a={a} />}
       {area === "connectors" && <ConnectorsNav s={s} />}
-      {area === "browser" && <BrowserNav />}
+      {area === "browser" && <PagesNav pages={pages} onNewItem={onNewItem} />}
+      {area === "sketch" && <SketchesNav s={s} a={a} onNewItem={onNewItem} />}
+      {area === "create" && <CreationsNav s={s} a={a} />}
+      {area === "map" && <MapNav s={s} a={a} />}
 
       {/* Trash has nothing to add — you cannot add a source to what has been
           removed — so its footer does the one bulk action the tab actually
@@ -835,22 +902,17 @@ function SourceRow({
 
 /* ---------- Recordings lens ---------- */
 
-function RecordingsNav({
-  s,
-  a,
-  shownFiles,
-}: {
-  s: WSState;
-  a: WSActions;
-  shownFiles: import("../api").FileMeta[];
-}) {
-  const recs = shownFiles.filter(isRecordingFile);
+function RecordingsNav({ s, a }: { s: WSState; a: WSActions }) {
+  // Reads `s.files`, not Home's population: Recordings lists ITS OWN objects,
+  // including any a person has removed from the Library. Sorted and filtered by
+  // the same controls the header draws, so the list matches them.
+  const q = s.fileFilter.trim().toLowerCase();
+  const recs = sortFiles(
+    s.files.filter(isRecordingFile).filter((f) => !q || f.name.toLowerCase().includes(q)),
+    s.fileSort,
+  );
   return (
     <div className="library-scroll">
-      <p className="area-nav-intro">
-        Capture, transcribe, edit, and export. Recordings are ordinary room
-        files — everything here is also in Browse.
-      </p>
       <button
         className="area-nav-row"
         disabled={s.recLive != null}
@@ -900,10 +962,12 @@ function WorkflowsNav({ s, a }: { s: WSState; a: WSActions }) {
   const workflows = visibleWorkflows(s.workflows);
   return (
     <div className="library-scroll">
-      <p className="area-nav-intro">
-        Repeatable pipelines over this room's files — run them now or on a
-        schedule.
-      </p>
+      {workflows.length === 0 && (
+        <p className="area-nav-intro">
+          Repeatable pipelines over this room's files — run them now or on a
+          schedule.
+        </p>
+      )}
       <button className="area-nav-row" onClick={() => a.openWorkflows()}>
         <span className="browse-icon">
           <PlusIcon size={14} />
@@ -951,10 +1015,12 @@ function WorkflowsNav({ s, a }: { s: WSState; a: WSActions }) {
 function ScriptsNav({ s, a }: { s: WSState; a: WSActions }) {
   return (
     <div className="library-scroll">
-      <p className="area-nav-intro">
-        Python or JavaScript files in this room, with declared inputs, outputs
-        and consent tied to their exact contents.
-      </p>
+      {s.scripts.length === 0 && (
+        <p className="area-nav-intro">
+          Python or JavaScript files in this room, with declared inputs, outputs
+          and consent tied to their exact contents.
+        </p>
+      )}
       <div className="group-heading">In this room</div>
       {s.scripts.length === 0 && (
         <div className="empty-hint">
@@ -997,10 +1063,12 @@ function ScriptsNav({ s, a }: { s: WSState; a: WSActions }) {
 function SkillsNav({ s, a }: { s: WSState; a: WSActions }) {
   return (
     <div className="library-scroll">
-      <p className="area-nav-intro">
-        Portable instructions and bundled resources the assistant loads only
-        when a task matches.
-      </p>
+      {s.skills.length === 0 && (
+        <p className="area-nav-intro">
+          Portable instructions and bundled resources the assistant loads only
+          when a task matches.
+        </p>
+      )}
       <div className="group-heading">In this room</div>
       {s.skills.length === 0 && (
         <div className="empty-hint">
@@ -1029,25 +1097,464 @@ function SkillsNav({ s, a }: { s: WSState; a: WSActions }) {
   );
 }
 
-/* ---------- Private browser lens ---------- */
+/* ---------- Private browser: the open pages ---------- */
 
-/** The browser keeps nothing on disk, so this pane has nothing to list — which
- * is exactly why it must SAY so. It used to render the heading and then an
- * empty column, which reads as a bug rather than as a promise being kept. */
-function BrowserNav() {
+/** THE OPEN PRIVATE PAGES, VERTICALLY, IN THE ONE DESTINATION THEY BELONG TO.
+ *
+ * This column used to be two paragraphs of instructions pointing at a
+ * horizontal strip above the workspace — a strip that also carried room
+ * documents, recordings and sketches, and that stayed on screen in every other
+ * destination. So a private page was visible from Skills and Memory, and the
+ * one place that ought to have listed pages listed nothing.
+ *
+ * A `tablist`, not a `list`, and honestly so: these rows select which page the
+ * workspace shows, which is what a tab does. That earns them Left/Right and
+ * Home/End, which the roving `tabIndex` below provides.
+ *
+ * The privacy contract is unchanged and is why the empty state says it ONCE,
+ * in one sentence, instead of spending the column on it. This list is the pages
+ * open right now, held in memory, never written down — see browserPages.ts. */
+function PagesNav({
+  pages,
+  onNewItem,
+}: {
+  pages: BrowserPagesApi;
+  onNewItem: (kind: NewItemKind) => void;
+}) {
+  const [dragging, setDragging] = useState("");
+
+  if (pages.pages.length === 0) {
+    return (
+      <div className="library-scroll">
+        <div className="empty-hint">
+          No pages open. This browser keeps no history, cookies or cache between
+          sessions.
+        </div>
+        <button className="area-nav-row" onClick={() => onNewItem("page")}>
+          <span className="browse-icon">
+            <PlusIcon size={14} />
+          </span>
+          <span className="area-nav-main">
+            <span className="area-nav-title">New page</span>
+            <span className="area-nav-copy">Search the web, or open an address</span>
+          </span>
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div
+      className="library-scroll"
+      role="tablist"
+      aria-label="Open private pages"
+      aria-orientation="vertical"
+    >
+      {pages.pages.map((p, index) => {
+        const current = p.id === pages.activeId;
+        return (
+          <div
+            key={p.id}
+            role="tab"
+            aria-selected={current}
+            // Roving focus: exactly one row is in the tab order, and the arrows
+            // move between them. Without it a tablist claims a keyboard model
+            // it does not implement.
+            tabIndex={current ? 0 : -1}
+            className={`area-nav-row page-row${current ? " is-current" : ""}${
+              dragging === p.id ? " is-dragging" : ""
+            }`}
+            draggable
+            onDragStart={() => setDragging(p.id)}
+            onDragEnd={() => setDragging("")}
+            onDragOver={(e) => {
+              e.preventDefault();
+              const from = pages.pages.findIndex((x) => x.id === dragging);
+              if (from >= 0 && from !== index) pages.move(from, index);
+            }}
+            onClick={() => pages.select(p.id)}
+            onAuxClick={(e) => {
+              // Middle-click closes, as everywhere else with tabs.
+              if (e.button === 1) {
+                e.preventDefault();
+                pages.close(p.id);
+              }
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                pages.select(p.id);
+                return;
+              }
+              // The keyboard equivalent of the hover close button — a control
+              // that only exists under a pointer is not a control everyone has.
+              if (e.key === "Backspace" || e.key === "Delete") {
+                e.preventDefault();
+                pages.close(p.id);
+                return;
+              }
+              if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+                e.preventDefault();
+                const count = pages.pages.length;
+                const to =
+                  (index + (e.key === "ArrowDown" ? 1 : -1) + count) % count;
+                pages.select(pages.pages[to].id);
+                (e.currentTarget.parentElement?.children[to] as HTMLElement)?.focus();
+              }
+            }}
+          >
+            <span className="browse-icon">
+              <GlobeIcon size={14} />
+            </span>
+            <span className="area-nav-main">
+              {/* The accessible name carries the host as well, because two
+                  pages with the same title are one repeated list item to a
+                  screen reader unless the row says which site each is on. */}
+              <span className="area-nav-title" aria-hidden>
+                {pageLabel(p)}
+              </span>
+              <span className="sr-only">{pageAccessibleName(p)}</span>
+              {/* Only when it says something the title does not — see
+                  `pageSubtitle`. A second line repeating the first is a row
+                  half wasted. */}
+              {pageSubtitle(p) && (
+                <span className="area-nav-copy" aria-hidden>
+                  {pageSubtitle(p)}
+                </span>
+              )}
+            </span>
+            <button
+              className="page-close"
+              aria-label={`Close ${pageAccessibleName(p)}`}
+              title="Close this page"
+              onClick={(e) => {
+                e.stopPropagation();
+                pages.close(p.id);
+              }}
+            >
+              <CloseIcon size={12} />
+            </button>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+/* ---------- Sketches ---------- */
+
+/** Every drawing in the room, and the one that is open.
+ *
+ * The list and its "New sketch" button used to be the CENTRE pane — a gallery
+ * you navigated to, that vanished the moment you opened a drawing, leaving no
+ * way to reach the next one without going back. As a sidebar it is beside the
+ * canvas the whole time, which is what a list of documents is for.
+ *
+ * Each row's own status is deliberately absent: `Section only` / `In Library`
+ * is drawn once, on the open sketch's toolbar (see ViewerPane), because a badge
+ * repeated down every row is decoration rather than information. */
+function SketchesNav({
+  s,
+  a,
+  onNewItem,
+}: {
+  s: WSState;
+  a: WSActions;
+  onNewItem: (kind: NewItemKind) => void;
+}) {
+  const q = s.fileFilter.trim().toLowerCase();
+  const sketches = s.files
+    .filter(isSketchFile)
+    .filter((f) => !q || f.name.toLowerCase().includes(q));
+  return (
+    <div className="library-scroll" role="list" aria-label="Sketches in this room">
+      {s.files.filter(isSketchFile).length === 0 ? (
+        <div className="empty-hint">
+          Nothing sketched yet. Press New sketch, or ask the room&rsquo;s AI —
+          &ldquo;draw my login flow&rdquo; — and it will.
+        </div>
+      ) : sketches.length === 0 ? (
+        <div className="empty-hint">No sketches match “{s.fileFilter}”.</div>
+      ) : (
+        sketches.map((f) => (
+          <div
+            key={f.id}
+            role="listitem"
+            className={`area-nav-row${s.openFile?.id === f.id ? " is-current" : ""}`}
+            onClick={() => void a.viewFile(f.id)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                void a.viewFile(f.id);
+              }
+            }}
+            tabIndex={0}
+            title={`Open ${f.name}`}
+          >
+            <span className="browse-icon">
+              <PencilIcon size={14} />
+            </span>
+            <span className="area-nav-main">
+              <span className="area-nav-title">{displayName(f.name)}</span>
+              <span className="area-nav-copy">{f.aiSummary ?? "a drawing"}</span>
+            </span>
+            {/* The two safe row verbs the app already uses everywhere else,
+                with the same armed confirm behind the destructive one. */}
+            <span className="area-nav-state">
+              <button
+                className="chip-btn"
+                title="Rename this sketch"
+                aria-label={`Rename ${displayName(f.name)}`}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  s.setRenamingFile({ id: f.id, name: f.name, where: "library" });
+                }}
+              >
+                <PencilIcon size={12} />
+              </button>
+              <DeleteControl
+                k={`sketch:${f.id}`}
+                trigger={<TrashIcon size={12} />}
+                question="Move this sketch to the trash?"
+                title="Move this sketch to the trash"
+                onConfirm={() => void a.removeFile(f.id)}
+                confirmDelete={s.confirmDelete}
+                askConfirm={a.askConfirm}
+                cancelConfirm={a.cancelConfirm}
+              />
+            </span>
+          </div>
+        ))
+      )}
+      {s.renamingFile?.where === "library" &&
+        sketches.some((f) => f.id === s.renamingFile?.id) && (
+          <input
+            className="folder-rename"
+            autoFocus
+            dir="auto"
+            aria-label="Rename this sketch"
+            value={s.renamingFile.name}
+            onChange={(e) =>
+              s.setRenamingFile({
+                id: s.renamingFile!.id,
+                name: e.target.value,
+                where: "library",
+              })
+            }
+            onBlur={a.commitRenameFile}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") a.commitRenameFile();
+              if (e.key === "Escape") s.setRenamingFile(null);
+            }}
+          />
+        )}
+      <button className="area-nav-row" onClick={() => onNewItem("sketch")}>
+        <span className="browse-icon">
+          <PlusIcon size={14} />
+        </span>
+        <span className="area-nav-main">
+          <span className="area-nav-title">New sketch</span>
+          <span className="area-nav-copy">A blank canvas, in Sketches (⌘T)</span>
+        </span>
+      </button>
+    </div>
+  );
+}
+
+/* ---------- Creations ---------- */
+
+/** What the Create page has made and is making.
+ *
+ * Three populations in one list, in the order a person cares about them:
+ * generations in flight (with their live progress), runs that failed (with
+ * their reason, because a failure that vanishes is a charge nobody can
+ * account for), and the finished pictures and clips.
+ *
+ * The FILTERS ARE THE ONES THE DATA SUPPORTS — All / Images / Video, off the
+ * files' own mime types. Nothing decorative: a "favourites" or "recent" filter
+ * would need a field no creation carries. */
+function CreationsNav({ s, a }: { s: WSState; a: WSActions }) {
+  const [lens, setLens] = useState<"all" | "image" | "video">("all");
+  const jobs = s.jobs.filter((j) => j.kind === "create");
+  const running = jobs.filter((j) => j.status === "running" || j.status === "queued");
+  // "error", not "failed" — the same status string the Create page's own
+  // failure list reads. Two spellings of one status is how a list quietly
+  // stops showing the runs it exists to account for.
+  const failed = jobs.filter((j) => j.status === "error");
+  const outputs = s.files.filter(isCreationFile).filter((f) => {
+    if (lens === "all") return true;
+    const video = f.mimeType.startsWith("video/");
+    return lens === "video" ? video : !video;
+  });
+  const nothingAtAll =
+    running.length === 0 && failed.length === 0 && s.files.filter(isCreationFile).length === 0;
+
   return (
     <div className="library-scroll">
-      <p className="area-nav-intro">
-        Open pages live in the tab strip above the page itself — there is no
-        list here because this browser keeps no history, no bookmarks and no
-        cookies between sessions.
-      </p>
-      <div className="group-heading">While you browse</div>
-      <p className="area-nav-intro">
-        Save a page or a download into the room from the browser's own toolbar;
-        anything you save becomes an ordinary encrypted room file and appears in
-        the Library.
-      </p>
+      {!nothingAtAll && (
+        <div className="pane-tabs" role="tablist" aria-label="Filter creations">
+          {(["all", "image", "video"] as const).map((k) => (
+            <button
+              key={k}
+              className="pane-tab"
+              role="tab"
+              aria-selected={lens === k}
+              onClick={() => setLens(k)}
+            >
+              {k === "all" ? "All" : k === "image" ? "Images" : "Video"}
+            </button>
+          ))}
+        </div>
+      )}
+      {nothingAtAll && (
+        <div className="empty-hint">
+          Nothing made yet. Describe a picture or a clip in the composer and
+          press Create — results land here, and stay in this room.
+        </div>
+      )}
+      {running.length > 0 && <div className="group-heading">Making now</div>}
+      {running.map((j) => {
+        const p = s.jobProgress[j.id];
+        return (
+          <div key={j.id} className="area-nav-row is-static">
+            <span className="browse-icon">
+              <CreateIcon size={14} />
+            </span>
+            <span className="area-nav-main">
+              <span className="area-nav-title">{j.title}</span>
+              <span className="area-nav-copy">
+                {/* The job's own reported step, or its plain status. Never a
+                    made-up percentage: `jobProgress` is absent until the run
+                    reports one, and inventing a number for the gap is the
+                    fake-progress-bar problem this app has ruled out. */}
+                {p ? `${p.label} ${p.done}/${p.total}` : j.status === "queued" ? "Queued" : "Working…"}
+              </span>
+            </span>
+          </div>
+        );
+      })}
+      {failed.length > 0 && <div className="group-heading">Didn’t finish</div>}
+      {failed.map((j) => (
+        <div key={j.id} className="area-nav-row is-static" title={j.error ?? undefined}>
+          <span className="browse-icon">
+            <CreateIcon size={14} />
+          </span>
+          <span className="area-nav-main">
+            <span className="area-nav-title">{j.title}</span>
+            <span className="area-nav-copy">{j.error ?? "Failed"}</span>
+          </span>
+        </div>
+      ))}
+      {outputs.length > 0 && <div className="group-heading">Made in this room</div>}
+      {outputs.map((f) => {
+        const status = libraryStatus(f);
+        return (
+          <button
+            key={f.id}
+            className={`area-nav-row${s.openFile?.id === f.id ? " is-current" : ""}`}
+            onClick={() => void a.viewFile(f.id)}
+            title={`Open ${f.name}`}
+          >
+            <span className="browse-icon">
+              <CreateIcon size={14} />
+            </span>
+            <span className="area-nav-main">
+              <span className="area-nav-title">{displayName(f.name)}</span>
+              <span className="area-nav-copy">{fileKindLabel(f)}</span>
+            </span>
+            {/* Only the exception is marked. A promoted creation is the unusual
+                one, so it is the one that says so. */}
+            {status?.linked && <span className="area-nav-state">In Library</span>}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+/* ---------- Room Map ---------- */
+
+/** The map's own controls: what it is drawing, and how much of it.
+ *
+ * This column used to be the whole room Library, on the reasoning that the map
+ * visualizes room content. That is a statement about the CENTRE pane, not about
+ * what a person needs beside it — the map already draws every file as a node,
+ * so listing them again next to it was the same navigation twice, and clicking
+ * a row took you out of the map you had come to look at.
+ *
+ * What is here instead is what the existing map model actually supports: the
+ * counts it is drawing from, and the search that is the honest way into a large
+ * one. Nothing invented — there are no layers or groups in the model, so none
+ * are offered. */
+function MapNav({ s, a }: { s: WSState; a: WSActions }) {
+  const files = s.files.length;
+  const folders = s.folders.length;
+  const derived = s.files.filter((f) => f.originDestination !== "library").length;
+  return (
+    <div className="library-scroll">
+      {/* The one instruction the map needs, and only while there is nothing on
+          it to learn from. A permanent paragraph explaining drag and zoom costs
+          a row of the column forever to teach something the first drag
+          teaches. */}
+      {files === 0 && (
+        <div className="empty-hint">
+          Nothing to draw yet. Add files to the room and the map fills in.
+        </div>
+      )}
+      <div className="group-heading">What it is drawing</div>
+      <div className="area-nav-row is-static">
+        <span className="browse-icon">
+          <FolderIcon size={14} />
+        </span>
+        <span className="area-nav-main">
+          <span className="area-nav-title">Files</span>
+        </span>
+        <span className="area-nav-state">{files}</span>
+      </div>
+      <div className="area-nav-row is-static">
+        <span className="browse-icon">
+          <FolderIcon size={14} />
+        </span>
+        <span className="area-nav-main">
+          <span className="area-nav-title">Folders</span>
+        </span>
+        <span className="area-nav-state">{folders}</span>
+      </div>
+      <div className="area-nav-row is-static">
+        <span className="browse-icon">
+          <CreateIcon size={14} />
+        </span>
+        <span className="area-nav-main">
+          <span className="area-nav-title">Made in a section</span>
+          <span className="area-nav-copy">Sketches, creations and recordings</span>
+        </span>
+        <span className="area-nav-state">{derived}</span>
+      </div>
+      <div className="group-heading">Find something</div>
+      <button
+        className="area-nav-row"
+        onClick={() => {
+          s.setSearchQuery("");
+          s.setShowSearch(true);
+        }}
+      >
+        <span className="browse-icon">
+          <SearchIcon size={14} />
+        </span>
+        <span className="area-nav-main">
+          <span className="area-nav-title">Search this room</span>
+          <span className="area-nav-copy">Files, chats and memory (⌘K)</span>
+        </span>
+      </button>
+      <button className="area-nav-row" onClick={() => void a.startDeepSummary()}>
+        <span className="browse-icon">
+          <BookOpenIcon size={14} />
+        </span>
+        <span className="area-nav-main">
+          <span className="area-nav-title">Summarize the room</span>
+          <span className="area-nav-copy">One pass over everything here</span>
+        </span>
+      </button>
     </div>
   );
 }
@@ -1057,10 +1564,12 @@ function BrowserNav() {
 function ConnectorsNav({ s }: { s: WSState }) {
   return (
     <div className="library-scroll">
-      <p className="area-nav-intro">
-        Tool connectors in this room. Manage them and add more in the center
-        pane.
-      </p>
+      {s.mcpStatuses.length === 0 && (
+        <p className="area-nav-intro">
+          Tool connectors in this room. Manage them and add more in the center
+          pane.
+        </p>
+      )}
       <div className="group-heading">Installed</div>
       {s.mcpStatuses.length === 0 && (
         <div className="empty-hint">
@@ -1109,10 +1618,12 @@ function MemoryNav({ s, a }: { s: WSState; a: WSActions }) {
   ];
   return (
     <div className="library-scroll">
-      <p className="area-nav-intro">
-        Durable context the AI may use when relevant. The scratch pad is an
-        ordinary private file — it never becomes memory on its own.
-      </p>
+      {s.memories.length === 0 && (
+        <p className="area-nav-intro">
+          Durable context the AI may use when relevant. The scratch pad is an
+          ordinary private file — it never becomes memory on its own.
+        </p>
+      )}
       <button
         className="area-nav-row"
         onClick={() => void a.openScratchPad()}

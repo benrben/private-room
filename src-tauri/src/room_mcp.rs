@@ -911,6 +911,11 @@ fn arcelle_tool_annotations(name: &str) -> Option<serde_json::Value> {
         | "set_cells"
         | "rename_file"
         | "move_file"
+        // Whether Home also lists an object. Room-local and reversible by its
+        // own opposite, and it touches no bytes — no export, no upload, no
+        // copy. Not read-only (it writes a column), and deliberately not
+        // marked open-world: nothing leaves the Mac.
+        | "set_in_library"
         | "add_memory"
         | "update_memory"
         | "save_skill"
@@ -2162,11 +2167,23 @@ mod tests {
         //    Reading a drawing and looking at one are now one act.
         // What is left is the cost of the capability existing, which is the
         // point. CloudAdvisor is untouched: an advisor cannot draw.
+        //
+        // RE-MEASURED 2026-08-15, after `set_in_library` (the contextual-
+        // navigation work): one tool, ~155 tokens on the three engine tiers,
+        // and the three budgets go up by exactly that.
+        //
+        // It has to exist as a TOOL rather than as a rule in the prompt: the
+        // whole point of section-only is that promotion is an explicit act with
+        // a name, reported in Activity, that the user asked for. A model that
+        // could only describe the promotion in prose would either not do it
+        // when asked, or "do" it and be believed. The description is already
+        // one sentence plus the never-automatically rule, which is the part
+        // that stops it becoming the default ending of every generation.
         let measured: Vec<(ToolScope, usize, usize)> = [
             (ToolScope::CloudAdvisor { include_mcp: true }, 5_300usize),
-            (ToolScope::CloudEngine, 10_975),
-            (ToolScope::LocalEngine, 10_820),
-            (ToolScope::ExternalAgent, 10_685),
+            (ToolScope::CloudEngine, 11_130),
+            (ToolScope::LocalEngine, 10_975),
+            (ToolScope::ExternalAgent, 10_840),
         ]
         .into_iter()
         .map(|(scope, budget)| (scope, approx_tokens(&scoped_specs(true, scope)), budget))

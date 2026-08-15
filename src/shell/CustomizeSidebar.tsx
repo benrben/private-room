@@ -50,8 +50,9 @@ export function CustomizeSidebarBody() {
       />
 
       <p className="cz-note">
-        The Library isn’t here because it isn’t a destination — it’s a pane.
-        Show or hide it from <b>Layout</b> in the toolbar, or press <kbd>⌘1</kbd>.
+        The second column isn’t here because it isn’t a destination — it’s a
+        pane, and each destination fills it with its own list. Show or hide it
+        from <b>Layout</b> in the toolbar, or press <kbd>⌘1</kbd>.
       </p>
 
       <button className="cz-reset" type="button" onClick={nav.reset}>

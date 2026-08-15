@@ -17,6 +17,7 @@ import {
   Folder,
   FrontPage,
   Job,
+  OrganizedRecord,
   BrowseConsentRequest,
   McpApproveRequest,
   McpServerStatus,
@@ -46,10 +47,7 @@ import {
 import { AutocompleteState } from "./composer";
 import { type FileSort, loadFileSort, saveFileSort } from "./fileSort";
 import { OpenFile, Toast, WorkArea } from "./types";
-
-/** How many messages may stack in the corner at once. Errors no longer expire,
- * so without a cap a run of failures would paper over the whole window. */
-const MAX_TOASTS = 5;
+import { stackToast, toastLifeMs } from "./toastStack";
 
 /** How many error messages the bug-report sheet may offer. Enough to cover the
  * run-up to a failure, few enough that the sheet stays readable — the user has
@@ -472,6 +470,17 @@ export function useWorkspaceState(_info: RoomInfo) {
   const [libraryTab, setLibraryTab] = useState<"browse" | "sources" | "trash">(
     "browse",
   );
+  // "New creation" (the Creations sidebar header, ⌘T in Create). A creation is
+  // COMPOSED rather than created, so there is no object to open — "new" means
+  // an empty composer. A counter, not a boolean: pressing it twice in a row has
+  // to clear twice, and a flag that was already true would do nothing the
+  // second time. The Create page watches it and resets its prompt.
+  const [newCreationSeq, setNewCreationSeq] = useState(0);
+  const bumpNewCreation = useCallback(() => setNewCreationSeq((n) => n + 1), []);
+  // Which creation the Creations sidebar has selected, when it is a job rather
+  // than a finished file (a finished one is just the open file). Null = the
+  // composer is what the workspace shows.
+  const [selectedCreationJob, setSelectedCreationJob] = useState<string | null>(null);
   // Wave 4a (Idea 2): the full-pane Workflows view, mirroring showMap (+ ref for
   // the mount-once Escape handler). `wfDetailId` selects a workflow inside it.
   const [showWorkflows, setShowWorkflows] = useState(false);
@@ -513,6 +522,15 @@ export function useWorkspaceState(_info: RoomInfo) {
     total: number;
     name: string;
   } | null>(null);
+  // What the ASSISTANT changed about how the room is organised, newest first —
+  // Activity's record of the one kind of room change that leaves no job behind.
+  //
+  // Session-only, and deliberately so. It is a convenience for the reader who
+  // steps away mid-turn, not an audit trail: the room's durable record of every
+  // agent act is the chat transcript, and a second one on disk would be a
+  // second thing to keep true, to migrate, and to leak. Capped for the same
+  // reason the error log is — a panel is not an archive.
+  const [organized, setOrganized] = useState<OrganizedRecord[]>([]);
   // ADD-30: unfinished background jobs + their live progress (sidebar cards).
   const [jobs, setJobs] = useState<Job[]>([]);
   const [jobProgress, setJobProgress] = useState<
@@ -610,7 +628,12 @@ export function useWorkspaceState(_info: RoomInfo) {
   // function would tear them down and back up on every render, and a fast
   // event can land in the gap.
   const pushToast = useCallback(
-    (kind: Toast["kind"], text: string, action?: Toast["action"]) => {
+    (
+      kind: Toast["kind"],
+      text: string,
+      action?: Toast["action"],
+      about?: string,
+    ) => {
       const id = ++toastSeq.current;
       // ADD-28 (audit #548): keep the last few error messages so the bug-report
       // sheet can offer them. An error pop-up is this app's ONLY report that
@@ -625,26 +648,15 @@ export function useWorkspaceState(_info: RoomInfo) {
           { at: new Date().toISOString(), text },
         ].slice(-MAX_ERROR_LOG);
       }
-      // Errors WAIT to be dismissed. They are this app's only report that
-      // something failed, and there is no log to go back to — deleting one on
-      // a timer means a user who looked away is simply never told.
-      setToasts((t) => {
-        const next = [...t, { id, kind, text, action }];
-        if (next.length <= MAX_TOASTS) return next;
-        // Over the cap, drop the oldest self-dismissing message first so a
-        // burst of successes can never push an error off the screen.
-        const oldestChatty = next.findIndex((x) => x.kind !== "error");
-        const victim = oldestChatty >= 0 ? oldestChatty : 0;
-        return next.filter((_, i) => i !== victim);
-      });
-      // A toast carrying an ACTION waits too. It is not a notice, it is an
-      // offer — the only route to something the app deliberately did not do
-      // for you (open the file a background job just produced, while you were
-      // mid-answer). Five seconds turns "later" into "never", silently.
-      if (kind === "error" || action) return;
+      // Which messages stack, which replace one another, and which wait to be
+      // dismissed are all one set of rules — see workspace/toastStack.ts.
+      const toast: Toast = { id, kind, text, action, about };
+      setToasts((t) => stackToast(t, toast));
+      const life = toastLifeMs(toast);
+      if (life === null) return;
       window.setTimeout(
         () => setToasts((t) => t.filter((x) => x.id !== id)),
-        5000,
+        life,
       );
     },
     [],
@@ -714,6 +726,8 @@ export function useWorkspaceState(_info: RoomInfo) {
     userPickedModelRef, showMemoryIntro, setShowMemoryIntro,
     showMap, setShowMap, showMapRef, showHelp, setShowHelp,
     area, setArea, aiTab, setAiTab, libraryTab, setLibraryTab,
+    newCreationSeq, bumpNewCreation,
+    selectedCreationJob, setSelectedCreationJob,
     showWorkflows, setShowWorkflows, showWorkflowsRef, wfDetailId, setWfDetailId,
     workflows, setWorkflows, wfNodeStatus, setWfNodeStatus,
     showScripts, setShowScripts, showScriptsRef, scripts, setScripts,
@@ -723,6 +737,7 @@ export function useWorkspaceState(_info: RoomInfo) {
     qaScriptMenuOpen, setQaScriptMenuOpen,
     fp, setFp, fpSuggestions, setFpSuggestions,
     importProgress, setImportProgress,
+    organized, setOrganized,
     jobs, setJobs, jobProgress, setJobProgress,
     summaryStarting, setSummaryStarting,
     studioStep, setStudioStep,

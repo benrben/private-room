@@ -114,13 +114,13 @@ export const PRESETS: Record<
   },
   research: {
     label: "Research",
-    hint: "Library, workspace, and the assistant",
+    hint: "Sidebar, workspace, and the assistant",
     hidden: { library: false, center: false, ai: false },
     ratios: { library: 0.16, center: 0.61, ai: 0.23 },
   },
   review: {
     label: "Review",
-    hint: "Library and workspace, no assistant",
+    hint: "Sidebar and workspace, no assistant",
     hidden: { library: false, center: false, ai: true },
     // A wider library than the default (26% of the visible width once the
     // assistant is out, against 21%), because reviewing means moving between
@@ -667,8 +667,11 @@ export function useLayout(roomPath: string) {
    * — so the plain branch below announced "Editor focus" to someone who had
    * simply pressed Assistant and pressed it again. Nobody focused anything;
    * the window is only wide enough for one pane. */
+  // "Sidebar", not "Library": this names the PANE, and what is in that pane
+  // depends on the destination. The status bar cannot know which one, and
+  // guessing Home's answer is what it used to do.
   const paneName =
-    focusPane === "ai" ? "Assistant" : focusPane === "library" ? "Library" : "Workspace";
+    focusPane === "ai" ? "Assistant" : focusPane === "library" ? "Sidebar" : "Workspace";
   const layoutLabel = isNarrow
     ? paneName
     : focusPane

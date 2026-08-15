@@ -90,6 +90,14 @@ export interface FileMeta {
    * automatically" in Settings, or a manual Summarize-room run) — null until
    * that has run for this file, or for a file with nothing to describe. */
   aiSummary: string | null;
+  /** Which destination MADE this file — "library" for everything that belongs
+   * to the room at large (imports, saved pages, generated artifacts, and every
+   * file that predates this column), else "sketch", "create", "recordings". */
+  originDestination: string;
+  /** Whether Home's Library shows it. A second, independent fact: a promoted
+   * sketch is still a sketch, and a Library file opened in the sketch editor is
+   * still a Library file. See `isLibraryVisible` in fileVisibility.ts. */
+  libraryVisibility: "linked" | "sectionOnly";
 }
 
 /** Who deleted a file. Recorded at the moment of deletion — `"unknown"` is a
@@ -1887,6 +1895,28 @@ export interface SketchDrawn {
  * `enabled` is false whenever no room is open. The menu bar outlives the room
  * (it is there over the password gate), and a View menu that offers to hide a
  * Library nobody is looking at is a dead control. */
+/** One organization change the ASSISTANT made — the payload of
+ * `assistant-organized`, and one row in Activity's history.
+ *
+ * Only what the room can state as fact: which object, and which way. No prose,
+ * because the sentence a reader sees is written where it is shown rather than
+ * carried across the wire from a model's turn. */
+export interface OrganizedChange {
+  id: string;
+  name: string;
+  /** True for "added to the Library", false for "removed from it". */
+  linked: boolean;
+}
+
+/** One change as Activity holds it: the payload, plus the order it arrived in.
+ *
+ * The order is not decoration. Add, remove and add again is three acts on one
+ * object and two of them are identical — without a counter they are the same
+ * row twice, which React cannot tell apart and a reader cannot either. */
+export interface OrganizedRecord extends OrganizedChange {
+  seq: number;
+}
+
 export interface ViewMenuState {
   enabled: boolean;
   library: boolean;
@@ -1899,4 +1929,9 @@ export interface ViewMenuState {
    * then refusing to tick back on. The rail's own expander hides for the same
    * reason; a menu row cannot hide. */
   railLabelsSettable: boolean;
+  /** What the ⌘1 row is CALLED — the active destination's name for its second
+   * column ("Library" at Home, "Sketches" in Sketch, "Private pages" in the
+   * browser). A tick alone was never enough: the row named Home's contents
+   * wherever it stood. */
+  sidebar: string;
 }

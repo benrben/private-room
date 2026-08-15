@@ -9,6 +9,7 @@ import {
   suggestFileMeta,
 } from "../api";
 import { displayName, uniqueFileName } from "./composer";
+import { sectionLabel } from "./fileVisibility";
 import { tryToast } from "./guard";
 import { WSState } from "./state";
 import {
@@ -672,6 +673,62 @@ export function makeFileActions(s: WSState) {
     }
   }
 
+  /** "New sketch": a blank drawing, filed under Sketches and opened on its
+   * canvas. Section-only from birth (`commands/sketch.rs`) — it appears in
+   * Sketches and reaches Home only if the person who drew it says so.
+   *
+   * Lives here rather than in the sketch gallery because it is now reachable
+   * from three places — the Sketches sidebar header, ⌘T in that destination,
+   * and the gallery — and three copies of "mint a unique name, create, refresh,
+   * open" is three chances for them to drift. */
+  async function createSketch() {
+    try {
+      const taken = new Set(s.files.map((f) => f.name.toLowerCase()));
+      let name = "Sketch";
+      for (let n = 2; taken.has(`${name.toLowerCase()}.sketch`); n++) name = `Sketch ${n}`;
+      const meta = await api.createSketch(name);
+      s.setFiles(await api.listFiles());
+      await viewFile(meta.id);
+    } catch (e) {
+      s.pushToast("error", String(e));
+    }
+  }
+
+  /** Add this object to Home's Library, or take the Home reference away.
+   *
+   * ONE OBJECT THROUGHOUT. The command updates a single column on a single row,
+   * so the id, the bytes, the version history, the title and the metadata are
+   * untouched and both views go on reading the same file. Removing is not
+   * deleting and never has been: the object stays exactly where it lives, which
+   * is why the confirmation says so out loud.
+   *
+   * Idempotent — the value is stated, not toggled — so a double press, a
+   * repeated agent call and a replayed undo all land in the same place. */
+  async function setInLibrary(id: string, linked: boolean) {
+    const before = s.files.find((f) => f.id === id);
+    const label = before ? displayName(before.name) : "That object";
+    const where = before ? sectionLabel(before.originDestination) : "its section";
+    try {
+      await api.setFileInLibrary(id, linked);
+      s.setFiles(await api.listFiles());
+      // Keyed on the OBJECT, so changing your mind about one sketch leaves one
+      // message rather than a column of contradictory ones — and so this
+      // confirmation expires, unlike an offer, because the object's own chip
+      // still offers both directions long after the toast has gone.
+      const said = linked
+        ? `Added “${label}” to the Library — it is still in ${where}.`
+        : `Removed “${label}” from the Library — it is still in ${where}.`;
+      s.pushToast(
+        "success",
+        said,
+        { label: "Undo", run: () => void setInLibrary(id, !linked) },
+        `library:${id}`,
+      );
+    } catch (e) {
+      s.pushToast("error", String(e));
+    }
+  }
+
   /** Create a starter `.py` script and open it in the editor (the Scripts page's
    * "New script" action — a room .py/.js file IS a script). */
   async function createNewScript() {
@@ -915,7 +972,8 @@ print(data.upper())
     // The multi-selection: its state handlers and the batch verbs they drive.
     clearSelection, selectedFiles, clickFile, selectAllVisible,
     moveFiles, removeFiles, restoreFiles, destroyFiles, exportFiles, attachFiles,
-    viewFile, createNewNote, createNewScript, saveEdit, saveEditAsCopy,
+    viewFile, createNewNote, createNewScript, createSketch, setInLibrary,
+    saveEdit, saveEditAsCopy,
     duplicateOpenFile, editCell, editModeOf, guardLeave, startCreateFolder, commitCreateFolder,
     commitFolderRename, deleteFolder, moveFile, commitRenameFile,
     toggleFolderCollapse, clampMenu,

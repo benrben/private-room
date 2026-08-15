@@ -52,6 +52,7 @@ export default function TopBar({
   a,
   info,
   layout,
+  sidebarTitle,
   onRenamed,
   approvals = 0,
   running = 0,
@@ -60,6 +61,11 @@ export default function TopBar({
   a: WSActions;
   info: RoomInfo;
   layout: LayoutApi;
+  /** The active destination's name for its second column, for the Layout
+   * menu's ⌘1 row. Passed in rather than derived: the shell owns the rule that
+   * turns three flags and `s.area` into one destination, and a second copy of
+   * it here is a second answer waiting to disagree. */
+  sidebarTitle: string;
   onRenamed?: (info: RoomInfo) => void;
   /** How many things are WAITING ON THE READER. Drawn on the Assistant button
    * as a hand-circled number, because that is where answering them happens. */
@@ -319,6 +325,7 @@ export default function TopBar({
             for why they are not places and never were. */}
         <LayoutMenu
           layout={layout}
+          sidebarTitle={sidebarTitle}
           open={s.openMenu === "layout"}
           onOpenChange={(o) => setOpenMenu(o ? "layout" : null)}
         />

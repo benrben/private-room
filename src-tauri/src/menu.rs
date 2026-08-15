@@ -44,6 +44,11 @@ pub const MENU_EVENT: &str = "menu-action";
 /// The View submenu's own id, so `menu_sync` can find it again.
 const VIEW_ID: &str = "view";
 
+/// The File submenu's own id. Gated by `menu_sync` exactly like View: its two
+/// rows act on the room's contents, so with no room open they are rows that
+/// cannot do what they say.
+const FILE_ID: &str = "file";
+
 // ---------------------------------------------------------------- the spec
 
 /// A row the PLATFORM owns. These carry macOS's own behaviour and its own key
@@ -131,6 +136,40 @@ pub(crate) const APP: &[Section] = &[
             Row::Platform(Platform::Quit),
         ],
     },
+    // ⌘T AND ⌘W ARE DECLARED HERE AND NOWHERE ELSE, for the same reason ⌘1 and
+    // ⌘2 are (see the View section below): macOS hands a key equivalent to the
+    // menu bar before the event reaches the key window.
+    //
+    // That is not a nicety here, it is the only thing that WORKS. The private
+    // browser's page is a native child webview, so while you are browsing the
+    // key window's focus is inside a view that the app's React `keydown`
+    // listener never hears from — ⌘T in the browser simply did nothing, which
+    // is precisely the destination it most needs to work in.
+    //
+    // "Close" replaces the predefined Close Window row, and takes its place in
+    // the Window menu's usual slot in the File menu instead. The predefined row
+    // owns ⌘W unconditionally and closes the WINDOW, which in a single-window
+    // app means ⌘W-while-reading-a-page quit Arcelle. The frontend decides what
+    // ⌘W closes — the active browser page, else the open document — and closes
+    // the window itself when there is nothing else to close, so the macOS
+    // behaviour survives as the last case rather than as the only one.
+    Section {
+        id: "file",
+        label: Some("File"),
+        rows: &[
+            Row::Command {
+                id: "file.new-item",
+                label: "New",
+                accel: Some("CmdOrCtrl+T"),
+            },
+            Row::Separator,
+            Row::Command {
+                id: "file.close-item",
+                label: "Close",
+                accel: Some("CmdOrCtrl+W"),
+            },
+        ],
+    },
     Section {
         id: "edit",
         label: Some("Edit"),
@@ -156,9 +195,16 @@ pub(crate) const APP: &[Section] = &[
             // given the two keys two owners — and a pane toggled twice is a
             // pane that never moves. useLayout keeps ⌘3 alone, the alias no
             // menu row can express.
+            // Named "Sidebar" only until the first sync: the row toggles the
+            // SECOND COLUMN, which is the Library at Home, Sketches in Sketch
+            // and Private pages in the browser, so `menu_sync` retitles it to
+            // whatever the reader is actually looking at. The static label is
+            // the honest word for it with no room open, and it is never
+            // "Library" — that is one destination's name for the column, and
+            // the menu bar spent the whole redesign using it over the others.
             Row::Check {
                 id: "view.library",
-                label: "Library",
+                label: "Sidebar",
                 accel: Some("CmdOrCtrl+1"),
             },
             Row::Check {
@@ -219,28 +265,45 @@ pub(crate) const APP: &[Section] = &[
         rows: &[
             Row::Platform(Platform::Minimize),
             Row::Platform(Platform::Zoom),
-            Row::Separator,
-            Row::Platform(Platform::CloseWindow),
+            // No Close Window row: ⌘W belongs to File → Close above, which
+            // closes the active ITEM and falls back to closing the window when
+            // there is none. Two rows both claiming ⌘W would give the key two
+            // owners, and the predefined one always wins.
         ],
     },
 ];
 
-/// Every id the View menu can raise, in menu order.
-pub(crate) fn ids() -> Vec<&'static str> {
-    fn walk(rows: &'static [Row], out: &mut Vec<&'static str>) {
+/// Every id the app's own menus can raise, paired with the SECTION that
+/// declares it, in menu order.
+///
+/// The pairing is what `menu_sync` needs and what it did without: it used to
+/// look every id up inside the View submenu, which was correct only while View
+/// was the one section with rows of ours. The File menu's ⌘T and ⌘W would have
+/// been "missing" on every sync — and, being born disabled, would have stayed
+/// grey for the life of the app.
+pub(crate) fn gated_rows() -> Vec<(&'static str, &'static str)> {
+    fn walk(section: &'static str, rows: &'static [Row], out: &mut Vec<(&'static str, &'static str)>) {
         for row in rows {
             match row {
-                Row::Command { id, .. } | Row::Check { id, .. } => out.push(id),
-                Row::Nested { rows, .. } => walk(rows, out),
+                Row::Command { id, .. } | Row::Check { id, .. } => out.push((section, id)),
+                Row::Nested { rows, .. } => walk(section, rows, out),
                 Row::Platform(_) | Row::Separator => {}
             }
         }
     }
     let mut out = Vec::new();
     for section in APP {
-        walk(section.rows, &mut out);
+        if section.id != VIEW_ID && section.id != FILE_ID {
+            continue;
+        }
+        walk(section.id, section.rows, &mut out);
     }
     out
+}
+
+/// Every id the menus can raise, in menu order.
+pub(crate) fn ids() -> Vec<&'static str> {
+    gated_rows().into_iter().map(|(_, id)| id).collect()
 }
 
 // ------------------------------------------------------------- the builder
@@ -363,6 +426,12 @@ pub struct ViewMenuState {
     /// then refuse to tick back on. The rail's own expander hides for the same
     /// reason; a menu row cannot hide, so it greys out instead.
     pub rail_labels_settable: bool,
+    /// What the ⌘1 row is called right now — the active destination's name for
+    /// its second column. Empty falls back to the generic word rather than to
+    /// any destination's, so a payload from an older frontend cannot leave the
+    /// row claiming to toggle something it is not standing over.
+    #[serde(default)]
+    pub sidebar: String,
 }
 
 impl ViewMenuState {
@@ -381,6 +450,21 @@ impl ViewMenuState {
     }
 }
 
+/// What to write on the ⌘1 row.
+///
+/// The generic word, never a destination's, when the frontend has nothing to
+/// say — with no room open there is no second column to name, and picking one
+/// destination's word for it is how the row came to read "Library" while
+/// standing over Memory in the first place.
+fn sidebar_label(sent: &str) -> &str {
+    let trimmed = sent.trim();
+    if trimmed.is_empty() {
+        "Sidebar"
+    } else {
+        trimmed
+    }
+}
+
 /// Push the window's layout state onto the native View menu.
 ///
 /// FAILURE BEHAVIOUR, decided: a tick is decoration on a control that already
@@ -390,10 +474,14 @@ impl ViewMenuState {
 /// one is logged. The frontend never sees an error either way.
 #[tauri::command]
 pub fn menu_sync<R: Runtime>(app: AppHandle<R>, view: ViewMenuState) {
-    let Some(section) = app.menu().and_then(|m| m.get(VIEW_ID)) else {
+    let Some(menu) = app.menu() else {
         return;
     };
-    let Some(section) = section.as_submenu().cloned() else {
+    let submenu = |id: &str| {
+        menu.get(id)
+            .and_then(|section| section.as_submenu().cloned())
+    };
+    let (Some(view_menu), Some(file_menu)) = (submenu(VIEW_ID), submenu(FILE_ID)) else {
         return;
     };
     // Row by row, never the section. View holds two different lifetimes: the
@@ -404,8 +492,9 @@ pub fn menu_sync<R: Runtime>(app: AppHandle<R>, view: ViewMenuState) {
     // and the password gate, which is exactly where someone sizing the window
     // reaches for it.
     let checks = view.checks();
-    for id in ids() {
-        let Some(item) = find(&section, id) else {
+    for (section_id, id) in gated_rows() {
+        let section = if section_id == FILE_ID { &file_menu } else { &view_menu };
+        let Some(item) = find(section, id) else {
             crate::obs::warn("menu_row_missing", &[("id", crate::obs::id(id))]);
             continue;
         };
@@ -419,6 +508,9 @@ pub fn menu_sync<R: Runtime>(app: AppHandle<R>, view: ViewMenuState) {
                     Some((_, checked, enabled)) => {
                         let _ = item.set_checked(*checked);
                         let _ = item.set_enabled(*enabled);
+                        if id == "view.library" {
+                            let _ = item.set_text(sidebar_label(&view.sidebar));
+                        }
                     }
                     None => crate::obs::warn("menu_check_unmapped", &[("id", crate::obs::id(id))]),
                 }
@@ -505,13 +597,21 @@ mod tests {
 
     #[test]
     fn ids_are_unique_and_namespaced() {
-        let ids = ids();
         let mut seen = std::collections::HashSet::new();
-        for id in &ids {
-            assert!(seen.insert(*id), "duplicate menu id {id}");
-            assert!(id.starts_with("view."), "{id} is not in the view namespace");
+        for (section, id) in gated_rows() {
+            assert!(seen.insert(id), "duplicate menu id {id}");
+            // An id names the menu it lives in, so a stray row cannot be
+            // synced (or handled) as though it belonged to the other one.
+            assert!(
+                id.starts_with(&format!("{section}.")),
+                "{id} is not in the {section} namespace"
+            );
         }
-        assert_eq!(ids.len(), 8, "a row was added or removed — check the frontend map too");
+        assert_eq!(
+            gated_rows().len(),
+            10,
+            "a row was added or removed — check the frontend maps too"
+        );
     }
 
     /// ⌘1 and ⌘2 have exactly one owner, and it is this file. The matching
@@ -546,7 +646,28 @@ mod tests {
             focus: false,
             rail_labels: true,
             rail_labels_settable: true,
+            sidebar: "Sketches".into(),
         }
+    }
+
+    /// The ⌘1 row is named after the column it toggles, and that column is a
+    /// different thing in each destination. With nothing to go on it must fall
+    /// back to the generic word — never to one destination's name for it, which
+    /// is how the row came to read "Library" while standing over Memory.
+    #[test]
+    fn the_sidebar_row_never_borrows_one_destinations_name() {
+        assert_eq!(sidebar_label("Sketches"), "Sketches");
+        assert_eq!(sidebar_label(""), "Sidebar");
+        assert_eq!(sidebar_label("   "), "Sidebar");
+        assert_eq!(sidebar_label("  Private pages "), "Private pages");
+        let static_label = rows_of(VIEW_ID)
+            .iter()
+            .find_map(|r| match r {
+                Row::Check { id, label, .. } if *id == "view.library" => Some(*label),
+                _ => None,
+            })
+            .expect("the ⌘1 row");
+        assert_ne!(static_label, "Library");
     }
 
     /// Add a tick row to the spec and forget its field in the payload and the
@@ -638,6 +759,11 @@ mod tests {
             }
         }
         walk(view.rows, &mut declared);
+        // The File menu's two rows are governed by the same sync and declared
+        // the same way; the point of this test is that the sync never reaches a
+        // PLATFORM row, not that View is the only gated section.
+        let file = APP.iter().find(|s| s.id == FILE_ID).expect("a File section");
+        walk(file.rows, &mut declared);
         declared.sort();
         let mut governed = governed;
         governed.sort();

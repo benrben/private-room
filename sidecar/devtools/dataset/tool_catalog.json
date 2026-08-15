@@ -1428,6 +1428,33 @@
       "openWorldHint": false,
       "readOnlyHint": false
     },
+    "description": "Add a section-only object (a sketch, a generated picture or clip) to this room's Library, or remove it from the Library. Room-local: nothing is exported or copied, and the object stays in its own section either way. Only when the user asks or approves — never automatically.",
+    "inputSchema": {
+      "properties": {
+        "in_library": {
+          "description": "true = add, false = remove",
+          "type": "boolean"
+        },
+        "name": {
+          "description": "File name or part of it",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "in_library"
+      ],
+      "type": "object"
+    },
+    "name": "set_in_library"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
     "description": "Start a durable BACKGROUND pass that reads an ENTIRE file part by part — every character, no matter how large the file is — and saves the result as a new file in the room. Use it whenever the user wants work covering a whole large file (summarize/analyze/translate it all), instead of answering from excerpts. It is slow (minutes to hours) but survives app restarts; the user sees a live progress card. mode \"merge\" (default) folds notes into one final document; mode \"stitch\" transforms each part and joins them in order (translation, rewriting). After starting it, tell the user it is underway — do not wait for it.",
     "inputSchema": {
       "properties": {

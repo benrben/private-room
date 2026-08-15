@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { FileContent, RoomInfo, formatSize } from "../api";
 import {
-  ChevronLeftIcon,
+  BookOpenIcon,
   CloseIcon,
   CollapseLeftIcon,
   DotsIcon,
@@ -20,7 +20,8 @@ import {
   TimeMachineIcon,
 } from "../icons";
 import RoomMap from "../viewers/RoomMap";
-import { fileLabel, formatWhen, provenanceLine } from "./composer";
+import { displayName, fileLabel, formatWhen, provenanceLine } from "./composer";
+import { libraryStatus } from "./fileVisibility";
 import ViewerRouter from "./ViewerRouter";
 import CloudView from "../viewers/CloudView";
 import { frameSelectionOf } from "../viewers/frameSelection";
@@ -48,14 +49,13 @@ import ConnectorsView from "./ConnectorsView";
 import { BrowserView } from "./BrowserView";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
-import { FILE_BEARING_AREAS, WorkArea } from "./types";
+import { FILE_BEARING_AREAS, WorkArea, isSketchFile } from "./types";
 import { LayoutApi } from "../shell/useLayout";
 import { WorkflowsPage } from "./workflows/WorkflowsPage";
 import { WorkflowGlyph } from "./workflows/workflowGlyph";
 import { ScriptsPage } from "./scripts/ScriptsPage";
 import SkillsView from "./skills/SkillsView";
 import { CreatePage } from "./create/CreatePage";
-import SketchGallery from "./sketch/SketchGallery";
 import { QuickActionsMenu, bindingMatches, QuickAction } from "./QuickActions";
 import type { ViewerKind } from "../api";
 
@@ -116,6 +116,174 @@ const NO_FILE: FileContent = {
   webMeta: null,
 };
 
+/** WHERE THIS OBJECT SHOWS UP, and the one control that changes it.
+ *
+ * Drawn only for objects that HAVE a placement to talk about — things made
+ * inside a destination. An ordinary Library file returns `null` from
+ * `libraryStatus` and gets no chip at all, because "In Library" stamped on
+ * every document in the room is noise that makes the real signal invisible.
+ *
+ * Two states, two different jobs:
+ *
+ *   • section-only → a button. "Add to Library" is the whole affordance, and
+ *     the confirmation says what will happen before it happens, because the
+ *     word "Add" invites the reading "make a copy" and this makes none.
+ *   • linked → a quiet status with a menu behind it. "View in Library" and
+ *     "Remove from Library", where Remove is careful to say that it removes
+ *     the Home reference and not the object — deleting is a different verb,
+ *     with the trash behind it, and the two must never read as neighbours.
+ */
+function LibraryChip({
+  s,
+  a,
+  fileId,
+}: {
+  s: WSState;
+  a: WSActions;
+  fileId: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const [asking, setAsking] = useState(false);
+  // Both popovers die with the file, like every other menu in this header.
+  useEffect(() => {
+    setOpen(false);
+    setAsking(false);
+  }, [fileId]);
+  const file = s.files.find((f) => f.id === fileId);
+  const status = file ? libraryStatus(file) : null;
+  if (!file || !status) return null;
+  const label = displayName(file.name);
+
+  if (!status.linked) {
+    return (
+      <span className="library-chip-wrap">
+        <span className="library-chip" role="status">
+          Section only
+        </span>
+        <button
+          className="btn-ic library-chip-btn"
+          aria-label={`Add ${label} to the Library`}
+          aria-haspopup="dialog"
+          aria-expanded={asking}
+          onClick={() => setAsking((v) => !v)}
+        >
+          <BookOpenIcon size={12} /> Add to Library
+        </button>
+        {asking && (
+          <>
+            <div className="menu-backdrop" onMouseDown={() => setAsking(false)} />
+            <div className="pop-menu library-chip-pop" role="dialog" aria-label="Add to Library">
+              <p className="library-chip-q">
+                <strong>Add to Library?</strong>
+                <span>
+                  “{label}” will also appear in Home. It stays in {status.where},
+                  and this keeps one file — no duplicate.
+                </span>
+              </p>
+              <div className="library-chip-actions">
+                <button className="subtle" onClick={() => setAsking(false)}>
+                  Cancel
+                </button>
+                <button
+                  className="primary"
+                  onClick={() => {
+                    setAsking(false);
+                    void a.setInLibrary(fileId, true);
+                  }}
+                >
+                  Add
+                </button>
+              </div>
+            </div>
+          </>
+        )}
+      </span>
+    );
+  }
+
+  return (
+    <span className="library-chip-wrap">
+      <button
+        className="library-chip is-linked"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        title={`“${label}” is in the Library and in ${status.where}`}
+        onClick={() => setOpen((v) => !v)}
+      >
+        <BookOpenIcon size={12} /> In Library
+      </button>
+      {open && (
+        <>
+          <div className="menu-backdrop" onMouseDown={() => setOpen(false)} />
+          <div className="pop-menu library-chip-pop" role="menu" aria-label="Library placement">
+            <button
+              role="menuitem"
+              className="pop-item"
+              onClick={() => {
+                setOpen(false);
+                // "View in Library" is a navigation, not a second copy: the
+                // object is already on screen, so this puts Home's list beside
+                // it with the row selected.
+                s.setShowMap(false);
+                s.setShowScripts(false);
+                s.setShowWorkflows(false);
+                s.setArea("files");
+                s.setLibraryTab("browse");
+              }}
+            >
+              View in Library
+            </button>
+            <button
+              role="menuitem"
+              className="pop-item"
+              title={`Stop showing this in Home. It stays in ${status.where} — this does not delete it.`}
+              onClick={() => {
+                setOpen(false);
+                void a.setInLibrary(fileId, false);
+              }}
+            >
+              <span className="pop-item-body">
+                Remove from Library
+                <span className="pop-item-sub">
+                  Hides the Home entry — the object stays in {status.where}
+                </span>
+              </span>
+            </button>
+          </div>
+        </>
+      )}
+    </span>
+  );
+}
+
+/** The Sketch destination with nothing selected.
+ *
+ * Deliberately thin, and thinner than the gallery it replaces: the room's
+ * sketches are listed in the contextual sidebar now, so repeating them here
+ * would be the same navigation twice — the exact duplication the two-level IA
+ * exists to remove. What the centre owes a reader who has just arrived is what
+ * this place is for and how to start, and nothing else. */
+function SketchLanding({ s, a }: { s: WSState; a: WSActions }) {
+  const count = s.files.filter(isSketchFile).length;
+  return (
+    <div className="sk-empty" role="status">
+      <p>{count === 0 ? "Nothing sketched yet" : "Pick a sketch to open it"}</p>
+      <span>
+        Drawings live in this room like any other file — versioned, searchable by
+        their labels, and the room&rsquo;s AI can draw on them beside you. They
+        stay in Sketches until you add one to the Library.
+      </span>
+      <button
+        type="button"
+        className="nb-btn nb-btn-primary"
+        onClick={() => void a.createSketch()}
+      >
+        New sketch
+      </button>
+    </div>
+  );
+}
+
 /** The center pane: a stable content header (breadcrumb + pane controls)
  * over the active surface — open file (any viewer), Workflows, Scripts,
  * Room Map, Memory, Recordings, the Front Page, or the sealed-room empty
@@ -127,18 +295,17 @@ export default function ViewerPane({
   info,
   layout,
   area,
-  contextArea,
 }: {
   s: WSState;
   a: WSActions;
   info: RoomInfo;
   layout: LayoutApi;
-  /** The place: which area page draws when no file is open, and where Escape
-   * returns to when one is. */
+  /** The destination: which page draws when no file is open, where Escape
+   * returns to when one is, and — since the two-level IA landed — the one
+   * context every surface here describes. A document its destination does not
+   * hold moves the app Home before it paints (see Workspace.tsx's
+   * `showFileHere`), so there is no longer a second, disagreeing answer. */
   area: WorkArea;
-  /** What the open document's own context is — see Workspace.tsx. Equal to
-   * `area` except when a file is showing over an area that does not hold it. */
-  contextArea: WorkArea;
 }) {
   const { openFile } = s;
   // PRIV-1: the reader's "blocked version" toggle — resets per file.
@@ -351,11 +518,12 @@ export default function ViewerPane({
     area === "files" && !s.showWorkflows && !s.showScripts && !s.showMap
       ? "Home"
       : AREA_CRUMBS[area];
-  // The place underneath, when it is not where this document lives. Drawn as a
-  // way back rather than as part of the trail: a room file opened from the
-  // browser is not browser content, but the browser IS still what Escape
-  // returns to, and that was previously true with nothing on screen saying so.
-  const backTo = openFile && contextArea !== area ? AREA_CRUMBS[area] : null;
+  // There is no "place underneath" any more, and that is the point. A document
+  // used to be able to draw over a destination that did not hold it, with a
+  // "back to Private browser" chip explaining the mismatch; the app now MOVES to
+  // the destination that owns the document instead, so the rail, this trail and
+  // the second column always name the same thing (see Workspace.tsx's
+  // `showFileHere`). The chip is gone with the state it described.
   // BROWSE-1: the page is a NATIVE webview floating above everything this app
   // draws, so any modal, approval card or palette is invisible and unclickable
   // underneath it. Park the page (BrowserView shrinks it to 1×1) whenever one
@@ -415,12 +583,12 @@ export default function ViewerPane({
           {" / "}
           {openFile ? (
             <>
-              {/* Only an area that CONTAINS this file may name itself here.
-                  Recordings and Scripts do; nothing else does, so the trail
-                  is otherwise the file's own folder — see types.ts. */}
-              {FILE_BEARING_AREAS.includes(contextArea)
-                ? `${AREA_CRUMBS[contextArea]} / `
-                : ""}
+              {/* Only a destination that CONTAINS this file may name itself
+                  here — and since a document now always appears in the
+                  destination that owns it, `area` IS that destination. The
+                  file-bearing ones say so; Home says nothing, because "Home"
+                  is not where a document lives, its folder is. */}
+              {FILE_BEARING_AREAS.includes(area) ? `${AREA_CRUMBS[area]} / ` : ""}
               {folderName ? `${folderName} / ` : ""}
               <span className="crumb-title">
                 {fileLabel(openFile.content.name, s.files)}
@@ -430,16 +598,13 @@ export default function ViewerPane({
             <span className="crumb-title">{areaCrumb}</span>
           )}
         </div>
-        {backTo && (
-          <button
-            className="crumb-back btn-ic"
-            aria-label={`Close this file and go back to ${backTo}`}
-            data-tip="Escape"
-            onClick={() => s.setOpenFile(null)}
-          >
-            <ChevronLeftIcon size={12} /> {backTo}
-          </button>
-        )}
+        {/* THE PROMOTION AFFORDANCE, drawn once, for the object on screen.
+            A section-only object offers "Add to Library"; a promoted one shows
+            a quiet status with View and Remove behind it. An ordinary Library
+            file gets neither — a badge on every one of a hundred documents is
+            decoration, and the point of this chip is that it marks the
+            exception (see fileVisibility.ts's `libraryStatus`). */}
+        {openFile && <LibraryChip s={s} a={a} fileId={openFile.id} />}
         <div className="pane-actions">
           <button
             className="pane-icon-btn"
@@ -1065,7 +1230,11 @@ export default function ViewerPane({
       ) : area === "create" ? (
         <CreatePage s={s} a={a} />
       ) : area === "sketch" ? (
-        <SketchGallery onOpen={(id) => void a.viewFile(id)} />
+        // The gallery's LIST moved to the contextual sidebar, where it stays
+        // beside the canvas instead of vanishing the moment a drawing opens.
+        // What is left in the centre is the landing: what this destination is
+        // for, and the one way to start.
+        <SketchLanding s={s} a={a} />
       ) : frontPageView ? (
         <FrontPage page={frontPageView} s={s} a={a} layout={layout} info={info} />
       ) : (

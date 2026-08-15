@@ -176,8 +176,14 @@ pub fn create_sketch(
     state: State<'_, AppState>,
     name: String,
 ) -> Result<FileMeta, String> {
-    let meta =
-        state.with_room(|room| insert_sketch(&room.conn, &name, &Sketch::default(), "upload"))?;
+    // Section-only: a new drawing belongs to Sketches, and appears in Home only
+    // when the person who made it says so ("Add to Library"). Same encrypted
+    // room file either way — see `db::mark_section_only`.
+    let meta = state.with_room(|room| {
+        let meta = insert_sketch(&room.conn, &name, &Sketch::default(), "upload")?;
+        db::mark_section_only(&room.conn, &meta.id, "sketch");
+        db::get_file_meta(&room.conn, &meta.id)
+    })?;
     let _ = app.emit("room-files-changed", ());
     Ok(meta)
 }
@@ -430,6 +436,12 @@ pub(crate) fn tool_draw(
                 Some((id, real)) => (id, real, false),
                 None => {
                     let meta = insert_sketch(&room.conn, &name, &Sketch::default(), "generated")?;
+                    // Section-only, exactly like one the user starts. A drawing
+                    // is a drawing whoever made it: filing the assistant's in
+                    // Home while the user's own stays in Sketches would make
+                    // the rule depend on who held the pen, and would put an
+                    // object in the Library that nobody asked to put there.
+                    db::mark_section_only(&room.conn, &meta.id, "sketch");
                     (meta.id, meta.name, true)
                 }
             },

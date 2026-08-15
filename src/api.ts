@@ -118,6 +118,7 @@ import type {
   BrowserTab,
   SketchDrawn,
   ViewMenuState,
+  OrganizedChange,
 } from "./apiTypes";
 
 /** The wire shape of every `ask-*` event: the payload the listener wants, in
@@ -240,6 +241,12 @@ export const api = {
   trashFile: (id: string) => invoke<void>("trash_file", { id }),
   listTrashedFiles: () => invoke<TrashedFile[]>("list_trashed_files"),
   restoreFile: (id: string) => invoke<FileMeta>("restore_file", { id }),
+  /** Add this object to Home's Library, or take the Home reference away.
+   * Room-local organization: one row is updated in place, so the object keeps
+   * its id, bytes, history, title and origin destination either way. Nothing is
+   * exported, uploaded, shared or copied. Idempotent in both directions. */
+  setFileInLibrary: (id: string, linked: boolean) =>
+    invoke<FileMeta>("set_file_in_library", { id, linked }),
   /** Irreversible, and only reachable for a file that is ALREADY in the trash. */
   deleteFilePermanently: (id: string) =>
     invoke<void>("delete_file_permanently", { id }),
@@ -1186,6 +1193,13 @@ export const api = {
     listen<AnnotationPayload>("agent-annotate", (e) => cb(e.payload)),
   onFileUpdated: (cb: (fileId: string) => void): Promise<UnlistenFn> =>
     listen<string>("file-updated", (e) => cb(e.payload)),
+  /** The assistant changed what the Library shows. A different fact from
+   *  `room-files-changed`, which only says the list is stale: this one names
+   *  the object and says which way it went, so Activity can record it. */
+  onAssistantOrganized: (
+    cb: (change: OrganizedChange) => void,
+  ): Promise<UnlistenFn> =>
+    listen<OrganizedChange>("assistant-organized", (e) => cb(e.payload)),
   onRoomFilesChanged: (cb: () => void): Promise<UnlistenFn> =>
     listen("room-files-changed", () => cb()),
   // SEC-1b: the AI is about to invoke a connected (MCP) tool and needs consent.

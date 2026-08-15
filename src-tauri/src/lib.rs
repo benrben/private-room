@@ -186,6 +186,7 @@ pub fn run() {
             commands::trash_file,
             commands::list_trashed_files,
             commands::restore_file,
+            commands::set_file_in_library,
             commands::delete_file_permanently,
             commands::empty_trash,
             // The batch twins of the four above (commands::bulk) — the Library's
