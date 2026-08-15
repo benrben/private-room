@@ -240,6 +240,16 @@
   font-size: var(--fs-meta);
   color: var(--muted);
 }
+/* Sits beside whatever the footer is already showing, never in place of it —
+   the label field it explains lives in that same row. */
+.sk-hint-typing {
+  margin-left: auto;
+  padding-left: var(--sp-3, 12px);
+  color: var(--faint);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 .sk-label-edit {
   display: flex;
   align-items: center;
@@ -340,4 +350,288 @@
   .sk-tool {
     transition: none;
   }
+}
+
+/* ---------------------------------------------------------------------------
+   THE EDITOR'S SECOND LAYER: selection, arrangement and the menus.
+   Everything below arrived with the editing pass. The rule it follows is the
+   toolbar's own: nothing here may add a permanent control, because a second
+   row of a spatial palette costs more canvas than any button is worth.
+   --------------------------------------------------------------------------- */
+
+/* The toolbar stops WRAPPING and starts giving way. With the assistant open,
+   zoom and export used to fall onto a second row and leave a stray strip
+   across the page. */
+.sk-tools {
+  flex-wrap: nowrap;
+  overflow: visible;
+}
+.sk-shrink {
+  flex: 0 1 auto;
+  min-width: 0;
+}
+
+/* A tool armed to stay on, so "why does it keep drawing?" is answerable by
+   looking. */
+.sk-locked-tool {
+  box-shadow: inset 0 -2px 0 0 var(--accent, currentColor);
+}
+
+.sk-current-ink i {
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  display: block;
+  background: currentColor;
+}
+
+/* ----- popovers ----- */
+.sk-pop-wrap {
+  position: relative;
+  display: inline-flex;
+}
+.sk-pop {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 40;
+  min-width: 190px;
+  padding: 6px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--page);
+  box-shadow: 0 10px 30px rgb(0 0 0 / 0.28);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.sk-pop-right {
+  left: auto;
+  right: 0;
+}
+.sk-pop-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: 7px;
+  background: none;
+  color: inherit;
+  font: inherit;
+  font-size: var(--fs-micro, 11px);
+  text-align: start;
+  cursor: pointer;
+}
+.sk-pop-item:hover:not(:disabled),
+.sk-pop-chip:hover:not(:disabled) {
+  background: var(--hover);
+}
+.sk-pop-item:disabled,
+.sk-pop-chip:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.sk-pop-key {
+  color: var(--faint);
+  font-size: 10px;
+}
+.sk-pop-label {
+  padding: 4px 8px 2px;
+  color: var(--faint);
+  font-size: 9.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.sk-pop-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 2px 4px 4px;
+}
+.sk-pop-chip {
+  padding: 4px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: none;
+  color: inherit;
+  font: inherit;
+  font-size: 10.5px;
+  cursor: pointer;
+}
+.sk-pop-sep {
+  height: 1px;
+  margin: 4px 2px;
+  background: var(--line);
+}
+
+/* ----- selection ----- */
+.sk-sel-box {
+  fill: none;
+  stroke: var(--accent, #7aa2ff);
+  stroke-width: 1.5;
+  stroke-dasharray: 5 4;
+  vector-effect: non-scaling-stroke;
+  opacity: 0.9;
+}
+.sk-grip {
+  fill: var(--page, #fff);
+  stroke: var(--accent, #7aa2ff);
+  stroke-width: 1.5;
+  vector-effect: non-scaling-stroke;
+}
+/* The cursor is the only thing that says a grip resizes rather than moves. */
+.sk-grip-nw, .sk-grip-se { cursor: nwse-resize; }
+.sk-grip-ne, .sk-grip-sw { cursor: nesw-resize; }
+.sk-grip-n, .sk-grip-s { cursor: ns-resize; }
+.sk-grip-e, .sk-grip-w { cursor: ew-resize; }
+
+.sk-marquee {
+  fill: var(--accent, #7aa2ff);
+  fill-opacity: 0.08;
+  stroke: var(--accent, #7aa2ff);
+  stroke-width: 1;
+  stroke-dasharray: 4 3;
+  vector-effect: non-scaling-stroke;
+}
+
+/* An alignment line is a statement about the drawing, not part of it: thin,
+   accented, and gone the moment the drag ends. */
+.sk-guide {
+  stroke: var(--accent, #7aa2ff);
+  stroke-width: 1;
+  stroke-dasharray: 3 3;
+  vector-effect: non-scaling-stroke;
+  opacity: 0.75;
+  pointer-events: none;
+}
+
+/* ----- the empty state ----- */
+.sk-empty {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  /* THE WHOLE LAYER IS TRANSPARENT TO THE POINTER. An offer that swallows the
+     first click on an empty canvas is worse than no offer at all; only the
+     buttons themselves opt back in. */
+  pointer-events: none;
+}
+.sk-empty-cards {
+  display: flex;
+  gap: 14px;
+  flex-wrap: wrap;
+  justify-content: center;
+  max-width: 720px;
+}
+.sk-empty-card {
+  pointer-events: auto;
+  width: 200px;
+  padding: 18px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--page);
+  color: inherit;
+  font: inherit;
+  text-align: start;
+  cursor: pointer;
+}
+.sk-empty-card:hover {
+  background: var(--hover);
+}
+.sk-empty-title {
+  font-family: var(--display);
+  font-size: 14px;
+}
+.sk-empty-copy {
+  color: var(--ink-2, var(--faint));
+  font-size: var(--fs-micro, 11px);
+  line-height: 1.45;
+}
+
+/* ----- the object list ----- */
+.sk-objects {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 4px 10px;
+  border-top: 1px solid var(--line);
+}
+/* The count is also the handle: it says how much there is and opens the lot. */
+.sk-objects-toggle {
+  flex: 0 0 auto;
+  padding: 3px 7px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: none;
+  color: var(--faint);
+  font: inherit;
+  font-size: 10.5px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.sk-objects-toggle:hover {
+  background: var(--hover);
+  color: inherit;
+}
+.sk-objects-toggle[aria-expanded="true"] {
+  color: inherit;
+  border-color: var(--accent, #7aa2ff);
+}
+/* One row that scrolls, until the count is clicked — then it wraps, up to a
+   height that still leaves most of the window to the drawing. */
+.sk-objects-row {
+  display: flex;
+  flex: 1 1 auto;
+  gap: 4px;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+.sk-objects-open .sk-objects-row {
+  flex-wrap: wrap;
+  overflow-x: hidden;
+  overflow-y: auto;
+  max-height: 22vh;
+}
+.sk-object {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: 0 0 auto;
+  max-width: 190px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 3px 8px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: none;
+  color: var(--faint);
+  font: inherit;
+  font-size: 10.5px;
+  cursor: pointer;
+}
+.sk-object:hover {
+  background: var(--hover);
+  color: inherit;
+}
+.sk-object.on {
+  border-color: var(--accent, #7aa2ff);
+  color: inherit;
+}
+.sk-object-locked {
+  font-style: italic;
+}
+.sk-object-lock {
+  flex: 0 0 auto;
+  width: 9px;
+  height: 9px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2.4;
 }

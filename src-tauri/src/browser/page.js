@@ -766,6 +766,19 @@
   /** The page — or the user's current selection — as save-ready content:
    *  readable markdown plus the raw HTML of the LIVE DOM. Unlike a re-fetch,
    *  this is what is actually on screen: scripts run, logins honoured. */
+  /** A non-empty selection, by `capture`'s own definition of one.
+   *
+   * Whitespace-only does not count: `capture` trims and then refuses, so a
+   * scope offered on the untrimmed answer would be offered for a selection
+   * that the very next call reports as nothing selected. */
+  function hasSelection() {
+    try {
+      return String(window.getSelection() || "").trim().length > 0;
+    } catch (e) {
+      return false;
+    }
+  }
+
   function capture(args) {
     var what = args && args.what === "selection" ? "selection" : "page";
     if (what === "selection") {
@@ -783,6 +796,11 @@
         text: sel.slice(0, CAPTURE_TEXT_MAX),
         html: "",
         truncated: sel.length > CAPTURE_TEXT_MAX,
+        // The WHOLE selection's length, so a caller that shows a clipped
+        // passage can say how much it is not showing. Without it the only
+        // honest thing to print is "some of this is missing", and the only
+        // dishonest one is a number nobody measured.
+        total: sel.length,
       };
     }
     var text = readMarkdown("main");
@@ -1363,6 +1381,13 @@
             // it, so a single double-Escape can never hand the keyboard back
             // twice.
             leaveRequested: takeLeaveRequest(),
+            // Is there a passage selected right now? Rides on the poll that is
+            // already running rather than costing a round trip of its own —
+            // the assistant's scope strip has to know whether to OFFER a
+            // "selected passage" scope, and a scope it offers for a selection
+            // that does not exist can only refuse. Read the same way `capture`
+            // reads it, so the two cannot disagree about what counts.
+            hasSelection: hasSelection(),
             doc: DOC_ID,
           };
         default:

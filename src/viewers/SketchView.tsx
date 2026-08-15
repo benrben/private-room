@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactElement } from "react";
 import { api } from "../api";
 import { prefersReducedMotion } from "../rooms/helpers";
+import { setSketchFocus } from "../workspace/sketchFocus";
 import "./sketch.css";
 import {
   CANVAS_H,
@@ -27,6 +28,29 @@ import {
   strokePath,
   translate,
   undo,
+  HANDLES,
+  type Handle,
+  type Rect,
+  align,
+  bboxOfMany,
+  canConnect,
+  chipLabel,
+  describeElement,
+  distribute,
+  duplicate,
+  fitToBox,
+  guidesFor,
+  handleAt,
+  historyHint,
+  hitTestArea,
+  reflow,
+  reorder,
+  resizedBox,
+  routeBetween,
+  snapTo,
+  type AlignEdge,
+  type Guide,
+  type Ordering,
 } from "./sketch/model";
 
 /**
@@ -142,10 +166,36 @@ export default function SketchView({ fileId, text }: Props) {
   const initial = useMemo(() => parseSketch(text), [text]);
   const [doc, setDoc] = useState<Sketch>(initial.doc);
   const [history, setHistory] = useState(emptyHistory());
-  const [tool, setTool] = useState<Tool>("pen");
+  // SELECT, not Pen. Opening a document must not put the canvas in a mode
+  // where the first click changes it: every sketch used to open ready to draw,
+  // so panning around someone's diagram left marks on it.
+  const [tool, setTool] = useState<Tool>("select");
+  /** Stay in the current tool after making one thing. Off by default — a tool
+   * that keeps drawing is the exception people ask for, not the resting
+   * state — and double-clicking a tool button turns it on. */
+  const [sticky, setSticky] = useState(false);
   const [ink, setInk] = useState<Ink>("blue");
   const [fill, setFill] = useState(false);
-  const [selected, setSelected] = useState<string | null>(null);
+  /** WHAT IS SELECTED — several things, in the order they were picked.
+   *
+   * An array rather than a Set so the inspector can name "3 things" and the
+   * arrange actions have a stable order to work in; small enough that the
+   * membership tests below cost nothing. */
+  const [selected, setSelected] = useState<string[]>([]);
+  /** Whether dragging snaps to other shapes and to the paper's dots. */
+  const [snap, setSnap] = useState(true);
+  /** The alignment lines to draw right now — live, only during a drag. */
+  const [guides, setGuides] = useState<Guide[]>([]);
+  /** The marquee being dragged, in canvas units. */
+  const [marquee, setMarquee] = useState<Rect | null>(null);
+  /** Which toolbar popover is open. One at a time, like the room's toolbar. */
+  const [menu, setMenu] = useState<"arrange" | "export" | "zoom" | "ink" | null>(null);
+  /** Whether the object strip shows every object at once or a single row. */
+  const [stripOpen, setStripOpen] = useState(false);
+  /** Whether a text field on this page owns the keyboard right now. */
+  const [typing, setTyping] = useState(false);
+  /** The shape a connector being drawn started on, if it started on one. */
+  const connectFrom = useRef<string | null>(null);
   const [saveState, setSaveState] = useState<"saved" | "saving" | "failed">("saved");
   const [note, setNote] = useState<string | null>(initial.error);
   /** Ids the agent just added, revealed one at a time. */
@@ -153,8 +203,20 @@ export default function SketchView({ fileId, text }: Props) {
   const [fresh, setFresh] = useState<Set<string>>(new Set());
 
   const svgRef = useRef<SVGSVGElement | null>(null);
+  /** Each object's chip in the strip below, so the selected one can be brought
+   * back into a row that scrolls sideways. */
+  const chipRefs = useRef(new Map<string, HTMLButtonElement>());
+  /** The live selection, for handlers that must not re-register per change. */
+  const selectedRef = useRef<string[]>([]);
+  /** …and the same for the open menu and the armed tool, both read by the
+   * capture-phase Escape listener below. */
+  const menuRef = useRef<string | null>(null);
+  const toolRef = useRef<Tool>("select");
   const docRef = useRef(doc);
   docRef.current = doc;
+  selectedRef.current = selected;
+  menuRef.current = menu;
+  toolRef.current = tool;
   /** Advance the live document NOW, not at the next render.
    *
    * Several pointer events can arrive between two React renders, and each one
@@ -181,6 +243,18 @@ export default function SketchView({ fileId, text }: Props) {
   const trail = useRef<Point[]>([]);
   const anchor = useRef<Point | null>(null);
   const dragFrom = useRef<Point | null>(null);
+  /** A resize in flight: which grip, the boxes it started from, and where the
+   * pointer went down. Resizes are computed from the ORIGINAL box and the
+   * TOTAL movement — see `resizedBox` for why accumulating deltas walks the
+   * shape across the page. */
+  const resizing = useRef<{
+    handle: Handle;
+    box: Rect;
+    from: Point;
+    els: SketchElement[];
+  } | null>(null);
+  /** Where a marquee started. */
+  const marqueeFrom = useRef<Point | null>(null);
   const erasing = useRef(false);
   const capturedPointer = useRef<number | null>(null);
   /** Which part of the page is on screen: the top-left corner and the scale.
@@ -460,7 +534,7 @@ export default function SketchView({ fileId, text }: Props) {
     }
     advance(next);
     scheduleSave(next);
-    setSelected(null);
+    setSelected([]);
   };
 
   const onPointerDown = (ev: React.PointerEvent) => {
@@ -501,9 +575,39 @@ export default function SketchView({ fileId, text }: Props) {
       return;
     }
     if (tool === "select") {
-      const hit = hitTest(doc, p[0], p[1]);
-      setSelected(hit ? hit.id : null);
-      dragFrom.current = hit ? p : null;
+      // A grip first: it sits on top of whatever it belongs to, so testing the
+      // shape underneath would make the corner of a selected box un-grabbable.
+      const grip = gripUnder(p);
+      if (grip) {
+        const els = docRef.current.elements.filter((e) => selected.includes(e.id));
+        const box = bboxOfMany(els);
+        if (box) {
+          resizing.current = { handle: grip, box, from: p, els };
+          return;
+        }
+      }
+      const hit = hitTest(docRef.current, p[0], p[1]);
+      if (hit?.locked) {
+        // Locked is background. Clicking it starts a marquee over it rather
+        // than selecting something the user cannot then do anything with.
+        setSelected([]);
+        marqueeFrom.current = p;
+        return;
+      }
+      if (!hit) {
+        if (!ev.shiftKey) setSelected([]);
+        marqueeFrom.current = p;
+        return;
+      }
+      // Shift adds and removes; a plain click on something already selected
+      // keeps the whole selection, so a group can be dragged by any member.
+      setSelected((cur) => {
+        if (ev.shiftKey) {
+          return cur.includes(hit.id) ? cur.filter((id) => id !== hit.id) : [...cur, hit.id];
+        }
+        return cur.includes(hit.id) ? cur : [hit.id];
+      });
+      dragFrom.current = p;
       return;
     }
 
@@ -514,6 +618,11 @@ export default function SketchView({ fileId, text }: Props) {
       trail.current = [p];
       setPreview({ id: "preview", type: "pen", points: [p, p], ink });
     } else if (tool === "arrow") {
+      // An arrow that STARTS on a shape is a connector being drawn. Recording
+      // it here — rather than guessing from the finished points — is what lets
+      // a link survive the boxes moving later.
+      const under = hitTest(docRef.current, p[0], p[1]);
+      connectFrom.current = canConnect(under) ? under.id : null;
       setPreview({ id: "preview", type: "arrow", points: [p, p], ink });
     } else {
       setPreview({ id: "preview", type: tool, x: p[0], y: p[1], w: 1, h: 1, ink, fill });
@@ -535,23 +644,83 @@ export default function SketchView({ fileId, text }: Props) {
       eraseAt(toCanvas(ev), false);
       return;
     }
-    // Dragging a selected element.
-    if (dragFrom.current && selected) {
+    // Stretching the selection by one of its grips.
+    if (resizing.current) {
+      const { handle, box, from, els } = resizing.current;
       const p = toCanvas(ev);
-      const dx = p[0] - dragFrom.current[0];
-      const dy = p[1] - dragFrom.current[1];
+      if (!drawingRef.current) {
+        drawingRef.current = true;
+        setHistory((h) => pushHistory(h, docRef.current));
+      }
+      const to = resizedBox(box, handle, p[0] - from[0], p[1] - from[1], ev.shiftKey);
+      const moved = new Map(els.map((e) => [e.id, fitToBox(e, box, to)]));
+      const next = reflow({
+        ...docRef.current,
+        elements: docRef.current.elements.map((e) => moved.get(e.id) ?? e),
+      });
+      advance(next);
+      scheduleSave(next);
+      return;
+    }
+    // Sweeping a marquee over the page.
+    if (marqueeFrom.current) {
+      const p = toCanvas(ev);
+      const [ax, ay] = marqueeFrom.current;
+      setMarquee({
+        x: Math.min(ax, p[0]),
+        y: Math.min(ay, p[1]),
+        w: Math.abs(p[0] - ax),
+        h: Math.abs(p[1] - ay),
+      });
+      return;
+    }
+    // Dragging the selection.
+    if (dragFrom.current && selected.length) {
+      const p = toCanvas(ev);
+      let dx = p[0] - dragFrom.current[0];
+      let dy = p[1] - dragFrom.current[1];
       if (!drawingRef.current && Math.hypot(dx, dy) < 3) return;
       if (!drawingRef.current) {
         drawingRef.current = true;
         setHistory((h) => pushHistory(h, docRef.current));
       }
-      dragFrom.current = p;
-      const next = {
+      const picked = new Set(selected);
+      const moving = docRef.current.elements.filter((e) => picked.has(e.id));
+      // Snap the WHOLE selection by its own outer box, against everything it
+      // is not — so three boxes dragged together line up as a block, and a
+      // shape can never snap to itself.
+      let landed: Guide[] = [];
+      if (snap && !ev.altKey) {
+        const box = bboxOfMany(moving);
+        if (box) {
+          const others = docRef.current.elements
+            .filter((e) => !picked.has(e.id))
+            .map((e) => bboxOf(e));
+          const shifted = { ...box, x: box.x + dx, y: box.y + dy };
+          const pull = guidesFor(shifted, others);
+          if (pull.guides.length) {
+            dx += pull.dx;
+            dy += pull.dy;
+            landed = pull.guides;
+          } else {
+            // Nothing to line up with, so fall back to the paper's own dots.
+            dx = snapTo(box.x + dx) - box.x;
+            dy = snapTo(box.y + dy) - box.y;
+          }
+        }
+      }
+      if (dx === 0 && dy === 0) {
+        setGuides(landed);
+        return;
+      }
+      dragFrom.current = [dragFrom.current[0] + dx, dragFrom.current[1] + dy];
+      setGuides(landed);
+      const next = reflow({
         ...docRef.current,
         elements: docRef.current.elements.map((e) =>
-          e.id === selected ? translate(e, dx, dy) : e,
+          picked.has(e.id) ? translate(e, dx, dy) : e,
         ),
-      };
+      });
       advance(next);
       scheduleSave(next);
       return;
@@ -593,12 +762,30 @@ export default function SketchView({ fileId, text }: Props) {
     }
   };
 
-  const endGesture = () => {
+  const endGesture = (ev?: React.PointerEvent) => {
     const wasDrawing = drawingRef.current;
     drawingRef.current = false;
     dragFrom.current = null;
     erasing.current = false;
     panning.current = null;
+    resizing.current = null;
+    setGuides([]);
+
+    // A marquee picks up everything it fully contains — and never anything
+    // locked, because a lasso that quietly grabbed the background would then
+    // move it.
+    if (marqueeFrom.current) {
+      marqueeFrom.current = null;
+      const area = marquee;
+      setMarquee(null);
+      if (area && (area.w > 3 || area.h > 3)) {
+        const inside = hitTestArea(docRef.current, area)
+          .filter((e) => !e.locked)
+          .map((e) => e.id);
+        setSelected((cur) => (ev?.shiftKey ? [...new Set([...cur, ...inside])] : inside));
+      }
+      return;
+    }
     if (capturedPointer.current !== null) {
       // `try` because releasing a pointer the element no longer holds throws,
       // and a throw here would skip everything below it — including the agent
@@ -619,7 +806,20 @@ export default function SketchView({ fileId, text }: Props) {
         if (points.length > 1) made = { ...preview, id, points };
       } else if (preview.type === "arrow") {
         const [a, b] = preview.points;
-        if (Math.hypot(b[0] - a[0], b[1] - a[1]) > 8) made = { ...preview, id };
+        if (Math.hypot(b[0] - a[0], b[1] - a[1]) > 8) {
+          made = { ...preview, id };
+          // Landing on a shape, having started on one, makes this a link
+          // rather than a line that happens to sit between two boxes.
+          const under = hitTest(docRef.current, b[0], b[1]);
+          const from = connectFrom.current;
+          if (from && canConnect(under) && under.id !== from) {
+            const start = docRef.current.elements.find((e) => e.id === from);
+            if (start) {
+              const [p, q] = routeBetween(bboxOf(start), bboxOf(under));
+              made = { ...made, from, to: under.id, points: [p, q] };
+            }
+          }
+        }
       } else if (
         (preview.type === "rect" || preview.type === "ellipse") &&
         preview.w > 10 &&
@@ -633,9 +833,14 @@ export default function SketchView({ fileId, text }: Props) {
           seq,
           elements: [...docRef.current.elements, made],
         });
-        setSelected(made.id);
+        setSelected([made.id]);
+        // One shape, then back to Select. A tool that stays armed is how a
+        // canvas collects marks nobody meant to make; double-clicking the
+        // tool button is the way to ask for the other behaviour.
+        if (!sticky) setTool("select");
       }
     }
+    connectFrom.current = null;
     anchor.current = null;
     trail.current = [];
     setPreview(null);
@@ -674,7 +879,7 @@ export default function SketchView({ fileId, text }: Props) {
     setHistory(r.history);
     setDoc(r.doc);
     scheduleSave(r.doc);
-    setSelected(null);
+    setSelected([]);
   }, [history, scheduleSave]);
 
   const doRedo = useCallback(() => {
@@ -686,13 +891,124 @@ export default function SketchView({ fileId, text }: Props) {
   }, [history, scheduleSave]);
 
   const deleteSelected = useCallback(() => {
-    if (!selected) return;
+    if (!selected.length) return;
+    const picked = new Set(selected);
+    // Reflowed, so a connector whose shape was just deleted drops its
+    // attachment here rather than at the next unrelated edit.
+    commit(
+      reflow({
+        ...docRef.current,
+        elements: docRef.current.elements.filter((e) => !picked.has(e.id) || e.locked),
+      }),
+    );
+    setSelected([]);
+  }, [selected, commit]);
+
+  /** The elements the selection names, in document order. */
+  const chosenEls = useCallback(
+    () => docRef.current.elements.filter((e) => selected.includes(e.id)),
+    [selected],
+  );
+
+  const doAlign = useCallback(
+    (edge: AlignEdge) => {
+      const moved = new Map(align(chosenEls(), edge).map((e) => [e.id, e]));
+      commit(
+        reflow({
+          ...docRef.current,
+          elements: docRef.current.elements.map((e) => moved.get(e.id) ?? e),
+        }),
+      );
+    },
+    [chosenEls, commit],
+  );
+
+  const doDistribute = useCallback(
+    (axis: "x" | "y") => {
+      const moved = new Map(distribute(chosenEls(), axis).map((e) => [e.id, e]));
+      commit(
+        reflow({
+          ...docRef.current,
+          elements: docRef.current.elements.map((e) => moved.get(e.id) ?? e),
+        }),
+      );
+    },
+    [chosenEls, commit],
+  );
+
+  const doOrder = useCallback(
+    (where: Ordering) => commit(reorder(docRef.current, selected, where)),
+    [selected, commit],
+  );
+
+  const doDuplicate = useCallback(() => {
+    const { doc: next, ids } = duplicate(docRef.current, selected);
+    if (!ids.length) return;
+    commit(next);
+    setSelected(ids);
+  }, [selected, commit]);
+
+  const toggleLock = useCallback(() => {
+    const picked = new Set(selected);
+    if (!picked.size) return;
+    // One question for the whole selection: if anything in it is loose,
+    // locking is what the user means. A per-element toggle would leave a mixed
+    // selection alternating on every press.
+    const anyLoose = docRef.current.elements.some((e) => picked.has(e.id) && !e.locked);
     commit({
       ...docRef.current,
-      elements: docRef.current.elements.filter((e) => e.id !== selected),
+      elements: docRef.current.elements.map((e) =>
+        picked.has(e.id) ? { ...e, locked: anyLoose || undefined } : e,
+      ),
     });
-    setSelected(null);
+    if (anyLoose) setSelected([]);
   }, [selected, commit]);
+
+  const selectAll = useCallback(() => {
+    setSelected(docRef.current.elements.filter((e) => !e.locked).map((e) => e.id));
+  }, []);
+
+  /** Move the selection by whole units, or by the grid with Shift. */
+  const nudge = useCallback(
+    (dx: number, dy: number) => {
+      const picked = new Set(selected);
+      if (!picked.size) return;
+      commit(
+        reflow({
+          ...docRef.current,
+          elements: docRef.current.elements.map((e) =>
+            picked.has(e.id) ? translate(e, dx, dy) : e,
+          ),
+        }),
+      );
+    },
+    [selected, commit],
+  );
+
+  /** Zoom until the selection fills the pane, or the whole page if nothing is
+   * selected. */
+  const zoomToSelection = useCallback(() => {
+    const box = bboxOfMany(chosenEls()) ?? {
+      x: 0,
+      y: 0,
+      w: docRef.current.width,
+      h: docRef.current.height,
+    };
+    if (box.w <= 0 || box.h <= 0) return;
+    const pad = 60;
+    const k = Math.max(
+      MIN_ZOOM,
+      Math.min(
+        MAX_ZOOM,
+        Math.min(docRef.current.width / (box.w + pad), docRef.current.height / (box.h + pad)),
+      ),
+    );
+    setView({
+      k,
+      x: box.x + box.w / 2 - docRef.current.width / k / 2,
+      y: box.y + box.h / 2 - docRef.current.height / k / 2,
+    });
+  }, [chosenEls]);
 
   const relabel = (id: string, label: string) => {
     commit({
@@ -703,14 +1019,157 @@ export default function SketchView({ fileId, text }: Props) {
     });
   };
 
-  const exportSvg = async () => {
-    try {
-      const meta = await api.exportSketchSvg(fileId);
-      setNote(`Exported "${meta.name}" into the Library.`);
-    } catch (e) {
-      setNote(e instanceof Error ? e.message : String(e));
-    }
+  /** Three linked boxes: something to rename and rearrange rather than a
+   * blank page. Deliberately the smallest useful thing — a template GALLERY is
+   * a feature of its own, and one starter that always works beats a menu of
+   * layouts that mostly do not fit. */
+  const startTemplate = () => {
+    let seq = docRef.current.seq;
+    const id = () => `e${++seq}`;
+    const a = id();
+    const b = id();
+    const c = id();
+    const mk = (eid: string, x: number, label: string): SketchElement => ({
+      id: eid,
+      type: "rect",
+      x,
+      y: 420,
+      w: 260,
+      h: 140,
+      ink,
+      label,
+    });
+    const boxes = [mk(a, 180, "First"), mk(b, 660, "Then"), mk(c, 1140, "After that")];
+    const link = (eid: string, from: string, to: string): SketchElement => ({
+      id: eid,
+      type: "arrow",
+      points: [
+        [0, 0],
+        [0, 0],
+      ],
+      ink,
+      from,
+      to,
+    });
+    const next = reflow({
+      ...docRef.current,
+      seq: seq + 2,
+      elements: [...boxes, link(id(), a, b), link(id(), b, c)],
+    });
+    commit(next);
+    setSelected([a]);
   };
+
+/* No export control on this toolbar.
+ *
+ * There was one, and the file header a few pixels above it had another with
+ * the same word on it — two buttons named Export, doing different things
+ * (this one wrote a flattened copy INTO the room; that one writes a copy OUT
+ * of it), with nothing on either saying which. File-level acts belong to the
+ * file header, so both of this one's formats moved there and the toolbar went
+ * back to being about drawing. */
+
+  /** ESCAPE, CLAIMED IN LAYERS — and claimed BEFORE the shell sees it.
+   *
+   * The shell closes the open file on Escape (`effects.ts`), and both handlers
+   * sit on `window`. The shell's is registered when the room mounts and this
+   * one when a sketch opens, so in the bubble phase the shell always ran
+   * first: pressing Escape to dismiss the Arrange menu closed the drawing
+   * instead. Capture runs before every bubble listener on the same target, so
+   * this one gets to decide first and stops the event when it does.
+   *
+   * The layers are what a person expects: the topmost thing goes first.
+   *
+   *   1. a menu is open  → close the menu, and nothing else
+   *   2. something is selected, or a tool is armed → back to a safe canvas
+   *   3. neither         → fall through, and the shell closes the file
+   *
+   * Only the layers this component actually acts on stop the event. Falling
+   * through silently is what keeps Escape-closes-the-file working everywhere
+   * else in the app. */
+  useEffect(() => {
+    const onEscape = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      const el = document.activeElement;
+      // A text field owns its own Escape (cancel the edit) — and the shell
+      // already declines to close a file while someone is typing.
+      if (el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA")) return;
+      if (menuRef.current) {
+        e.preventDefault();
+        e.stopPropagation();
+        setMenu(null);
+        return;
+      }
+      if (selectedRef.current.length || toolRef.current !== "select") {
+        e.preventDefault();
+        e.stopPropagation();
+        setSelected([]);
+        setTool("select");
+        setSticky(false);
+      }
+    };
+    window.addEventListener("keydown", onEscape, { capture: true });
+    return () => window.removeEventListener("keydown", onEscape, { capture: true });
+  }, []);
+
+  /** WHICH UNDO THE KEYBOARD IS TALKING TO.
+   *
+   * A note or a label is a real text field, and ⌘Z inside one is the field's
+   * own undo — the drawing keeps out of it deliberately (see the shortcut
+   * handler above). So typing, then pressing ⌘Z, then seeing the toolbar's
+   * undo greyed out reads as a broken history when both are working: two
+   * histories, one of them not the toolbar's. Knowing which has the keyboard
+   * is what lets the page say so. */
+  useEffect(() => {
+    const isField = (n: EventTarget | null): boolean => {
+      const el = n as HTMLElement | null;
+      return !!el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA");
+    };
+    const arrived = (e: FocusEvent) => setTyping(isField(e.target));
+    const left = () => setTyping(false);
+    window.addEventListener("focusin", arrived);
+    window.addEventListener("focusout", left);
+    return () => {
+      window.removeEventListener("focusin", arrived);
+      window.removeEventListener("focusout", left);
+    };
+  }, []);
+
+  /** TELL THE ASSISTANT WHAT IS SELECTED.
+   *
+   * The chat is a sibling pane with no way to see this canvas; without this it
+   * answers "what is missing here?" from the whole room while the drawing sits
+   * unread beside it. Published as the same sentences the object strip shows,
+   * so the two can never describe the selection differently. */
+  useEffect(() => {
+    setSketchFocus({
+      fileId,
+      selection: doc.elements
+        .filter((e) => selected.includes(e.id))
+        .map(describeElement),
+    });
+  }, [fileId, doc.elements, selected]);
+  // Separately from the value, because closing the drawing must retire it even
+  // if the last render never ran: a stale focus would have the chat offering to
+  // answer from a canvas that is no longer on screen.
+  useEffect(() => () => setSketchFocus(null), []);
+
+  /** BRING THE SELECTED OBJECT BACK INTO THE ROW.
+   *
+   * The strip is one row that scrolls sideways, so on a busy page the chip for
+   * whatever was just selected — clicked on the canvas, caught by a marquee,
+   * or drawn a moment ago — is usually past the right edge. A strip that does
+   * not follow the selection is worse than no strip at all: it shows a row of
+   * unselected chips while claiming to be the list of what is selected. */
+  useEffect(() => {
+    const first = selected[0];
+    if (!first) return;
+    chipRefs.current.get(first)?.scrollIntoView({
+      block: "nearest",
+      inline: "nearest",
+      behavior: prefersReducedMotion() ? "auto" : "smooth",
+    });
+  }, [selected]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -738,7 +1197,43 @@ export default function SketchView({ fileId, text }: Props) {
         else doUndo();
         return;
       }
+      if (meta && e.key.toLowerCase() === "a") {
+        e.preventDefault();
+        selectAll();
+        return;
+      }
+      if (meta && e.key.toLowerCase() === "d") {
+        e.preventDefault();
+        doDuplicate();
+        return;
+      }
+      if (meta && e.key === "]") {
+        e.preventDefault();
+        doOrder(e.shiftKey ? "front" : "forward");
+        return;
+      }
+      if (meta && e.key === "[") {
+        e.preventDefault();
+        doOrder(e.shiftKey ? "back" : "backward");
+        return;
+      }
       if (meta || e.altKey) return;
+      // Arrow keys move the selection: one unit for fine work, a whole grid
+      // square with Shift. Without this the only way to place something
+      // precisely was to drag it and hope.
+      const step: Record<string, [number, number]> = {
+        ArrowLeft: [-1, 0],
+        ArrowRight: [1, 0],
+        ArrowUp: [0, -1],
+        ArrowDown: [0, 1],
+      };
+      const move = step[e.key];
+      if (move && selectedRef.current.length) {
+        e.preventDefault();
+        const by = e.shiftKey ? GRID_GAP : 1;
+        nudge(move[0] * by, move[1] * by);
+        return;
+      }
       const t = KEY_TOOL[e.key.toLowerCase()];
       if (t) {
         setTool(t);
@@ -748,65 +1243,276 @@ export default function SketchView({ fileId, text }: Props) {
         e.preventDefault();
         deleteSelected();
       }
-      if (e.key === "Escape") setSelected(null);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [doUndo, doRedo, deleteSelected, zoomAt, fitPage]);
+  }, [doUndo, doRedo, deleteSelected, zoomAt, fitPage, selectAll, doDuplicate, doOrder, nudge]);
 
-  const chosen = doc.elements.find((e) => e.id === selected) ?? null;
+  /** WHAT SOMEONE WHO CANNOT SEE THE CANVAS IS TOLD IT CONTAINS.
+   *
+   * The canvas used to reach the accessibility tree as a count of anonymous
+   * images — "12 things on the page" and no way to learn what any of them
+   * were, or to reach one. The count stays, because it is true and useful, but
+   * it is no longer the whole story: the list below names every object and can
+   * be tabbed through, and selecting a row selects the shape. */
+  const picked = doc.elements.filter((e) => selected.includes(e.id));
+  const chosen = picked.length === 1 ? picked[0] : null;
+  const selBox = bboxOfMany(picked);
+  /** Which grip, if any, is under a canvas point. Generous, because a corner
+   * is a small target and missing it starts a marquee instead. */
+  const gripUnder = (p: Point): Handle | null => {
+    if (!selBox) return null;
+    const near = 11 / view.k;
+    for (const h of HANDLES) {
+      const [hx, hy] = handleAt(selBox, h);
+      if (Math.abs(p[0] - hx) <= near && Math.abs(p[1] - hy) <= near) return h;
+    }
+    return null;
+  };
+  const canvasSummary = doc.elements.length
+    ? `Drawing canvas, ${doc.elements.length} object${doc.elements.length === 1 ? "" : "s"}${
+        selected.length ? `, ${selected.length} selected` : ""
+      }`
+    : "Drawing canvas, empty";
+
   const saveWord =
     saveState === "saved" ? "Saved" : saveState === "saving" ? "Saving…" : "Not saved";
 
   return (
     <div className="sk-page">
       <div className="sk-tools" role="toolbar" aria-label="Drawing tools">
-        {TOOLS.map((t) => (
+        {TOOLS.map((tl) => (
           <button
-            key={t.key}
+            key={tl.key}
             type="button"
-            className="sk-tool"
-            title={t.hint}
-            aria-label={t.label}
-            aria-pressed={tool === t.key}
-            onClick={() => setTool(t.key)}
+            className={`sk-tool${sticky && tool === tl.key ? " sk-locked-tool" : ""}`}
+            title={`${tl.hint}${tl.key === tool && sticky ? " · staying on" : ""}`}
+            aria-label={tl.label}
+            aria-pressed={tool === tl.key}
+            onClick={() => {
+              setTool(tl.key);
+              setSticky(false);
+              setMenu(null);
+            }}
+            // Double-click arms a tool to STAY. One shape then back to Select
+            // is the safe default; this is how to ask for the other one, and
+            // the button shows which state it is in.
+            onDoubleClick={() => {
+              setTool(tl.key);
+              setSticky(tl.key !== "select");
+            }}
           >
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              {t.icon}
-            </svg>
+            <svg viewBox="0 0 24 24" aria-hidden="true">{tl.icon}</svg>
           </button>
         ))}
+
         <span className="sk-div" />
-        {INKS.map((k) => (
+
+        {/* ONE colour control, not five permanent swatches. The palette is a
+            press away, and the button shows what is currently loaded — which
+            is the fact the five dots were spending the whole width to say. */}
+        <div className="sk-pop-wrap">
           <button
-            key={k}
             type="button"
-            className={`sk-swatch sk-ink-${k}`}
-            title={k}
-            aria-label={`${k} pen`}
-            aria-pressed={ink === k}
-            onClick={() => setInk(k)}
+            className={`sk-tool sk-current-ink sk-ink-${ink}`}
+            aria-haspopup="menu"
+            aria-expanded={menu === "ink"}
+            aria-label={`Colour: ${ink}`}
+            title={`Colour: ${ink}`}
+            onClick={() => setMenu((m) => (m === "ink" ? null : "ink"))}
           >
             <i />
           </button>
-        ))}
-        <button
-          type="button"
-          className="sk-tool sk-wide"
-          aria-pressed={fill}
-          onClick={() => setFill((f) => !f)}
-          title="Fill new shapes with a translucent wash"
-        >
-          Fill
-        </button>
+          {menu === "ink" ? (
+            <div className="sk-pop" role="menu" aria-label="Colour">
+              <div className="sk-pop-row">
+                {INKS.map((k) => (
+                  <button
+                    key={k}
+                    type="button"
+                    role="menuitemradio"
+                    aria-checked={ink === k}
+                    className={`sk-swatch sk-ink-${k}`}
+                    aria-label={`${k} ink`}
+                    title={k}
+                    onClick={() => {
+                      setInk(k);
+                      // A colour chosen with something selected recolours it —
+                      // otherwise the control only ever affects the NEXT shape,
+                      // which is not what picking a colour looks like it does.
+                      if (selected.length) {
+                        const on = new Set(selected);
+                        commit({
+                          ...docRef.current,
+                          elements: docRef.current.elements.map((e) =>
+                            on.has(e.id) ? { ...e, ink: k } : e,
+                          ),
+                        });
+                      }
+                      setMenu(null);
+                    }}
+                  >
+                    <i />
+                  </button>
+                ))}
+              </div>
+              <button
+                type="button"
+                role="menuitemcheckbox"
+                aria-checked={fill}
+                className="sk-pop-item"
+                onClick={() => setFill((f) => !f)}
+              >
+                Fill shapes with a wash
+              </button>
+              <button
+                type="button"
+                role="menuitemcheckbox"
+                aria-checked={snap}
+                className="sk-pop-item"
+                onClick={() => setSnap((s) => !s)}
+              >
+                Snap to shapes and the grid
+              </button>
+            </div>
+          ) : null}
+        </div>
+
+        {/* ARRANGE — everything that acts on a selection, in one place rather
+            than as eight more permanent buttons. Disabled, not hidden, so the
+            actions are discoverable before anything is selected. */}
+        <div className="sk-pop-wrap">
+          <button
+            type="button"
+            className="sk-tool sk-wide"
+            aria-haspopup="menu"
+            aria-expanded={menu === "arrange"}
+            disabled={!selected.length}
+            title={selected.length ? "Arrange the selection" : "Select something first"}
+            onClick={() => setMenu((m) => (m === "arrange" ? null : "arrange"))}
+          >
+            Arrange
+          </button>
+          {menu === "arrange" ? (
+            <div className="sk-pop" role="menu" aria-label="Arrange">
+              <div className="sk-pop-label">Align</div>
+              <div className="sk-pop-row">
+                {(
+                  [
+                    ["left", "Left"],
+                    ["hcenter", "Centre"],
+                    ["right", "Right"],
+                    ["top", "Top"],
+                    ["vcenter", "Middle"],
+                    ["bottom", "Bottom"],
+                  ] as Array<[AlignEdge, string]>
+                ).map(([edge, word]) => (
+                  <button
+                    key={edge}
+                    type="button"
+                    role="menuitem"
+                    className="sk-pop-chip"
+                    disabled={selected.length < 2}
+                    onClick={() => {
+                      doAlign(edge);
+                      setMenu(null);
+                    }}
+                  >
+                    {word}
+                  </button>
+                ))}
+              </div>
+              <div className="sk-pop-label">Distribute</div>
+              <div className="sk-pop-row">
+                <button
+                  type="button"
+                  role="menuitem"
+                  className="sk-pop-chip"
+                  disabled={selected.length < 3}
+                  onClick={() => {
+                    doDistribute("x");
+                    setMenu(null);
+                  }}
+                >
+                  Across
+                </button>
+                <button
+                  type="button"
+                  role="menuitem"
+                  className="sk-pop-chip"
+                  disabled={selected.length < 3}
+                  onClick={() => {
+                    doDistribute("y");
+                    setMenu(null);
+                  }}
+                >
+                  Down
+                </button>
+              </div>
+              <div className="sk-pop-sep" role="separator" />
+              {(
+                [
+                  ["front", "Bring to front", "⇧⌘]"],
+                  ["forward", "Bring forward", "⌘]"],
+                  ["backward", "Send backward", "⌘["],
+                  ["back", "Send to back", "⇧⌘["],
+                ] as Array<[Ordering, string, string]>
+              ).map(([where, word, key]) => (
+                <button
+                  key={where}
+                  type="button"
+                  role="menuitem"
+                  className="sk-pop-item"
+                  onClick={() => {
+                    doOrder(where);
+                    setMenu(null);
+                  }}
+                >
+                  {word}
+                  <span className="sk-pop-key">{key}</span>
+                </button>
+              ))}
+              <div className="sk-pop-sep" role="separator" />
+              <button
+                type="button"
+                role="menuitem"
+                className="sk-pop-item"
+                onClick={() => {
+                  doDuplicate();
+                  setMenu(null);
+                }}
+              >
+                Duplicate
+                <span className="sk-pop-key">⌘D</span>
+              </button>
+              <button
+                type="button"
+                role="menuitem"
+                className="sk-pop-item"
+                onClick={() => {
+                  toggleLock();
+                  setMenu(null);
+                }}
+              >
+                {picked.some((e) => !e.locked) ? "Lock in place" : "Unlock"}
+              </button>
+            </div>
+          ) : null}
+        </div>
+
         <span className="sk-div" />
         <button
           type="button"
           className="sk-tool"
           onClick={doUndo}
           disabled={!history.past.length}
-          title="Undo · ⌘Z"
-          aria-label="Undo"
+          title={historyHint({
+            verb: "Undo",
+            shortcut: "⌘Z",
+            depth: history.past.length,
+            typing,
+          })}
+          aria-label="Undo drawing change"
         >
           <svg viewBox="0 0 24 24" aria-hidden="true">
             <path d="M8.5 6 4.5 10l4 4M4.5 10h9a5.5 5.5 0 1 1 0 11H9" />
@@ -817,49 +1523,84 @@ export default function SketchView({ fileId, text }: Props) {
           className="sk-tool"
           onClick={doRedo}
           disabled={!history.future.length}
-          title="Redo · ⇧⌘Z"
-          aria-label="Redo"
+          title={historyHint({
+            verb: "Redo",
+            shortcut: "⇧⌘Z",
+            depth: history.future.length,
+            typing,
+          })}
+          aria-label="Redo drawing change"
         >
           <svg viewBox="0 0 24 24" aria-hidden="true">
             <path d="M15.5 6l4 4-4 4M19.5 10h-9a5.5 5.5 0 1 0 0 11H15" />
           </svg>
         </button>
-        <span className="sk-div" />
-        <button
-          type="button"
-          className="sk-tool"
-          onClick={() => zoomAt(0.8)}
-          title="Zoom out · ⌘−"
-          aria-label="Zoom out"
-        >
-          <svg viewBox="0 0 24 24" aria-hidden="true">
-            <circle cx="11" cy="11" r="6.5" />
-            <path d="M8 11h6M20 20l-4.4-4.4" />
-          </svg>
-        </button>
-        <button
-          type="button"
-          className="sk-tool sk-zoom"
-          onClick={fitPage}
-          title="Fit the page · ⌘0"
-        >
-          {Math.round(view.k * 100)}%
-        </button>
-        <button
-          type="button"
-          className="sk-tool"
-          onClick={() => zoomAt(1.25)}
-          title="Zoom in · ⌘+"
-          aria-label="Zoom in"
-        >
-          <svg viewBox="0 0 24 24" aria-hidden="true">
-            <circle cx="11" cy="11" r="6.5" />
-            <path d="M8 11h6M11 8v6M20 20l-4.4-4.4" />
-          </svg>
-        </button>
-        <button type="button" className="sk-tool sk-wide" onClick={exportSvg}>
-          Export SVG
-        </button>
+
+        {/* Zoom collapses into ONE control. Three buttons plus a percentage
+            were what pushed this toolbar onto a second row with the assistant
+            open — and a second row of a spatial palette is worse than a menu. */}
+        <div className="sk-pop-wrap sk-shrink">
+          <button
+            type="button"
+            className="sk-tool sk-zoom"
+            aria-haspopup="menu"
+            aria-expanded={menu === "zoom"}
+            title="Zoom"
+            onClick={() => setMenu((m) => (m === "zoom" ? null : "zoom"))}
+          >
+            {Math.round(view.k * 100)}%
+          </button>
+          {menu === "zoom" ? (
+            <div className="sk-pop" role="menu" aria-label="Zoom">
+              <button
+                type="button"
+                role="menuitem"
+                className="sk-pop-item"
+                onClick={() => {
+                  zoomAt(1.25);
+                  setMenu(null);
+                }}
+              >
+                Zoom in<span className="sk-pop-key">⌘+</span>
+              </button>
+              <button
+                type="button"
+                role="menuitem"
+                className="sk-pop-item"
+                onClick={() => {
+                  zoomAt(0.8);
+                  setMenu(null);
+                }}
+              >
+                Zoom out<span className="sk-pop-key">⌘−</span>
+              </button>
+              <button
+                type="button"
+                role="menuitem"
+                className="sk-pop-item"
+                disabled={!selected.length}
+                onClick={() => {
+                  zoomToSelection();
+                  setMenu(null);
+                }}
+              >
+                Zoom to selection
+              </button>
+              <button
+                type="button"
+                role="menuitem"
+                className="sk-pop-item"
+                onClick={() => {
+                  fitPage();
+                  setMenu(null);
+                }}
+              >
+                Fit the page<span className="sk-pop-key">⌘0</span>
+              </button>
+            </div>
+          ) : null}
+        </div>
+
       </div>
 
       <div className="sk-stage">
@@ -868,12 +1609,14 @@ export default function SketchView({ fileId, text }: Props) {
           className={`sk-canvas${spaceHeld || panning.current ? " sk-panning" : ""}`}
           viewBox={`${view.x} ${view.y} ${doc.width / view.k} ${doc.height / view.k}`}
           preserveAspectRatio="xMidYMid meet"
-          aria-label={`Drawing canvas, ${doc.elements.length} things on the page`}
+          role="application"
+          aria-label={canvasSummary}
           onPointerDown={onPointerDown}
           onPointerMove={onPointerMove}
           onPointerUp={endGesture}
           onPointerCancel={endGesture}
         >
+          <title>{canvasSummary}</title>
           <defs>
             <pattern
               id="sk-dots"
@@ -903,11 +1646,119 @@ export default function SketchView({ fileId, text }: Props) {
           <rect className="sk-edge" width={doc.width} height={doc.height} />
           {doc.elements.map((e) =>
             hidden.has(e.id) ? null : (
-              <Drawn key={e.id} el={e} selected={e.id === selected} fresh={fresh.has(e.id)} />
+              <Drawn
+                key={e.id}
+                el={e}
+                selected={selected.includes(e.id)}
+                fresh={fresh.has(e.id)}
+              />
             ),
           )}
           {preview ? <Drawn el={preview} selected={false} fresh={false} /> : null}
+
+          {/* The alignment lines, only while something is being dragged onto
+              them. Drawn across the whole sheet, because a guide that stops at
+              the two shapes it relates is hard to read as a line at all. */}
+          {guides.map((g) => (
+            <line
+              key={`${g.axis}${g.at}`}
+              className="sk-guide"
+              x1={g.axis === "x" ? g.at : -doc.width}
+              y1={g.axis === "x" ? -doc.height : g.at}
+              x2={g.axis === "x" ? g.at : doc.width * 2}
+              y2={g.axis === "x" ? doc.height * 2 : g.at}
+            />
+          ))}
+
+          {marquee ? (
+            <rect
+              className="sk-marquee"
+              x={marquee.x}
+              y={marquee.y}
+              width={marquee.w}
+              height={marquee.h}
+            />
+          ) : null}
+
+          {/* THE SELECTION AND ITS GRIPS.
+              Drawn once around the whole selection rather than per element, so
+              three shapes resize as one block — and so the grips are where a
+              person expects them, on the outside of everything selected. */}
+          {selBox && tool === "select" ? (
+            <g className="sk-sel" aria-hidden="true">
+              <rect
+                className="sk-sel-box"
+                x={selBox.x - 6}
+                y={selBox.y - 6}
+                width={selBox.w + 12}
+                height={selBox.h + 12}
+              />
+              {picked.some((e) => e.locked) ? null : (
+                HANDLES.map((h) => {
+                  const [hx, hy] = handleAt(
+                    { x: selBox.x - 6, y: selBox.y - 6, w: selBox.w + 12, h: selBox.h + 12 },
+                    h,
+                  );
+                  // Sized against the zoom so a grip is the same physical
+                  // target however far the page is scaled.
+                  const r = 5 / view.k;
+                  return (
+                    <rect
+                      key={h}
+                      className={`sk-grip sk-grip-${h}`}
+                      x={hx - r}
+                      y={hy - r}
+                      width={r * 2}
+                      height={r * 2}
+                    />
+                  );
+                })
+              )}
+            </g>
+          ) : null}
         </svg>
+
+        {/* THREE WAYS IN, instead of one passive sentence.
+            `pointer-events: none` on the layer with the buttons opted back in,
+            so an empty canvas can still be drawn on THROUGH the offer — a hint
+            that swallows the first click is worse than no hint. */}
+        {doc.elements.length === 0 && !preview ? (
+          <div className="sk-empty" aria-hidden={false}>
+            <div className="sk-empty-cards">
+              <button
+                type="button"
+                className="sk-empty-card"
+                onClick={() => {
+                  setTool("pen");
+                  setSticky(true);
+                }}
+              >
+                <span className="sk-empty-title">Draw freely</span>
+                <span className="sk-empty-copy">Use the pen and shapes to sketch ideas.</span>
+              </button>
+              <button
+                type="button"
+                className="sk-empty-card"
+                onClick={() => startTemplate()}
+              >
+                <span className="sk-empty-title">Start from a shape</span>
+                <span className="sk-empty-copy">
+                  Three linked boxes to rename and rearrange.
+                </span>
+              </button>
+              <button
+                type="button"
+                className="sk-empty-card"
+                onClick={() => setNote("Ask the assistant to draw from your room's files.")}
+              >
+                <span className="sk-empty-title">Turn room files into a diagram</span>
+                <span className="sk-empty-copy">
+                  Ask the assistant, with this sketch open.
+                </span>
+              </button>
+            </div>
+          </div>
+        ) : null}
 
         {textAt ? (
           <input
@@ -933,6 +1784,74 @@ export default function SketchView({ fileId, text }: Props) {
         ) : null}
       </div>
 
+      {/* EVERY OBJECT, REACHABLE WITHOUT A POINTER.
+          Visually a thin strip that only appears when the canvas has content;
+          for a screen reader it is the canvas's table of contents, and the one
+          way to select a shape without being able to see where it is.
+
+          One row by default, because it sits under the canvas and taking three
+          rows from the drawing to list the drawing is a bad trade. The count on
+          the left says how much is off the end and opens the whole set. */}
+      {doc.elements.length > 0 ? (
+        <div className={`sk-objects${stripOpen ? " sk-objects-open" : ""}`}>
+          <button
+            type="button"
+            className="sk-objects-toggle"
+            aria-expanded={stripOpen}
+            title={stripOpen ? "Back to a single row" : "Show every object at once"}
+            onClick={() => setStripOpen((v) => !v)}
+          >
+            {doc.elements.length} object{doc.elements.length === 1 ? "" : "s"}
+          </button>
+          <div
+            className="sk-objects-row"
+            role="listbox"
+            aria-label="Objects on this page"
+            aria-multiselectable="true"
+          >
+            {doc.elements.map((e, i) => (
+              <button
+                key={e.id}
+                ref={(node) => {
+                  if (node) chipRefs.current.set(e.id, node);
+                  else chipRefs.current.delete(e.id);
+                }}
+                type="button"
+                role="option"
+                aria-selected={selected.includes(e.id)}
+                // The chip shows a short name; the full sentence — including
+                // where the object sits — is the accessible name, where it
+                // costs no width.
+                aria-label={describeElement(e)}
+                aria-posinset={i + 1}
+                aria-setsize={doc.elements.length}
+                className={`sk-object${selected.includes(e.id) ? " on" : ""}${
+                  e.locked ? " sk-object-locked" : ""
+                }`}
+                title={describeElement(e)}
+                onClick={(ev) =>
+                  setSelected((cur) =>
+                    ev.shiftKey
+                      ? cur.includes(e.id)
+                        ? cur.filter((id) => id !== e.id)
+                        : [...cur, e.id]
+                      : [e.id],
+                  )
+                }
+              >
+                {e.locked ? (
+                  <svg className="sk-object-lock" viewBox="0 0 24 24" aria-hidden="true">
+                    <rect x="5" y="11" width="14" height="10" rx="2" />
+                    <path d="M8 11V8a4 4 0 0 1 8 0v3" />
+                  </svg>
+                ) : null}
+                {chipLabel(e)}
+              </button>
+            ))}
+          </div>
+        </div>
+      ) : null}
+
       <div className="sk-foot">
         {chosen ? (
           <label className="sk-label-edit">
@@ -943,13 +1862,25 @@ export default function SketchView({ fileId, text }: Props) {
               onChange={(e) => relabel(chosen.id, e.target.value)}
             />
           </label>
+        ) : picked.length > 1 ? (
+          <span className="sk-hint">
+            {picked.length} selected · Arrange to align them · ⌘D to duplicate
+          </span>
         ) : (
           <span className="sk-hint">
             {doc.elements.length === 0
-              ? "Pick a pen and draw — or ask the room's AI to draw it for you."
-              : "Drag to draw · V to select · ⌘Z to undo"}
+              ? "Pick a tool and draw — or ask the room's AI to draw it for you."
+              : "Click to select · drag a box around several · ⌘Z to undo"}
           </span>
         )}
+        {/* Said here because a disabled button cannot say it: while a field
+            has the keyboard, ⌘Z is the field's and the toolbar's undo is the
+            drawing's. Both work; they are simply not the same history. */}
+        {typing ? (
+          <span className="sk-hint sk-hint-typing">
+            ⌘Z undoes your typing here — the toolbar’s undo covers the drawing
+          </span>
+        ) : null}
         <span className={`sk-save sk-save-${saveState}`} role="status">
           {note ?? saveWord}
         </span>

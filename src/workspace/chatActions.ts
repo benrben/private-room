@@ -3,6 +3,7 @@ import {
   KeyboardEvent as ReactKeyboardEvent,
 } from "react";
 import { api, FileTarget, memorySuggestion, Message } from "../api";
+import type { BrowserPageSelection, BrowserPageText } from "../apiTypes";
 import {
   AutocompleteItem,
   fileToBase64,
@@ -18,6 +19,15 @@ import {
 import { runGuarded } from "./guard";
 import { prefersReducedMotion } from "../rooms/helpers";
 import { speakerName, splitMarkupBlocks } from "./markup";
+import {
+  BrowserScope,
+  ChatScope,
+  ROOM_ONLY,
+  pageContext,
+  withPageContext,
+  withSelectionContext,
+  withPreamble,
+} from "./browserScope";
 import { HELP_COMMAND } from "./constants";
 import * as voice from "./voice";
 import { WSState } from "./state";
@@ -26,6 +36,52 @@ import { WSState } from "./state";
  * updater is allowed to run more than once for one update (StrictMode, a
  * re-entrant render), so the decline it fires has to be idempotent. */
 const declinedApprovals = new Set<string>();
+
+/**
+ * WHAT THE NEXT TURN IS ANSWERED FROM.
+ *
+ * Module state, deliberately. One fact with three readers and no owner between
+ * them: the strip that states the scope is in AiPane, the placeholder that
+ * echoes it is three levels down in the composer, and the send that has to make
+ * it true is here. AiPane is the single writer — it is the surface the user
+ * changes the scope on — and everything else subscribes.
+ *
+ * Read at SEND time, like `viewing` in `askOnce`: the turn is what the scope
+ * has to describe, not whatever was on screen when the box was first focused.
+ */
+let turnScope: ChatScope = ROOM_ONLY;
+const scopeReaders = new Set<() => void>();
+
+export function setTurnScope(next: ChatScope): void {
+  if (next === turnScope) return;
+  turnScope = next;
+  for (const notify of scopeReaders) notify();
+}
+
+export function currentTurnScope(): ChatScope {
+  return turnScope;
+}
+
+export function subscribeTurnScope(notify: () => void): () => void {
+  scopeReaders.add(notify);
+  return () => {
+    scopeReaders.delete(notify);
+  };
+}
+
+/**
+ * How each scope reads the page it names.
+ *
+ * "selection" is deliberately absent from this table rather than mapped to a
+ * mode: it does not read the page at all, it reads what a person has
+ * highlighted on it, through a different command. The two are kept apart here
+ * so that a scope with no read path CANNOT fall through to the whole room —
+ * `scopedQuestion` refuses instead, which is the behaviour this table exists to
+ * guarantee.
+ */
+const PAGE_TEXT_MODE: Partial<Record<BrowserScope, "main" | "full">> = {
+  page: "main",
+};
 
 /** Chat sessions + the AI-turn flow + the composer's #, @, / and * autocomplete. Cross-hook
  * deps threaded from the shell: files' viewFile (openSource), recording's
@@ -242,10 +298,96 @@ export function makeChatActions(
       s.files,
       s.folders,
     );
+    // …including the drawing the strip is scoped to. The saved text already
+    // carries any block the first attempt prepended; the file it named is not
+    // in the text, so without this a retry asks the same question with less
+    // evidence than the question it is retrying.
     const attachmentIds = [
-      ...new Set([...s.attachments.map((f) => f.id), ...parsed.refIds]),
+      ...new Set([
+        ...s.attachments.map((f) => f.id),
+        ...parsed.refIds,
+        ...currentTurnScope().fileIds,
+      ]),
     ];
     await askOnce(lastUser.content, attachmentIds, true);
+  }
+
+  /**
+   * The question with the text the strip PROMISED in front of it, or the reason
+   * there is none.
+   *
+   * Failure is reported, never absorbed. A page that refuses the extractor — it
+   * is parked behind the results screen, it is a PDF, it returned nothing — has
+   * to stop the turn: answering from the whole room instead would be a
+   * different question, answered from different evidence, with nothing on
+   * screen saying so.
+   */
+  /** The passage a person highlighted on the live page.
+   *
+   * A separate path from the page scope, not a mode of it: it asks a different
+   * command, and its empty answer means something different. An empty
+   * selection is `Ok` with no text — the flag that offered this scope is a
+   * poll old, and the user can clear a selection in the time between the strip
+   * rendering and the send — so it is reported as what it is rather than as a
+   * page that returned nothing. */
+  async function selectedPassage(
+    question: string,
+  ): Promise<{ ok: true; text: string } | { ok: false; why: string }> {
+    let got: BrowserPageSelection;
+    try {
+      got = await api.browserPageSelection();
+    } catch (e) {
+      return {
+        ok: false,
+        why: `The selection couldn't be read, so nothing was asked: ${e}`,
+      };
+    }
+    if (!got.text.trim()) {
+      return {
+        ok: false,
+        why: "Nothing is selected on the page any more, so nothing was asked.",
+      };
+    }
+    return {
+      ok: true,
+      text: withSelectionContext(question, {
+        title: got.title,
+        url: got.url,
+        text: got.text,
+        // A real count, measured by the page script on the WHOLE selection.
+        // `truncated` alone could only have produced "some of this is missing",
+        // and the only alternative was a number nobody had measured.
+        omitted: Math.max(0, got.total - got.text.length),
+      }),
+    };
+  }
+
+  async function scopedQuestion(
+    scope: ChatScope,
+    question: string,
+  ): Promise<{ ok: true; text: string } | { ok: false; why: string }> {
+    if (scope.scope === "selection") return await selectedPassage(question);
+    const mode = PAGE_TEXT_MODE[scope.scope];
+    if (!mode) {
+      return {
+        ok: false,
+        why: `This room can't read ${scope.label} yet, so nothing was asked.`,
+      };
+    }
+    let got: BrowserPageText;
+    try {
+      got = await api.browserPageText(mode, 0);
+    } catch (e) {
+      return { ok: false, why: `The page couldn't be read, so nothing was asked: ${e}` };
+    }
+    const page = pageContext(got);
+    if (!page) {
+      return {
+        ok: false,
+        why: "This page returned no text — it may be a PDF, a canvas or a video. Nothing was asked.",
+      };
+    }
+    return { ok: true, text: withPageContext(question, page) };
   }
 
   /** `text` overrides the composer draft (hands-free dictation sends the
@@ -320,10 +462,31 @@ export function makeChatActions(
       : parsed.specialist
         ? hoistTag(raw, parsed.specialist)
         : raw;
+    // The strip's promise, made good. A #command is exempt: it is not free text
+    // — it carries its own arguments and picks its own sources — so a page
+    // block prepended to it would ride along in something that never reads it.
+    const scope = currentTurnScope();
+    let sending = outgoing;
+    if (!parsed.command && scope.sendsPageText) {
+      const scoped = await scopedQuestion(scope, outgoing);
+      if (!scoped.ok) {
+        // Nothing was sent, so the question goes back in the box: losing what
+        // someone typed is a second failure on top of the one being reported.
+        s.pushToast("error", scoped.why);
+        s.setQuestion(raw);
+        return;
+      }
+      sending = scoped.text;
+    } else if (!parsed.command) {
+      // A scope that already knows its evidence — the objects selected on the
+      // open drawing — carries it straight in. Nothing to fetch, so nothing
+      // that can fail; the empty preamble is the ordinary case and a no-op.
+      sending = withPreamble(outgoing, scope.preamble);
+    }
     const optimistic: Message = {
       id: `pending-${Date.now()}`,
       role: "user",
-      content: outgoing,
+      content: sending,
       sources: [],
       createdAt: "",
       effects: null,
@@ -336,11 +499,19 @@ export function makeChatActions(
         api.runCommand(chatId, parsed.command!, parsed.args, parsed.refIds, raw, askId),
       );
     } else {
+      // The scope's own files ride ALONGSIDE what is pinned, never instead of
+      // it: "“Portfolio map” + 2 attached" is what the strip says it will do,
+      // and dropping a source someone deliberately pinned would be a change
+      // they never asked for and could not see.
       const attachmentIds = [
-        ...new Set([...s.attachments.map((f) => f.id), ...parsed.refIds]),
+        ...new Set([
+          ...s.attachments.map((f) => f.id),
+          ...parsed.refIds,
+          ...scope.fileIds,
+        ]),
       ];
       s.setAttachments([]);
-      await askOnce(outgoing, attachmentIds);
+      await askOnce(sending, attachmentIds);
     }
   }
 

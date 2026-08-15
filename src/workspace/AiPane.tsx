@@ -1,4 +1,10 @@
-import { useEffect, useMemo, useState, type CSSProperties } from "react";
+import {
+  useEffect,
+  useMemo,
+  useState,
+  useSyncExternalStore,
+  type CSSProperties,
+} from "react";
 import { jobMeter } from "./jobProgress";
 import { RoomInfo } from "../api";
 import {
@@ -11,6 +17,18 @@ import {
   SparkIcon,
 } from "../icons";
 import { isCloudRoute, trustState } from "./markup";
+import {
+  BrowserScope,
+  OpenPage,
+  OpenSketch,
+  ROOM_ONLY,
+  chatScope,
+  readablePage,
+  scopeLabel,
+} from "./browserScope";
+import { browserPageSnapshot, subscribeBrowserPage } from "./browserSignal";
+import { currentSketchFocus, subscribeSketchFocus } from "./sketchFocus";
+import { setTurnScope } from "./chatActions";
 import { displayName } from "./composer";
 import ChatPane from "./ChatPane";
 import StudioShelf from "./StudioShelf";
@@ -48,6 +66,39 @@ export default function AiPane({
   const pendingApprovals = pendingApprovalCount(s);
   const jobsRunning = runningJobCount(s);
   const cloud = isCloudRoute(s.model, s.ai);
+  // Same vocabulary as the top-bar badge and the status-bar trust chip
+  // (workspace/markup.ts trustState) — the pill below and the scope's own
+  // disclosure must never say something different about the same room's route.
+  const trust = trustState(cloud, s.privacyOn);
+  // What the browser is showing, and what the reader has chosen to do about it.
+  // The pick is state; the scope is derived, so leaving the browser retires a
+  // stale choice instead of carrying it somewhere it means nothing.
+  const page = useOpenPage();
+  // …and the same for the drawing on screen, which publishes its own selection
+  // because nothing between the canvas and this pane has any use for it.
+  const sketch = useOpenSketch(s.openFile);
+  const [chosen, setChosen] = useState<BrowserScope | null>(null);
+  const subject = useMemo(
+    () => ({
+      area,
+      page,
+      // Reported by the chrome's own poll (`browser_info.hasSelection`), so
+      // offering the scope costs no round trip — and it is only ever true for a
+      // selection that can actually be read back.
+      hasSelection: page?.hasSelection === true,
+      sketch,
+      attachments: s.attachments.length,
+    }),
+    [area, page, sketch, s.attachments.length],
+  );
+  const view = useMemo(() => chatScope(subject, chosen), [subject, chosen]);
+  // The scope belongs to the strip that states it: while this pane is on
+  // screen the send honours it, and the moment it is gone the room-wide
+  // default is the truth again.
+  useEffect(() => {
+    setTurnScope(view);
+    return () => setTurnScope(ROOM_ONLY);
+  }, [view]);
   return (
     <>
       <div
@@ -139,47 +190,58 @@ export default function AiPane({
           <div className="context-strip">
             <span className="context-label">
               <span className="context-label-prefix">Answering from </span>
-              {s.attachments.length > 0 ? (
-                <button
-                  className="context-count"
-                  title="Change which files are attached"
-                  onClick={() => {
-                    s.setLibraryTab("sources");
-                    layout.showPane("library");
-                  }}
+              {/* With a page on screen the scope is a CHOICE, so it is a real
+                  control rather than a shortcut to the sources list. Nothing
+                  may float over the native web page — but this is the sibling
+                  pane, so a plain select is exactly what it looks like. */}
+              {view.available.length > 1 ? (
+                <select
+                  className="context-scope"
+                  aria-label="What this chat answers from"
+                  title="Change what this chat answers from"
+                  value={view.scope}
+                  onChange={(e) => setChosen(e.target.value as BrowserScope)}
                 >
-                  {s.attachments.length} attached source
-                  {s.attachments.length === 1 ? "" : "s"}
-                </button>
+                  {view.available.map((k) => (
+                    <option key={k} value={k}>
+                      {scopeLabel(k, subject)}
+                    </option>
+                  ))}
+                </select>
               ) : (
                 <button
                   className="context-count"
-                  title="Pick specific files for the AI to answer from"
+                  title={
+                    s.attachments.length > 0
+                      ? "Change which files are attached"
+                      : "Pick specific files for the AI to answer from"
+                  }
                   onClick={() => {
                     s.setLibraryTab("sources");
                     layout.showPane("library");
                   }}
                 >
-                  the whole room
+                  {view.label}
                 </button>
               )}
             </span>
-            {(() => {
-              // Same vocabulary as the top-bar badge and status-bar trust chip
-              // (workspace/markup.ts trustState) — this pill must never say
-              // something different about the same room's data route.
-              const trust = trustState(cloud, s.privacyOn);
-              return (
-                <span className={`local-mini ${trust.tone}`} title={trust.title}>
-                  {cloud ? (
-                    <CloudIcon size={12} />
-                  ) : (
-                    <span className="status-dot" aria-hidden />
-                  )}
-                  <span>{trust.label}</span>
-                </span>
-              );
-            })()}
+            {/* The consequence of the scope, in the words the composer's own
+                cloud strip uses for the same fact. Only when it is true: on a
+                local route the page text is read and answered on this Mac, and
+                the trust pill beside this already says so. */}
+            {view.sendsPageText && cloud && (
+              <span className="context-leaves" title={trust.title}>
+                The page’s text will leave your Mac.
+              </span>
+            )}
+            <span className={`local-mini ${trust.tone}`} title={trust.title}>
+              {cloud ? (
+                <CloudIcon size={12} />
+              ) : (
+                <span className="status-dot" aria-hidden />
+              )}
+              <span>{trust.label}</span>
+            </span>
           </div>
           <ChatPane s={s} a={a} info={info} />
         </>
@@ -192,6 +254,46 @@ export default function AiPane({
       )}
     </>
   );
+}
+
+/**
+ * The page the private browser is showing, while its text can actually be read.
+ *
+ * Subscribed rather than polled. `browser_info` is not a cheap read — it is an
+ * `evaluateJavaScript` round trip into the native page — and the browser's own
+ * chrome already pays for one every 1.2s against that same webview, so a second
+ * poll here doubled the cost of standing in the Browser to buy a strictly worse
+ * answer: whether the view is parked lives in `BrowserView`'s React state,
+ * where no host command can see it. That component publishes what it alone
+ * knows (workspace/browserSignal), which also makes this null by construction
+ * whenever the Browser is not the destination on screen.
+ */
+function useOpenPage(): OpenPage | null {
+  const signal = useSyncExternalStore(subscribeBrowserPage, browserPageSnapshot);
+  return useMemo(() => readablePage(signal), [signal]);
+}
+
+/**
+ * The drawing on screen, as the scope rule wants it.
+ *
+ * Two halves from two owners, joined here: WHICH file is open is the shell's
+ * knowledge, and WHAT is selected inside it is the canvas's. They are checked
+ * against each other rather than trusted — a viewer that has been swapped out
+ * for another file can leave its last selection behind for a moment, and a
+ * scope offered from that would name one drawing and answer from another.
+ */
+function useOpenSketch(openFile: WSState["openFile"]): OpenSketch | null {
+  const focus = useSyncExternalStore(subscribeSketchFocus, currentSketchFocus);
+  return useMemo(() => {
+    if (!openFile || !openFile.content.name.toLowerCase().endsWith(".sketch")) {
+      return null;
+    }
+    return {
+      fileId: openFile.id,
+      name: displayName(openFile.content.name),
+      selection: focus?.fileId === openFile.id ? focus.selection : [],
+    };
+  }, [openFile, focus]);
 }
 
 /* ---------- Studio tab ---------- */

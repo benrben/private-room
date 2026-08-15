@@ -3,6 +3,87 @@
 All notable, user-facing changes to Arcelle. Versions follow
 [semver](https://semver.org); dates are the GitHub release dates.
 
+## 0.23.0 — 2026-08-15
+
+### Sketch becomes an editor
+
+Drawings opened ready to draw. Every one of them — so panning around a diagram
+someone else had made left marks on it. **Select is the resting state now**, and
+a tool goes back to it after making one thing. Double-click a tool to make it
+stay; the button shows which state it is in.
+
+Once something is selected there is finally something to do with it. Eight
+grips resize it, a dragged box selects several, and a multi-selection can be
+aligned, spread evenly, sent forward or back, duplicated, locked in place, or
+nudged with the arrow keys. Objects snap to the page's dots and to each other,
+with alignment guides while you drag.
+
+**Arrows attach.** Draw one from one box to another and it stays attached: move
+either box and the arrow re-routes to follow. The drawing agent's arrows attach
+the same way, so a diagram it draws survives being rearranged by hand. Drawings
+made before this release still open — an arrow that was never attached to
+anything simply stays where it was put.
+
+Every object is reachable without a pointer. The strip under the canvas names
+each one — what it is, what it says, where it sits, whether it is locked — and
+selecting a row selects the shape. It follows the selection instead of leaving
+it off the end of the row, and the count on the left opens the whole set.
+
+A drawing can be saved into the room as a **picture (PNG)** or a **drawing
+(SVG)**, both from the file header alongside Export, worded so the two acts
+cannot be confused: one writes into this room, the other writes out of it.
+
+### The assistant can see the drawing you are looking at
+
+Asked "what's missing here?" over a full diagram, the room used to search two
+hundred files, find nothing about the drawing, and answer anyway — with nothing
+on screen saying it had never looked.
+
+The chat now says what it is answering from, and offers the drawing by name.
+Select some objects and it offers those instead. Pinned sources are added to,
+never silently swapped out — the strip says `"Portfolio map" + 2 attached` when
+that is what it is about to do.
+
+### Fixes
+
+- **Escape no longer closes the whole drawing.** It now closes a menu, then
+  clears the selection, and only then reaches the shell.
+- **Export appeared twice**, a few pixels apart, doing different things.
+- "Could not open that file" named no file, offered no way to try again, and
+  stayed on screen after a second click had opened it. All three fixed. Errors
+  still never vanish on a timer.
+- Undo looked broken while typing in a note. It was not: a note has its own
+  undo and the drawing deliberately keeps out of it. The page says so now
+  instead of leaving you to guess.
+- Removing a sketch from the Library jumped to a different sketch.
+- Add/Remove confirmations piled up until they covered the workspace.
+- The contextual sidebar was still labelled "Library" inside Memory.
+- An agent promoting a file to the Library was recorded in Chat but not in
+  Activity.
+
+### The private browser stops overstating itself
+
+The shield read **Private** — "nothing saved, trackers blocked" — off a single
+check that knows about storage and nothing whatsoever about tracker blocking.
+It kept saying so while the room's own journal filled with "Content blocking
+FAILED to load". Two facts now, asked separately and stated separately, and the
+weaker one sets the tone.
+
+Closing the last page left the toolbar showing the closed page's address, its
+padlock and a live Save strip; leaving the destination and coming back was the
+only way to get an honest toolbar. Page-scoped state is now dropped with the
+page, and the Save strip's buttons no longer stay clickable with no browser
+open.
+
+The activity journal was 300 rows of every event from every sitting in one flat
+list — auditable and unreadable, which for an audit trail is the same as
+unauditable. It is grouped by browsing sitting now, with "what just happened"
+first and filters over the kinds.
+
+A page's text and a way back out of it can now be reached by keyboard and
+screen reader — the page is a native view whose accessibility tree the app
+cannot otherwise reach into.
+
 ## 0.22.0 — 2026-08-15
 
 ### Quote from anything you can read

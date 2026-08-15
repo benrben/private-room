@@ -173,10 +173,44 @@ pub(crate) struct Element {
     /// a text-only model, so the tool descriptions push hard for it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) label: Option<String>,
+    /// THE TWO ENDS OF A CONNECTOR.
+    ///
+    /// `link` used to compute two points and forget which shapes they came
+    /// from, so the arrow was a picture of a relationship rather than the
+    /// relationship itself: the next `move` left it pointing at where a box
+    /// had been. Recording the ends is what lets [`reflow`] keep the diagram
+    /// true — for the agent's own edits and for the editor's, which routes by
+    /// the same rule (`src/viewers/sketch/model.ts`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) from: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) to: Option<String>,
+    /// Held in place: not pickable, draggable or erasable in the editor.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) locked: bool,
 }
 
 fn is_false(b: &bool) -> bool {
     !*b
+}
+
+impl Element {
+    /// The parts of an element that are nothing in particular — no
+    /// attachment, not locked. Every construction site fills the fields it
+    /// means and takes these, so adding a field later cannot silently give
+    /// one call site a different default from its neighbour.
+    pub(crate) fn plain() -> Self {
+        Element {
+            id: String::new(),
+            shape: Shape::Rect { x: 0, y: 0, w: 0, h: 0 },
+            ink: Ink::default(),
+            fill: false,
+            label: None,
+            from: None,
+            to: None,
+            locked: false,
+        }
+    }
 }
 
 /// A rectangle in canvas units. Used for layout checks and arrow routing.
@@ -702,6 +736,12 @@ pub(crate) fn apply_script(doc: &mut Sketch, script: &str) -> Result<ScriptOutco
     for (_, stmt) in stmts {
         apply_stmt(doc, stmt, &mut back, &mut out);
     }
+    // Once, at the end, rather than after each statement: a script that moves
+    // three boxes and then deletes a fourth should route its arrows against
+    // where everything finally landed, not against each intermediate step. It
+    // is also idempotent, so running it over a script that moved nothing costs
+    // one pass and changes nothing.
+    reflow(doc);
     Ok(out)
 }
 
@@ -986,7 +1026,14 @@ fn apply_stmt(doc: &mut Sketch, stmt: Stmt, back: &mut Vec<String>, out: &mut Sc
                 Shape::Text { text, .. } => text.clone(),
                 _ => String::new(),
             });
-            doc.elements.push(Element { id: id.clone(), shape, ink, fill, label });
+            doc.elements.push(Element {
+                id: id.clone(),
+                shape,
+                ink,
+                fill,
+                label,
+                ..Element::plain()
+            });
             back.push(id.clone());
             out.steps.push(if what.is_empty() {
                 format!("drew {kind} {id}")
@@ -1016,6 +1063,11 @@ fn apply_stmt(doc: &mut Sketch, stmt: Stmt, back: &mut Vec<String>, out: &mut Sc
                 ink,
                 fill: false,
                 label: label.clone(),
+                // What makes this a LINK and not an arrow that happens to be
+                // in the right place. `reflow` reads these after every edit.
+                from: Some(a.clone()),
+                to: Some(b.clone()),
+                locked: false,
             });
             back.push(id.clone());
             out.steps.push(match &label {
@@ -1107,6 +1159,50 @@ fn translate(shape: &mut Shape, dx: i32, dy: i32) {
 /// Route an arrow between two boxes: centre to centre, trimmed to each box's
 /// edge with a small gap.
 ///
+/// Re-route every attached connector against where its ends are NOW.
+///
+/// The other half of recording `from`/`to`. Without it a link is only correct
+/// until the first `move`: the agent would tidy a diagram and leave every
+/// arrow pointing at the empty space a box used to occupy — and, worse, keep
+/// reporting the connection in `layout_report`, so it would believe the
+/// picture was still right.
+///
+/// An end whose element is gone drops the attachment and keeps the last
+/// points, exactly as the editor does (`model.ts` `reflow`). The two sides
+/// must agree: one document, one picture, whoever drew it.
+pub(crate) fn reflow(doc: &mut Sketch) {
+    let boxes: std::collections::HashMap<String, Rect> = doc
+        .elements
+        .iter()
+        .map(|e| (e.id.clone(), e.bbox()))
+        .collect();
+    for e in &mut doc.elements {
+        if e.from.is_none() && e.to.is_none() {
+            continue;
+        }
+        if !matches!(e.shape, Shape::Arrow { .. } | Shape::Line { .. }) {
+            continue;
+        }
+        let a = e.from.as_ref().and_then(|id| boxes.get(id)).copied();
+        let b = e.to.as_ref().and_then(|id| boxes.get(id)).copied();
+        match (a, b) {
+            (Some(a), Some(b)) => {
+                let (start, end) = route(a, b);
+                match &mut e.shape {
+                    Shape::Arrow { points } | Shape::Line { points } => {
+                        *points = vec![start, end];
+                    }
+                    _ => {}
+                }
+            }
+            _ => {
+                e.from = None;
+                e.to = None;
+            }
+        }
+    }
+}
+
 /// This exists so the model never does arrow arithmetic. Asked to connect two
 /// boxes it will confidently emit endpoints that start inside one shape and
 /// stop short of the other, and that error is invisible in text — it only
@@ -1650,6 +1746,7 @@ pub(crate) fn layout_graph(nodes: &[GraphNode], edges: &[GraphEdge]) -> Sketch {
                 ink,
                 fill: terminal,
                 label: Some(clamp_label(&node.label)),
+                ..Element::plain()
             });
             ids[n] = id;
             // The explanation, under its box. Short by construction: a
@@ -1669,6 +1766,7 @@ pub(crate) fn layout_graph(nodes: &[GraphNode], edges: &[GraphEdge]) -> Sketch {
                     ink,
                     fill: false,
                     label: None,
+                    ..Element::plain()
                 });
             }
         }
@@ -1687,6 +1785,12 @@ pub(crate) fn layout_graph(nodes: &[GraphNode], edges: &[GraphEdge]) -> Sketch {
             ink: Ink::Blue,
             fill: false,
             label: label.map(clamp_label).filter(|s| !s.is_empty()),
+            // A generated graph is a diagram, so its arrows are links: moving
+            // a box later must not leave the picture lying about what joins
+            // what.
+            from: Some(ids[a].clone()),
+            to: Some(ids[b].clone()),
+            locked: false,
         });
     }
     doc
@@ -2231,4 +2335,82 @@ mod tests {
         assert_eq!(e["label"], "Login form");
         assert!(e.get("shape").is_none(), "geometry must not be nested: {e}");
     }
+
+    /// A link is a RELATIONSHIP, not two points that happen to be in the right
+    /// place. Before this, `link` computed the arrow once and forgot where it
+    /// came from — so the very next `move` left the diagram lying about what
+    /// joined what, while `layout_report` went on reporting the connection.
+    #[test]
+    fn a_link_follows_the_box_it_is_attached_to() {
+        let mut doc = Sketch::default();
+        apply_script(&mut doc, "box e1 100 100 200 100 \"A\"\nbox e2 700 100 200 100 \"B\"\nlink e1 e2")
+            .expect("script");
+        let before = match &doc.elements[2].shape {
+            Shape::Arrow { points } => points.clone(),
+            other => panic!("expected an arrow, got {other:?}"),
+        };
+        apply_script(&mut doc, "move e2 0 500").expect("move");
+        let after = match &doc.elements[2].shape {
+            Shape::Arrow { points } => points.clone(),
+            other => panic!("expected an arrow, got {other:?}"),
+        };
+        assert_ne!(before, after, "the arrow must follow the box");
+        assert!(
+            after[1][1] > before[1][1],
+            "…downwards, where the box actually went: {after:?}"
+        );
+    }
+
+    /// Deleting one end must not leave an arrow claiming to join something the
+    /// page no longer has — nor make it vanish or spring to the corner. It
+    /// stays where it was drawn and stops calling itself a link.
+    #[test]
+    fn a_link_whose_end_is_deleted_stays_put_and_forgets_it() {
+        let mut doc = Sketch::default();
+        apply_script(&mut doc, "box e1 100 100 200 100\nbox e2 700 100 200 100\nlink e1 e2")
+            .expect("script");
+        let drawn = match &doc.elements[2].shape {
+            Shape::Arrow { points } => points.clone(),
+            other => panic!("expected an arrow, got {other:?}"),
+        };
+        apply_script(&mut doc, "delete e2").expect("delete");
+        let arrow = doc.elements.iter().find(|e| e.id == "e3").expect("the arrow survives");
+        assert_eq!(arrow.from, None);
+        assert_eq!(arrow.to, None);
+        match &arrow.shape {
+            Shape::Arrow { points } => assert_eq!(points, &drawn, "it stays where it was drawn"),
+            other => panic!("expected an arrow, got {other:?}"),
+        }
+    }
+
+    /// The editor routes with its own port of `edge_point`, so the two halves
+    /// have to produce the same connector for the same pair of boxes — or the
+    /// exported file draws differently from the page it was exported from.
+    #[test]
+    fn the_editors_router_is_a_port_of_this_one() {
+        let ts = std::fs::read_to_string("../src/viewers/sketch/model.ts")
+            .expect("the editor's model");
+        assert!(ts.contains("export function edgePoint"), "ported edge_point");
+        assert!(ts.contains("export function routeBetween"), "ported route");
+        assert!(
+            ts.contains("export function reflow"),
+            "and the reflow that keeps a link true"
+        );
+    }
+
+    /// An old file has none of these fields, and must read back as a drawing
+    /// with no links rather than failing to parse.
+    #[test]
+    fn a_sketch_written_before_links_existed_still_opens() {
+        let raw = r#"{"version":1,"width":1600,"height":1000,"seq":1,
+            "elements":[{"id":"e1","type":"rect","x":0,"y":0,"w":10,"h":10,"ink":"blue"}]}"#;
+        let doc: Sketch = serde_json::from_str(raw).expect("parses");
+        assert_eq!(doc.elements[0].from, None);
+        assert!(!doc.elements[0].locked);
+        // …and writing it back must not add noise to a file that has no links.
+        let out = serde_json::to_string(&doc).expect("serialises");
+        assert!(!out.contains("\"from\""), "absent fields stay absent: {out}");
+        assert!(!out.contains("\"locked\""));
+    }
+
 }

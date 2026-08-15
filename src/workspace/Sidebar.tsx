@@ -652,7 +652,12 @@ function BrowsePanel({
         : shownFiles.filter((f) => f.folderId === folder.id).map((f) => f.id),
     ),
   ];
-  const orderKey = paintedOrder.join(" ");
+  // "\n", not "\0". A NUL is the classic collision-proof separator and it works
+  // perfectly — but it also makes this whole FILE read as binary, so grep, rg
+  // and every editor search silently report no matches anywhere in it. A
+  // newline cannot appear in a file id either, and leaves the source
+  // searchable.
+  const orderKey = paintedOrder.join("\n");
   useEffect(() => {
     s.setVisibleFileOrder(paintedOrder);
     // Keyed on the joined order, not the array: a fresh array with identical
@@ -1253,6 +1258,25 @@ function PagesNav({
  * Each row's own status is deliberately absent: `Section only` / `In Library`
  * is drawn once, on the open sketch's toolbar (see ViewerPane), because a badge
  * repeated down every row is decoration rather than information. */
+/** "today" / "yesterday" / a short date — the same convention the search
+ * results and Activity's history use for a margin date. Deliberately not a
+ * clock time: the hour a drawing was started is never the thing anyone is
+ * scanning this list for. */
+function sketchWhen(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "a drawing";
+  const now = new Date();
+  if (d.toDateString() === now.toDateString()) return "Started today";
+  const yesterday = new Date(now);
+  yesterday.setDate(now.getDate() - 1);
+  if (d.toDateString() === yesterday.toDateString()) return "Started yesterday";
+  const opts: Intl.DateTimeFormatOptions =
+    d.getFullYear() === now.getFullYear()
+      ? { month: "short", day: "numeric" }
+      : { month: "short", day: "numeric", year: "numeric" };
+  return `Started ${d.toLocaleDateString(undefined, opts)}`;
+}
+
 function SketchesNav({
   s,
   a,
@@ -1296,11 +1320,26 @@ function SketchesNav({
             </span>
             <span className="area-nav-main">
               <span className="area-nav-title">{displayName(f.name)}</span>
-              <span className="area-nav-copy">{f.aiSummary ?? "a drawing"}</span>
+              {/* WHAT THE ROW ACTUALLY KNOWS.
+                  Every row used to read "a drawing", which is the one thing
+                  the reader could already see from the heading above them. The
+                  summary is shown when the room has written one; otherwise the
+                  line says when the drawing arrived and whether Home lists it,
+                  because those are facts this list HAS. It does not invent a
+                  size or an object count — the file list carries neither, and
+                  a made-up number is worse than a quiet row. */}
+              <span className="area-nav-copy">
+                {f.aiSummary ?? sketchWhen(f.createdAt)}
+              </span>
             </span>
             {/* The two safe row verbs the app already uses everywhere else,
                 with the same armed confirm behind the destructive one. */}
             <span className="area-nav-state">
+              {libraryStatus(f)?.linked ? (
+                <span className="nav-chip" title="Home's Library lists this too">
+                  In Library
+                </span>
+              ) : null}
               <button
                 className="chip-btn"
                 title="Rename this sketch"

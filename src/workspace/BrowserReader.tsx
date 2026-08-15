@@ -19,15 +19,23 @@ import { hostOf } from "./browserAnnounce";
  * the content comes from the one place that really has it: the same `read`
  * extractor the agent's `browse_read` uses, rendered as real HTML in the host.
  *
- * IT SHRINKS THE STAGE, IT DOES NOT COVER IT — the pattern the journal panel
- * already uses, and the one thing that must not change. The results page and
- * the start screen sit over a webview PARKED AT 1×1, and a WKWebView's layout
- * viewport is its frame: at one pixel wide the page reflows to tens of
- * thousands of pixels tall and the extractor's own visibility rule drops
- * nearly all of it. A reading view that parked the page would render a
- * fragment and call it the page. Rust refuses to read a parked page for
- * exactly this reason (`too_small_to_read`); this layout is what stops that
- * refusal from ever being the normal case.
+ * IT NEVER COVERS THE STAGE — nothing in this window can, the page is drawn
+ * above every DOM node. What it does instead changed (product audit P2,
+ * 2026-08-15): it used to shrink the stage to a 320px sliver and keep it there
+ * for the whole reading, so the workspace was permanently split between a
+ * squeezed live page and a second copy of the same page. It now REPLACES the
+ * page, and the split is a deliberate `Compare with page` rather than the
+ * default.
+ *
+ * THE CONSTRAINT THAT MAKES THAT DELICATE, AND WHY THE SPLIT STILL EXISTS. A
+ * WKWebView's layout viewport is its frame. At one pixel wide the page reflows
+ * to tens of thousands of pixels tall and the extractor's own visibility rule
+ * drops nearly all of it, so Rust refuses to read a parked page at all
+ * (`too_small_to_read`). The page therefore needs a real viewport to be READ —
+ * not to be LOOKED AT. `onExtracting` is that distinction made mechanical: the
+ * host hands the stage back for the duration of an extraction and takes it away
+ * again once the text is in hand. Rust's own settle loop (`BOUNDS_SETTLE`)
+ * waits for the new bounds to arrive, which is what makes the handover safe.
  */
 
 type Mode = "main" | "full";
@@ -44,10 +52,19 @@ interface Loaded {
 
 export function BrowserReader({
   info,
+  comparing,
+  onCompare,
+  onExtracting,
   onNavigate,
   onClose,
 }: {
   info: BrowserInfo;
+  /** The live page is being shown beside the text, because the user asked. */
+  comparing: boolean;
+  onCompare: (on: boolean) => void;
+  /** An extraction is starting or has finished. The host gives the page a real
+   *  layout viewport for exactly this window — see the note above. */
+  onExtracting: (on: boolean) => void;
   /** A link in the text. Routed through the private browser, never the system
    *  browser — leaving the room's browser silently would be the one thing this
    *  whole area promises not to do. */
@@ -64,29 +81,37 @@ export function BrowserReader({
   // so this is the real scroll position and not an estimate.
   const read = useReadingProgress(bodyRef);
 
-  const load = useCallback(async (which: Mode) => {
-    setBusy(true);
-    setError(null);
-    try {
-      const got: BrowserPageText = await api.browserPageText(which, 0);
-      setPage({
-        text: got.text ?? "",
-        title: got.title ?? "",
-        url: got.url ?? "",
-        next: got.nextOffset ?? 0,
-        total: got.total ?? 0,
-        truncated: got.truncated === true,
-      });
-    } catch (e) {
-      // Printed, never swallowed: a page that refuses the script (a PDF, a
-      // strict-CSP site) must say so rather than render as a blank document
-      // that reads like an empty page.
-      setPage(null);
-      setError(String(e));
-    } finally {
-      setBusy(false);
-    }
-  }, []);
+  const load = useCallback(
+    async (which: Mode) => {
+      setBusy(true);
+      setError(null);
+      onExtracting(true);
+      try {
+        const got: BrowserPageText = await api.browserPageText(which, 0);
+        setPage({
+          text: got.text ?? "",
+          title: got.title ?? "",
+          url: got.url ?? "",
+          next: got.nextOffset ?? 0,
+          total: got.total ?? 0,
+          truncated: got.truncated === true,
+        });
+      } catch (e) {
+        // Printed, never swallowed: a page that refuses the script (a PDF, a
+        // strict-CSP site) must say so rather than render as a blank document
+        // that reads like an empty page.
+        setPage(null);
+        setError(String(e));
+      } finally {
+        setBusy(false);
+        // In `finally`, not after the happy path: a refusal that left the page
+        // holding the stage would leave the reader permanently beside a live
+        // page it could not read.
+        onExtracting(false);
+      }
+    },
+    [onExtracting],
+  );
 
   /** The next slice, appended.
    *
@@ -98,6 +123,7 @@ export function BrowserReader({
   const more = useCallback(async () => {
     if (!page || !page.truncated) return;
     setBusy(true);
+    onExtracting(true);
     try {
       const got: BrowserPageText = await api.browserPageText(mode, page.next);
       setPage((p) =>
@@ -115,8 +141,9 @@ export function BrowserReader({
       setError(String(e));
     } finally {
       setBusy(false);
+      onExtracting(false);
     }
-  }, [mode, page]);
+  }, [mode, page, onExtracting]);
 
   // Re-read whenever the page under us changes. The URL is the identity: a
   // reader still showing the previous page's text after a link was followed is
@@ -185,16 +212,36 @@ export function BrowserReader({
               : "Encrypted connection"}
           </span>
         </p>
+        {/* The double-Escape chord is how you get the keyboard back OUT of the
+            native page, so the instruction only belongs here while the page is
+            actually on screen to be trapped in. Reading it beside a page that
+            has been put away was an instruction with nothing to act on. */}
         <p className="browser-reader-note">
           The text of the page as the assistant reads it. The page itself is a
           separate window layer this app cannot put into the reading order, so
-          this is a copy — links here open in the browser beside it. Press
-          Escape twice inside the page to bring the keyboard back here.
+          this is a copy — links here open in the browser.
+          {comparing
+            ? " The live page is beside it; press Escape twice inside that page to bring the keyboard back here."
+            : " Escape closes this view."}
         </p>
+        {/* Stale relative to the live page, and says so. The text was
+            extracted once; the page behind it may have moved on. */}
+        {page && page.url !== "" && info.url && page.url !== info.url && (
+          <p className="browser-reader-note" role="status">
+            This text was taken from {page.url}, and the browser has since moved
+            to {info.url}. Re-read the page to catch up.
+          </p>
+        )}
         <div className="browser-reader-tools">
+          {/* `busy`, like its two neighbours. Without it, one click during a
+              slow extraction started a SECOND one through the mode effect —
+              two readers of the page's borrowed viewport, and the refcount in
+              BrowserView exists precisely because they overlap. Gating it
+              stops the overlap rather than only surviving it. */}
           <button
             className="browser-btn"
             type="button"
+            disabled={busy}
             aria-pressed={mode === "full"}
             onClick={() => setMode((m) => (m === "full" ? "main" : "full"))}
           >
@@ -209,6 +256,16 @@ export function BrowserReader({
             onClick={() => void load(mode)}
           >
             Re-read the page
+          </button>
+          {/* The audit asked for the split to be an option rather than the
+              default. This is that option. */}
+          <button
+            className="browser-btn"
+            type="button"
+            aria-pressed={comparing}
+            onClick={() => onCompare(!comparing)}
+          >
+            {comparing ? "Hide the live page" : "Compare with page"}
           </button>
           <button
             className="browser-btn"

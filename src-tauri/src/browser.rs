@@ -85,6 +85,21 @@ pub struct TabInfo {
     pub active: bool,
 }
 
+/// What the content blocker actually did — as opposed to what the shield used
+/// to claim it did.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize)]
+#[serde(tag = "state", rename_all = "camelCase")]
+pub enum Protection {
+    /// The compile has not come back yet. NEVER shown as protected.
+    #[default]
+    Unknown,
+    Active,
+    /// WebKit refused to compile or attach the list.
+    Failed { reason: String },
+    /// This build/system has no content blocker at all.
+    Unavailable { reason: String },
+}
+
 /// One open page, as Rust tracks it.
 ///
 /// The URL is RECORDED here rather than read back from the webview, because
@@ -94,10 +109,20 @@ pub struct TabInfo {
 /// aborted the whole process (crash report 2026-07-31 22:58, SIGABRT through
 /// `core::option::unwrap_failed`). We already know every URL a page is sent to,
 /// so we keep it and never ask.
+///
+/// The blocker's verdict lives here too, PER PAGE: the rule list is attached to
+/// one webview's user-content controller, so "is the browser protected" is only
+/// ever the sum of one answer per page — see [`protection`].
+///
+/// `deferred_since` is the other half of the same story: while it is set, this
+/// page is parked on [`START_BLANK`] waiting for its rule list, and everything
+/// the page says about itself is about a document that is on its way out.
 #[derive(Debug, Clone)]
 struct Page {
     id: String,
     url: String,
+    protection: Protection,
+    deferred_since: Option<Instant>,
 }
 
 /// The agent's page script, injected at document start into every frame.
@@ -113,6 +138,18 @@ const EVAL_TIMEOUT: Duration = Duration::from_secs(15);
 /// answered nothing at all": `EVAL_TIMEOUT` is longer than the smallest
 /// readiness budget, so one stuck probe outlasts the whole wait on its own.
 const EVAL_TIMED_OUT: &str = "The page did not answer in time.";
+
+/// What [`eval_json`] answers when its callback is DROPPED instead of fired.
+///
+/// It used to say "The browser closed while the page was answering", which is a
+/// guess, and usually the wrong one: WebKit drops a pending
+/// `evaluateJavaScript` completion handler when the document underneath it goes
+/// away, and the ordinary way a document goes away is a NAVIGATION. Nothing
+/// closed. The first page of a launch hit this every time — the blocker's first
+/// compile is the uncached one, so the real navigation fires late, straight
+/// through whatever `browser_info` poll happened to be in flight — and the
+/// toolbar reported a dead browser for a page that was loading normally.
+const EVAL_LOST: &str = "The page was replaced while it was answering.";
 
 /// Poll interval while waiting on an async page ticket.
 const POLL_INTERVAL: Duration = Duration::from_millis(60);
@@ -135,6 +172,8 @@ const READY_BUDGET_NAV: Duration = Duration::from_secs(10);
 #[serde(rename_all = "camelCase")]
 pub struct JournalEntry {
     pub at: String,
+    /// The browsing SITTING this line belongs to — see [`BrowserState::session`].
+    pub session: String,
     pub kind: String,
     pub url: String,
     pub detail: String,
@@ -158,11 +197,49 @@ pub struct BrowserState {
     /// Page ids are never reused within a room, so a stale frontend reference
     /// resolves to "gone" instead of to somebody else's page.
     pub next_id: AtomicU64,
+    /// The browsing SITTING the journal is currently writing into: minted when
+    /// the first page opens, cleared when the last one closes, empty in between.
+    ///
+    /// It exists nowhere else — not in settings, not in a file — because it is
+    /// not a fact about the user, only a boundary in a record they already own.
+    /// The journal rows carry it, so "this sitting" is a comparison the Journal
+    /// view can make without the browser having to remember anything.
+    session: Mutex<String>,
+    /// How many sittings this process has opened; see [`mint_session_id`].
+    next_session: AtomicU64,
     /// Downloads in flight: URL → where the file is being staged and the name
     /// it will carry into the room. Needed because on macOS the `Finished`
     /// download event never reports where the file went — only the `Requested`
     /// handler knows, since it chose the path.
     downloads: Mutex<HashMap<String, StagedDownload>>,
+}
+
+impl BrowserState {
+    /// Take a freshly built page into the records, opening a browsing sitting if
+    /// it is the first one. The check and the push share one lock: two pages
+    /// opened at once must join one sitting, not mint two.
+    fn add_page(&self, page: Page) {
+        let mut tabs = self.tabs.lock().unwrap();
+        if tabs.is_empty() {
+            let nth = self.next_session.fetch_add(1, Ordering::SeqCst);
+            *self.session.lock().unwrap() = mint_session_id(nth);
+        }
+        tabs.push(page);
+    }
+
+    /// Forget a page, ending the sitting with the last one. Answers where the
+    /// page was and what is left, which is what the heir rule reads.
+    fn drop_page(&self, id: &str) -> (Option<usize>, Vec<String>) {
+        let mut tabs = self.tabs.lock().unwrap();
+        let at = tabs.iter().position(|p| p.id == id);
+        tabs.retain(|p| p.id != id);
+        // The sitting ends with the last page: whatever is browsed next started
+        // after a gap the user can see in their own record.
+        if tabs.is_empty() {
+            self.session.lock().unwrap().clear();
+        }
+        (at, tabs.iter().map(|p| p.id.clone()).collect())
+    }
 }
 
 /// One download being staged for import (see `download_allowed`).
@@ -269,10 +346,6 @@ pub fn new_tab(app: &tauri::AppHandle, url: &str) -> Result<String, String> {
         .fetch_add(1, Ordering::SeqCst)
         .to_string();
     create(app, &id, url)?;
-    {
-        let state = app.state::<BrowserState>();
-        state.tabs.lock().unwrap().push(Page { id: id.clone(), url: url.to_string() });
-    }
     select_tab(app, &id)?;
     Ok(id)
 }
@@ -299,12 +372,8 @@ pub fn close_tab(app: &tauri::AppHandle, id: &str) -> Result<(), String> {
     // clicking that tab did nothing because Rust already believed it was
     // active.
     let closed_the_visible_page = *state.active.lock().unwrap() == id;
-    let mut tabs = state.tabs.lock().unwrap();
-    let at = tabs.iter().position(|p| p.id == id);
-    tabs.retain(|p| p.id != id);
-    let remaining: Vec<String> = tabs.iter().map(|p| p.id.clone()).collect();
+    let (at, remaining) = state.drop_page(id);
     let heir = heir_after(&remaining, at);
-    drop(tabs);
     if closed_the_visible_page {
         *state.active.lock().unwrap() = heir;
     }
@@ -320,7 +389,7 @@ pub fn active_url(app: &tauri::AppHandle) -> Option<String> {
 
 /// One page's own record of where it was last sent. `None` while the tab is
 /// still being built — `new_tab` pushes the `Page` only after `create` returns.
-fn recorded_url(app: &tauri::AppHandle, id: &str) -> Option<String> {
+fn recorded_url<R: tauri::Runtime>(app: &tauri::AppHandle<R>, id: &str) -> Option<String> {
     let state = app.state::<BrowserState>();
     let tabs = state.tabs.lock().unwrap();
     tabs.iter().find(|p| p.id == id).map(|p| p.url.clone())
@@ -491,9 +560,16 @@ fn create(app: &tauri::AppHandle, id: &str, url: &str) -> Result<(), String> {
         )
         .map_err(|e| format!("The browser could not start: {e}"))?;
 
+    // Recorded BEFORE the blocker is attached, not after `create` returns: the
+    // attach reports its verdict onto this page, and three of its exits answer
+    // synchronously — a page not yet in `tabs` has nowhere to keep them, so the
+    // browser would report `Unknown` forever for exactly the failures the
+    // shield exists to show.
+    register_page(app, id, url);
+
     // The content rule list can only be attached once the webview (and thus its
     // configuration's user-content controller) exists. Attached to THIS page by
-    // id: `create` runs before the page is pushed and made active, so reaching
+    // id: `create` runs before the page is made active, so reaching
     // for "the active webview" here attached the blocker to the previous page
     // (which already had it) and left every new page — including the very first
     // one — with no tracker or private-range blocking at all, while the shield
@@ -504,8 +580,10 @@ fn create(app: &tauri::AppHandle, id: &str, url: &str) -> Result<(), String> {
 }
 
 /// Send a page that is parked on [`START_BLANK`] to where it was actually
-/// asked to go. A no-op for a genuinely blank new tab.
-fn go_after_rules(app: &tauri::AppHandle, id: &str, url: &str) {
+/// asked to go. A no-op for a genuinely blank new tab, and for the retry path,
+/// which re-attaches the blocker to pages the user is already reading.
+fn go_after_rules<R: tauri::Runtime>(app: &tauri::AppHandle<R>, id: &str, then: &ThenGo) {
+    let ThenGo::Navigate(url) = then else { return };
     if !should_go_after_rules(url, recorded_url(app, id).as_deref()) {
         return;
     }
@@ -524,10 +602,45 @@ fn go_after_rules(app: &tauri::AppHandle, id: &str, url: &str) {
 /// visual jump: `browse_open` journals the second page, waits for it, and then
 /// describes the first — the fabrication this module exists to prevent.
 ///
-/// `recorded` is the page's own record ([`recorded_url`]); `None` means we are
-/// still inside `create`, where nothing can have superseded us yet.
+/// `recorded` is the page's own record ([`recorded_url`]). `None` is a page
+/// that is not in `tabs` — one closed while its rules compiled — and firing for
+/// it is harmless: [`go_after_rules`] finds no webview to navigate.
 fn should_go_after_rules(url: &str, recorded: Option<&str>) -> bool {
     url != START_BLANK && recorded.is_none_or(|current| current == url)
+}
+
+/// Take a freshly built page into the browser's own records, and open a
+/// browsing sitting if it is the first one.
+///
+/// A page is in `tabs` from the moment its webview exists — `tab_list` filters
+/// on the webview anyway, so an entry can never outlive the thing it describes.
+fn register_page(app: &tauri::AppHandle, id: &str, url: &str) {
+    app.state::<BrowserState>().add_page(Page {
+        id: id.to_string(),
+        url: url.to_string(),
+        protection: Protection::Unknown,
+        deferred_since: None,
+    });
+}
+
+/// A browsing sitting's id: the wall clock it began at, plus a counter so two
+/// sittings inside one second are still two.
+///
+/// It must be unique against rows written by EARLIER RUNS of the app — journal
+/// lines outlive the process, and a bare counter would restart at 0 and label
+/// last week's browsing as part of this sitting — while being stored nowhere
+/// but those rows.
+fn mint_session_id(nth: u64) -> String {
+    format!("{}-{nth}", chrono::Local::now().format("%Y%m%d%H%M%S"))
+}
+
+/// The sitting the journal is writing into, empty when nothing is being
+/// browsed. Read through `try_state` because [`journal`] runs from paths (app
+/// quit, download callbacks) that cannot promise the state is still managed.
+pub fn session_id(app: &tauri::AppHandle) -> String {
+    app.try_state::<BrowserState>()
+        .map(|state| state.session.lock().unwrap().clone())
+        .unwrap_or_default()
 }
 
 /// Close EVERY page — room close and app quit, the two paths that are meant to
@@ -545,6 +658,7 @@ pub fn close<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<(), String>
         }
     }
     state.active.lock().unwrap().clear();
+    state.session.lock().unwrap().clear();
     state.takeover.store(false, Ordering::SeqCst);
     state.downloads.lock().unwrap().clear();
     let _ = std::fs::remove_dir_all(staging_dir());
@@ -953,6 +1067,7 @@ fn import_finished_download(app: &tauri::AppHandle, url: String, staged: StagedD
 pub fn journal(app: &tauri::AppHandle, kind: &str, url: &str, detail: &str) {
     let entry = JournalEntry {
         at: now_iso(),
+        session: session_id(app),
         kind: kind.to_string(),
         url: url.to_string(),
         detail: detail.to_string(),
@@ -964,6 +1079,7 @@ pub fn journal(app: &tauri::AppHandle, kind: &str, url: &str, detail: &str) {
             if let Some(room) = guard.as_ref() {
                 let _ = crate::db::insert_browse_journal(
                     &room.conn,
+                    &entry.session,
                     &entry.kind,
                     &entry.url,
                     &entry.detail,
@@ -1005,7 +1121,7 @@ pub async fn eval_json(
     let raw = tokio::time::timeout(EVAL_TIMEOUT, rx)
         .await
         .map_err(|_| EVAL_TIMED_OUT.to_string())?
-        .map_err(|_| "The browser closed while the page was answering.".to_string())?;
+        .map_err(|_| EVAL_LOST.to_string())?;
 
     if raw.is_empty() {
         // wry cannot distinguish `undefined` from a thrown exception — both
@@ -1128,15 +1244,20 @@ async fn probe_ready(app: &tauri::AppHandle) -> Option<Readiness> {
 /// How a FAILED readiness probe should be read.
 ///
 /// `None` is "the document answered nothing, and never will" — the PDF case,
-/// which [`wait_ready`] is right to report as refused. A probe that ran out of
-/// time is a different page: its JavaScript thread is blocked (a very long
-/// task, or a blocking dialog wry never dismisses), which is exactly
-/// `Loading`. Reading it as `None` reported a merely busy page with
-/// [`SCRIPT_REFUSED`] — worded to stop the model retrying — instead of "the
-/// page did not finish loading", and one stuck probe was enough to do it
-/// because `EVAL_TIMEOUT` outlasts the smallest readiness budget.
+/// which [`wait_ready`] is right to report as refused. Two probe failures are
+/// not that page at all:
+///
+/// * [`EVAL_TIMED_OUT`] — the JavaScript thread is blocked (a very long task,
+///   or a blocking dialog wry never dismisses), which is exactly `Loading`.
+///   Reading it as `None` reported a merely busy page with [`SCRIPT_REFUSED`] —
+///   worded to stop the model retrying — instead of "the page did not finish
+///   loading", and one stuck probe was enough to do it because `EVAL_TIMEOUT`
+///   outlasts the smallest readiness budget.
+/// * [`EVAL_LOST`] — the document under the probe was replaced. A probe that
+///   was interrupted BY a navigation is the strongest evidence there is that a
+///   navigation is in progress, which is the definition of `Loading`.
 fn readiness_from_probe_error(err: &str) -> Option<Readiness> {
-    (err == EVAL_TIMED_OUT).then_some(Readiness::Loading)
+    (err == EVAL_TIMED_OUT || err == EVAL_LOST).then_some(Readiness::Loading)
 }
 
 /// Wait until the injected page script answers.
@@ -1273,8 +1394,178 @@ pub async fn call_async(
 // macOS specifics: rule list + the ephemerality assertion
 // ---------------------------------------------------------------------------
 
+/// What to do once the rule list has been dealt with.
+///
+/// The destination used to be an assumption baked into the attach: every call
+/// came from `create`, so "afterwards" always meant "navigate". Retrying the
+/// blocker on pages the user is ALREADY reading has to re-attach without moving
+/// them, so where to go afterwards is data now.
+#[derive(Debug, Clone)]
+enum ThenGo {
+    /// Send the page to the destination it was parked for.
+    Navigate(String),
+    /// Leave the page exactly where it is.
+    Stay,
+}
+
+/// One exit from [`attach_rules`]: record what the blocker did to this page,
+/// let the page go where it was told, and stop claiming it is waiting on the
+/// blocker.
+///
+/// Every exit goes through here, including the ones that used to answer
+/// nothing at all. A verdict that is never recorded reads as `Unknown` forever,
+/// and `Unknown` is precisely the state the shield must not present as safe.
+/// The deferral is cleared HERE, in the one funnel, rather than at each exit:
+/// a wait that outlives the thing being waited for is a toolbar stuck on
+/// "loading" for the rest of the room's life.
+///
+/// Runtime-generic for the same reason [`close`] is — the clear-on-every-exit
+/// invariant is only testable if the chain accepts a mock runtime.
+fn settle<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    id: &str,
+    verdict: Protection,
+    then: &ThenGo,
+) {
+    set_protection(app, id, verdict);
+    go_after_rules(app, id, then);
+    navigation_arrived(app, id);
+}
+
+/// Record what the blocker did to ONE page. A verdict for a page that has since
+/// closed is dropped: the compile is asynchronous, so losing the race with a
+/// closing tab is ordinary, not a failure.
+fn set_protection<R: tauri::Runtime>(app: &tauri::AppHandle<R>, id: &str, verdict: Protection) {
+    let state = app.state::<BrowserState>();
+    let mut tabs = state.tabs.lock().unwrap();
+    if let Some(page) = tabs.iter_mut().find(|p| p.id == id) {
+        page.protection = verdict;
+    }
+}
+
+/// This page is parked on [`START_BLANK`] with a real destination waiting
+/// behind the rule list's compile.
+fn defer_navigation<R: tauri::Runtime>(app: &tauri::AppHandle<R>, id: &str) {
+    let state = app.state::<BrowserState>();
+    let mut tabs = state.tabs.lock().unwrap();
+    if let Some(page) = tabs.iter_mut().find(|p| p.id == id) {
+        page.deferred_since = Some(Instant::now());
+    }
+}
+
+/// The wait is over — issued, superseded or abandoned, all three end it.
+fn navigation_arrived<R: tauri::Runtime>(app: &tauri::AppHandle<R>, id: &str) {
+    let state = app.state::<BrowserState>();
+    let mut tabs = state.tabs.lock().unwrap();
+    if let Some(page) = tabs.iter_mut().find(|p| p.id == id) {
+        page.deferred_since = None;
+    }
+}
+
+/// How long a page may claim to be waiting on its content blocker.
+///
+/// [`settle`] clears the wait on every exit, so this ceiling is only ever
+/// reached when WebKit drops the compile's completion block without calling it
+/// — the one ending no exit of ours can see. It is a backstop, not the
+/// mechanism: without it that page would report "still loading" forever, and
+/// `browser_info` would go on hiding real page errors behind a wait that ended
+/// long ago.
+const DEFER_GRACE: Duration = Duration::from_secs(20);
+
+/// Is a recorded deferral still worth believing?
+fn deferral_is_live(since: Option<Instant>) -> bool {
+    since.is_some_and(|at| at.elapsed() < DEFER_GRACE)
+}
+
+/// Is the SHOWING page still parked behind its blocker's compile?
+///
+/// `browser_info` reports for the active page, so this asks about the same one.
+/// While it holds, what the page says about itself describes the blank start
+/// document, and an eval that fails describes a document already replaced —
+/// neither is news about the page the user asked for.
+pub fn navigation_deferred(app: &tauri::AppHandle) -> bool {
+    let Some(id) = active_id(app) else { return false };
+    let state = app.state::<BrowserState>();
+    let tabs = state.tabs.lock().unwrap();
+    tabs.iter()
+        .find(|p| p.id == id)
+        .is_some_and(|p| deferral_is_live(p.deferred_since))
+}
+
+/// What the whole browser's blocker is doing — worst page wins.
+///
+/// The same doctrine as [`verify_ephemeral`]: the shield speaks for the browser,
+/// so one page whose rule list never attached makes the browser unprotected, no
+/// matter how many of its neighbours are fine. `Unknown` with nothing open,
+/// because a browser with no pages has not protected anything.
+pub fn protection(app: &tauri::AppHandle) -> Protection {
+    let state = app.state::<BrowserState>();
+    let pages: Vec<(String, Protection)> = state
+        .tabs
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|p| (p.id.clone(), p.protection.clone()))
+        .collect();
+    let open: Vec<Protection> = pages
+        .into_iter()
+        .filter(|(id, _)| webview_of(app, id).is_some())
+        .map(|(_, verdict)| verdict)
+        .collect();
+    worst_protection(&open)
+}
+
+/// How bad a verdict is. `Unknown` outranks `Active` because a page nobody has
+/// heard back about is not a protected page.
+fn protection_severity(verdict: &Protection) -> u8 {
+    match verdict {
+        Protection::Failed { .. } => 3,
+        Protection::Unavailable { .. } => 2,
+        Protection::Unknown => 1,
+        Protection::Active => 0,
+    }
+}
+
+/// The worst of the lot, first one wins a tie so the reason belongs to the page
+/// that hit the trouble earliest. Empty is `Unknown`, never `Active`.
+fn worst_protection(verdicts: &[Protection]) -> Protection {
+    let mut worst: Option<&Protection> = None;
+    for verdict in verdicts {
+        if worst.is_none_or(|w| protection_severity(verdict) > protection_severity(w)) {
+            worst = Some(verdict);
+        }
+    }
+    worst.cloned().unwrap_or_default()
+}
+
+/// Re-compile and re-attach the rule list to EVERY open page, without moving
+/// any of them. What the shield's "Try again" runs.
+///
+/// Pages that are already `Active` are re-attached too: the list is one
+/// identifier compiled from one `rules_json`, so a page that gets it twice
+/// blocks exactly what it blocked before, and skipping them would leave the
+/// shield's verdict depending on which pages happened to be fine when the user
+/// pressed the button.
+pub fn retry_protection(app: &tauri::AppHandle) -> Result<(), String> {
+    let ids: Vec<String> = app
+        .state::<BrowserState>()
+        .tabs
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|p| p.id.clone())
+        .collect();
+    if ids.is_empty() {
+        return Err("The browser isn't open.".to_string());
+    }
+    for id in ids {
+        attach_rules(app, &id, ThenGo::Stay);
+    }
+    Ok(())
+}
+
 /// Compile the content rule list, attach it to the live webview, and only THEN
-/// send the page to `url`.
+/// do whatever `then` says.
 ///
 /// WebKit compiles asynchronously and caches by identifier, so this is cheap
 /// after the first call in a process. Failure is non-fatal but IS journalled —
@@ -1282,27 +1573,43 @@ pub async fn call_async(
 /// one where it is working — and the page is still loaded: a blocker that
 /// could not compile must not turn into a browser that cannot open a page.
 #[cfg(target_os = "macos")]
-fn attach_rules_then_go(app: &tauri::AppHandle, id: &str, url: &str) {
+fn attach_rules(app: &tauri::AppHandle, id: &str, then: ThenGo) {
     use objc2_foundation::{MainThreadMarker, NSString};
     use objc2_web_kit::{WKContentRuleList, WKContentRuleListStore, WKWebView};
 
-    let Some(wv) = webview_of(app, id) else { return };
+    // Back to "nobody has heard yet" for the whole of the compile: a `Failed`
+    // left over from the last attempt would otherwise survive a retry that is
+    // about to succeed, and the shield would keep reporting the old verdict.
+    set_protection(app, id, Protection::Unknown);
+    // …and while the compile runs, this page is not where it is going. A blank
+    // new tab is excluded: it is not on its way anywhere, so nothing about it
+    // is loading. Every exit clears this again through `settle`.
+    if matches!(&then, ThenGo::Navigate(url) if url != START_BLANK) {
+        defer_navigation(app, id);
+    }
+    let Some(wv) = webview_of(app, id) else {
+        settle(app, id, Protection::Failed { reason: "The page is no longer open.".into() }, &then);
+        return;
+    };
     let owned = app.clone();
     let go_id = id.to_string();
-    let go_url = url.to_string();
+    let inner = then.clone();
     let attached = wv.with_webview(move |platform| unsafe {
         let Some(mtm) = MainThreadMarker::new() else {
-            go_after_rules(&owned, &go_id, &go_url);
+            let reason = "The content blocker can only be attached on the main thread.".into();
+            settle(&owned, &go_id, Protection::Failed { reason }, &inner);
             return;
         };
         let Some(store) = WKContentRuleListStore::defaultStore(mtm) else {
             journal(&owned, "blocker", "", "Content blocker unavailable on this system.");
-            go_after_rules(&owned, &go_id, &go_url);
+            let reason = "This system has no content-blocker store.".into();
+            settle(&owned, &go_id, Protection::Unavailable { reason }, &inner);
             return;
         };
         let ptr = platform.inner() as *mut WKWebView;
         if ptr.is_null() {
-            go_after_rules(&owned, &go_id, &go_url);
+            let reason = "The page has no native view to attach the blocker to.".into();
+            settle(&owned, &go_id, Protection::Failed { reason }, &inner);
             return;
         }
         let webview: &WKWebView = &*ptr;
@@ -1311,9 +1618,10 @@ fn attach_rules_then_go(app: &tauri::AppHandle, id: &str, url: &str) {
         let app2 = owned.clone();
         let handler = block2::RcBlock::new(
             move |list: *mut WKContentRuleList, err: *mut objc2_foundation::NSError| {
-                if !list.is_null() {
+                let verdict = if !list.is_null() {
                     controller.addContentRuleList(&*list);
                     journal(&app2, "blocker", "", "Content blocking active.");
+                    Protection::Active
                 } else {
                     let msg = if err.is_null() {
                         "unknown error".to_string()
@@ -1326,10 +1634,11 @@ fn attach_rules_then_go(app: &tauri::AppHandle, id: &str, url: &str) {
                         "",
                         &format!("Content blocking FAILED to load: {msg}"),
                     );
-                }
+                    Protection::Failed { reason: msg }
+                };
                 // Whether the blocker loaded or not, the page must go
                 // somewhere — but never BEFORE this point.
-                go_after_rules(&app2, &go_id, &go_url);
+                settle(&app2, &go_id, verdict, &inner);
             },
         );
         store.compileContentRuleListForIdentifier_encodedContentRuleList_completionHandler(
@@ -1339,14 +1648,21 @@ fn attach_rules_then_go(app: &tauri::AppHandle, id: &str, url: &str) {
         );
     });
     // `with_webview` never ran, so nothing above will navigate for us.
-    if attached.is_err() {
-        go_after_rules(app, id, url);
+    if let Err(e) = attached {
+        settle(app, id, Protection::Failed { reason: e.to_string() }, &then);
     }
 }
 
 #[cfg(not(target_os = "macos"))]
+fn attach_rules(app: &tauri::AppHandle, id: &str, then: ThenGo) {
+    let reason = "This build has no content blocker.".into();
+    settle(app, id, Protection::Unavailable { reason }, &then);
+}
+
+/// The name every caller that opens a page already uses: attach the blocker,
+/// then send the page to `url`.
 fn attach_rules_then_go(app: &tauri::AppHandle, id: &str, url: &str) {
-    go_after_rules(app, id, url);
+    attach_rules(app, id, ThenGo::Navigate(url.to_string()));
 }
 
 /// Assert, against EVERY live webview, that its website data store is
@@ -1783,6 +2099,193 @@ mod tests {
         assert_eq!(START_BLANK, "about:blank");
     }
 
+    /// The shield speaks for the WHOLE browser, so one page whose rule list
+    /// never attached makes the browser unprotected — the same doctrine
+    /// `verify_ephemeral` applies to the storage check. Before this, the chip
+    /// read "Trackers blocked." off an unrelated storage assertion, so a failed
+    /// compile and a working one looked identical.
+    #[test]
+    fn one_unprotected_page_makes_the_whole_browser_unprotected() {
+        let failed = Protection::Failed { reason: "compile refused".into() };
+        let unavailable = Protection::Unavailable { reason: "no store".into() };
+
+        // Nothing open has protected nothing — never Active.
+        assert_eq!(worst_protection(&[]), Protection::Unknown);
+        // The only state that may be reported as protected: every page said so.
+        assert_eq!(
+            worst_protection(&[Protection::Active, Protection::Active]),
+            Protection::Active
+        );
+        // …and one of anything else outranks any number of Active pages.
+        for bad in [failed.clone(), unavailable.clone(), Protection::Unknown] {
+            let mixed = [Protection::Active, bad.clone(), Protection::Active];
+            assert_eq!(worst_protection(&mixed), bad, "one {bad:?} page must win");
+            assert_ne!(worst_protection(&mixed), Protection::Active);
+        }
+        // Severity order in full: Failed > Unavailable > Unknown > Active.
+        assert_eq!(
+            worst_protection(&[unavailable.clone(), failed.clone(), Protection::Unknown]),
+            failed
+        );
+        assert_eq!(
+            worst_protection(&[Protection::Unknown, unavailable.clone()]),
+            unavailable
+        );
+        // A tie keeps the FIRST page's reason rather than the last one's.
+        assert_eq!(
+            worst_protection(&[
+                failed.clone(),
+                Protection::Failed { reason: "second".into() },
+            ]),
+            failed
+        );
+    }
+
+    /// The shield reads this off `browser_info`, so the JSON shape is the
+    /// contract — a renamed tag or variant silently turns the chip's checks
+    /// into "none of the above".
+    #[test]
+    fn the_verdict_reaches_the_frontend_as_a_tagged_state() {
+        let json = |p: &Protection| serde_json::to_value(p).unwrap();
+        assert_eq!(json(&Protection::Unknown), serde_json::json!({ "state": "unknown" }));
+        assert_eq!(json(&Protection::Active), serde_json::json!({ "state": "active" }));
+        assert_eq!(
+            json(&Protection::Failed { reason: "boom".into() }),
+            serde_json::json!({ "state": "failed", "reason": "boom" })
+        );
+        assert_eq!(
+            json(&Protection::Unavailable { reason: "none here".into() }),
+            serde_json::json!({ "state": "unavailable", "reason": "none here" })
+        );
+        // The default is the one that is never presented as safe.
+        assert_eq!(Protection::default(), Protection::Unknown);
+    }
+
+    /// Three of the six exits used to answer NOTHING — no journal line, no
+    /// verdict — so a browser whose blocker never attached was indistinguishable
+    /// from one where it did. Pinned as a source scan: every one of these paths
+    /// needs a live WKWebView (or a machine without one) to reach, and each
+    /// compiles perfectly while saying nothing.
+    #[test]
+    fn every_exit_from_the_blocker_attach_records_a_verdict() {
+        let src = include_str!("browser.rs");
+        let body = src
+            .split("fn attach_rules(app: &tauri::AppHandle, id: &str, then: ThenGo)")
+            .nth(1)
+            .expect("the macOS attach exists")
+            .split("\n#[cfg(not(target_os = \"macos\"))]")
+            .next()
+            .expect("the stub follows the macOS attach");
+
+        // Every early return is preceded by the line that records the verdict.
+        let lines: Vec<&str> = body.lines().collect();
+        let mut exits = 0;
+        for (n, line) in lines.iter().enumerate() {
+            if line.trim() != "return;" {
+                continue;
+            }
+            exits += 1;
+            let before = lines[..n].iter().rev().find(|l| !l.trim().is_empty());
+            assert!(
+                before.is_some_and(|l| l.contains("settle(")),
+                "an exit from the blocker attach says nothing about protection: \
+                 line {n} of the body",
+            );
+        }
+        // …and the scan must have found them, or a renamed signature would make
+        // this test pass by reading nothing at all.
+        assert!(
+            exits >= 4,
+            "expected the page-gone, main-thread, store and null-view exits; saw {exits}"
+        );
+        // The compile's own two outcomes, and the case where `with_webview`
+        // never ran at all.
+        assert!(body.contains("Protection::Active"), "a successful attach must be recorded");
+        assert!(
+            body.contains("if let Err(e) = attached"),
+            "a `with_webview` that never ran leaves the page unprotected and must say so"
+        );
+        // A retry must not inherit the last attempt's verdict.
+        assert!(
+            body.contains("set_protection(app, id, Protection::Unknown)"),
+            "a stale Failed would survive a re-attach that is about to succeed"
+        );
+        // …and a build with no content blocker at all is Unavailable, not silence.
+        let stub = src
+            .split("#[cfg(not(target_os = \"macos\"))]\nfn attach_rules")
+            .nth(1)
+            .expect("the non-macOS stub exists");
+        let stub: String = stub.chars().take(300).collect();
+        assert!(stub.contains("Protection::Unavailable"));
+    }
+
+    /// The journal is one stream across every sitting ever; the boundary is
+    /// what lets the view separate now from before. It lives ONLY in memory and
+    /// in the rows already written, so it has to open with the first page and
+    /// close with the last one.
+    #[test]
+    fn a_browsing_sitting_opens_with_the_first_page_and_closes_with_the_last() {
+        let page = |id: &str| Page {
+            id: id.to_string(),
+            url: "https://example.com/".to_string(),
+            protection: Protection::Unknown,
+            deferred_since: None,
+        };
+        let state = BrowserState::default();
+        assert!(state.session.lock().unwrap().is_empty(), "nothing browsed yet");
+
+        state.add_page(page("0"));
+        let first = state.session.lock().unwrap().clone();
+        assert!(!first.is_empty());
+        // A second page joins the sitting the first one opened.
+        state.add_page(page("1"));
+        assert_eq!(*state.session.lock().unwrap(), first);
+        // Closing one page does not end it…
+        state.drop_page("0");
+        assert_eq!(*state.session.lock().unwrap(), first);
+        // …closing the LAST one does.
+        state.drop_page("1");
+        assert!(
+            state.session.lock().unwrap().is_empty(),
+            "the sitting must end with the browser, or the next one is labelled \
+             as this one"
+        );
+        // …and the next sitting is a different sitting.
+        state.add_page(page("2"));
+        assert_ne!(*state.session.lock().unwrap(), first);
+    }
+
+    /// A sitting id is compared against rows written by EARLIER RUNS of the
+    /// app, which is why it is not a bare counter: a counter restarts at 0 and
+    /// labels last week's browsing as this sitting.
+    #[test]
+    fn two_sittings_in_the_same_second_are_still_two() {
+        assert_ne!(mint_session_id(0), mint_session_id(1));
+        assert!(mint_session_id(0).len() > 8, "a bare counter would collide across runs");
+    }
+
+    /// Room close and app quit destroy the session; the sitting must not
+    /// outlive it, or the first line of the next one joins the last one.
+    #[test]
+    fn closing_the_browser_ends_the_sitting() {
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        app.manage(BrowserState::default());
+        let state = app.state::<BrowserState>();
+        state.add_page(Page {
+            id: "0".into(),
+            url: "https://example.com/".into(),
+            protection: Protection::Active,
+            deferred_since: None,
+        });
+        assert!(!state.session.lock().unwrap().is_empty());
+
+        close(app.handle()).unwrap();
+        assert!(state.session.lock().unwrap().is_empty());
+        assert!(state.tabs.lock().unwrap().is_empty());
+    }
+
     /// Parking every page on `about:blank` moved the real navigation into the
     /// blocker's async compile handler, which fires with the URL captured when
     /// the page was BUILT. A second address entered during the compile window
@@ -1804,10 +2307,11 @@ mod tests {
         assert!(!should_go_after_rules(START_BLANK, Some(START_BLANK)));
     }
 
-    /// A probe that never came back found a page whose JS thread is busy, not a
-    /// document without a script. Telling them apart matters because one stuck
-    /// probe outlasts the whole readiness budget on its own, and the refused
-    /// message is deliberately worded to stop the model retrying.
+    /// A probe that never came back found a page whose JS thread is busy, or a
+    /// document that was replaced under it — neither is a document without a
+    /// script. Telling them apart matters because one stuck probe outlasts the
+    /// whole readiness budget on its own, and the refused message is
+    /// deliberately worded to stop the model retrying.
     #[test]
     fn a_readiness_probe_that_timed_out_is_a_busy_page_not_an_undriveable_one() {
         assert!(
@@ -1815,14 +2319,102 @@ mod tests {
             "if a probe could no longer outlast a budget this distinction would be moot"
         );
         assert_eq!(readiness_from_probe_error(EVAL_TIMED_OUT), Some(Readiness::Loading));
+        // THE FIRST-NAVIGATION BUG. This used to map to `None`, and the old
+        // assertion pinned it there under the old wording ("the browser closed
+        // while the page was answering") — an intent that was simply wrong. A
+        // dropped callback means the document under the probe went away, and
+        // the ordinary way a document goes away is a navigation. Read as `None`
+        // it never set `could_still_load`, so a window of these expired the
+        // budget into SCRIPT_REFUSED — the message written to stop the model
+        // retrying — for a page that was merely loading.
+        assert_eq!(readiness_from_probe_error(EVAL_LOST), Some(Readiness::Loading));
         // A document that answered NOTHING really has no script for us.
         assert_eq!(readiness_from_probe_error(SCRIPT_REFUSED), None);
-        assert_eq!(readiness_from_probe_error("The browser closed while the page was answering."), None);
-        // …and the message must stay the one `eval_json` actually produces.
+        assert_eq!(readiness_from_probe_error("The page answered with something unreadable: x"), None);
+        // …and the messages must stay the ones `eval_json` actually produces.
+        let src = include_str!("browser.rs");
         assert!(
-            include_str!("browser.rs").contains("map_err(|_| EVAL_TIMED_OUT.to_string())"),
-            "eval_json must report its timeout through the constant probe_ready matches on"
+            src.contains("map_err(|_| EVAL_TIMED_OUT.to_string())")
+                && src.contains("map_err(|_| EVAL_LOST.to_string())"),
+            "eval_json must report both failures through the constants probe_ready matches on"
         );
+        // "closed" was a guess, and the wrong one: nothing closed.
+        assert!(
+            !EVAL_LOST.contains("closed"),
+            "the lost-callback message must not diagnose a closed browser"
+        );
+    }
+
+    /// While a page waits for its blocker to compile it is parked on
+    /// `about:blank`, so BOTH halves of what it says are about the wrong
+    /// document — and the wait must end on every path out of the attach, not
+    /// just the successful one. A wait that outlives the thing waited for is a
+    /// toolbar stuck on "loading" for the rest of the room's life.
+    #[test]
+    fn a_deferred_navigation_is_cleared_however_the_attach_ends() {
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        app.manage(BrowserState::default());
+        let state = app.state::<BrowserState>();
+        let deferred = || {
+            state
+                .tabs
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|p| deferral_is_live(p.deferred_since))
+        };
+
+        state.add_page(Page {
+            id: "0".into(),
+            url: "https://example.com/".into(),
+            protection: Protection::Unknown,
+            deferred_since: None,
+        });
+        // Every exit of `attach_rules` funnels through `settle` (pinned by
+        // `every_exit_from_the_blocker_attach_records_a_verdict`), so each of
+        // these stands for one of them — including the ones where the
+        // navigation is ABANDONED and never fires at all.
+        for (verdict, then) in [
+            (Protection::Active, ThenGo::Navigate("https://example.com/".into())),
+            (
+                Protection::Failed { reason: "compile refused".into() },
+                ThenGo::Navigate("https://example.com/".into()),
+            ),
+            (
+                Protection::Unavailable { reason: "no store".into() },
+                // Superseded: the page was sent somewhere else while the rules
+                // compiled, so this navigation is dropped on the floor — and
+                // dropping it must still end the wait.
+                ThenGo::Navigate("https://elsewhere.example/".into()),
+            ),
+        ] {
+            defer_navigation(app.handle(), "0");
+            assert!(deferred(), "the page should be waiting on its blocker");
+            settle(app.handle(), "0", verdict, &then);
+            assert!(
+                !deferred(),
+                "the wait outlived the attach — the toolbar would report loading forever"
+            );
+        }
+    }
+
+    /// The backstop, for the one ending no exit of ours can see: WebKit drops
+    /// the compile's completion block without ever calling it. The page has to
+    /// go back to telling the ordinary truth rather than claiming to be loading
+    /// for as long as the room is open.
+    #[test]
+    fn a_wait_nobody_ever_ended_stops_being_believed() {
+        assert!(!deferral_is_live(None), "a page that never deferred is not loading");
+        assert!(deferral_is_live(Some(Instant::now())), "a fresh wait counts");
+        let ancient = Instant::now()
+            .checked_sub(DEFER_GRACE + Duration::from_secs(1))
+            .expect("the clock has been up longer than the grace");
+        assert!(!deferral_is_live(Some(ancient)));
+        // The ceiling has to outlast a real cold compile, or it would hide the
+        // very state it exists to report.
+        assert!(DEFER_GRACE >= Duration::from_secs(10));
     }
 
     /// The readiness probe is the fix for the live-QA loop, and it is pure

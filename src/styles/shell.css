@@ -1026,6 +1026,27 @@ body.resizing-col * {
 .context-strip .context-count:hover {
   text-decoration: underline;
 }
+/* The scope control. Reads as the same word the button above is — it stands in
+   the same sentence — so it borrows the accent and gives up the platform's
+   field chrome; the caret the browser still draws is what says it opens. */
+.context-strip .context-scope {
+  color: var(--accent-2);
+  background: none;
+  border: 0;
+  padding: 0;
+  max-width: 22ch;
+  font: inherit;
+  cursor: pointer;
+}
+/* What the chosen scope COSTS, beside what it is. Amber, like every other
+   surface that says room content is leaving this Mac (.local-mini.warn). */
+.context-strip .context-leaves {
+  color: var(--amber);
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 .local-mini {
   margin-left: auto;
   color: var(--green);
@@ -2611,4 +2632,17 @@ button.status-trust.danger:hover {
   border-radius: 3px 2px 4px 2px / 2px 4px 2px 3px;
   background: var(--accent);
   transition: width 0.2s ease;
+}
+
+/* A quiet membership mark on a destination's own row — "Home lists this too".
+   Deliberately not a colour alone: the words are the carrier, and the tint
+   only reinforces them. */
+.nav-chip {
+  padding: 1px 6px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--faint);
+  font-size: 9.5px;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
 }

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useSyncExternalStore } from "react";
 import {
   CloseIcon,
   CloudIcon,
@@ -11,6 +11,7 @@ import {
 } from "../icons";
 import { displayName, openingSigil } from "./composer";
 import { isCloudEngine, isCloudRoute, isExternalEngine } from "./markup";
+import { currentTurnScope, subscribeTurnScope } from "./chatActions";
 import { bestLocalModel } from "./localModel";
 import { RECOMMENDED_MODELS } from "./constants";
 import { WSState } from "./state";
@@ -51,6 +52,11 @@ export default function Composer({ s, a }: { s: WSState; a: WSActions }) {
   // matching chip can be drawn circled. Display only — `parseComposer` still
   // decides what is actually sent, and this reads the same patterns it does.
   const sigil = openingSigil(s.question);
+  // The box says what this turn will actually be answered from, in the same
+  // words the strip above the chat states it in. Subscribed rather than passed:
+  // the strip is three components up, and a box promising the room while the
+  // strip promises the page is precisely the drift this is here to prevent.
+  const scope = useSyncExternalStore(subscribeTurnScope, currentTurnScope);
   return (
     <div className="composer">
       {batchTidy ? (
@@ -381,7 +387,7 @@ export default function Composer({ s, a }: { s: WSState; a: WSActions }) {
         <textarea
           ref={s.composerRef}
           className="composer-input"
-          placeholder="Ask anything about this room…"
+          placeholder={scope.placeholder}
           value={s.question}
           rows={3}
           dir="auto"

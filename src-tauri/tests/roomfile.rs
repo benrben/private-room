@@ -222,6 +222,55 @@ fn adds_the_parked_reason_column_to_a_legacy_jobs_table() {
     assert_eq!(db::list_jobs(&conn).unwrap().len(), 1);
 }
 
+/// A room whose `browse_journal` predates the sitting boundary. Every room that
+/// has ever browsed is one of these, and `list_browse_journal` selects `session`
+/// by name — miss the ALTER and the Journal view cannot render a single line of
+/// the record it is there to show. The lines it already had belong to no
+/// sitting, which is exactly what an empty string says.
+#[test]
+fn adds_the_session_column_to_a_legacy_browse_journal() {
+    let dir = Scratch::new("roomai-journal");
+    let path = dir.join("legacy-journal.roomai");
+    let path_str = path.to_string_lossy().to_string();
+
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.pragma_update(None, "key", "pw").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta VALUES('format','roomai'),('name','legacy');
+             CREATE TABLE messages(
+               id TEXT PRIMARY KEY, role TEXT NOT NULL, content TEXT NOT NULL,
+               sources TEXT,
+               created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')));
+             CREATE TABLE browse_journal(
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               kind TEXT NOT NULL,
+               url TEXT NOT NULL DEFAULT '',
+               detail TEXT NOT NULL DEFAULT '',
+               created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')));
+             INSERT INTO browse_journal(kind, url, detail)
+               VALUES('open','https://example.com/','Opened by the user');",
+        )
+        .unwrap();
+    }
+
+    let conn = db::open_room(&path_str, "pw").unwrap();
+    let rows = db::list_browse_journal(&conn, 10).unwrap();
+    assert_eq!(rows.len(), 1, "the old record must survive the migration");
+    assert_eq!(
+        rows[0].session, "",
+        "a line written before sittings existed belongs to none of them"
+    );
+    // A new line lands in its sitting alongside the old ones.
+    db::insert_browse_journal(&conn, "20260815120000-0", "open", "https://b/", "now").unwrap();
+    assert_eq!(db::list_browse_journal(&conn, 10).unwrap()[0].session, "20260815120000-0");
+    // Re-opening is a no-op: the duplicate-column error is the idempotence check.
+    drop(conn);
+    let conn = db::open_room(&path_str, "pw").unwrap();
+    assert_eq!(db::list_browse_journal(&conn, 10).unwrap().len(), 2);
+}
+
 #[test]
 fn chunking_and_extraction() {
     let text = "para one\n\npara two\n\n".repeat(200);

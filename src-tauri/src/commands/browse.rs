@@ -915,6 +915,12 @@ pub async fn browser_info(app: tauri::AppHandle) -> Result<serde_json::Value, St
         // looked exactly like one that was fine. Hand the reason back.
         Err(e) => (serde_json::Value::Null, Some(e)),
     };
+    let deferred = browser::navigation_deferred(&app);
+    let (ready, error) = reportable_page_state(
+        deferred,
+        info.get("ready").cloned().unwrap_or(serde_json::Value::Null),
+        error,
+    );
     // The page script answers for the MAIN frame, so this is the authoritative
     // "where is this page" — write it back so a record corrupted by a
     // sub-frame navigation heals on the next poll instead of persisting as a
@@ -922,11 +928,14 @@ pub async fn browser_info(app: tauri::AppHandle) -> Result<serde_json::Value, St
     if let Some(url) = info.get("url").and_then(|u| u.as_str()) {
         browser::record_active_url(&app, url);
     }
-    // With no answer from the page, our own RECORD of where this page was sent
-    // is the only honest address there is — better than a null the view falls
-    // back to its last known value for.
+    // With no answer from the page — or while it is still parked on the blank
+    // start document waiting for its blocker, where the address it reports is
+    // `about:blank` and not where it is going — our own RECORD of where this
+    // page was sent is the only honest address there is. Better than a null the
+    // view falls back to its last known value for, and better than flashing
+    // `about:blank` in the bar the user just typed a destination into.
     let url = match info.get("url").cloned() {
-        Some(url) if !url.is_null() => url,
+        Some(url) if !url.is_null() && !deferred => url,
         _ => browser::active_url(&app)
             .map(serde_json::Value::from)
             .unwrap_or(serde_json::Value::Null),
@@ -935,15 +944,29 @@ pub async fn browser_info(app: tauri::AppHandle) -> Result<serde_json::Value, St
         "open": true,
         // Recorded, not read from the page script — a blank page runs no script.
         "blank": browser::is_blank(&app),
+        // What the content blocker DID, worst page first. The shield used to
+        // read "Trackers blocked." off the storage check, which knows nothing
+        // about the rule list.
+        "protection": browser::protection(&app),
+        // The browsing sitting the journal is writing into — empty when none is
+        // live — so the Journal can tell this sitting from the earlier ones.
+        "session": browser::session_id(&app),
         "url": url,
         "title": info.get("title").cloned().unwrap_or(serde_json::Value::Null),
-        "ready": info.get("ready").cloned().unwrap_or(serde_json::Value::Null),
+        "ready": ready,
         "takeover": app.state::<browser::BrowserState>().takeover.load(Ordering::SeqCst),
         // Item #18: the page latches a double Escape and reports it here, once.
         // This poll is the ONLY channel out of the native layer — nothing the
         // page script does can reach the app directly — so the flag has to ride
         // the state the chrome already asks for.
         "leaveRequested": info.get("leaveRequested").and_then(|l| l.as_bool()) == Some(true),
+        // Whether a passage is selected on the page, so the assistant's scope
+        // strip can OFFER a "selected passage" scope only when there is one.
+        // It rides this poll rather than costing a round trip of its own, and
+        // a page still parked behind its blocker cannot have a selection —
+        // that answer describes the blank start document, which has none.
+        "hasSelection": !deferred
+            && info.get("hasSelection").and_then(|h| h.as_bool()) == Some(true),
     });
     // Present ONLY when there is a reason, so the field means what `apiTypes.ts`
     // declares it to mean (`error?: string`). A `null` on every poll is not an
@@ -953,6 +976,29 @@ pub async fn browser_info(app: tauri::AppHandle) -> Result<serde_json::Value, St
         out["error"] = serde_json::Value::from(reason);
     }
     Ok(out)
+}
+
+/// What the toolbar may be told about a page that still has a navigation
+/// deferred behind its content blocker: it is LOADING, and nothing it just said
+/// about itself is news.
+///
+/// Neither half of the page's answer describes the page the user asked for
+/// while that is true. A SUCCESS describes the blank start document the page is
+/// parked on, so `ready` would be `true` for a page that has not begun loading.
+/// A FAILURE is the round trip the deferred navigation itself interrupted —
+/// `EVAL_LOST` — which the toolbar rendered as "this page is not answering".
+/// The first page of every launch hit exactly that, because the first compile
+/// of the rule list is the uncached one, and the only cure the user had was to
+/// press Reload on a page that was loading perfectly well.
+fn reportable_page_state(
+    deferred: bool,
+    ready: serde_json::Value,
+    error: Option<String>,
+) -> (serde_json::Value, Option<String>) {
+    if deferred {
+        return (serde_json::Value::Bool(false), None);
+    }
+    (ready, error)
 }
 
 /// What one chrome action runs, and whether it puts the browser back on the
@@ -1022,12 +1068,32 @@ pub fn browser_clear_journal(state: State<'_, AppState>) -> Result<(), String> {
     db::clear_web_cache(&room.conn)
 }
 
+/// What a Clear would actually erase. The button's own words cover the journal
+/// only, so the counts are offered to whatever asks before running it.
+#[tauri::command]
+pub fn browser_clear_scope(state: State<'_, AppState>) -> Result<db::ClearScope, String> {
+    let guard = state.room.lock().unwrap();
+    let room = guard.as_ref().ok_or("No room is open.")?;
+    db::browse_clear_scope(&room.conn)
+}
+
 /// Ask the LIVE webview whether its storage is really ephemeral. Surfaced in
 /// the shield chip so the privacy claim is something the app checks, not
 /// something it asserts.
 #[tauri::command]
 pub async fn browser_verify_private(app: tauri::AppHandle) -> Result<bool, String> {
     browser::verify_ephemeral(&app).await
+}
+
+/// Compile and attach the content rule list again, on every open page, without
+/// moving any of them.
+///
+/// The compile is asynchronous, so this reports only that the attempt was
+/// started — the verdict arrives on the next `browser_info` poll, which is the
+/// one place the shield reads its state from.
+#[tauri::command]
+pub fn browser_retry_protection(app: tauri::AppHandle) -> Result<(), String> {
+    browser::retry_protection(&app)
 }
 
 #[cfg(test)]
@@ -1047,6 +1113,37 @@ mod tests {
             }
         }
         v
+    }
+
+    /// THE FIRST-NAVIGATION BANNER (audit P1). The blocker's first compile of a
+    /// launch is the uncached one, so the real navigation fires late — straight
+    /// through whatever poll was in flight, whose callback WebKit then drops.
+    /// The toolbar rendered that as "This page is not answering", on a page
+    /// that was loading normally, and Reload "fixed" it.
+    #[test]
+    fn a_page_waiting_on_its_blocker_is_loading_not_broken() {
+        let ready = serde_json::Value::Bool(true);
+        let lost = Some("The page was replaced while it was answering.".to_string());
+
+        // While the navigation is deferred: no error reaches the toolbar, and
+        // the page is NOT ready — the `true` came from the blank start
+        // document, which is not the page anybody asked for.
+        let (r, e) = reportable_page_state(true, ready.clone(), lost.clone());
+        assert_eq!(r, serde_json::Value::Bool(false));
+        assert_eq!(e, None);
+        // …and with no answer at all it is still just loading.
+        let (r, e) = reportable_page_state(true, serde_json::Value::Null, lost.clone());
+        assert_eq!(r, serde_json::Value::Bool(false));
+        assert_eq!(e, None);
+
+        // Once the wait is over, a page that has stopped answering says so
+        // again — the point is to delay the report, never to swallow it.
+        let (r, e) = reportable_page_state(false, serde_json::Value::Null, lost.clone());
+        assert_eq!(r, serde_json::Value::Null);
+        assert_eq!(e, lost);
+        // …and an ordinary healthy poll is passed through untouched.
+        let (r, e) = reportable_page_state(false, ready.clone(), None);
+        assert_eq!((r, e), (ready, None));
     }
 
     #[test]

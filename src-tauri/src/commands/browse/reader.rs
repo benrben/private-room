@@ -63,6 +63,27 @@ const PARKED_REFUSAL: &str =
      would only be a fragment. Close whatever is covering the browser and try \
      again.";
 
+/// Everything both readers must be sure of before they believe a word the page
+/// says: there is a page, it is on screen at a real size, and its script is up.
+///
+/// One helper rather than two copies — the whole point of the size check is
+/// that a page reporting on itself from a 1×1 layout viewport answers `ok:true`
+/// with a fragment, and a second copy of that rule is a second chance to get it
+/// subtly different.
+async fn ready_to_be_read(app: &tauri::AppHandle) -> Result<(), String> {
+    if !browser::is_open(app) {
+        return Err("The browser isn't open — there is no page to read.".into());
+    }
+    let settle = std::time::Instant::now();
+    while too_small_to_read(browser::bounds(app)) {
+        if settle.elapsed() > BOUNDS_SETTLE {
+            return Err(PARKED_REFUSAL.into());
+        }
+        tokio::time::sleep(BOUNDS_POLL).await;
+    }
+    browser::wait_ready(app, READY_BUDGET_OPEN).await
+}
+
 /// The current page as text, for the reading view.
 ///
 /// Returned RAW rather than formatted: the view follows `nextOffset` and
@@ -74,17 +95,7 @@ pub async fn browser_page_text(
     mode: String,
     offset: u64,
 ) -> Result<serde_json::Value, String> {
-    if !browser::is_open(&app) {
-        return Err("The browser isn't open — there is no page to read.".into());
-    }
-    let settle = std::time::Instant::now();
-    while too_small_to_read(browser::bounds(&app)) {
-        if settle.elapsed() > BOUNDS_SETTLE {
-            return Err(PARKED_REFUSAL.into());
-        }
-        tokio::time::sleep(BOUNDS_POLL).await;
-    }
-    browser::wait_ready(&app, READY_BUDGET_OPEN).await?;
+    ready_to_be_read(&app).await?;
     let mode = if mode == "full" { "full" } else { "main" };
     browser::call(
         &app,
@@ -92,6 +103,84 @@ pub async fn browser_page_text(
         serde_json::json!({ "mode": mode, "offset": offset }),
     )
     .await
+}
+
+/// What the page script answers `capture` with when the user has selected
+/// nothing. Kept as a constant here because it is the ONE page-script error
+/// this command must not pass on as a failure — `browser_page_selection` turns
+/// it into an empty answer, and a rename on either side would silently turn
+/// "nothing is selected" back into "the page refused".
+const NOTHING_SELECTED: &str = "Nothing is selected on the page.";
+
+/// How much selected text comes back.
+///
+/// The page script's own `capture` cap is 800 KB, which is sized for a room
+/// FILE. This is the reading path, so it takes the reading cap: `READ_MAX`,
+/// the same 40,000 characters one `read` slice returns. Counted here in Rust
+/// `char`s where the page counts UTF-16 units, so the two agree on ordinary
+/// text and differ only on how much astral-plane text rides under one cap —
+/// which is a bound on a passage, not a byte budget.
+const SELECTION_MAX: usize = 40_000;
+
+/// The user's current selection, as text. READ-ONLY: nothing is written, and
+/// nothing is journalled.
+///
+/// The selection has been capturable since BROWSE-2, but only through
+/// `browser_save_page`, which writes a file into the room and answers with a
+/// sentence about it — so "what has the user got selected" was a question the
+/// app could only answer by SAVING it. This is the same `capture` op with
+/// neither the file nor the journal row: the module's rule is that a person
+/// reading the page they are looking at is not the agent, and `capture_and_save`
+/// journals because SAVING is an act, not because reading is.
+///
+/// An empty `text` means nothing is selected — an honest empty answer, not an
+/// error. A page that genuinely refused the read still fails, so the caller can
+/// tell the two apart.
+#[tauri::command]
+pub async fn browser_page_selection(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+    ready_to_be_read(&app).await?;
+    let captured = browser::call(&app, "capture", serde_json::json!({ "what": "selection" })).await;
+    let v = match captured {
+        Ok(v) => v,
+        Err(e) if e == NOTHING_SELECTED => return Ok(empty_selection()),
+        Err(e) => return Err(e),
+    };
+    let (text, clipped) = clip_selection(
+        v.get("text").and_then(|t| t.as_str()).unwrap_or_default(),
+        v.get("truncated").and_then(|t| t.as_bool()) == Some(true),
+    );
+    // The page script measures the WHOLE selection; both caps below it are ours
+    // or its own. Carried through so a caller showing a clipped passage can say
+    // how much it is leaving out rather than implying it has all of it.
+    let total = v
+        .get("total")
+        .and_then(|t| t.as_u64())
+        .unwrap_or(text.chars().count() as u64);
+    Ok(serde_json::json!({
+        "text": text,
+        "url": v.get("url").and_then(|u| u.as_str()).unwrap_or_default(),
+        "title": v.get("title").and_then(|t| t.as_str()).unwrap_or_default(),
+        "truncated": clipped,
+        "total": total,
+    }))
+}
+
+/// Nothing selected: the shape is the same one, so the caller reads `text`
+/// either way instead of branching on which kind of answer it got.
+fn empty_selection() -> serde_json::Value {
+    serde_json::json!({ "text": "", "url": "", "title": "", "truncated": false, "total": 0 })
+}
+
+/// The selection, cut to the reading cap, and whether anything was cut.
+///
+/// `page_clipped` is the page script's own flag: it clips at its far larger
+/// save cap first, and either cut means the caller is holding PART of a
+/// passage. Presenting part of a passage as the passage is the failure this app
+/// keeps writing tests about, so the flag travels with the text.
+fn clip_selection(text: &str, page_clipped: bool) -> (String, bool) {
+    let kept: String = text.chars().take(SELECTION_MAX).collect();
+    let clipped = page_clipped || kept.chars().count() < text.chars().count();
+    (kept, clipped)
 }
 
 /// Hand the keyboard back to the app.
@@ -137,6 +226,62 @@ mod tests {
             width: 300.0,
             height: 600.0
         }));
+    }
+
+    /// Nothing selected is an ANSWER, not a failure. It reaches Rust as the
+    /// page script's `ok:false`, which `browser::call` turns into an `Err` —
+    /// so the one error that means "the user has not selected anything" has to
+    /// be recognised and converted, and the two sides must keep saying the same
+    /// words. Everything else the page refuses still fails, which is how the
+    /// caller tells "nothing selected" from "this page cannot be read".
+    #[test]
+    fn nothing_selected_is_an_empty_answer_not_a_refusal() {
+        assert!(
+            browser::PAGE_JS.contains(NOTHING_SELECTED),
+            "the page script no longer says what this command listens for — an \
+             empty selection would surface as a page failure"
+        );
+        let empty = empty_selection();
+        assert_eq!(empty["text"], "");
+        assert_eq!(empty["truncated"], false);
+        // The shape is the same either way, so the caller never branches on
+        // which KIND of answer it got — only on whether there is any text.
+        for key in ["text", "url", "title", "truncated"] {
+            assert!(empty.get(key).is_some(), "the empty answer is missing {key}");
+        }
+    }
+
+    /// The selection takes the READING cap, not the 800 KB save cap — this
+    /// feeds a chat scope, not a room file — and a passage that was cut says so
+    /// rather than passing a slice off as the whole passage.
+    #[test]
+    fn a_long_selection_is_cut_at_the_reading_cap_and_admits_it() {
+        let (text, clipped) = clip_selection("a short passage", false);
+        assert_eq!(text, "a short passage");
+        assert!(!clipped);
+        // Exactly at the cap is NOT truncated — the boundary case that would
+        // otherwise warn about a passage that came back whole.
+        let exact = "x".repeat(SELECTION_MAX);
+        let (text, clipped) = clip_selection(&exact, false);
+        assert_eq!(text.chars().count(), SELECTION_MAX);
+        assert!(!clipped);
+        // One character past it is.
+        let (text, clipped) = clip_selection(&"x".repeat(SELECTION_MAX + 1), false);
+        assert_eq!(text.chars().count(), SELECTION_MAX);
+        assert!(clipped);
+        // The page's own clip counts too, even when what arrived is short.
+        assert!(clip_selection("tiny", true).1);
+        // Multi-byte text is cut on CHARACTER boundaries — slicing bytes would
+        // panic on the first emoji anyone selects.
+        let wide = "é🙂".repeat(SELECTION_MAX);
+        let (text, clipped) = clip_selection(&wide, false);
+        assert_eq!(text.chars().count(), SELECTION_MAX);
+        assert!(clipped);
+        // …and the cap is the reader's own, borrowed rather than invented.
+        assert!(
+            browser::PAGE_JS.contains(&format!("var READ_MAX = {SELECTION_MAX}")),
+            "the selection cap has drifted from the page script's read cap"
+        );
     }
 
     #[test]

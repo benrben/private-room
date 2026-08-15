@@ -47,7 +47,7 @@ import {
 import { AutocompleteState } from "./composer";
 import { type FileSort, loadFileSort, saveFileSort } from "./fileSort";
 import { OpenFile, Toast, WorkArea } from "./types";
-import { stackToast, toastLifeMs } from "./toastStack";
+import { clearToastsAbout, stackToast, toastLifeMs } from "./toastStack";
 
 /** How many error messages the bug-report sheet may offer. Enough to cover the
  * run-up to a failure, few enough that the sheet stays readable — the user has
@@ -666,6 +666,12 @@ export function useWorkspaceState(_info: RoomInfo) {
     setToasts((t) => t.filter((x) => x.id !== id));
   }
 
+  /** Retire whatever was said about `about` — for the caller that just made it
+   * untrue by succeeding. See `clearToastsAbout`. */
+  const forgetToastsAbout = useCallback((about: string) => {
+    setToasts((t) => clearToastsAbout(t, about));
+  }, []);
+
   return {
     files, setFiles, trashed, setTrashed, chats, setChats, activeChatId, setActiveChatId,
     messages, setMessages, memories, setMemories, ai, setAi, model, setModel,
@@ -747,7 +753,7 @@ export function useWorkspaceState(_info: RoomInfo) {
     aiPrompt, setAiPrompt, aiBusy, setAiBusy,
     aiOpId, setAiOpId, aiStopping, setAiStopping,
     memSuggestion, setMemSuggestion,
-    importSuggestions, setImportSuggestions, pushToast, dismissToast,
+    importSuggestions, setImportSuggestions, pushToast, dismissToast, forgetToastsAbout,
     recLive, setRecLive, recLiveRef, recSave, setRecSave,
     sttStatus, setSttStatus, showFeedback, setShowFeedback,
     autoSpeak, setAutoSpeak, handsFree, setHandsFree, handsFreeRef,

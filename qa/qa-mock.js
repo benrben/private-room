@@ -433,7 +433,23 @@
    * is a native view floating above the DOM, so once something is loaded the
    * stage is the empty rectangle that view would be parked over. */
   const browserTabs = [];
-  const browserState = { takeover: false };
+  /* The blocker starts FAILED on purpose.
+   *
+   * It is the state the product audit caught the shipped app lying about — the
+   * chip said "Private / Trackers blocked." while WebKit had refused the rule
+   * list — and a harness that only ever shows the happy path is how that
+   * shipped. `browser_retry_protection` flips it to active, so the whole loop
+   * (degraded chip → banner naming WebKit's reason → Retry → recovered) is
+   * walkable here without a Mac, a webview or a broken block list. */
+  const browserState = {
+    takeover: false,
+    protection: { state: "failed", reason: "WKErrorDomain error 6" },
+    // The browsing sitting the journal is writing into. Older fixture rows
+    // carry an earlier one, so the panel has two sittings to tell apart.
+    session: "20260815103000-2",
+    hasSelection: false,
+  };
+  const PAST_SESSION = "20260815094500-1";
   const activeTab = () => browserTabs.find((t) => t.active) ?? null;
   /** The title a page gets from its address, the way a real `<title>` reads. */
   const titleFor = (url) => {
@@ -445,17 +461,30 @@
       return url;
     }
   };
+  /* Two SITTINGS, and a blocker failure written three times.
+   *
+   * Both are load-bearing for what this fixture is meant to show. The panel
+   * defaults to the live sitting and puts the rest behind "Show 1 earlier
+   * sitting", so one sitting cannot demonstrate the boundary; and the blocker
+   * journals once per page created, so a real failing block list writes the
+   * same sentence over and over — which is what buried the rest of the record
+   * before the runs were collapsed to a ×N. */
+  const FAILED_BLOCK = "Content blocking FAILED to load: WKErrorDomain error 6";
   const browseJournal = [
-    { id: 4, at: iso(1), kind: "read", url: "https://en.wikipedia.org/wiki/Speaker_diarisation", detail: "read 3,120 words" },
-    { id: 3, at: iso(2), kind: "consent", url: "https://en.wikipedia.org/wiki/Speaker_diarisation", detail: "typing allowed once" },
-    { id: 2, at: iso(4), kind: "blocked", url: "https://ads.example.com/track", detail: "content blocker" },
-    { id: 1, at: iso(5), kind: "open", url: "https://en.wikipedia.org/wiki/Speaker_diarisation", detail: "opened by the Web agent" },
+    { id: 8, at: iso(1), kind: "read", session: "20260815103000-2", url: "https://en.wikipedia.org/wiki/Speaker_diarisation", detail: "read 3,120 words" },
+    { id: 7, at: iso(2), kind: "blocker", session: "20260815103000-2", url: "", detail: FAILED_BLOCK },
+    { id: 6, at: iso(2), kind: "blocker", session: "20260815103000-2", url: "", detail: FAILED_BLOCK },
+    { id: 5, at: iso(3), kind: "blocker", session: "20260815103000-2", url: "", detail: FAILED_BLOCK },
+    { id: 4, at: iso(3), kind: "consent", session: "20260815103000-2", url: "https://en.wikipedia.org/wiki/Speaker_diarisation", detail: "typing allowed once" },
+    { id: 3, at: iso(4), kind: "open", session: "20260815103000-2", url: "https://en.wikipedia.org/wiki/Speaker_diarisation", detail: "opened by the Web agent" },
+    { id: 2, at: iso(64), kind: "blocked", session: "20260815094500-1", url: "https://ads.example.com/track", detail: "content blocker" },
+    { id: 1, at: iso(65), kind: "search", session: "20260815094500-1", url: "", detail: "searched for “speaker diarisation”" },
   ];
   /** Record what the harness just did, newest first, and tell the view — the
    * journal panel refreshes on the event, not on a poll, so a row that is only
    * appended here would not appear until it was reopened. */
   const journal = (kind, url, detail) => {
-    const row = { id: (browseJournal[0]?.id ?? 0) + 1, at: new Date().toISOString(), kind, url, detail };
+    const row = { id: (browseJournal[0]?.id ?? 0) + 1, at: new Date().toISOString(), session: browserState.session, kind, url, detail };
     browseJournal.unshift(row);
     window.__qaEmit?.("browser-journal", row);
     return row;
@@ -949,6 +978,11 @@
         // as Rust reports it, so the view's branch is exercised as a no-op
         // rather than left undefined.
         leaveRequested: false,
+        // What the content blocker actually did — the second of the two checks
+        // the shield now stands on, and the one it used to assume.
+        protection: browserState.protection,
+        session: browserState.session,
+        hasSelection: browserState.hasSelection,
       };
     },
     browser_tabs: () => browserTabs,
@@ -984,6 +1018,40 @@
     browser_focus_app: () => null,
     browser_journal: (a2) => browseJournal.slice(0, (a2 && a2.limit) || browseJournal.length),
     browser_verify_private: () => true,
+    /* The recovery the shield offers. Flipping to `active` here is the whole
+     * point of the fixture: it is the only way to see the chip climb back from
+     * "Partly private" to "Private" and the banner leave. */
+    browser_retry_protection: () => {
+      browserState.protection = { state: "active" };
+      journal("blocker", "", "Content blocking active.");
+      return null;
+    },
+    /* What a Clear would erase — journal rows AND the web cache the button
+     * never used to mention. */
+    browser_clear_scope: () => ({
+      journal: browseJournal.length,
+      searches: 12,
+      pages: 7,
+      images: 23,
+    }),
+    /* Read-only: unlike `browser_save_page("selection")` this writes no file
+     * and no journal row, so nothing is recorded here either. */
+    browser_page_selection: () => {
+      if (!browserState.hasSelection) {
+        return { text: "", url: "", title: "", truncated: false, total: 0 };
+      }
+      const t = activeTab();
+      const text =
+        "Diarisation partitions an audio stream into homogeneous segments " +
+        "according to the speaker identity.";
+      return {
+        text,
+        url: t?.url || "",
+        title: t?.url ? t.title : "",
+        truncated: false,
+        total: text.length,
+      };
+    },
     // Bounds are pushed several times a second by the view's ResizeObserver.
     // Nothing to park in a plain browser, but it must not be an unhandled
     // command: that alone made every Browser-area capture and spec suspect.

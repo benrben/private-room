@@ -785,6 +785,29 @@ export default function ViewerPane({
               {(() => {
                 // Wave 4a shortcuts: file-scoped ACTIVE workflows matching this
                 // file, run on the open file with one click.
+                // A DRAWING'S TWO FLAT FORMATS, in the file header where every
+                // other file-level act lives. They used to be a second Export
+                // menu on the canvas toolbar, a few pixels under the header's
+                // own Export — same word, different act, nothing saying which.
+                // These write a new file INTO the room; the Export button
+                // beside them writes a copy OUT of it, which is why they are
+                // worded the way they are.
+                const sketchActions: QuickAction[] = openFile.content.name.toLowerCase().endsWith(".sketch")
+                  ? [
+                      {
+                        id: "sketch-png",
+                        label: "Save a picture (PNG) in this room",
+                        icon: <DownloadIcon size={14} />,
+                        onRun: () => void a.exportSketchAs(openFile.id, "png"),
+                      },
+                      {
+                        id: "sketch-svg",
+                        label: "Save a drawing (SVG) in this room",
+                        icon: <DownloadIcon size={14} />,
+                        onRun: () => void a.exportSketchAs(openFile.id, "svg"),
+                      },
+                    ]
+                  : [];
                 const fileActions: QuickAction[] = s.workflows
                   .filter(
                     (w) =>
@@ -805,7 +828,7 @@ export default function ViewerPane({
                   }));
                 return (
                   <QuickActionsMenu
-                    actions={fileActions}
+                    actions={[...sketchActions, ...fileActions]}
                     open={s.qaFileMenuOpen ?? false}
                     onOpenChange={(o) => s.setQaFileMenuOpen(o)}
                     buttonLabel="Actions"

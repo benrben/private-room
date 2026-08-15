@@ -493,6 +493,43 @@ test("a burst of confirmations can never push a failure off the screen", () => {
   assert.ok(stack.some((t) => t.kind === "error"), "the error was evicted");
 });
 
+test("a failure that has stopped being true is retired, not left on screen", () => {
+  // "Could not open that file" sat over the workspace indefinitely — including
+  // over the very file it named, after a second click opened it. Errors still
+  // never expire on a timer; succeeding at the act one describes retires it.
+  const stack = [
+    say({ id: 1, kind: "error", about: "open:f1" }),
+    say({ id: 2, kind: "error", about: "open:f2" }),
+    say({ id: 3 }),
+  ];
+  const after = toasts.clearToastsAbout(stack, "open:f1");
+  assert.deepEqual(after.map((t) => t.id), [2, 3]);
+});
+
+test("a second attempt replaces the first failure rather than stacking on it", () => {
+  let stack = toasts.stackToast([], say({ id: 1, kind: "error", about: "open:f1" }));
+  stack = toasts.stackToast(stack, say({ id: 2, kind: "error", about: "open:f1" }));
+  assert.equal(stack.length, 1);
+  assert.equal(stack[0].id, 2);
+});
+
+test("opening a file names it, offers the way back, and clears on success", () => {
+  const src = read("src/workspace/fileActions.ts");
+  const fn = src.slice(src.indexOf("async function viewFile("));
+  const body = fn.slice(0, fn.indexOf("\n  }"));
+  // Unanswerable in a room of two hundred: the click that failed is over, and
+  // the message outlives the selection that would have said which file it was.
+  assert.match(body, /Could not open \$\{what\}/);
+  assert.match(body, /displayName\(known\.name\)/);
+  assert.match(body, /label: "Try again"/);
+  assert.match(body, /s\.forgetToastsAbout\(about\)/);
+  // Retired only after the read succeeded — the early return is above it.
+  assert.ok(
+    body.indexOf("s.forgetToastsAbout(about)") > body.indexOf("return;"),
+    "a failure must not clear itself",
+  );
+});
+
 /* ---------- 6. a document always appears in the destination that owns it --- */
 
 test("the destinations that hold their own documents say which", () => {

@@ -415,6 +415,12 @@ CREATE TABLE IF NOT EXISTS browse_journal (
   kind TEXT NOT NULL,
   url TEXT NOT NULL DEFAULT '',
   detail TEXT NOT NULL DEFAULT '',
+  -- Which browsing SITTING this line belongs to: minted when the first page
+  -- opens and cleared when the last one closes, so the Journal can separate
+  -- what is happening now from everything that came before. Empty for lines
+  -- written outside a sitting, and for every line written before this column
+  -- existed.
+  session TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
 );
 -- The voices this room can recognise: one row per person the user has NAMED in
@@ -1313,10 +1319,20 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), String> {
            kind TEXT NOT NULL,
            url TEXT NOT NULL DEFAULT '',
            detail TEXT NOT NULL DEFAULT '',
+           session TEXT NOT NULL DEFAULT '',
            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
          );",
     )
     .map_err(|e| e.to_string())?;
+    // The sitting boundary, added after the trail shipped. `CREATE TABLE IF NOT
+    // EXISTS` above is a no-op for every room that has ever browsed, so without
+    // this the column would exist only in rooms made from now on — and the
+    // Journal's "this sitting" would fail on exactly the rooms with a record in
+    // them.
+    add_column_if_missing(
+        conn,
+        "ALTER TABLE browse_journal ADD COLUMN session TEXT NOT NULL DEFAULT ''",
+    )?;
 
     // The room's saved voices (see db/voices.rs). In BOTH places for the reason
     // spelled out at `jobs` above: create_room runs only SCHEMA, so a table that

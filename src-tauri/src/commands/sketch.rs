@@ -263,6 +263,40 @@ pub fn export_sketch_svg(
     Ok(meta)
 }
 
+/// Flatten a drawing into a standalone `.png` room file.
+///
+/// The same rasteriser the agent looks through (`to_png`), so what someone
+/// exports and what the model sees are one picture. SVG stays the better
+/// export — it is the one that can be reopened and edited — but a PNG is what
+/// goes into a message, a document, or anywhere that will not take a vector.
+#[tauri::command]
+pub fn export_sketch_png(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<FileMeta, String> {
+    let meta = state.with_room(|room| {
+        let name = db::get_file_name(&room.conn, &id)?;
+        let doc = load(&room.conn, &id)?;
+        let stem = name.trim_end_matches(&format!(".{SKETCH_EXT}"));
+        let png = sketchdoc::to_png(&doc)?;
+        let unique = db::available_name(&room.conn, &format!("{stem}.png"))?;
+        // The labels, so an exported picture is still searchable in the room
+        // it came from — a flat image nobody can find again is a dead end.
+        let text = doc.extracted_text();
+        db::insert_file(
+            &room.conn,
+            &unique,
+            "image/png",
+            &png,
+            if text.trim().is_empty() { None } else { Some(text.as_str()) },
+            "generated",
+        )
+    })?;
+    let _ = app.emit("room-files-changed", ());
+    Ok(meta)
+}
+
 // ---------------------------------------------------------------------------
 // The agent's tools
 // ---------------------------------------------------------------------------

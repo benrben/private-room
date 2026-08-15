@@ -57,9 +57,11 @@ import type {
   SkillBundle,
   SkillResourceContent,
   BrowserInfo,
+  BrowserPageSelection,
   BrowserPageText,
   BrowserSearchResult,
   ResultPreview,
+  BrowseClearScope,
   BrowseJournalRow,
   StopReport,
   FileVersion,
@@ -383,7 +385,19 @@ export const api = {
   browserJournal: (limit?: number) =>
     invoke<BrowseJournalRow[]>("browser_journal", { limit }),
   browserClearJournal: () => invoke<void>("browser_clear_journal"),
+  /** What a Clear would actually delete.
+   *
+   * The button says "Erase this record"; the command behind it also empties the
+   * whole web cache — cached search terms, page text and preview images. Asking
+   * first is what lets the confirmation name the larger deletion instead of
+   * understating it. */
+  browserClearScope: () => invoke<BrowseClearScope>("browser_clear_scope"),
   browserVerifyPrivate: () => invoke<boolean>("browser_verify_private"),
+  /** Compile and re-attach the tracker block list to every open page, without
+   *  navigating any of them. The recovery the shield offers when WebKit refused
+   *  the list — a browser that silently gave up on its own protection is the
+   *  defect this exists for. */
+  browserRetryProtection: () => invoke<void>("browser_retry_protection"),
   /** Item #18: the current page as text, for the reading view. The page is a
    *  native layer the host DOM cannot reach into, so this — the same extractor
    *  `browse_read` uses — is the only honest way to put its content in front of
@@ -391,6 +405,11 @@ export const api = {
    *  the fragment a 1×1 layout viewport produces. */
   browserPageText: (mode: "main" | "full", offset: number) =>
     invoke<BrowserPageText>("browser_page_text", { mode, offset }),
+  /** The passage selected on the live page, for the assistant's "selected
+   *  passage" scope. Read-only: unlike `browserSavePage("selection")` it writes
+   *  no room file and no journal row. */
+  browserPageSelection: () =>
+    invoke<BrowserPageSelection>("browser_page_selection"),
   /** Item #18: take the window's first responder back from the native page.
    *  Nothing in JavaScript can do this — they are different native views. */
   browserFocusApp: () => invoke<void>("browser_focus_app"),
@@ -1080,6 +1099,9 @@ export const api = {
     invoke<void>("save_sketch", { id, doc, snapshot }),
   exportSketchSvg: (id: string): Promise<FileMeta> =>
     invoke<FileMeta>("export_sketch_svg", { id }),
+  /** …and as a flat picture, for everywhere that will not take a vector. */
+  exportSketchPng: (id: string): Promise<FileMeta> =>
+    invoke<FileMeta>("export_sketch_png", { id }),
   // The drawing agent finished a `draw` call. Carries the WHOLE document, so
   // an open editor can fold it in without a re-read — the window between a
   // write and a read is exactly when a user's un-autosaved stroke goes missing.

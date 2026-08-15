@@ -383,6 +383,7 @@ pub fn run() {
             commands::create_sketch,
             commands::save_sketch,
             commands::export_sketch_svg,
+            commands::export_sketch_png,
             // ADD-27: live Recording file (streaming transcription, editing,
             // translate). ADD-28: feedback → GitHub issue.
             commands::rec_start,
@@ -473,10 +474,13 @@ pub fn run() {
             commands::browser_set_takeover,
             commands::browser_journal,
             commands::browser_clear_journal,
+            commands::browser_clear_scope,
             commands::browser_verify_private,
+            commands::browser_retry_protection,
             commands::browser_save_page,
             // Item #18: the reading view, and the keyboard's way back out.
             commands::browser_page_text,
+            commands::browser_page_selection,
             commands::browser_focus_app,
             // BROWSE-3: the address bar's search half.
             commands::browser_search,

@@ -114,6 +114,30 @@ pub fn prune_web_cache(conn: &Connection) {
     }
 }
 
+/// How much of the room a [`clear_web_cache`] would take with it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WebCacheCounts {
+    pub searches: i64,
+    pub pages: i64,
+    pub images: i64,
+}
+
+/// Count what [`clear_web_cache`] would delete, so the Clear button can say it
+/// before it does it.
+///
+/// The two must always name the same three tables — `clearing_is_exactly_what_
+/// the_count_promised` holds them together by behaviour rather than by comment.
+pub fn count_web_cache(conn: &Connection) -> Result<WebCacheCounts, String> {
+    let count = |table: &str| {
+        query_one(conn, &format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+    };
+    Ok(WebCacheCounts {
+        searches: count("web_searches")?,
+        pages: count("web_pages")?,
+        images: count("web_images")?,
+    })
+}
+
 /// Wipe every cached search, page and image.
 ///
 /// Wired to the browser's Clear button alongside the journal: a user who

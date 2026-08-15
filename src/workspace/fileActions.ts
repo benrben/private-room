@@ -637,6 +637,9 @@ export function makeFileActions(s: WSState) {
   }
 
   async function viewFile(id: string, target?: FileTarget) {
+    // One key for every message about opening THIS file. It makes the failure
+    // replaceable rather than stackable, and retirable by the success below.
+    const about = `open:${id}`;
     // Say it is opening BEFORE the wait, not after it. `get_file_content` is a
     // synchronous command behind the room mutex, so on a large file this await
     // is the whole delay — and nothing on screen changed for its duration.
@@ -648,9 +651,21 @@ export function makeFileActions(s: WSState) {
       // Opening is the most-used action in the app; failing it silently left
       // the previous file on screen and read as a dead click.
       s.setOpeningFileId(null);
-      s.pushToast("error", `Could not open that file: ${String(e)}`);
+      // NAME THE FILE. "Could not open that file" is unanswerable in a room of
+      // two hundred: the click that failed is over, the Library selection may
+      // have moved on, and the message outlives both.
+      const known = s.files.find((f) => f.id === id);
+      const what = known ? `“${displayName(known.name)}”` : "that file";
+      s.pushToast(
+        "error",
+        `Could not open ${what}: ${String(e)}`,
+        { label: "Try again", run: () => void viewFile(id, target) },
+        about,
+      );
       return;
     }
+    // It opened. Whatever this file's last failure said about it is now false.
+    s.forgetToastsAbout(about);
     s.setOpeningFileId(null);
     s.setOpenFile({ id, content, target });
     s.setEditMode(false);
@@ -726,6 +741,26 @@ export function makeFileActions(s: WSState) {
       );
     } catch (e) {
       s.pushToast("error", String(e));
+    }
+  }
+
+  /** Flatten a drawing into a picture or a vector, as a new room file.
+   *
+   * A drawing's two shareable formats. Deliberately a room file rather than a
+   * download: everything else in this app stays inside the room unless the
+   * user explicitly exports it out, and a sketch should not be the one thing
+   * that quietly writes to the Desktop. */
+  async function exportSketchAs(id: string, kind: "png" | "svg") {
+    try {
+      const meta =
+        kind === "png" ? await api.exportSketchPng(id) : await api.exportSketchSvg(id);
+      s.setFiles(await api.listFiles());
+      s.pushToast("success", `Saved “${displayName(meta.name)}” into this room.`, {
+        label: "Open it",
+        run: () => void viewFile(meta.id),
+      });
+    } catch (e) {
+      s.pushToast("error", `Could not save that ${kind.toUpperCase()}: ${String(e)}`);
     }
   }
 
@@ -972,7 +1007,7 @@ print(data.upper())
     // The multi-selection: its state handlers and the batch verbs they drive.
     clearSelection, selectedFiles, clickFile, selectAllVisible,
     moveFiles, removeFiles, restoreFiles, destroyFiles, exportFiles, attachFiles,
-    viewFile, createNewNote, createNewScript, createSketch, setInLibrary,
+    viewFile, createNewNote, createNewScript, createSketch, setInLibrary, exportSketchAs,
     saveEdit, saveEditAsCopy,
     duplicateOpenFile, editCell, editModeOf, guardLeave, startCreateFolder, commitCreateFolder,
     commitFolderRename, deleteFolder, moveFile, commitRenameFile,

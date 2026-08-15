@@ -1757,7 +1757,35 @@ export interface BrowserInfo {
    *  it, so acting on it twice is impossible. */
   leaveRequested?: boolean;
   error?: string;
+  /** A passage is selected on the page right now. Carried on this poll rather
+   *  than asked for separately — the scope strip needs it every tick to decide
+   *  whether to offer a "selected passage" scope at all. */
+  hasSelection?: boolean;
+  /** What the content blocker actually did. Absent from an older backend, which
+   *  `protectionClaim` reads as "unknown" — never as protected. */
+  protection?: BrowserProtection;
+  /** The browsing sitting the journal is currently writing into, `""` when no
+   *  page is open. */
+  session?: string;
 }
+
+/** The content blocker's real verdict, asked of WebKit rather than assumed.
+ *
+ * THE DEFECT THIS TYPE EXISTS FOR (product audit, 2026-08-15): the shield said
+ * "Trackers blocked." off `browser_verify_private`, which checks whether the
+ * website data store is non-persistent and knows nothing whatsoever about
+ * blocking. Meanwhile the room's journal was filling with "Content blocking
+ * FAILED to load", and the interface showed a confident protected state
+ * throughout. Two different questions had one answer between them.
+ *
+ * `unknown` is a real state and is never rendered as protected: the rule list
+ * compiles asynchronously, so there is a window in which the honest answer is
+ * that we do not know yet. */
+export type BrowserProtection =
+  | { state: "unknown" }
+  | { state: "active" }
+  | { state: "failed"; reason: string }
+  | { state: "unavailable"; reason: string };
 
 /** One slice of the current page as text (`browser_page_text`).
  *
@@ -1850,10 +1878,44 @@ export interface ResultPreview {
 export interface BrowseJournalRow {
   id: number;
   at: string;
-  /** open | read | act | look | consent | blocked | download | takeover | blocker */
+  /** open | search | read | act | look | consent | save | download | blocked |
+   *  blocker | error | takeover. Free-form in Rust — `browserJournal.ts` holds
+   *  the one map from these to the panel's filters, and shows anything it does
+   *  not recognise rather than hiding it. */
   kind: string;
   url: string;
   detail: string;
+  /** The browsing sitting this row belongs to, or `""` for rows written before
+   *  sittings were recorded. What lets the panel default to "what just
+   *  happened" instead of every event in the room's history. */
+  session: string;
+}
+
+/** How much a Clear would erase (`browser_clear_scope`).
+ *
+ * Clearing the journal also empties the web cache, which the button's own words
+ * never mentioned. These counts are what let the confirmation say so. */
+export interface BrowseClearScope {
+  journal: number;
+  searches: number;
+  pages: number;
+  images: number;
+}
+
+/** The passage a person has selected on the live page (`browser_page_selection`).
+ *
+ * Read-only and journalled NOWHERE: saving is an act worth recording, but a
+ * person reading the page in front of them is not the agent doing something.
+ * An empty `text` is an honest "nothing is selected", not a failure — a page
+ * that genuinely refuses rejects instead. */
+export interface BrowserPageSelection {
+  text: string;
+  url: string;
+  title: string;
+  truncated: boolean;
+  /** The WHOLE selection's length, so a clipped passage can say how much it is
+   *  leaving out instead of implying it carries all of it. */
+  total: number;
 }
 
 /** What one Stop actually stopped (`cancel_ask`).

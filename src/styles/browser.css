@@ -125,6 +125,17 @@
    dropdown opened here would be drawn under the native page.
    ========================================================================== */
 
+/* OPAQUE, AND THAT IS THE POINT (product audit P1, 2026-08-15).
+   This strip used to be transparent, on the doctrine that the dotted sheet runs
+   under every frame in the app. That doctrine is right everywhere else and
+   wrong here: this area's neighbour is not the app's own sheet, it is an
+   arbitrary web page, and on a white one the address bar and its controls
+   visually dissolved into the page below — worst with the assistant pane open,
+   where the strip is narrowest. Browser chrome is the app speaking, and the app
+   must be distinguishable from the document it is showing you. It gets its own
+   ground, its own rule, and a shadow that reads as "this is in front".
+
+   The stage keeps the sheet. Only the chrome and the banner rows are lifted. */
 .browser-chrome {
   position: relative;
   display: flex;
@@ -136,8 +147,9 @@
   flex-wrap: wrap;
   gap: var(--sp-2);
   padding: var(--sp-2) 10px;
-  border-bottom: 1px solid var(--line);
-  background: transparent;
+  border-bottom: 1px solid var(--rule-strong);
+  background: var(--panel);
+  box-shadow: 0 1px 0 color-mix(in srgb, var(--ink) 6%, transparent);
   flex: 0 0 auto;
 }
 
@@ -372,16 +384,25 @@
    private-browsing indicator that is hard to read is a safety problem, not a
    style choice.
 
-   Three states:
-     verified   done-green ink   the live webview answered "non-persistent"
-     unchecked  neutral ink      the check has not come back yet
-     warn       urgent-red ink   the store is NOT ephemeral
+   FOUR states, because the badge used to make TWO claims off ONE check.
+   "Trackers blocked." rode on the storage-ephemerality probe, which knows
+   nothing about blocking — so a browser whose block list had failed to compile
+   wore the same green capsule as one where it had worked (product audit P0,
+   2026-08-15). The blocker now answers for itself, and the weaker of the two
+   facts sets the state:
 
-   The dangerous one is never signalled by colour alone — the word itself
-   changes to "Not private". Verified and unchecked share a word, and the
-   difference between them is deliberately a matter of the badge WITHHOLDING
-   its claim ink rather than of two colours meaning two things; the accessible
-   name and the title spell the difference out either way.
+     verified   done-green ink   store ephemeral AND the block list is loaded
+     checking   neutral ink      one of the two checks has not come back
+     degraded   caution ink      store ephemeral, block list NOT running
+     breached   urgent-red ink   the store is NOT ephemeral
+
+   NO STATE IS SIGNALLED BY COLOUR ALONE — each carries its own word:
+   "Private", "Checking", "Partly private", "Not private". That is stricter
+   than the three-state badge this replaces, where verified and unchecked
+   deliberately shared a word and differed only by the badge withholding its
+   claim ink. Withholding ink is legible as caution; it is not legible as
+   "which of two things is wrong", and with a fourth state to tell apart the
+   words have to do the work.
 
    Contrast, measured against the sheet in both themes: 5.8:1 dark and 4.8:1
    light for the green, 5.8:1 / 4.8:1 for the red. Hover is a wash of the
@@ -424,20 +445,33 @@
    colour carrying a state on its own — it is the badge WITHHOLDING the ink it
    uses for a verified fact until the webview has actually answered. The
    accessible name and the title already spell the difference out. */
-.browser-shield.pending {
+.browser-shield.checking {
   color: var(--muted);
   border-color: var(--rule-strong);
 }
-.browser-shield.pending:hover {
+.browser-shield.checking:hover {
   background: color-mix(in srgb, var(--ink) 6%, transparent);
   border-color: var(--sketch);
 }
 
-.browser-shield.warn {
+/* Storage is ephemeral, the tracker blocker is not running. Caution ink rather
+   than urgent: the browser IS still private in the sense the room promises —
+   nothing is written to disk — and spending the red on this would leave nothing
+   louder for the state where that promise has actually broken. */
+.browser-shield.degraded {
+  color: var(--sem-pending);
+  border-color: var(--sem-pending);
+}
+.browser-shield.degraded:hover {
+  background: color-mix(in srgb, var(--sem-pending-fill) 10%, transparent);
+  border-color: var(--sem-pending);
+}
+
+.browser-shield.breached {
   color: var(--sem-urgent);
   border-color: var(--sem-urgent);
 }
-.browser-shield.warn:hover {
+.browser-shield.breached:hover {
   background: color-mix(in srgb, var(--sem-urgent-fill) 10%, transparent);
   border-color: var(--sem-urgent);
 }
@@ -567,6 +601,10 @@
   line-height: var(--lh-body);
   border-bottom: 1px solid var(--line);
   box-shadow: inset 3px 0 0 var(--mk-ink);
+  /* Opaque under the wash, for the same reason the chrome above it is: these
+     rows sit directly against an arbitrary web page, and a translucent slip
+     over a white one loses both its wash and its words. */
+  background-color: var(--panel);
   background-image: linear-gradient(
     97deg,
     color-mix(in srgb, var(--mk) 18%, transparent) 0%,
@@ -820,6 +858,72 @@
   color: var(--ink-2);
 }
 
+/* ----- the record, as SITTINGS -----
+   The panel used to be one flat list of the newest 300 rows across every
+   browsing sitting the room had ever had, unfiltered and ungrouped (audit P1).
+   Three additions carry the fix: a row of facet toggles, a heading and one-line
+   summary per sitting, and a ×N on runs that were collapsed. */
+
+.browser-journal-facets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-bottom: var(--sp-4);
+}
+
+.browser-journal-facets .browser-btn {
+  min-height: 24px;
+  padding: 0 8px;
+  font-size: var(--fs-micro, var(--fs-meta));
+}
+
+.browser-journal-session + .browser-journal-session {
+  margin-top: var(--sp-5);
+}
+
+.browser-journal-session > h3 {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  margin: 0 0 2px;
+  font-family: var(--sans);
+  font-size: var(--fs-meta);
+  font-weight: 600;
+  color: var(--text-strong);
+}
+
+/* A timestamp is data you check character by character — mono, like the URLs
+   in the rows below it. */
+.browser-journal-when {
+  font-family: var(--mono);
+  font-size: var(--fs-micro, var(--fs-meta));
+  font-weight: 400;
+  color: var(--faint);
+  white-space: nowrap;
+}
+
+.browser-journal-summary {
+  margin: 0 0 var(--sp-3);
+  color: var(--muted);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+}
+
+.browser-journal-more {
+  margin-top: var(--sp-4);
+}
+
+/* How many identical rows this one line stands for. MONO, like the timestamps
+   and the URLs: it is a counted fact the reader may need to check, and the hand
+   is reserved for words a person actually wrote (paper.css §3). */
+.browser-journal .jn {
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  color: var(--faint);
+  white-space: nowrap;
+}
+
 /* The dashed pencil thread that ties the entries together (.nb-connect on the
    list), with a node hung off it per row. */
 .browser-journal-list {
@@ -977,8 +1081,23 @@
   overflow-y: auto;
 }
 
-/* Kept a real viewport, not parked: see the note above. */
+/* THE READING VIEW REPLACES THE PAGE; `split` is the exception.
+   It used to hold the live page at a permanent 320px sliver, so reading a page
+   meant looking at two copies of it and having room for neither (audit P2).
+   The stage collapses to nothing while the text has the floor — the native view
+   is parked at 1×1 to match, so the hole must not reserve width it is not
+   using.
+
+   `split` is set for exactly two reasons, both in BrowserView: the user pressed
+   `Compare with page`, or an extraction is in flight and the page needs a real
+   layout viewport to be read from. 320px is the width that made the second case
+   safe (Rust refuses anything under 200px) and it stays that width. */
 .browser-body.reading .browser-stage {
+  flex: 0 0 0;
+  min-width: 0;
+}
+
+.browser-body.reading.split .browser-stage {
   flex: 0 0 320px;
 }
 

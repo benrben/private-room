@@ -43,6 +43,18 @@ export function stackToast(current: Toast[], toast: Toast): Toast[] {
   return next.filter((_, i) => i !== victim);
 }
 
+/** The stack with every message about `about` gone.
+ *
+ * An error is the one kind that waits forever, and rightly so — it is this
+ * app's only report that something failed. But "forever" was being read as
+ * "even after it stopped being true": a file that would not open, then opened
+ * on the second try, left its own failure sitting over the file it had just
+ * finished opening. Succeeding at the act a message describes retires the
+ * message; nothing else does, so no error is ever dropped on a timer. */
+export function clearToastsAbout(current: Toast[], about: string): Toast[] {
+  return current.filter((t) => t.about !== about);
+}
+
 /** Milliseconds until this message clears itself, or `null` if it waits to be
  * dismissed.
  *
