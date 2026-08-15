@@ -43,11 +43,23 @@ export function makeMiscActions(
       .catch(() => {});
   }
 
-  // PRIV-1: whether the cloud-privacy door is effectively on for this room.
+  // PRIV-1: the three facts every privacy surface reads — is the door on, how
+  // many files are still unscanned, and is the scanner running right now. One
+  // `privacyStatus()` call already returns all three; keeping only the first
+  // and letting Home fetch the second again is what left the count stale.
+  //
+  // A failure clears the door to `null` (the "not loaded" state the banner and
+  // badge already handle) and leaves the other two alone rather than reporting
+  // a confident zero: "the room has no unscanned files" is a claim, and we
+  // just failed to find out.
   function refreshPrivacy() {
     api
       .privacyStatus()
-      .then((st) => s.setPrivacyOn(st.effectiveOn))
+      .then((st) => {
+        s.setPrivacyOn(st.effectiveOn);
+        s.setPrivacyPending(st.pendingFiles);
+        s.setPrivacyScanning(st.scanning);
+      })
       .catch(() => s.setPrivacyOn(null));
   }
 

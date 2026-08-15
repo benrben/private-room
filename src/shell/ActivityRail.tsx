@@ -121,7 +121,7 @@ export default function ActivityRail({
           title={wide ? undefined : "Expand the sidebar"}
           onClick={layout.toggleRail}
         >
-          {wide ? <ChevronLeftIcon size={17} /> : <ChevronRightIcon size={17} />}
+          {wide ? <ChevronLeftIcon size={16} /> : <ChevronRightIcon size={16} />}
           {wide && <span className="rail-label">Collapse</span>}
         </button>
       )}
@@ -158,11 +158,11 @@ export default function ActivityRail({
             title={wide ? undefined : "More tools"}
             onClick={layout.toggleMoreTools}
           >
-            <ToolsIcon size={17} />
+            <ToolsIcon size={16} />
             {wide && <span className="rail-label">More tools</span>}
             {wide && (
               <ChevronDownIcon
-                size={13}
+                size={14}
                 className={`rail-chev${layout.moreToolsOpen ? " is-open" : ""}`}
               />
             )}
@@ -191,7 +191,7 @@ export default function ActivityRail({
         title={wide ? undefined : "Customize sidebar"}
         onClick={onCustomize}
       >
-        <ListFilterIcon size={17} />
+        <ListFilterIcon size={16} />
         {wide && <span className="rail-label">Customize sidebar</span>}
       </button>
       <button
@@ -201,7 +201,7 @@ export default function ActivityRail({
         title={wide ? undefined : "Settings"}
         onClick={onSettings}
       >
-        <SettingsIcon size={17} />
+        <SettingsIcon size={16} />
         {wide && <span className="rail-label">Settings</span>}
       </button>
     </nav>

@@ -68,11 +68,10 @@
   font-size: var(--fs-meta);
   color: var(--text-strong);
 }
-/* A count pencilled beside a heading is exactly what Kalam is reserved for —
-   the same treatment the ⌘K launcher gives its per-group tallies. */
+/* A count beside a heading, in the sans — the same treatment the ⌘K launcher
+   gives its per-group tallies. */
 .room-map-count {
-  font-family: var(--hand);
-  font-size: var(--fs-hand);
+  font-size: var(--fs-meta);
   line-height: 1;
   color: var(--ink-2);
 }

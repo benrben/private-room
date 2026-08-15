@@ -36,6 +36,9 @@
   display: flex;
   flex-direction: column;
   background: var(--bg);
+  /* The positioning context for `.viewer-opening`, which reports a file being
+     fetched without displacing whatever is on screen. */
+  position: relative;
 
   /* ----- the reading room's own vocabulary -----
      The sheet. --surface is already "warm paper" in both themes by design —
@@ -94,7 +97,7 @@
 
 .viewer-body img {
   max-width: 100%;
-  border-radius: 8px 6px 9px 7px / 7px 9px 6px 8px;
+  border-radius: var(--radius-sm);
 }
 
 /* A bare <pre> in the viewer is TECHNICAL text — a raw dump, a stack trace,
@@ -253,7 +256,7 @@
   max-width: 46ch;
   padding: var(--sp-2) var(--sp-3);
   border: 1px solid var(--line);
-  border-radius: 10px 8px 11px 9px / 9px 11px 8px 10px;
+  border-radius: var(--radius);
   background: transparent;
   color: var(--muted);
   font-size: var(--fs-micro);
@@ -478,7 +481,7 @@
   justify-content: space-between;
   gap: var(--sp-2);
   padding: 7px 8px;
-  border-radius: 8px 6px 9px 7px / 7px 9px 6px 8px;
+  border-radius: var(--radius-sm);
 }
 
 .history-row:hover {
@@ -496,14 +499,12 @@
   font-size: var(--fs-meta);
 }
 
-/* A date is exactly what the hand is for. Set at --fs-meta rather than the
-   --fs-micro it used to carry: Kalam has a small x-height, so the same nominal
-   size reads a tier smaller than Manrope does, and the metadata floor is
-   already 13px. */
+/* A timestamp the room recorded, so the sans. It stays at --fs-meta, the
+   metadata floor — it was raised off --fs-micro when this was set in the hand,
+   and 13px is the floor whatever face is carrying it. */
 .history-time {
-  font-family: var(--hand);
   font-size: var(--fs-meta);
-  line-height: var(--lh-hand);
+  line-height: var(--lh-body);
   color: var(--text-dim);
 }
 
@@ -685,6 +686,7 @@
 
 .viewer-empty-title {
   font-size: var(--fs-section);
+  font-family: var(--display);
   font-weight: 600;
   color: var(--text-strong);
   margin: 0 0 10px;
@@ -790,7 +792,7 @@
   padding: 13px 15px;
   background: transparent;
   border: 1px solid var(--line);
-  border-radius: 11px 9px 12px 10px / 10px 12px 9px 11px;
+  border-radius: var(--radius);
   font-size: var(--fs-meta);
   line-height: var(--lh-body);
   color: var(--text-dim);
@@ -938,4 +940,57 @@
 }
 .viewer-actions .cloudview-on {
   color: var(--accent);
+}
+
+/* "Quote in chat" — the affordance that turns a text selection into something
+   the room can act on.
+
+   `position: fixed` against the viewport, because the coordinates come from
+   `Range.getBoundingClientRect()`, which is viewport-relative. Nothing
+   recomputes them as the page moves — the button is dismissed on scroll and
+   resize instead, which is the honest behaviour for a control that should
+   appear exactly when it is wanted. The translate centres it on the selection
+   and lifts it clear of the text.
+
+   No animation. This system allows no constant movement, and a control that
+   appears exactly when it is wanted needs none to be noticed. */
+.quote-selection-btn {
+  position: fixed;
+  z-index: 40;
+  transform: translate(-50%, calc(-100% - var(--sp-2)));
+  padding: 3px var(--sp-2);
+  font-size: var(--fs-meta);
+  line-height: 1.5;
+  color: var(--ink);
+  background: var(--raised);
+  border: var(--stroke-w) solid var(--sketch);
+  border-radius: var(--radius-sm);
+  box-shadow: 0 2px 8px var(--shadow-lift);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.quote-selection-btn:hover {
+  border-color: var(--accent);
+}
+
+/* "Opening…" — a file's bytes are on their way.
+
+   An overlay rather than a replacement for the pane's contents: what is
+   already on screen stays readable, and a failed open cannot unmount the page
+   underneath it. Fixed like the quote button and for the same reason — it is
+   pinned to the pane, not to the document that is scrolling inside it. */
+.viewer-opening {
+  position: absolute;
+  top: var(--sp-3);
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 30;
+  padding: 3px var(--sp-3);
+  font-size: var(--fs-meta);
+  color: var(--text-dim);
+  background: var(--raised);
+  border: var(--stroke-w) solid var(--sketch);
+  border-radius: var(--radius-sm);
+  box-shadow: 0 2px 8px var(--shadow-lift);
+  pointer-events: none;
 }

@@ -210,10 +210,9 @@
   font-weight: 600;
 }
 
-/* A count in the margin is exactly what the hand is for. */
+/* A count in the margin — a tally the app made, so the sans. */
 .find-group-n {
-  font-family: var(--hand);
-  font-size: var(--fs-hand);
+  font-size: var(--fs-meta);
   color: var(--ink-2);
 }
 
@@ -337,13 +336,12 @@
   color: var(--ink-2);
 }
 
-/* The date pencilled into the margin, the way a dated entry is marked in a
-   notebook. Kalam is allowed here: a date is an annotation. */
+/* The date in the margin. Sans, not the hand: the room recorded this, nobody
+   pencilled it in. */
 .find-row-date {
   align-self: start;
   padding-top: 2px;
-  font-family: var(--hand);
-  font-size: var(--fs-hand);
+  font-size: var(--fs-meta);
   line-height: 1.2;
   color: var(--ink-2);
   white-space: nowrap;

@@ -930,7 +930,11 @@ fn spawn_studio(
                 let _ = db::set_job_status(&r.conn, &job_id, "running", None);
             }
         }
-        emit_progress(&window, &job_id, "Starting…", 0, 1);
+        // Total 0, not 1 — the same absence the job row carries. A live event
+        // overrides the row's total in the Activity pane, so a `1` here would
+        // reinstate "0 / 1" beside "Starting…" no matter what the row said.
+        // The phases this run reports are its progress; it has no steps.
+        emit_progress(&window, &job_id, "Starting…", 0, 0);
 
         // Ok(meta) = done; Err(None) = paused (Stop); Err(Some(e)) = error.
         let outcome: Result<FileMeta, Option<String>> = match studio_spec_for(&kind) {
@@ -1134,7 +1138,13 @@ pub(crate) async fn start_studio_job_inner(
         if queue::at_capacity(&room.conn) {
             return Err(queue::QUEUE_FULL.into());
         }
-        let id = db::create_job(&room.conn, "studio", title, &plan, 1)?;
+        // No step count: a Studio run is one long generation with named phases
+        // ("Reading the material…", "Designing your deck…"), and nothing ever
+        // advances the cursor. A total of 1 turned that absence into a claim —
+        // "0 / 1" beside "Starting…", and a finished deck reading "Finished —
+        // 0 of 1 steps". The phases are the honest progress; the row shows
+        // those and prints no fraction.
+        let id = db::create_job(&room.conn, "studio", title, &plan, 0)?;
         Ok((id, room.path.clone()))
     })?;
     if queue::try_reserve(state, &job_id) {
@@ -2688,6 +2698,57 @@ mod tests {
         assert_eq!(
             panic_reason(&"   " as &(dyn std::any::Any + Send)),
             "the job runner crashed"
+        );
+    }
+}
+
+#[cfg(test)]
+mod studio_step_count_tests {
+    /// A Studio run is one long generation with named phases, not a sequence of
+    /// countable steps: nothing in `spawn_studio` ever advances the cursor. It
+    /// was nonetheless created with a total of 1, so the Activity row said
+    /// "0 / 1" beside the word "Starting…", and — worse, because it survives —
+    /// a FINISHED deck sat in the history reading "Finished — 0 of 1 steps".
+    /// A completed job claiming it completed none of its one step.
+    ///
+    /// Zero is the honest total: the row prints the phase label and no
+    /// fraction, and the history line drops the "N of M steps" clause it
+    /// already guards with `j.total > 0`.
+    #[test]
+    fn a_studio_job_claims_no_step_count_it_does_not_keep() {
+        let src = include_str!("jobs.rs");
+        let line = src
+            .lines()
+            .find(|l| l.contains(concat!("create_job(", "&room.conn, \"studio\"")))
+            .expect("the studio job creation site moved — find it and re-pin this");
+        assert!(
+            line.trim_end().ends_with("0)?;"),
+            "a Studio job must be created with no step count, got: {}",
+            line.trim()
+        );
+    }
+
+    /// The row's total is not the only place the claim can come from: a live
+    /// `job-progress` event OVERRIDES it in the Activity pane. Fixing the
+    /// creation site alone left `emit_progress(.., "Starting…", 0, 1)` putting
+    /// "0 / 1" straight back on screen — which is exactly what happened, and
+    /// what a green suite did not catch, because nothing pinned this line.
+    #[test]
+    fn no_progress_event_claims_one_step_it_never_counts() {
+        let src = include_str!("jobs.rs");
+        // Every opening event, not just the Studio's — the file pass passes its
+        // real `start_cursor, total` and is fine; a literal `0, 1` is the shape
+        // of the defect wherever it appears.
+        let liars: Vec<&str> = src
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.contains(concat!("emit_progress(&window, &job_id, \"Star", "ting…\"")))
+            .filter(|l| l.ends_with(", 0, 1);"))
+            .collect();
+        assert!(
+            liars.is_empty(),
+            "a job that never advances its cursor must not open by claiming a \
+             step count; these do: {liars:?}"
         );
     }
 }

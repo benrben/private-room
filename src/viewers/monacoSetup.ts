@@ -149,9 +149,9 @@ const THEMES: Record<
     base: "vs-dark",
     ink: {
       comment: "8f958c", // pencil. 5.87:1
-      keyword: "d1849a", // --mk-pink-ink. 6.41:1
+      keyword: "cc7ecf", // --mk-berry-ink. 6.39:1
       string: "79a47d", // --mk-green-ink. 6.36:1
-      number: "baa457", // --mk-yellow-ink. 7.32:1
+      number: "bb9444", // --mk-yellow-ink. 6.37:1
       type: "73a0bc", // --mk-blue-ink. 6.42:1
       regexp: "cf8883", // --mk-red-ink. 6.43:1
       operator: "a9ada3", // --ink-2. 7.88:1
@@ -161,8 +161,8 @@ const THEMES: Record<
       ink: "#f0eee5",
       gutter: "#959a92",
       hover: "#2e322e",
-      accent: "#d1849a",
-      selection: "#c77a9040",
+      accent: "#cc7ecf",
+      selection: "#c47ac740",
       rule: "#3d413c",
     },
   },
@@ -170,9 +170,9 @@ const THEMES: Record<
     base: "vs",
     ink: {
       comment: "666960", // pencil, --ink-muted. 4.95:1
-      keyword: "ba3350", // --mk-pink-ink. 5.06:1
+      keyword: "a82fad", // --mk-berry-ink. 5.06:1
       string: "447142", // --mk-green-ink. 5.04:1
-      number: "786420", // --mk-yellow-ink. 5.10:1
+      number: "83601c", // --mk-yellow-ink. 5.09:1
       type: "366b8d", // --mk-blue-ink. 5.10:1
       regexp: "b53c32", // --mk-red-ink. 5.08:1
       operator: "5a5d54", // --ink-2. 5.94:1
@@ -182,8 +182,8 @@ const THEMES: Record<
       ink: "#20221f",
       gutter: "#666960",
       hover: "#ebe7da",
-      accent: "#ba3350",
-      selection: "#e9a4b355",
+      accent: "#a82fad",
+      selection: "#e7a4e955",
       rule: "#d8d3c4",
     },
   },

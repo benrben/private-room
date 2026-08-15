@@ -22,8 +22,29 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-/// Stop a daemon we started after this long with no calls in flight.
-pub const IDLE_SLEEP: Duration = Duration::from_secs(5 * 60);
+/// How long Ollama is asked to hold a warmed model resident — the `keep_alive`
+/// this app sends (`commands::models::KEEP_ALIVE_WARM`, and the literal in
+/// `ollama::warm`). Stated here as a Duration because the idle policy below is
+/// defined against it and a bare string cannot be compared; the test at the
+/// foot of this file pins the two together.
+const KEEP_ALIVE_WARM_WINDOW: Duration = Duration::from_secs(30 * 60);
+
+/// Stop a daemon WE started once holding it open has stopped buying anything.
+///
+/// This is a PROCESS backstop, not a memory policy, and the difference is the
+/// whole point: `keep_alive` decides how long the model stays in RAM, this
+/// decides how long the `ollama serve` we spawned outlives it. At five minutes
+/// it was the shorter of the two, so the app asked for thirty minutes of warmth
+/// and then SIGTERMed the daemon holding it at five — and every return after a
+/// short pause paid a full cold start the app had already decided not to
+/// charge. Coming back to a room after stepping away is the most common way a
+/// person meets it, and it was the slowest path in.
+///
+/// DERIVED, not written down, so the ordering cannot come apart again: whatever
+/// the warm window becomes, the process backstop stays five minutes behind it.
+/// A literal here is what let the two drift for as long as they did.
+pub const IDLE_SLEEP: Duration =
+    Duration::from_secs(KEEP_ALIVE_WARM_WINDOW.as_secs() + 5 * 60);
 /// How often the watcher re-checks the idle condition.
 const WATCH_INTERVAL: Duration = Duration::from_secs(30);
 /// How long to wait for a freshly spawned daemon to answer before giving up.
@@ -58,7 +79,7 @@ fn should_sleep(we_started: bool, idle: Duration, inflight: usize) -> bool {
 }
 
 /// RAII marker for one in-flight real call: keeps the daemon awake for the
-/// duration and bumps the idle clock on the way out, so the 5-minute window is
+/// duration and bumps the idle clock on the way out, so the idle window is
 /// measured from the END of the last call.
 pub struct Busy;
 
@@ -284,6 +305,24 @@ pub async fn is_awake(base: &str) -> bool {
     reachable(base).await
 }
 
+/// Locking the room ends the reason to stay warm.
+///
+/// [`IDLE_SLEEP`] is sized for a person who stepped away from an OPEN room and
+/// is about to come back. Locking is that person saying they are done, and a
+/// daemon we spawned holding a multi-gigabyte model for another half hour
+/// behind a password screen is a resource nobody asked us to spend. Nothing is
+/// killed here: the idle clock is wound back so the next watcher tick makes the
+/// ordinary decision (ours, quiet, nothing in flight) — an external daemon is
+/// still never touched, and a job still draining is still protected by
+/// `inflight`.
+pub(crate) fn note_room_closed() {
+    if let Ok(mut t) = lc().last_used.lock() {
+        *t = Instant::now()
+            .checked_sub(IDLE_SLEEP)
+            .unwrap_or_else(Instant::now);
+    }
+}
+
 /// Stop a daemon we started, now — used on app shutdown so we never leak a
 /// background `ollama serve` we spawned. A no-op for an external daemon.
 ///
@@ -314,6 +353,44 @@ mod tests {
         assert!(!should_sleep(true, IDLE_SLEEP * 10, 1));
         // Ours and quiet but not yet idle enough → keep it up.
         assert!(!should_sleep(true, IDLE_SLEEP - Duration::from_secs(1), 0));
+    }
+
+    /// Locking the room hands the idle watcher an ordinary sleep decision on
+    /// its next tick, instead of holding a spawned daemon — and the model it
+    /// is keeping resident — for another `IDLE_SLEEP` behind a password screen.
+    /// Still only ever a daemon we own, and still never one with work in flight.
+    #[test]
+    fn locking_the_room_lets_the_idle_watcher_sleep_our_daemon() {
+        note_room_closed();
+        let idle = lc().last_used.lock().unwrap().elapsed();
+        assert!(
+            should_sleep(true, idle, 0),
+            "after a lock the next tick should sleep a daemon we started; idle read as {idle:?} \
+             against a {IDLE_SLEEP:?} window"
+        );
+        assert!(
+            !should_sleep(false, idle, 0),
+            "an external daemon is still never ours to stop"
+        );
+        assert!(
+            !should_sleep(true, idle, 1),
+            "work still in flight still keeps the daemon up"
+        );
+    }
+
+    /// `KEEP_ALIVE_WARM_WINDOW` mirrors a string in another module. A textual
+    /// assertion rather than an import: `commands` is private, and widening it
+    /// for one constant would be a bigger change than the fact it guards. Move
+    /// the wire value and this fails HERE, beside the policy that depends on it.
+    #[test]
+    fn the_warm_window_matches_the_keep_alive_we_send() {
+        let models = include_str!("commands/models.rs");
+        assert!(
+            models.contains(r#"KEEP_ALIVE_WARM: &str = "30m""#),
+            "commands::models::KEEP_ALIVE_WARM is no longer \"30m\" — IDLE_SLEEP is sized \
+             against it and has to move with it"
+        );
+        assert_eq!(KEEP_ALIVE_WARM_WINDOW, Duration::from_secs(30 * 60));
     }
 
     #[test]

@@ -149,6 +149,7 @@
 .gate-card h1 {
   margin: var(--sp-3) 0 var(--sp-2);
   font-size: var(--fs-section);
+  font-family: var(--display);
   font-weight: 800;
   letter-spacing: 0.01em;
   line-height: 1.1;
@@ -437,11 +438,11 @@
   margin-top: 2px;
 }
 
-/* "Opened 2 hours ago" is an annotation on a list entry — the hand's job. */
+/* "Opened 2 hours ago" is a time the app worked out, so it reads in the sans
+   like every other computed fact on the row. */
 .recent-when {
-  font-family: var(--hand);
-  font-size: var(--fs-hand);
-  line-height: var(--lh-hand);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
   color: var(--ink-2);
 }
 

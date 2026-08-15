@@ -129,7 +129,7 @@ export default function RoomServerSection({
                 />
                 <div className="settings-actions">
                   <button className="btn-ic" onClick={copyLeashConfig}>
-                    {leashCopied ? (<><CircleCheckIcon size={13} /> Copied</>) : "Copy config"}
+                    {leashCopied ? (<><CircleCheckIcon size={14} /> Copied</>) : "Copy config"}
                   </button>
                   {scope === "full" && (
                     <button

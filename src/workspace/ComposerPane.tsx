@@ -55,7 +55,7 @@ export default function Composer({ s, a }: { s: WSState; a: WSActions }) {
     <div className="composer">
       {batchTidy ? (
         <div className="import-suggestion batch">
-          <SparkIcon size={13} />
+          <SparkIcon size={14} />
           <span className="import-suggestion-text">
             {s.importSuggestions.length} new files could be renamed and filed.
           </span>
@@ -163,7 +163,7 @@ export default function Composer({ s, a }: { s: WSState; a: WSActions }) {
                 .join("\n")}
             >
               <span className="cloud-strip-label">
-                <CloudIcon size={13} />
+                <CloudIcon size={14} />
                 {reachesInternet
                   ? "This will leave your Mac — this room can also reach the internet."
                   : "This will leave your Mac."}
@@ -202,7 +202,7 @@ export default function Composer({ s, a }: { s: WSState; a: WSActions }) {
         return (
           <div className="mcp-badge" title={reachTitle}>
             <span className="badge-label">
-              <GlobeIcon size={13} /> This room can reach the internet
+              <GlobeIcon size={14} /> This room can reach the internet
             </span>
           </div>
         );
@@ -229,7 +229,7 @@ export default function Composer({ s, a }: { s: WSState; a: WSActions }) {
               attach it.
             </span>
             <button className="subtle" onClick={() => a.toggleAttach(hit)}>
-              <PaperclipIcon size={13} /> Attach it
+              <PaperclipIcon size={14} /> Attach it
             </button>
           </div>
         );
@@ -244,10 +244,11 @@ export default function Composer({ s, a }: { s: WSState; a: WSActions }) {
             s.attachments.length === 1 ? "file" : "files"
           }`}
         >
-          {/* A count is what the handwriting is for, and the ring keeps it from
-              reading as part of a sentence. aria-hidden: the group above
-              already says the number, and saying it twice is noise. */}
-          <span className="attach-row-label nb-hand" aria-hidden="true">
+          {/* The ring keeps the number from reading as part of a sentence.
+              Not the hand: the app counted these, and the hand is for words a
+              person wrote (paper.css §3). aria-hidden: the group above already
+              says the number, and saying it twice is noise. */}
+          <span className="attach-row-label" aria-hidden="true">
             Attached <span className="nb-circled">{s.attachments.length}</span>
           </span>
           {s.attachments.map((f) => (
@@ -256,7 +257,7 @@ export default function Composer({ s, a }: { s: WSState; a: WSActions }) {
             // the type icon beside it says that), so ellipsising its tail can
             // never hide what kind of file this is.
             <span key={f.id} className="attach-chip" title={f.name}>
-              <FileTypeIcon file={f} size={13} />
+              <FileTypeIcon file={f} size={14} />
               <span className="attach-chip-name">{displayName(f.name)}</span>
               <button
                 title="Remove"

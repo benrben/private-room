@@ -16,6 +16,7 @@ import {
   uniqueFileName,
 } from "./composer";
 import { runGuarded } from "./guard";
+import { prefersReducedMotion } from "../rooms/helpers";
 import { speakerName, splitMarkupBlocks } from "./markup";
 import { HELP_COMMAND } from "./constants";
 import * as voice from "./voice";
@@ -206,7 +207,12 @@ export function makeChatActions(
   async function askOnce(q: string, attachmentIds: string[], privacyBypass?: boolean) {
     const chatId = s.activeChatId;
     if (!chatId) return;
-    await runTurn((askId) => api.ask(chatId, q, attachmentIds, askId, privacyBypass));
+    // What is on screen as the question is sent. A ref, not state: this reads at
+    // send time, and the turn is what the name has to describe.
+    const viewing = s.openFileRef.current?.content.name ?? null;
+    await runTurn((askId) =>
+      api.ask(chatId, q, attachmentIds, askId, viewing, privacyBypass),
+    );
   }
 
   /** PRIV-1 — the "this once" valve: re-ask the last question with the privacy
@@ -582,9 +588,7 @@ export function makeChatActions(
       }
       await new Promise((r) => window.setTimeout(r, 250));
     }
-    const reduced =
-      window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
-    if (!reduced) playSealSound();
+    if (!prefersReducedMotion()) playSealSound();
     try {
       await onLock();
     } catch {

@@ -72,11 +72,11 @@ function CaptureDock({ s }: { s: WSState }) {
     <div className={`capture-dock ${s.dictState}`} role="status">
       {s.dictState === "preparing" ? (
         <span className="capture-label">
-          <MicIcon size={13} /> Preparing the microphone…
+          <MicIcon size={14} /> Preparing the microphone…
         </span>
       ) : s.dictState === "busy" ? (
         <span className="capture-label">
-          <MicIcon size={13} /> {who} — transcribing on this Mac…
+          <MicIcon size={14} /> {who} — transcribing on this Mac…
         </span>
       ) : (
         <>
@@ -566,7 +566,7 @@ export default function Overlays({
               <span className="nb-cat nb-sem-pending">Permission</span>
             </div>
             <div className="approve-title">
-              <ScriptIcon size={17} /> Run a script from this room?
+              <ScriptIcon size={16} /> Run a script from this room?
             </div>
             <p className="approve-body">
               <strong>{pendingScript.name}</strong> is a real program:{" "}
@@ -633,7 +633,7 @@ export default function Overlays({
               <span className="nb-cat nb-sem-urgent">Deletion</span>
             </div>
             <div className="approve-title">
-              <ShieldIcon size={17} /> Delete the {pendingApproval.tool}{" "}
+              <ShieldIcon size={16} /> Delete the {pendingApproval.tool}{" "}
               &ldquo;{pendingApproval.server}&rdquo;?
             </div>
             <p className="approve-body">
@@ -670,7 +670,7 @@ export default function Overlays({
               <span className="nb-cat nb-sem-pending">Permission</span>
             </div>
             <div className="approve-title">
-              <GlobeIcon size={17} /> Allow a connected tool to run?
+              <GlobeIcon size={16} /> Allow a connected tool to run?
             </div>
             <p className="approve-body">
               The AI wants to use{" "}
@@ -727,7 +727,7 @@ export default function Overlays({
               <span className="nb-cat nb-sem-urgent">Leaves this room</span>
             </div>
             <div className="approve-title">
-              <ShieldIcon size={17} /> Type this into the page?
+              <ShieldIcon size={16} /> Type this into the page?
             </div>
             <p className="approve-body">
               The assistant wants to type this into{" "}
@@ -940,7 +940,7 @@ export default function Overlays({
                     else void a.removeFile(ids[0]);
                   }}
                 >
-                  <CheckIcon size={13} /> Move to trash
+                  <CheckIcon size={14} /> Move to trash
                 </button>
                 <button
                   role="menuitem"
@@ -948,7 +948,7 @@ export default function Overlays({
                   className="ctx-item btn-ic"
                   onClick={a.cancelConfirm}
                 >
-                  <CloseIcon size={13} /> Keep
+                  <CloseIcon size={14} /> Keep
                 </button>
               </div>
             ) : (

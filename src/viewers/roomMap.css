@@ -87,7 +87,7 @@
 .room-map {
   --rm-edge-derived: var(--mk-green-ink); /* the room watched this happen */
   --rm-edge-page: var(--mk-blue-ink);
-  --rm-edge-mentions: var(--mk-pink-ink);
+  --rm-edge-mentions: var(--mk-berry-ink);
   --rm-edge-cited: var(--mk-yellow-ink);
   /* The two neutral kinds. Same graphite, told apart by a 5-3 dash against a
      1-3.5 dot, by weight, and by the words on their chips. */
@@ -281,14 +281,12 @@
    and the focus ring all come from the system. Scoped under .room-map purely to
    outrank paper.css on the two properties that differ — import order between a
    component stylesheet and the App.css chain is not something to bet a control
-   on. Kalam because these are short labels naming a kind of line, which is on
-   the hand's reserve list; --fs-hand, not --fs-micro, because Kalam runs small
-   and a 12px hand is not a 12px floor. */
+   on. The SANS: these are control labels — a chip you press to filter the map —
+   and functional controls are the sans's job however short their words are. */
 .room-map .rm-legend-chip {
   gap: var(--sp-2);
   padding: 3px 10px;
-  font-family: var(--hand);
-  font-size: var(--fs-hand);
+  font-size: var(--fs-meta);
   line-height: 1.2;
 }
 .rm-legend-swatch {
@@ -336,8 +334,7 @@
   align-items: center;
   gap: var(--sp-2);
   margin-left: auto;
-  font-family: var(--hand);
-  font-size: var(--fs-hand);
+  font-size: var(--fs-meta);
   color: var(--muted);
 }
 /* The control's own name is a structural label, so it stays in the interface
@@ -476,11 +473,10 @@
 .rm-toolbtn {
   margin-left: 6px;
 }
-/* The two header toggles. Kalam, like the legend chips: "Links", "List" and
-   "Map" are short labels, and the toolbar reads as one row of chips. */
+/* The two header toggles. The sans, like the legend chips: "Links", "List"
+   and "Map" are controls, and the toolbar reads as one row of chips. */
 .room-map .rm-toolchip {
-  font-family: var(--hand);
-  font-size: var(--fs-hand);
+  font-size: var(--fs-meta);
   line-height: 1.2;
   padding: 3px 10px;
 }

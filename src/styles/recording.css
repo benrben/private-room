@@ -828,6 +828,8 @@
   flex-wrap: wrap;
 }
 .rec-read-stale {
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
   flex: 1;
 }
 .rec-found-list {
@@ -843,7 +845,7 @@
   align-items: baseline;
   gap: 10px;
   padding: 6px 10px;
-  border-radius: 10px 10px 10px 10px / 6px 8px 6px 8px;
+  border-radius: var(--radius-sm);
   background-color: var(--hover);
 }
 .rec-found.is-guessed {
@@ -933,6 +935,7 @@
 .rec-blank-title {
   margin: 0 0 var(--sp-2);
   font-size: var(--fs-section);
+  font-family: var(--display);
   font-weight: 600;
   line-height: 1.15;
   color: var(--text-strong);
@@ -992,6 +995,8 @@
 }
 /* A count is the handwriting's natural home. */
 .rec-clips-note {
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
   margin-inline-start: auto;
   color: var(--faint);
 }
@@ -1037,12 +1042,12 @@
   align-items: baseline;
   gap: var(--sp-2);
 }
-/* A speaker label is one of the short labels the hand is reserved for. */
+/* The sans. A speaker label is the diarizer's answer, not a note anybody
+   wrote down — the hand is reserved for words a person set there. */
 .rec-clip-who {
   /* min-width:0 or a flex item refuses to shrink below its content and a long
      name pushes the duration off the row instead of ellipsing. */
   min-width: 0;
-  font-family: var(--hand);
   font-size: var(--fs-meta);
   line-height: 1.2;
   color: var(--mk-ink, var(--accent));
@@ -1541,6 +1546,7 @@
 .rec-home-title {
   margin: 0;
   font-size: var(--fs-page);
+  font-family: var(--display);
   font-weight: 700;
   letter-spacing: -0.02em;
   color: var(--text-strong);
@@ -1697,6 +1703,8 @@
   gap: var(--sp-3);
 }
 .rec-home-when {
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
   color: var(--ink-muted);
 }
 .rec-home-state {

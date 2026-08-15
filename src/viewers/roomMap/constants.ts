@@ -21,8 +21,10 @@ export const FIT_PAD = 52; // px of breathing room around the graph when fitting
  * is exactly the size at which a room full of similar file names stops being
  * readable at a glance — the thing labels exist for.
  *
- * LABEL_CHAR_W is a deliberate OVERestimate of Manrope's average advance at
- * that size (~6.6px): the number only feeds the collision test, and guessing a
+ * LABEL_CHAR_W is a deliberate OVERestimate of the interface face's average
+ * advance at that size. Measured over the characters file names are actually
+ * made of, Figtree comes to 6.600px at 12px — the same figure Manrope gave
+ * before the swap, so this constant did not have to move: the number only feeds the collision test, and guessing a
  * label slightly too wide costs a little empty paper, while guessing it too
  * narrow lets two names print on top of each other. */
 export const LABEL_MIN_R_PX = 6.4; // a star must render at least this big to auto-label

@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { unzip } from "fflate";
 import { api } from "../api";
 import { Book, chapterHtml, parseEpub } from "./epub";
 import { frameIsDark, useFrameTheme } from "./frameTheme";
+import { textOf } from "./htmlText";
 import { useFileBytes } from "./useFileBytes";
 import "./book.css";
 
@@ -44,6 +45,10 @@ export default function BookView({
   const theme = useFrameTheme();
   const [fontStep, setFontStep] = useState(1);
   const [tocOpen, setTocOpen] = useState(false);
+  // A chapter renders in an opaque frame, so a selection made inside it never
+  // reaches the app and cannot be quoted. This is the same second reading the
+  // page reader offers, and the only way a book's words can be pointed at.
+  const [mode, setMode] = useState<"page" | "text">("page");
 
   useEffect(() => {
     if (!bytes) return;
@@ -99,6 +104,19 @@ export default function BookView({
     // reader changed page or font size.
   }, [book, at, fontStep, theme]);
 
+  const plain = useMemo(() => {
+    const files = filesRef.current;
+    const chapter = book?.chapters[at];
+    if (mode !== "text" || !files || !chapter) return "";
+    const raw = files[chapter.path];
+    if (!raw) return "";
+    try {
+      return textOf(new TextDecoder().decode(raw));
+    } catch {
+      return "";
+    }
+  }, [mode, book, at]);
+
   const go = useCallback(
     (delta: number) => {
       if (!book) return;
@@ -135,6 +153,26 @@ export default function BookView({
             {" "}
             · {at + 1} of {book.chapters.length}
           </span>
+        </span>
+        <span className="rdr-modes" role="group" aria-label="How to read this chapter">
+          <button
+            type="button"
+            className="rdr-mode"
+            aria-pressed={mode === "page"}
+            title="The chapter as the publisher set it"
+            onClick={() => setMode("page")}
+          >
+            Page
+          </button>
+          <button
+            type="button"
+            className="rdr-mode"
+            aria-pressed={mode === "text"}
+            title="The chapter's words — selectable, and quotable in chat"
+            onClick={() => setMode("text")}
+          >
+            Text
+          </button>
         </span>
         <span className="book-actions">
           <button
@@ -198,7 +236,20 @@ export default function BookView({
             </ol>
           </nav>
         )}
-        {url ? (
+        {mode === "text" ? (
+          <div className="book-text">
+            {plain ? (
+              <pre className="html-doc" dir="auto">
+                {plain}
+              </pre>
+            ) : (
+              <div className="empty-hint">
+                This chapter has no text of its own — it may be a full-page
+                image or a plate.
+              </div>
+            )}
+          </div>
+        ) : url ? (
           <iframe
             key={url}
             className="book-frame"

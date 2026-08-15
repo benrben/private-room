@@ -174,9 +174,9 @@ export default function TokenBudgetBar({ s, a }: { s: WSState; a: WSActions }) {
         onClick={() => void a.handoffContext()}
       >
         {s.handoffStarting ? (
-          <RefreshIcon size={13} className="token-handoff-spin" />
+          <RefreshIcon size={14} className="token-handoff-spin" />
         ) : (
-          <SparklesIcon size={13} />
+          <SparklesIcon size={14} />
         )}
         {s.handoffStarting ? "Summarizing…" : "Hand off"}
       </button>

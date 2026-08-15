@@ -19,7 +19,7 @@ export function WorkflowsPage({ s, a }: Props) {
     <div className="wf-page">
       <div className="viewer-head">
         <span className="viewer-title">
-          <WorkflowsIcon size={15} /> Workflows
+          <WorkflowsIcon size={14} /> Workflows
         </span>
         <span className="viewer-actions">
           <button className="subtle btn-ic" onClick={() => s.setShowWorkflows(false)}>

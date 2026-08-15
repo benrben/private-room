@@ -316,7 +316,20 @@ def create_app(
     mcp_factory: McpFactory = _default_mcp,
     token: str | None = None,
 ) -> FastAPI:
-    app = FastAPI(title="Arcelle agent sidecar", version=__version__)
+    @contextlib.asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        # Off the request path, on purpose — see tts.warm_import. Fire and
+        # forget: nothing waits for it, and a failure changes nothing about how
+        # the first spoken sentence behaves. Dropped on shutdown so nothing
+        # awaits it; the import itself runs in a worker thread the loop's own
+        # executor joins, which `Task.cancel` cannot and does not interrupt.
+        warm = asyncio.get_running_loop().create_task(tts_mod.warm_import())
+        try:
+            yield
+        finally:
+            warm.cancel()
+
+    app = FastAPI(title="Arcelle agent sidecar", version=__version__, lifespan=lifespan)
     app.add_middleware(BodyLimitMiddleware, max_bytes=MAX_REQUEST_BYTES)
     # Added AFTER the body limit so it runs BEFORE it (Starlette wraps
     # outermost-last): an unauthorized caller is turned away without us reading

@@ -107,7 +107,7 @@ export default function TopBar({
     .map((w) => ({
       id: w.id,
       label: w.name,
-      icon: <WorkflowGlyph emoji={w.emoji} size={15} />,
+      icon: <WorkflowGlyph emoji={w.emoji} size={14} />,
       hint: w.name,
       onRun: () => void a.runWorkflowNow(w.id),
     }));
@@ -117,7 +117,7 @@ export default function TopBar({
     .map((sc) => ({
       id: sc.fileId,
       label: sc.name,
-      icon: <PlayIcon size={13} />,
+      icon: <PlayIcon size={14} />,
       hint: `Run ${sc.name}`,
       onRun: () => void a.runScript(sc.fileId),
     }));
@@ -204,7 +204,7 @@ export default function TopBar({
             open={s.openMenu === "workflows"}
             onOpenChange={(o) => setOpenMenu(o ? "workflows" : null)}
             buttonLabel="Workflows"
-            buttonIcon={<WorkflowsIcon size={15} />}
+            buttonIcon={<WorkflowsIcon size={14} />}
             inlineMax={3}
             pill
             footer={{ label: "All workflows…", onClick: a.openWorkflows }}
@@ -489,7 +489,7 @@ export default function TopBar({
           data-agent-blocked
           onClick={a.handleLock}
         >
-          <LockIcon size={13} /> Lock
+          <LockIcon size={14} /> Lock
         </button>
       </div>
     </header>

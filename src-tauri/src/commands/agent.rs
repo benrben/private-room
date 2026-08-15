@@ -377,6 +377,14 @@ pub async fn ask(
     chat_id: String,
     question: String,
     attachments: Vec<String>,
+    // The NAME of the file the user has open while asking, when they have one.
+    // "Summarize this" with a lease on screen was answered by a model that had
+    // no idea a lease was on screen — the single thing that most made the room
+    // feel like it was somewhere else. A name and nothing more: file names
+    // already ride in this turn's room inventory, so this discloses nothing
+    // new, while the CONTENT stays behind the paperclip, which is the user's
+    // own explicit gesture and not ours to spend for them.
+    viewing: Option<String>,
     // PRIV-1: "send real details this once" — set only by the chat valve's
     // confirmed re-ask; absent for every ordinary turn.
     privacy_bypass: Option<bool>,
@@ -412,7 +420,13 @@ pub async fn ask(
     if !crate::ollama_lifecycle::is_awake(&ollama::resolved_base_url()).await {
         turn.step(&window, "Starting the local AI…");
     }
-    turn.step(&window, "Searching your files…");
+    // "Searching your files…" used to be emitted HERE, before the embedding
+    // below — so the whole embed step, which can mean loading a 274 MB model
+    // into RAM, ran under a line claiming the room was already searching.
+    // Reordering alone would not fix it: `is_awake` probes the socket only, so
+    // a warm daemon holding a cold embed model shows no chip at all through
+    // that load. Each phase now names itself as it begins.
+    turn.step(&window, "Preparing the search…");
 
     // ADD-13: embed the question BEFORE taking the room lock (the Ollama call is
     // async; the lock is not held across it). None on any failure → keyword-only.
@@ -420,6 +434,7 @@ pub async fn ask(
         .map(|(_, request)| request)
         .unwrap_or(question.trim());
     let question_embedding = embed_question(embedding_question).await;
+    turn.step(&window, "Searching your files…");
 
     // Phase 1 (locked): gather context, save the user message.
     let QuestionContext {
@@ -439,6 +454,7 @@ pub async fn ask(
         &question,
         &attachments,
         question_embedding.as_deref(),
+        viewing.as_deref(),
     )?;
 
     // Live-QA 2026-07-23: a PURE "save that as a file" turn is deterministic —
@@ -690,6 +706,7 @@ fn gather_context_and_save_question(
     question: &str,
     attachments: &[String],
     question_embedding: Option<&[f32]>,
+    viewing: Option<&str>,
 ) -> Result<QuestionContext, String> {
         let guard = state.room.lock().unwrap();
         let room = guard.as_ref().ok_or("No room is open.")?;
@@ -1036,6 +1053,32 @@ fn gather_context_and_save_question(
                 user_content.push_str(&format!("[file: {}]\n{}\n\n", chunk.file_name, chunk.text));
             }
             user_content.push_str("---\n\n");
+        }
+        // What the user is looking at while they ask. In the always-new user
+        // message, never the system prompt: ADD-22 keeps that prefix
+        // byte-stable so Ollama reuses the cached KV, and a fact that changes
+        // whenever a tab does would invalidate it on every turn.
+        //
+        // Stated as the name only, and stated as what it is — the model still
+        // has to `open_file` to read a word of it, exactly as before.
+        //
+        // "has open", not "is looking at": the flag says a file is loaded in
+        // the workspace, and the workspace pane can be collapsed, stepped aside
+        // or behind Home. Claiming eye contact we cannot observe is the same
+        // class of thing this wave exists to remove.
+        //
+        // Skipped when the user attached files: the paperclip is an explicit
+        // choice about what this question is about, and a hint that points
+        // somewhere else would argue with the person who made it. There is also
+        // no anaphora left to resolve — the attachments already answer "this".
+        if attachments.is_empty() {
+            if let Some(open) = viewing.map(str::trim).filter(|v| !v.is_empty()) {
+                user_content.push_str(&format!(
+                    "The user has \"{open}\" open in the workspace. If their question says \
+                     \"this\" or \"here\" without naming anything, they almost certainly \
+                     mean that file — open it and work from what it says.\n\n"
+                ));
+            }
         }
         // Deterministic anaphora hint (see `is_bare_save_reference`): a 4B model
         // sees its own previous reply in the history yet still asks the user to
@@ -3043,9 +3086,14 @@ pub(crate) async fn exec_tool(
             )?;
             effects.annotation = Some(payload.clone());
             let _ = window.emit("agent-annotate", &payload);
-            Ok(format!(
-                "Highlighted {described} in \"{real_name}\" — the user can now see it marked in the viewer."
-            ))
+            // What we know is that the viewer was SENT there. Whether the mark
+            // landed is the viewer's own business and it never travels back —
+            // a PDF page that has not rendered yet simply misses, and the model
+            // was told, in the same breath, that the user could see it. Two
+            // voices in one room disagreeing about a fact only one of them has.
+            // The honest claim is the one this code can actually make; the
+            // grounding check above already reports when the quote itself drifted.
+            Ok(format!("Sent the viewer to {described} in \"{real_name}\"."))
         }
         "edit_file" => {
             let name = args["name"].as_str().unwrap_or_default();
@@ -3951,6 +3999,14 @@ pub(crate) async fn exec_tool(
                 return Ok("Already remembered.".into());
             }
             db::add_memory(&room.conn, content, category)?;
+            // A room mutation the user can be LOOKING AT. The chat path happens
+            // to re-list memories when its turn ends, so this was invisible
+            // there — but a workflow node, a scheduled run and an outside agent
+            // on the room bridge all write memories with no turn to end, and
+            // the pane simply kept showing the old set. Same shape the file
+            // writes above use (`room-files-changed`) and the workflow writes
+            // use (`emit_workflows_changed`); memories had neither.
+            let _ = window.emit("memories-changed", ());
             Ok("Memory saved.".into())
         }
         // Wave 1b (idea 5): read the FULL memory set on demand. The per-question
@@ -3986,6 +4042,7 @@ pub(crate) async fn exec_tool(
                         // the AI delete" now has an answer, same as the files
                         // trash already gives for `TrashActor::Agent`.
                         db::delete_memory(&room.conn, id, db::TrashActor::Agent("delete_memory"))?;
+                        let _ = window.emit("memories-changed", ());
                         Ok(format!("Forgot: {old}"))
                     } else {
                         let content = args["content"].as_str().unwrap_or_default().trim();
@@ -4006,6 +4063,7 @@ pub(crate) async fn exec_tool(
                             .find(|m| &m.id == id)
                             .and_then(|m| m.category);
                         db::update_memory(&room.conn, id, content, keep.as_deref())?;
+                        let _ = window.emit("memories-changed", ());
                         Ok(format!("Updated. Was: {old}"))
                     }
                 }
@@ -4655,6 +4713,21 @@ pub(crate) fn clamp_bytes(mut s: String, max: usize) -> String {
     s
 }
 
+/// Truncate a string to at most `max` CHARACTERS. The sibling of
+/// [`clamp_bytes`], for the caps that are stated in characters — a memory's
+/// length, which the user typed and can count.
+///
+/// The two are not interchangeable and picking the wrong one is silent: the
+/// memory commands clamped BYTES against `MAX_MEMORY_CONTENT_CHARS`, so a note
+/// typed in Hebrew lost half of itself on save while the same note in English
+/// went through whole, and nothing said a word about it.
+pub(crate) fn clamp_chars(mut s: String, max: usize) -> String {
+    if let Some((byte_idx, _)) = s.char_indices().nth(max) {
+        s.truncate(byte_idx);
+    }
+    s
+}
+
 /// The LAST `max` bytes of `s`, never splitting a char. Empty when `s` already
 /// fits (the caller has the whole thing and needs no tail).
 ///
@@ -5015,6 +5088,28 @@ pub(crate) fn claims_unbacked_action(text: &str, wrote: bool, highlighted: bool)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A cap stated in characters has to cut at characters. The memory commands
+    /// clamped BYTES against `MAX_MEMORY_CONTENT_CHARS`, so a note the user
+    /// typed in Hebrew lost half of itself on save — silently, while the agent's
+    /// own path politely refused an over-long one and said why.
+    #[test]
+    fn a_character_cap_keeps_whole_characters_in_every_script() {
+        let hebrew: String = "א".repeat(MAX_MEMORY_CONTENT_CHARS);
+        assert_eq!(
+            clamp_chars(hebrew.clone(), MAX_MEMORY_CONTENT_CHARS).chars().count(),
+            MAX_MEMORY_CONTENT_CHARS,
+            "a note exactly at the cap must survive whole"
+        );
+        // Over the cap: cut to the cap, on a character boundary, never mid-char.
+        let over: String = "א".repeat(MAX_MEMORY_CONTENT_CHARS + 10);
+        let cut = clamp_chars(over, MAX_MEMORY_CONTENT_CHARS);
+        assert_eq!(cut.chars().count(), MAX_MEMORY_CONTENT_CHARS);
+        assert!(cut.chars().all(|c| c == 'א'));
+        // Under the cap is returned untouched, in any script.
+        assert_eq!(clamp_chars("hello".to_string(), 500), "hello");
+        assert_eq!(clamp_chars("שלום".to_string(), 500), "שלום");
+    }
 
     #[test]
     fn unmasking_not_auto_approve_decides_the_outbound_args() {

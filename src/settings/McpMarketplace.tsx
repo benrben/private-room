@@ -809,7 +809,7 @@ function InstallDrawer({
             onClick={() => (confirming ? void doInstall() : setConfirming(true))}
           >
             {done
-              ? (<><CircleCheckIcon size={13} /> Installed</>)
+              ? (<><CircleCheckIcon size={14} /> Installed</>)
               : busy
                 ? "Installing…"
                 : confirming
@@ -833,7 +833,7 @@ function InstallDrawer({
                 onClick={doOauth}
               >
                 {signedIn
-                  ? (<><CircleCheckIcon size={13} /> Signed in</>)
+                  ? (<><CircleCheckIcon size={14} /> Signed in</>)
                   : authBusy
                     ? "Waiting for your browser…"
                     : "Connect account (sign in)"}

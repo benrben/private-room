@@ -410,8 +410,9 @@ function ReadPanel({
   return (
     <div className="rec-found-panel">
       <div className="rec-read-actions">
+        {/* A consequence the reader has to act on, so never the hand. */}
         {stale && (
-          <span className="rec-read-stale nb-note" data-testid="rec-read-stale">
+          <span className="rec-read-stale" data-testid="rec-read-stale">
             The transcript changed since this was read.
           </span>
         )}
@@ -1384,7 +1385,7 @@ export default function RecordingView({
         cls: "rec-record is-stopping",
         label: "Stop & save",
         title: "Stop recording and save this file",
-        glyph: <StopIcon size={15} />,
+        glyph: <StopIcon size={14} />,
         run: () => void onStop(),
       }
     : {
@@ -1471,7 +1472,7 @@ export default function RecordingView({
                 title={playing ? "Pause" : "Play"}
                 onClick={togglePlay}
               >
-                {playing ? <PauseIcon size={15} /> : <PlayIcon size={15} />}
+                {playing ? <PauseIcon size={14} /> : <PlayIcon size={14} />}
               </button>
             )}
             {recordingNow && (
@@ -1481,7 +1482,7 @@ export default function RecordingView({
                 title="Pause recording"
                 onClick={() => void onPause()}
               >
-                <PauseIcon size={15} />
+                <PauseIcon size={14} />
               </button>
             )}
             {status === "paused" && (
@@ -1491,7 +1492,7 @@ export default function RecordingView({
                 title="Resume recording"
                 onClick={() => void onResume()}
               >
-                <PlayIcon size={15} />
+                <PlayIcon size={14} />
               </button>
             )}
             {status !== "saving" && (
@@ -1956,7 +1957,7 @@ export default function RecordingView({
         <aside className="rec-clips" aria-label="Clips in this recording">
           <div className="rec-clips-head">
             <h3>Clips</h3>
-            <span className="nb-hand rec-clips-note">
+            <span className="rec-clips-note">
               {clips.length === 0
                 ? "none yet"
                 : `${clips.length} turn${clips.length === 1 ? "" : "s"}`}

@@ -636,15 +636,21 @@ export function makeFileActions(s: WSState) {
   }
 
   async function viewFile(id: string, target?: FileTarget) {
+    // Say it is opening BEFORE the wait, not after it. `get_file_content` is a
+    // synchronous command behind the room mutex, so on a large file this await
+    // is the whole delay — and nothing on screen changed for its duration.
+    s.setOpeningFileId(id);
     let content: FileContent;
     try {
       content = await api.getFileContent(id);
     } catch (e) {
       // Opening is the most-used action in the app; failing it silently left
       // the previous file on screen and read as a dead click.
+      s.setOpeningFileId(null);
       s.pushToast("error", `Could not open that file: ${String(e)}`);
       return;
     }
+    s.setOpeningFileId(null);
     s.setOpenFile({ id, content, target });
     s.setEditMode(false);
     s.setShowMap(false);

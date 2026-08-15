@@ -781,9 +781,8 @@ button.primary.running:disabled {
 .tm-retention {
   margin-top: 6px;
   padding: var(--sp-2) 10px 2px;
-  font-family: var(--hand);
-  font-size: var(--fs-hand);
-  line-height: var(--lh-hand);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
   color: var(--ink-2);
   background-image: linear-gradient(
     90deg,

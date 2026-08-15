@@ -286,7 +286,7 @@ export default function TabStrip({
                   tabs.close(tab.id);
                 }}
               >
-                <CloseIcon size={11} />
+                <CloseIcon size={12} />
               </button>
             </div>
           );
@@ -299,7 +299,7 @@ export default function TabStrip({
             onClick={onNewPage}
           >
             <PlusIcon size={12} />
-            <GlobeIcon size={11} />
+            <GlobeIcon size={12} />
           </button>
         )}
       </div>

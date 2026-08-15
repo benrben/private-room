@@ -181,11 +181,15 @@ pub(crate) const NOTEBOOK_CSS: &str = r####"
   --sketch:#292b27; --rule:#b8b7ac; --rule-strong:#847f6f; --line-soft:#e0dccf;
 
   /* markers, FILL track: translucent, absorbed, NOT legible as text */
-  --mk-pink:#e9a4b3; --mk-yellow:#e6cc70; --mk-green:#9fc59d;
+  --mk-berry:#e7a4e9; --mk-yellow:#edc169; --mk-green:#9fc59d;
   --mk-blue:#8eb8d2; --mk-red:#dc8179;
-  /* markers, INK track: contrast-checked, these can carry a word */
-  --mk-pink-ink:#be3754; --mk-yellow-ink:#7c6824; --mk-green-ink:#477445;
-  --mk-blue-ink:#3a6f91; --mk-red-ink:#b94036;
+  /* markers, INK track: contrast-checked, these can carry a word. EQUAL to
+     tokens.css, value for value — this file's grounds are the same four, so a
+     second solve would only be a second chance to be wrong, and was: the ink
+     track here had drifted, with the dark greens copied from the FILL row
+     outright. `visualRegister.test.mjs` compares the two now. */
+  --mk-berry-ink:#a82fad; --mk-yellow-ink:#83601c; --mk-green-ink:#447142;
+  --mk-blue-ink:#366b8d; --mk-red-ink:#b53c32;
 
   /* primary "button": filled ink. Light fills with charcoal — 14.19:1. */
   --btn-ink:#20221f; --btn-ink-text:#f4f1e8;
@@ -198,10 +202,10 @@ html[data-theme="dark"]{
   --grid-dot:rgba(80,84,79,.42);
   --ink:#f0eee5; --ink-strong:#fbfaf4; --ink-2:#a9ada3; --ink-muted:#959a92;
   --sketch:#d8d8cc; --rule:#555a54; --rule-strong:#787e77; --line-soft:#343834;
-  --mk-pink:#c77a90; --mk-yellow:#c2a84f; --mk-green:#719c75;
+  --mk-berry:#c47ac7; --mk-yellow:#c99e48; --mk-green:#719c75;
   --mk-blue:#6896b2; --mk-red:#bb6661;
-  --mk-pink-ink:#c87b91; --mk-yellow-ink:#baa457; --mk-green-ink:#719c75;
-  --mk-blue-ink:#6a97b3; --mk-red-ink:#c67f7a;
+  --mk-berry-ink:#cc7ecf; --mk-yellow-ink:#bb9444; --mk-green-ink:#79a47d;
+  --mk-blue-ink:#73a0bc; --mk-red-ink:#cf8883;
   --btn-ink:#f0eee5; --btn-ink-text:#151716;
   --shadow:rgba(0,0,0,.46); --shadow-lift:rgba(0,0,0,.34);
 }
@@ -211,25 +215,31 @@ html[data-theme="dark"]{
      USED, and the hues above are already themed. Reach for the semantic name
      whenever a colour is saying something. Per the spec these always ride with
      a word or a glyph — colour is never the only signal. */
-  --sem-saved:var(--mk-pink-ink);     --sem-saved-fill:var(--mk-pink);
+  --sem-saved:var(--mk-berry-ink);     --sem-saved-fill:var(--mk-berry);
   --sem-pending:var(--mk-yellow-ink); --sem-pending-fill:var(--mk-yellow);
   --sem-done:var(--mk-green-ink);     --sem-done-fill:var(--mk-green);
   --sem-linked:var(--mk-blue-ink);    --sem-linked-fill:var(--mk-blue);
   --sem-urgent:var(--mk-red-ink);     --sem-urgent-fill:var(--mk-red);
   /* the pink pen */
-  --accent:var(--mk-pink-ink); --accent-fill:var(--mk-pink);
-  --accent-soft:color-mix(in srgb,var(--mk-pink) 18%,transparent);
+  --accent:var(--mk-berry-ink); --accent-fill:var(--mk-berry);
+  --accent-soft:color-mix(in srgb,var(--mk-berry) 18%,transparent);
   --ok:var(--sem-done);
 
-  /* THE THREE FACES, DEGRADED HONESTLY.
-     The app bundles Manrope, Kalam and IBM Plex Mono (src/styles/fonts.css)
-     and this page can reach NONE of them: the roomdoc:// sandbox serves it
-     with `default-src 'none'`, so a @font-face url() is blocked, a path to the
-     app's own woff2 does not resolve from an opaque origin, and a remote font
-     would break the promise of a local room. So each face names the nearest
-     thing macOS already has — Arcelle is Mac-only — and the document is a
-     system-font rendering of the notebook rather than a page pretending to
-     fonts it cannot load. Never add a url() to these. */
+  /* THE FACES, DEGRADED HONESTLY.
+     The app bundles Figtree, Space Grotesk, Kalam and IBM Plex Mono
+     (src/styles/fonts.css) and this page can reach NONE of them: the roomdoc://
+     sandbox serves it with `default-src 'none'`, so a @font-face url() is
+     blocked, a path to the app's own woff2 does not resolve from an opaque
+     origin, and a remote font would break the promise of a local room. So each
+     face names the nearest thing macOS already has — Arcelle is Mac-only — and
+     the document is a system-font rendering of the notebook rather than a page
+     pretending to fonts it cannot load. Never add a url() to these.
+
+     Three roles, not the app's four: --display exists in tokens.css to set
+     titles in Space Grotesk against Figtree, and with both degraded to the
+     same system stack the distinction would be a token that resolves to --sans
+     and reads as a promise the page cannot keep. Titles here separate by size
+     and weight, which survive the degrade. */
   --sans:-apple-system,"SF Pro Text",system-ui,"Segoe UI",Roboto,sans-serif;
   --hand:"Bradley Hand","Noteworthy","Chalkboard SE",cursive;
   --mono:ui-monospace,SFMono-Regular,Menlo,"IBM Plex Mono",monospace;
@@ -245,10 +255,16 @@ html[data-theme="dark"]{
 
   /* Drawn, not computed: asymmetric radii give any box a hand-made outline for
      free, and they are fixed values so a box draws identically every render. */
-  --radius-sm:6px 5px 7px 5px / 5px 7px 5px 6px;
-  --radius:9px 7px 10px 8px / 8px 10px 7px 9px;
-  --radius-lg:13px 11px 14px 12px / 12px 14px 11px 13px;
-  --stroke-w:1.5px;
+  /* Symmetric, and 1px: an exported document follows the app's register.
+     See tokens.css for why — 1.5px lands on a half pixel at 2x, and 225 wobbly
+     corners read as a rendering fault rather than as a drawn edge. The drawn
+     MARKS below (the hero rule, the circled counts, the timeline dots) keep
+     their asymmetry: that is the notebook, and it survived the pass. */
+  --radius-xs:6px;
+  --radius-sm:8px;
+  --radius:10px;
+  --radius-lg:12px;
+  --stroke-w:1px;
 
   --sp-1:4px; --sp-2:8px; --sp-3:12px; --sp-4:16px; --sp-6:24px; --sp-8:32px;
 
@@ -295,7 +311,7 @@ label:focus-visible,[tabindex]:focus-visible{
     --grid-dot:transparent;
     --ink:#111111; --ink-strong:#000000; --ink-2:#3a3a36; --ink-muted:#44443f;
     --sketch:#222222; --rule:#9a988e; --rule-strong:#6b6a60; --line-soft:#d8d5cb;
-    --mk-pink-ink:#a02744; --mk-yellow-ink:#6a5a1c; --mk-green-ink:#3b6339;
+    --mk-berry-ink:#9c27a0; --mk-yellow-ink:#6a501c; --mk-green-ink:#3b6339;
     --mk-blue-ink:#2f5f7d; --mk-red-ink:#a03328;
     --btn-ink:#111111; --btn-ink-text:#ffffff;
     --shadow:transparent; --shadow-lift:transparent;
@@ -351,7 +367,7 @@ hr{border:0;height:1px;background:linear-gradient(90deg,transparent,var(--rule) 
    summarize.rs's "Generated on ..."), and a date is a timestamp. */
 .hero .sub{color:var(--ink-2);font-family:var(--sans);font-variant-numeric:tabular-nums;font-size:var(--fs-lead);margin:.15rem 0 0;display:inline-block;position:relative;padding-bottom:3px}
 .hero .sub::after{content:"";position:absolute;left:-3px;right:-6px;bottom:0;height:2.5px;border-radius:2px 4px 2px 3px / 3px 2px 4px 2px;background:linear-gradient(91deg,var(--sem-pending-fill) 2%,color-mix(in srgb,var(--mk-yellow) 62%,transparent) 76%,transparent 100%)}
-.hero .rule{height:3px;width:66px;border-radius:3px 2px 4px 2px / 2px 4px 2px 3px;background:linear-gradient(90deg,var(--accent-fill),color-mix(in srgb,var(--mk-pink) 30%,transparent));margin-top:1.15rem}
+.hero .rule{height:3px;width:66px;border-radius:3px 2px 4px 2px / 2px 4px 2px 3px;background:linear-gradient(90deg,var(--accent-fill),color-mix(in srgb,var(--mk-berry) 30%,transparent));margin-top:1.15rem}
 /* The one washed panel in the document: the room's purpose, highlighted. */
 .lead-wrap{background:color-mix(in srgb,var(--mk-yellow) 16%,transparent);border:var(--stroke-w) solid var(--sketch);border-left:3px solid var(--sem-pending-fill);border-radius:var(--radius-lg);padding:1.05rem 1.25rem;margin:.4rem 0 0}
 .lead{font-size:var(--fs-lead);line-height:1.62;margin:0}
@@ -363,7 +379,7 @@ hr{border:0;height:1px;background:linear-gradient(90deg,transparent,var(--rule) 
    float; nothing in a document does. */
 .files{list-style:none;margin:.4rem 0 0;padding:0;display:grid;gap:.5rem}
 .files li{display:flex;gap:.75rem;align-items:flex-start;background:transparent;border:var(--stroke-w) solid var(--sketch);border-radius:var(--radius-lg);padding:.7rem .85rem}
-.files .ic{flex:none;width:2rem;height:2rem;border-radius:var(--radius);background:color-mix(in srgb,var(--mk-pink) 20%,transparent);display:grid;place-items:center;font-size:1.05rem;line-height:1}
+.files .ic{flex:none;width:2rem;height:2rem;border-radius:var(--radius);background:color-mix(in srgb,var(--mk-berry) 20%,transparent);display:grid;place-items:center;font-size:1.05rem;line-height:1}
 .files .nm{font-weight:600}
 .files .ds{color:var(--ink-2);font-size:var(--fs-meta);margin-top:.12rem}
 .asks{list-style:none;counter-reset:a;display:grid;gap:.55rem;margin:.4rem 0 0;padding:0}
@@ -567,6 +583,72 @@ pub(crate) fn extract_md_table(text: &str) -> Option<Vec<Vec<String>>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_generated_page_defines_the_tokens_it_reads() {
+        // A generated page is standalone behind `default-src 'none'`, so an
+        // undefined custom property has nowhere to resolve from. It does not
+        // fall back to the app's value or to the property's initial value
+        // either — the whole declaration is thrown out at computed-value time,
+        // so the element loses the property entirely and the page renders a
+        // gap where the mark was. Nothing raises, nothing logs; you only find
+        // it by opening an export and noticing something missing.
+        //
+        // These four pages splice NOTEBOOK_CSS in and then write their own
+        // rules on top, which is exactly the seam a rename slips through: the
+        // tokens move in one file and the rules that read them live in four
+        // others. Renaming --mk-pink to --mk-berry did precisely this and took
+        // the hero divider off three Studio exports.
+        let pages = [
+            ("html_document", format!("{NOTEBOOK_CSS}\n{DOC_STYLE}")),
+            (
+                "flashcards",
+                crate::commands::FLASHCARDS_TEMPLATE.replace("__NOTEBOOK__", NOTEBOOK_CSS),
+            ),
+            (
+                "mindmap",
+                crate::commands::MINDMAP_TEMPLATE.replace("__NOTEBOOK__", NOTEBOOK_CSS),
+            ),
+            (
+                "podcast",
+                crate::commands::PODCAST_TEMPLATE.replace("__NOTEBOOK__", NOTEBOOK_CSS),
+            ),
+        ];
+
+        let mut undefined: Vec<String> = Vec::new();
+        for (name, css) in &pages {
+            let defined: std::collections::HashSet<&str> = css
+                .match_indices("--")
+                .filter_map(|(i, _)| {
+                    let rest = &css[i..];
+                    let end = rest.find(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))?;
+                    // A definition is `--name:`; a reference is `var(--name)`.
+                    rest[end..].starts_with(':').then(|| &rest[..end])
+                })
+                .collect();
+            for (i, _) in css.match_indices("var(--") {
+                let rest = &css[i + 4..];
+                let Some(end) = rest.find(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+                else {
+                    continue;
+                };
+                // `var(--x, fallback)` survives an undefined token by design.
+                if rest[end..].starts_with(',') {
+                    continue;
+                }
+                let token = &rest[..end];
+                if !defined.contains(token) {
+                    undefined.push(format!("{name}: {token}"));
+                }
+            }
+        }
+        undefined.sort();
+        undefined.dedup();
+        assert!(
+            undefined.is_empty(),
+            "these pages read custom properties nothing defines: {undefined:#?}"
+        );
+    }
 
     #[test]
     fn extract_md_table_parses_and_skips_separator() {

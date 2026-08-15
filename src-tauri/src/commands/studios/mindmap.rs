@@ -162,7 +162,7 @@ __NOTEBOOK__
 .wrap{max-width:50rem;margin:0 auto;padding:2.5rem 1.25rem 3rem}
 .eyebrow{display:inline-block;font-size:var(--fs-micro);font-weight:700;letter-spacing:.15em;text-transform:uppercase;color:var(--accent);margin-bottom:.4rem}
 h1{font-family:var(--sans);font-weight:700;font-size:var(--fs-page);line-height:1.15;letter-spacing:-.022em;color:var(--ink-strong);margin:.05rem 0 0}
-.rule{height:3px;width:66px;border-radius:3px 2px 4px 2px / 2px 4px 2px 3px;background:linear-gradient(90deg,var(--accent-fill),color-mix(in srgb,var(--mk-pink) 30%,transparent));margin:1rem 0 2rem}
+.rule{height:3px;width:66px;border-radius:3px 2px 4px 2px / 2px 4px 2px 3px;background:linear-gradient(90deg,var(--accent-fill),color-mix(in srgb,var(--mk-berry) 30%,transparent));margin:1rem 0 2rem}
 /* Connectors are PENCIL — a guide line drawn before the ink, not a frame. The
    spine runs down each branch and an elbow reaches out to every node. */
 ul{list-style:none;margin:0;padding-left:1.5rem;border-left:var(--stroke-w) solid var(--rule)}

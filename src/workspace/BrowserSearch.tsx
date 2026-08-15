@@ -303,7 +303,7 @@ export function BrowserSearch({
       )}
 
       <button className="bsearch-ask" type="button" onClick={() => onAsk(query)}>
-        <SparklesIcon size={15} />
+        <SparklesIcon size={14} />
         <span>
           <b>Ask the assistant about this</b> — it can read these pages and work
           from them; the results are already cached, so its search is free.
@@ -481,7 +481,7 @@ function SummaryCard({
   if (!summary && !busy && !error) {
     return (
       <button className="bsearch-summary-ask" type="button" onClick={onRun}>
-        <SparklesIcon size={15} />
+        <SparklesIcon size={14} />
         <span>
           <b>Summarize these results</b> — one grounded paragraph from the top
           three pages, with every claim cited.
@@ -674,7 +674,7 @@ function SearchCard({
               title="Open in a new tab"
               onClick={onOpenNewTab}
             >
-              <LinkIcon size={13} />
+              <LinkIcon size={14} />
             </button>
             <button
               className="browser-btn"
@@ -684,7 +684,7 @@ function SearchCard({
               aria-pressed={peek !== undefined}
               onClick={onPeek}
             >
-              <EyeIcon size={13} />
+              <EyeIcon size={14} />
             </button>
             <button
               className={`browser-btn bsearch-add${addState === "added" ? " done" : ""}`}
@@ -695,11 +695,11 @@ function SearchCard({
               onClick={onAdd}
             >
               {addState === "added" ? (
-                <CheckIcon size={13} />
+                <CheckIcon size={14} />
               ) : addState === "adding" ? (
                 <span className="bsearch-spin" />
               ) : (
-                <PlusIcon size={13} />
+                <PlusIcon size={14} />
               )}
             </button>
           </span>

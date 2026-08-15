@@ -302,7 +302,7 @@ function CastStrip({
                 <HeroFace fileId={member.faceFileId} />
               ) : (
                 <span className="cr-hero-noface">
-                  <CreateIcon size={18} />
+                  <CreateIcon size={16} />
                   <span>no face yet</span>
                 </span>
               )}
@@ -1480,7 +1480,7 @@ function ShotRow({
                       : `${member.name} has no picture yet, so only their description goes`
                   }
                 >
-                  {on && <CheckIcon size={10} />}
+                  {on && <CheckIcon size={12} />}
                   {member.name}
                   {!member.faceFileId && <span className="cr-who-noface"> ·no face</span>}
                 </button>
@@ -1596,7 +1596,7 @@ function ShotRow({
 export function StorySeam() {
   return (
     <div className="cr-seam">
-      <LockIcon size={13} />
+      <LockIcon size={14} />
       <p>
         Making a picture or a clip sends the prompt — and any face you attach —
         to the provider. Nothing else in the story leaves this Mac: a

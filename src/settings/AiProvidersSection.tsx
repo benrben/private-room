@@ -96,7 +96,7 @@ export default function AiProvidersSection({
         </div>
         {openrouter?.connected ? (
           <button type="button" className="subtle btn-ic" onClick={disconnect} disabled={busy}>
-            <CloseIcon size={13} /> Disconnect
+            <CloseIcon size={14} /> Disconnect
           </button>
         ) : (
           <div className="provider-key-row">

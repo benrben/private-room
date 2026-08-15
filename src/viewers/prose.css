@@ -8,7 +8,7 @@
 .prose-view {
   /* Never a bare font-family: --sans is the only stack in the app carrying
      the per-glyph fallbacks Hebrew, CJK and the rest need, and a plain-text
-     file is exactly where those turn up. Turkish stays in Manrope (latin-ext
+     file is exactly where those turn up. Turkish stays in Figtree (latin-ext
      is bundled), so İstanbul, ÇAĞRI and GÜNEŞ render in the page's own face.
      Each paragraph carries dir="auto", so an RTL document sets itself. */
   font-family: var(--sans);

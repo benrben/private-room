@@ -27,7 +27,7 @@
  *   Kalam          the Private badge, the journal's descriptions of what the
  *                  agent did, counts, and the empty-state direction. Short
  *                  annotations only.
- *   Manrope        everything else, including every explanation and every
+ *   Figtree        everything else, including every explanation and every
  *                  control label.
  */
 
@@ -174,7 +174,7 @@
   background-position: left center;
   background-size: 0% 100%;
   border: 1px solid transparent;
-  border-radius: 7px 5px 8px 6px / 6px 8px 5px 7px;
+  border-radius: var(--radius-xs);
   font: inherit;
   font-family: var(--sans);
   font-size: var(--fs-meta);
@@ -303,7 +303,7 @@
   position: absolute;
   inset: -3px;
   border: 1px solid color-mix(in srgb, var(--sketch) 30%, transparent);
-  border-radius: 7px 6px 8px 6px / 6px 8px 6px 7px;
+  border-radius: var(--radius-xs);
   pointer-events: none;
 }
 
@@ -365,10 +365,12 @@
 }
 
 /* ----- the Private badge -----
-   Handwritten, because it is the room's own annotation on the page rather
-   than a system label — and set at --fs-hand in Kalam's bold weight, which is
-   LARGER than the 11.5px sans it replaced. A private-browsing indicator that
-   is hard to read is a safety problem, not a style choice.
+   The SANS, and the rule below says so again where it is easy to miss: this
+   badge is the app's one visible claim about whether the browsing store is
+   ephemeral, which makes it a security string, and the brief bars handwriting
+   on those. Set at --fs-body, larger than the 11.5px it replaced — a
+   private-browsing indicator that is hard to read is a safety problem, not a
+   style choice.
 
    Three states:
      verified   done-green ink   the live webview answered "non-persistent"
@@ -465,7 +467,7 @@
   color: var(--text);
   background: transparent;
   border: 1px solid var(--rule-strong);
-  border-radius: 7px 5px 8px 6px / 6px 8px 5px 7px;
+  border-radius: var(--radius-xs);
   font: inherit;
   font-family: var(--sans);
   font-size: var(--fs-meta);
@@ -535,7 +537,7 @@
   color: var(--text);
   background: var(--raised);
   border: 1px solid var(--accent);
-  border-radius: 8px 6px 9px 7px / 7px 9px 6px 8px;
+  border-radius: var(--radius-sm);
   box-shadow: 0 6px 18px var(--shadow-lift);
   outline: 2px solid var(--accent);
   outline-offset: 2px;
@@ -682,6 +684,7 @@
   margin: 0;
   color: var(--text-strong);
   font-size: var(--fs-section);
+  font-family: var(--display);
   font-weight: 600;
   line-height: calc(var(--bstart-rule) * 2);
   letter-spacing: -0.01em;
@@ -1000,6 +1003,7 @@
   margin: 0 0 var(--sp-2);
   color: var(--text-strong);
   font-size: var(--fs-section);
+  font-family: var(--display);
   font-weight: 600;
   line-height: 1.2;
   letter-spacing: -0.01em;
@@ -1119,7 +1123,7 @@
 .browser-reader-body pre {
   overflow-x: auto;
   padding: 10px var(--sp-3);
-  border-radius: 8px 6px 9px 7px / 7px 9px 6px 8px;
+  border-radius: var(--radius-sm);
   background: color-mix(in srgb, var(--raised) 70%, transparent);
   border: 1px solid var(--line-soft);
   font-family: var(--mono);
@@ -1153,7 +1157,7 @@
   padding: 10px var(--sp-3);
   color: var(--sem-urgent);
   border: 1px solid var(--sem-urgent);
-  border-radius: 8px 6px 9px 7px / 7px 9px 6px 8px;
+  border-radius: var(--radius-sm);
 }
 
 /* How much of the page is on screen. A sentence, so it stays in the sans —
@@ -1207,7 +1211,7 @@
   padding: 12px 13px;
   margin: var(--sp-2) 0;
   border: 1px solid var(--mk-ink);
-  border-radius: 10px 8px 11px 9px / 9px 11px 8px 10px;
+  border-radius: var(--radius);
   background-image: linear-gradient(
     97deg,
     color-mix(in srgb, var(--mk) 16%, transparent) 0%,
@@ -1226,7 +1230,7 @@
 /* WHAT is about to leave, verbatim. Mono, so it can be read exactly. */
 .browse-consent .bc-what {
   padding: 7px 9px;
-  border-radius: 7px 5px 8px 6px / 6px 8px 5px 7px;
+  border-radius: var(--radius-xs);
   background: color-mix(in srgb, var(--raised) 70%, transparent);
   border: 1px solid var(--line);
   font-family: var(--mono);
@@ -1284,6 +1288,7 @@
   margin: 0 0 var(--sp-2);
   color: var(--text-strong);
   font-size: var(--fs-section);
+  font-family: var(--display);
   font-weight: 600;
   letter-spacing: -0.01em;
   line-height: 1.2;

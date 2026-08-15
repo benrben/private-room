@@ -54,7 +54,7 @@
   min-width: 200px;
   background: var(--surface-3);
   border: 1.5px solid var(--sketch);
-  border-radius: 10px 8px 11px 9px / 9px 11px 8px 10px;
+  border-radius: var(--radius);
   padding: 6px;
   box-shadow: 0 12px 34px rgba(0, 0, 0, 0.45);
   display: flex;
@@ -69,7 +69,7 @@
   text-align: left;
   background: none;
   border: none;
-  border-radius: 7px 5px 8px 6px / 6px 8px 5px 7px;
+  border-radius: var(--radius-xs);
   padding: 8px 10px;
   font-size: var(--fs-meta);
   color: var(--text);
@@ -279,13 +279,13 @@
   gap: var(--sp-1);
   padding: 3px;
   background: var(--surface-2);
-  border-radius: 8px 6px 9px 7px / 7px 9px 6px 8px;
+  border-radius: var(--radius-sm);
 }
 .engine-tier-tab {
   flex: 1;
   background: none;
   border: none;
-  border-radius: 6px 4px 7px 5px / 5px 7px 4px 6px;
+  border-radius: var(--radius-xs);
   padding: 6px 8px;
   font-size: var(--fs-micro);
   color: var(--text-dim);
@@ -407,7 +407,7 @@
 .effort-chip {
   background: var(--surface-2);
   border: 1px solid var(--border);
-  border-radius: 6px 4px 7px 5px / 5px 7px 4px 6px;
+  border-radius: var(--radius-xs);
   padding: 2px 8px;
   font-size: 11px;
   color: var(--text-dim);
@@ -507,6 +507,7 @@
   margin: 0 0 var(--sp-3);
   color: var(--text-strong);
   font-size: var(--fs-page);
+  font-family: var(--display);
   font-weight: 600;
   letter-spacing: -0.02em;
   line-height: 1.08;
@@ -536,19 +537,19 @@
   text-align: right;
   padding-top: 6px;
 }
-/* A date is exactly what the hand is for. At --fs-hand-lg it is large text,
-   so --muted clears comfortably. */
+/* The masthead date, in the sans. It steps down from the hand's 24px to the
+   card rung: the same nominal size in Figtree reads a tier LARGER than it did
+   in Kalam, and the 44px title beside it is what carries the masthead anyway.
+   At --fs-card, --muted still clears comfortably. */
 .rh-stamp-date {
-  font-family: var(--hand);
-  font-size: var(--fs-hand-lg);
+  font-size: var(--fs-card);
   line-height: 1.15;
   color: var(--muted);
   white-space: nowrap;
 }
 .rh-stamp-counts {
-  font-family: var(--hand);
-  font-size: var(--fs-hand);
-  line-height: var(--lh-hand);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
   color: var(--faint);
   white-space: nowrap;
 }
@@ -592,9 +593,8 @@
 }
 .rh-section-note {
   margin-left: auto;
-  font-family: var(--hand);
-  font-size: var(--fs-hand);
-  line-height: var(--lh-hand);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
   color: var(--faint);
 }
 
@@ -727,9 +727,8 @@
   text-overflow: ellipsis;
 }
 .rh-tl-when {
-  font-family: var(--hand);
-  font-size: var(--fs-hand);
-  line-height: var(--lh-hand);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
   color: var(--faint);
   white-space: nowrap;
 }
@@ -849,6 +848,8 @@
 }
 /* The reason, in the reader's own margin voice, sitting with its chip. */
 .rh-chip-why {
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
   color: var(--ink-2);
   align-self: center;
 }

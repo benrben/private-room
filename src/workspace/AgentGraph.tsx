@@ -22,6 +22,7 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import type { AgentNodeStatus, AskPlanStep, AskActiveAgent } from "../apiTypes";
+import { prefersReducedMotion } from "../rooms/helpers";
 import { MAIN_KEY, chipClass, toBands, toNodes, type GraphNode } from "./agentNodes";
 
 /** Mirror of the sidecar's `agents.REGISTRY` descriptions (agents.py), for the
@@ -620,10 +621,9 @@ function Inspector({
   const panelRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
     if (!autoScroll) return;
-    const still = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     panelRef.current?.scrollIntoView({
       block: "nearest",
-      behavior: still ? "auto" : "smooth",
+      behavior: prefersReducedMotion() ? "auto" : "smooth",
     });
   }, [autoScroll, node.key]);
   return (

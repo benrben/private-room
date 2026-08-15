@@ -10,7 +10,7 @@ export function base64ToBytes(b64: string): Uint8Array {
    language as a highlight in a document. Read from the theme rather than fixed
    hex: the old set was tuned for a dark UI and washed out on light paper. */
 export const BOX_COLORS = [
-  "var(--mk-pink-ink)",
+  "var(--mk-berry-ink)",
   "var(--mk-green-ink)",
   "var(--mk-yellow-ink)",
   "var(--mk-blue-ink)",

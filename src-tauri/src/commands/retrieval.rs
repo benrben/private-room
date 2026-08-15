@@ -360,8 +360,17 @@ pub(crate) fn select_memories(memories: &[String], question: &str, budget: usize
     let mut out = Vec::new();
     let mut used = 0usize;
     for (_, _, m) in scored {
-        let cost = m.len() + 3; // "- " + "\n"
+        // CHARACTERS, matching the budget's name (`MAX_MEMORY_INJECT_CHARS`).
+        // This charged `m.len()` — bytes — so a note in Hebrew, Arabic, Greek
+        // or Cyrillic cost twice what the same note costs in English, and a
+        // room written in one of them got half the memory injected. Nothing
+        // about the budget's purpose is script-dependent; the counting was.
+        let cost = m.chars().count() + 3; // "- " + "\n"
         if used + cost > budget {
+            // BREAK WOULD BE WRONG HERE, and the test above is red on it: the
+            // list is relevance-ordered, so skipping one note that will not fit
+            // to take a later one that does spends budget that would otherwise
+            // sit empty. Stopping would drop context for nothing.
             continue;
         }
         used += cost;
@@ -383,6 +392,52 @@ pub(crate) fn select_memories(memories: &[String], question: &str, budget: usize
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The budget is named in characters, so it has to hold the same number of
+    /// notes whatever script they are written in. Counting bytes instead gave a
+    /// Hebrew-speaking user half the memory an English-speaking one got, in a
+    /// room where Hebrew is a first-class language.
+    #[test]
+    fn the_memory_budget_is_the_same_size_in_every_script() {
+        let latin: Vec<String> = (0..6)
+            .map(|i| format!("note {i} {}", "a".repeat(40)))
+            .collect();
+        let hebrew: Vec<String> = (0..6)
+            .map(|i| format!("note {i} {}", "א".repeat(40)))
+            .collect();
+        let budget = 200;
+        let n_latin = select_memories(&latin, "note", budget).len();
+        let n_hebrew = select_memories(&hebrew, "note", budget).len();
+        assert!(n_latin > 0, "the fixture should fit at least one note");
+        assert_eq!(
+            n_latin, n_hebrew,
+            "same notes, same length, different script — {n_latin} fit in Latin but \
+             {n_hebrew} in Hebrew"
+        );
+    }
+
+    /// Relevance-ordered, then greedy: a note that does not fit is SKIPPED, not
+    /// a stopping point, so the remaining budget goes to the next one that
+    /// does. Pinned because the obvious "tidier" rewrite — `break` — silently
+    /// throws away context that had room.
+    #[test]
+    fn a_note_too_big_to_fit_does_not_end_the_selection() {
+        // The oversized note has to sort FIRST for this to pin anything: both
+        // notes match "short", and the tie breaks on recency (later index
+        // wins), so the huge one is considered before the small one. With
+        // `break` the selection ends there and returns nothing; with `continue`
+        // the budget goes to the note that fits.
+        let memories = vec![
+            "short one".to_string(),
+            format!("short {}", "x".repeat(120)),
+        ];
+        let chosen = select_memories(&memories, "short", 60);
+        assert_eq!(
+            chosen,
+            vec!["short one".to_string()],
+            "a note too big for the remaining budget is skipped, not a stopping point"
+        );
+    }
 
     #[test]
     fn snippet_centers_on_the_match() {

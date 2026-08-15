@@ -83,7 +83,7 @@
    The type is never carried by colour alone either: a string keeps its quotes,
    a number has no quotes, and null/boolean are also italicised. */
 .json-key {
-  color: var(--mk-pink-ink);
+  color: var(--mk-berry-ink);
 }
 .json-key::after {
   content: ":";

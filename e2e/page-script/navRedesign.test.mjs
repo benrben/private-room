@@ -177,12 +177,18 @@ test("a move at the end of a group is a no-op, by identity", () => {
 
 /* ================================================================= layout */
 
-test("the ⌘-keys map to the two side panes, with ⌘3 kept as an alias", () => {
+test("the only ⌘-key this file still claims is the ⌘3 alias", () => {
+  // ⌘1 and ⌘2 moved to the native View menu, which macOS consults BEFORE the
+  // key window — a listener here would be a second owner for the same press,
+  // and a pane toggled twice never moves. The other half of this invariant
+  // (that the menu declares them) is menu.rs's
+  // `the_pane_keys_are_declared_once_each`, and nativeMenu.test.mjs is what
+  // holds the two files to the same story.
   const map = /export const PANE_KEYS[^=]*=\s*\{([^}]*)\}/.exec(LAYOUT)?.[1];
   assert.ok(map, "PANE_KEYS not found");
-  assert.match(map, /"1":\s*"library"/);
-  assert.match(map, /"2":\s*"ai"/);
   assert.match(map, /"3":\s*"ai"/, "⌘3 has always meant the assistant — keep it");
+  assert.ok(!/"1":/.test(map), "⌘1 belongs to the View menu now");
+  assert.ok(!/"2":/.test(map), "⌘2 belongs to the View menu now");
   assert.ok(!/"\d":\s*"center"/.test(map), "no key may hide the workspace");
 });
 

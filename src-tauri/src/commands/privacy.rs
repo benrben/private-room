@@ -613,6 +613,10 @@ pub struct PrivacyStatus {
     /// Files whose scan is missing or stale under the current rules.
     pub pending_files: usize,
     pub scanning: bool,
+    /// Why the last scan stopped without finishing, if it did. The terminal
+    /// event says the same thing, once; this survives for a reader who was not
+    /// listening yet — the app's own window, at mount.
+    pub last_scan_error: Option<String>,
     /// Whether remote-connector arguments are masked right now — see
     /// [`connector_args_masked`]. Independent of `effective_on`, which is why
     /// the panel has to be told rather than infer it.
@@ -657,6 +661,7 @@ pub async fn privacy_status(
             concepts,
             pending_files: pending,
             scanning: scan_running(),
+            last_scan_error: last_scan_error().lock().unwrap().clone(),
             connector_args_masked: connector_masked,
         })
     })
@@ -840,10 +845,36 @@ pub async fn privacy_preview(
     })
 }
 
+/// The one sentence every refusal to scan uses. It is one situation — Home's
+/// brief and the Settings panel both offer the button — so it must not read as
+/// two different problems.
+pub(crate) const SCAN_DOOR_OFF: &str =
+    "Scanning is off while this room's cloud-privacy door is off. Turn the door on and the \
+     scan starts by itself.";
+
+/// The USER pressing "Scan now". Unlike [`schedule_privacy_scan`], which is an
+/// internal trigger and is right to be silent, this one answers a person — so a
+/// door-off room gets a reason instead of an `Ok(())` that starts nothing.
+///
+/// Both callers showed a button that did nothing and then went quiet; Settings
+/// additionally painted "Starting the scan…" that no event ever cleared. Fixing
+/// it here rather than in each caller keeps one answer to one question.
 #[tauri::command]
 pub async fn start_privacy_scan(app: tauri::AppHandle) -> Result<(), String> {
+    if !door_is_active(&app) {
+        return Err(SCAN_DOOR_OFF.into());
+    }
     schedule_privacy_scan(app);
     Ok(())
+}
+
+/// Is the cloud-privacy door effectively ON for the open room? Refreshes the
+/// cached policy first, so the answer reflects a switch flipped a moment ago.
+fn door_is_active(app: &tauri::AppHandle) -> bool {
+    use tauri::Manager;
+    let state = app.state::<AppState>();
+    refresh_policy(app, &state);
+    policy_cell().lock().unwrap().as_ref().map(|p| p.active) == Some(true)
 }
 
 // ---------------------------------------------------------------------------
@@ -860,6 +891,19 @@ fn scan_generation() -> &'static AtomicU64 {
     G.get_or_init(|| AtomicU64::new(0))
 }
 
+/// Why the LAST scan could not finish, until something reports it.
+///
+/// The terminal `privacy-scan` event is emitted once and then gone, and a scan
+/// scheduled at room-open can finish before the workspace has mounted its
+/// listener — so the one failure this app most owes the user an explanation for
+/// could vanish with nobody told. Parked here, it is still there for the
+/// mount-time `privacy_status` read. Cleared when the next scan starts, so it
+/// only ever describes the most recent attempt.
+fn last_scan_error() -> &'static StdMutex<Option<String>> {
+    static E: OnceLock<StdMutex<Option<String>>> = OnceLock::new();
+    E.get_or_init(|| StdMutex::new(None))
+}
+
 pub(crate) fn scan_running() -> bool {
     scan_flag().load(Ordering::SeqCst)
 }
@@ -872,23 +916,22 @@ fn bump_scan_generation() {
 /// a second call while one runs is a no-op (the runner re-checks for stale
 /// files before exiting, so nothing is missed).
 pub(crate) fn schedule_privacy_scan(app: tauri::AppHandle) {
-    use tauri::Manager;
-    {
-        let state = app.state::<AppState>();
-        // Scan only when the switch is effectively ON — scanning is the half
-        // that costs compute; with the door off it can wait for the flip.
-        refresh_policy(&app, &state);
-        let on = policy_cell().lock().unwrap().as_ref().map(|p| p.active) == Some(true);
-        if !on {
-            return;
-        }
+    // Scan only when the switch is effectively ON — scanning is the half that
+    // costs compute; with the door off it can wait for the flip. Silent here on
+    // purpose: this is the automatic trigger (an import, a rules change), and
+    // nobody asked it a question. `start_privacy_scan` is the one that answers.
+    if !door_is_active(&app) {
+        return;
     }
     if scan_flag().swap(true, Ordering::SeqCst) {
         return; // already running
     }
+    // A new attempt supersedes whatever the last one had to say.
+    *last_scan_error().lock().unwrap() = None;
     tauri::async_runtime::spawn(async move {
         let error = run_privacy_scan(app.clone()).await;
         scan_flag().store(false, Ordering::SeqCst);
+        *last_scan_error().lock().unwrap() = error.clone();
         use tauri::Manager;
         let state = app.state::<AppState>();
         refresh_policy(&app, &state);

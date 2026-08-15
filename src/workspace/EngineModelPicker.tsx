@@ -268,7 +268,7 @@ export default function EngineModelPicker({
                   <span className="model-dot cloud" />
                   <span className="model-menu-name">{ENGINE_LABELS[engine] ?? engine}</span>
                   <ChevronDownIcon
-                    size={13}
+                    size={14}
                     className={`engine-expand-caret${expanded === engine ? " open" : ""}`}
                   />
                 </button>
@@ -312,7 +312,7 @@ export default function EngineModelPicker({
                             aria-pressed={needsTools}
                             onClick={() => setNeedsTools((value) => !value)}
                           >
-                            {needsTools && <CheckIcon size={11} />}
+                            {needsTools && <CheckIcon size={12} />}
                             Tools
                           </button>
                           <button
@@ -321,7 +321,7 @@ export default function EngineModelPicker({
                             aria-pressed={needsVision}
                             onClick={() => setNeedsVision((value) => !value)}
                           >
-                            {needsVision && <CheckIcon size={11} />}
+                            {needsVision && <CheckIcon size={12} />}
                             Vision
                           </button>
                           <button
@@ -330,7 +330,7 @@ export default function EngineModelPicker({
                             aria-pressed={needsReasoning}
                             onClick={() => setNeedsReasoning((value) => !value)}
                           >
-                            {needsReasoning && <CheckIcon size={11} />}
+                            {needsReasoning && <CheckIcon size={12} />}
                             Reasoning
                           </button>
                           <button
@@ -339,7 +339,7 @@ export default function EngineModelPicker({
                             aria-pressed={needsStructured}
                             onClick={() => setNeedsStructured((value) => !value)}
                           >
-                            {needsStructured && <CheckIcon size={11} />}
+                            {needsStructured && <CheckIcon size={12} />}
                             JSON
                           </button>
                           <span>{visibleModels.length.toLocaleString()} shown</span>
@@ -413,7 +413,7 @@ export default function EngineModelPicker({
                                   }
                                   onClick={() => onSelect(base)}
                                 >
-                                  {model === base && <CheckIcon size={11} />}
+                                  {model === base && <CheckIcon size={12} />}
                                   Default
                                 </button>
                                 {mi.efforts.map((eff) => {
@@ -426,7 +426,7 @@ export default function EngineModelPicker({
                                       aria-pressed={model === withEffort}
                                       onClick={() => onSelect(withEffort)}
                                     >
-                                      {model === withEffort && <CheckIcon size={11} />}
+                                      {model === withEffort && <CheckIcon size={12} />}
                                       {eff}
                                     </button>
                                   );

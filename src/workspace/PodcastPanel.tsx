@@ -350,7 +350,7 @@ export default function PodcastPanel({
         <button className="primary btn-ic" onClick={() => void saveCast()} disabled={!dirty}>
           {saved && !dirty ? (
             <>
-              <CircleCheckIcon size={13} /> Saved
+              <CircleCheckIcon size={14} /> Saved
             </>
           ) : (
             "Save cast"
@@ -371,7 +371,7 @@ export default function PodcastPanel({
           }
           onClick={() => void record()}
         >
-          <MicIcon size={13} /> {recorded ? "Record again" : "Record the episode"}
+          <MicIcon size={14} /> {recorded ? "Record again" : "Record the episode"}
         </button>
         {recorded && (
           <button className="subtle" onClick={() => void a.viewFile(recorded)}>

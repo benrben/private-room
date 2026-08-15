@@ -329,7 +329,7 @@ export default function ConnectorsView() {
                               : "Local — runs on your Mac"
                           }
                         >
-                          {s.remote && <CloudIcon size={11} />}
+                          {s.remote && <CloudIcon size={12} />}
                           {s.remote ? "Remote" : "Local"}
                         </span>
                       </span>
@@ -566,7 +566,7 @@ export default function ConnectorsView() {
           <summary>Advanced: paste or edit the raw config</summary>
           <div className="conn-advanced-body">
             <p className="mkt-note mkt-note--flag nb-sem-pending">
-              <AlertIcon size={15} /> Connected tools are separate programs and
+              <AlertIcon size={14} /> Connected tools are separate programs and
               can reach the internet — what the AI sends them leaves this room.
               Paste the same <code>mcpServers</code> config used by Claude
               Desktop or Cursor.

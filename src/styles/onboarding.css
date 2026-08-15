@@ -97,12 +97,12 @@
   font-size: var(--fs-card);
   color: var(--text-strong);
 }
-/* The one handwritten line on the page: an aside about what is about to
-   happen, which is exactly what Kalam is reserved for. */
+/* Instruction copy — what this choice means and where to change it later.
+   The hand's reserve bars instructions outright (see paper.css), which this
+   line had been quietly breaking. */
 .model-pick-sub {
-  font-family: var(--hand);
-  font-size: var(--fs-hand);
-  line-height: var(--lh-hand);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
   color: var(--ink-2);
 }
 .model-pick-grid {
@@ -133,13 +133,13 @@
    does not look stamped. Deterministic — the same card draws identically on
    every render. */
 .model-pick-grid > *:nth-child(4n + 2) {
-  border-radius: 9px 12px 10px 11px / 12px 10px 11px 9px;
+  border-radius: var(--radius);
 }
 .model-pick-grid > *:nth-child(4n + 3) {
-  border-radius: 12px 10px 9px 12px / 9px 11px 12px 10px;
+  border-radius: var(--radius);
 }
 .model-pick-grid > *:nth-child(4n + 4) {
-  border-radius: 10px 11px 12px 9px / 11px 9px 10px 12px;
+  border-radius: var(--radius);
 }
 /* "Recommended" — a marker category label, not a filled pill. The word is
    written in --ink over the wash rather than in the marker's own ink: a hue's

@@ -162,7 +162,7 @@ export default function PrivacySection({
             {pwError && <div className="gate-error">{pwError}</div>}
             <div className="settings-actions">
               <button className="primary btn-ic" onClick={changePassword}>
-                {pwSaved ? (<><CircleCheckIcon size={13} /> Password changed</>) : "Change password"}
+                {pwSaved ? (<><CircleCheckIcon size={14} /> Password changed</>) : "Change password"}
               </button>
             </div>
             {pwRecoveryCode && (
@@ -191,7 +191,7 @@ export default function PrivacySection({
                       }
                     }}
                   >
-                    {pwRecoveryCopied ? (<><CircleCheckIcon size={13} /> Copied</>) : "Copy code"}
+                    {pwRecoveryCopied ? (<><CircleCheckIcon size={14} /> Copied</>) : "Copy code"}
                   </button>
                   <button className="subtle" onClick={() => window.print()}>
                     Print
@@ -265,7 +265,7 @@ export default function PrivacySection({
             {dupError && <div className="gate-error">{dupError}</div>}
             <div className="settings-actions">
               <button className="primary btn-ic" onClick={duplicate}>
-                {dupDone ? (<><CircleCheckIcon size={13} /> Duplicated</>) : "Duplicate"}
+                {dupDone ? (<><CircleCheckIcon size={14} /> Duplicated</>) : "Duplicate"}
               </button>
             </div>
 

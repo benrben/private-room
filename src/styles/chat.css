@@ -24,12 +24,12 @@
    promise of this product and it is not a decorative surface.
 
    WHAT THE INTERFACE NEVER WRITES: there are no invented reactions and no
-   invented margin notes anywhere in this pane. Every handwritten mark on an
-   answer comes from something real — a heading the model wrote, an annotation
-   it emitted, a citation it cited, or a word the app itself is responsible for
-   (the speaker's name, a notice's label). "Good point" printed beside an
-   answer would be Arcelle manufacturing an opinion and attributing it to
-   nobody, so the decorative reading of that idea is deliberately not built.
+   invented margin notes anywhere in this pane. Every mark on an answer comes
+   from something real — an annotation the model emitted, a citation it cited,
+   or a word the app itself is responsible for (a notice's label). "Good point"
+   printed beside an answer would be Arcelle manufacturing an opinion and
+   attributing it to nobody, so the decorative reading of that idea is
+   deliberately not built.
 
    LOAD ORDER, because four later sheets touch elements that live inside a
    message: composer.css (.agent-chip, .step-chip, .source-chip, .chat-rename),
@@ -38,7 +38,7 @@
    rule here that has to beat one is scoped under `.msg` or `.chat-head` and
    wins on specificity rather than on order. `.chat-select` in particular is
    ALSO worn by a <select> in Settings → Spoken voice, which is why the header's
-   handwritten title is scoped and not global.
+   title rule is scoped and not global.
 
    Both themes come from tokens by construction — nothing below names a colour,
    so there is deliberately no light-mode block at the end of this file. */
@@ -83,14 +83,10 @@
   user-select: none;
 }
 
-/* The conversation's NAME, in the hand: a chat title is something someone
-   wrote at the top of a page, not interface copy. Scoped to `.chat-head`
-   because Settings → Spoken voice wears `.chat-select` too, and a settings
-   control stays in the interface face. */
 /* The sans: a conversation's name is frequently one the READER typed, and a
-   renamed chat can be in any script — Kalam ships latin + latin-ext only. The
-   handwritten treatment stays on the static title beside it, which is the
-   app's own word. */
+   renamed chat can be in any script — Kalam ships latin + latin-ext only.
+   Scoped to `.chat-head` because Settings → Spoken voice wears `.chat-select`
+   too, and a settings control stays in the interface face either way. */
 .chat-head .chat-select {
   flex: 1;
   min-width: 0;
@@ -288,14 +284,14 @@
   color: var(--text);
   background: transparent;
   border: 1px solid color-mix(in srgb, var(--sketch) 72%, transparent);
-  border-radius: 11px 9px 12px 10px / 10px 12px 9px 11px;
+  border-radius: var(--radius);
   transition:
     transform var(--dur-fast) var(--ease-pen),
     border-color var(--dur-fast) var(--ease-pen),
     box-shadow var(--dur-fast) var(--ease-pen);
 }
 .prompt-chip:nth-child(even) {
-  border-radius: 9px 12px 10px 11px / 12px 10px 11px 9px;
+  border-radius: var(--radius);
 }
 .prompt-chip:hover {
   transform: translateY(-2px);
@@ -309,9 +305,10 @@
 
 /* ==========================================================================
    5. THE SPEAKER LINE
-   Who wrote it, and when. The name is handwritten — it is the one word on the
-   row that a person would have written in the margin — and the clock is mono,
-   with the rest of the technical metadata.
+   Who wrote it, and when. Both are facts the app holds — the name comes from
+   the message's role, the clock from its stored timestamp — so neither is in
+   the hand: the name in the sans at the metadata rung, the clock in mono with
+   the rest of the technical metadata.
    ========================================================================== */
 
 .msg-label {
@@ -324,9 +321,8 @@
 }
 
 .msg-who {
-  font-family: var(--hand);
-  font-size: var(--fs-hand);
-  line-height: var(--lh-hand);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
   color: var(--ink-2);
 }
 /* Pink is AI attribution across the whole product, so the answer's name is
@@ -348,7 +344,7 @@
   width: 20px;
   height: 20px;
   flex: none;
-  border-radius: 6px 4px 7px 5px / 5px 7px 4px 6px;
+  border-radius: var(--radius-xs);
   display: grid;
   place-items: center;
   font-size: var(--fs-micro);
@@ -387,7 +383,7 @@
 .msg.user {
   padding: var(--sp-3) var(--sp-4);
   border: var(--stroke-w) solid color-mix(in srgb, var(--sketch) 58%, transparent);
-  border-radius: 11px 9px 12px 10px / 10px 12px 9px 11px;
+  border-radius: var(--radius);
   /* Copy and "Edit & resend" ride in the note's OWN header line, beside the
      name and the time, rather than in a band under the question.
 
@@ -419,7 +415,7 @@
   padding-top: 0;
 }
 .msg.user:nth-child(even) {
-  border-radius: 9px 12px 10px 11px / 12px 10px 11px 9px;
+  border-radius: var(--radius);
 }
 
 .msg-content {
@@ -489,31 +485,31 @@
 
 /* ----- section kickers -----
    A heading the model wrote IS the answer's kicker — "Key idea", "Next step",
-   "Watch out" — so it is set in the hand rather than having one invented for
-   it. Sized from the type scale (never below the lead size, because a
-   handwritten heading that has to be leaned into is a failed heading) and
-   marked with a short marker tick instead of being scaled up: a chat answer
-   has no room for a 26px section title, and the tick gives the hierarchy the
-   size cannot. */
-/* A model-written heading takes the hand — that is the brief's rule for a long
-   answer: clean body text, handwritten headings. Gated on `.is-latin` because
-   Kalam bundles latin + latin-ext only, so the headings of a Hebrew or CJK
-   answer stay in the sans rather than being drawn in a face that has none of
-   their glyphs. The marker tick below still applies either way. */
-.msg.is-latin .msg-content :is(h1, h2, h3, h4, h5, h6) {
-  font-family: var(--hand);
-  font-weight: 400;
-}
+   "Watch out" — and it is marked with a short marker tick rather than scaled
+   up: a chat answer has no room for a 26px section title, and the tick gives
+   the hierarchy that size cannot.
+
+   THE SANS, said out loud, because the hand reaches this subtree. A model
+   wrote these words, which puts them on the computed side of the hand's rule
+   (paper.css §3) — and `.msg.is-hand .msg-content` sets the hand on the whole
+   content block, so a short message that happens to contain a heading would
+   otherwise draw it in Kalam. This is also why the rule that used to sit here
+   is gone: it said the same thing gated on `.is-latin`, a guard that existed
+   only to keep a Hebrew or CJK heading out of a face with none of its glyphs.
+   Nothing is in that face now, so there is nothing to guard. */
 .msg .msg-content :is(h1, h2, h3, h4, h5, h6) {
   margin: var(--sp-4) 0 var(--sp-2);
-  font-weight: 400;
+  font-family: var(--sans);
+  font-weight: 600;
   font-size: var(--fs-lead);
   line-height: 1.35;
   color: var(--text-strong);
 }
-.msg .msg-content h1 {
-  font-size: var(--fs-hand-lg);
-}
+/* An h1 used to step up to 24px, which was Kalam's --fs-hand-lg: the hand
+   needed the extra size to read as a heading at all. In the sans it does not —
+   the weight above and the tick below already separate it from the body — and
+   borrowing the hand's rung for a face that is not the hand is how a token
+   stops meaning what it says. */
 .msg .msg-content :is(h1, h2, h3, h4, h5, h6)::before {
   content: "";
   display: inline-block;
@@ -597,9 +593,8 @@
 }
 
 .msg-sources-kicker {
-  font-family: var(--hand);
-  font-size: var(--fs-hand);
-  line-height: var(--lh-hand);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
   color: var(--ink-2);
 }
 
@@ -815,15 +810,15 @@
 /* ==========================================================================
    10. THE ACTIVITY LOG
    Which agents ran and which tools they used, as the log line of a notebook
-   page: a handwritten caption, then the technical names in mono. The step
+   page: a quiet sans caption, then the technical names in mono. The caption is
+   the app naming its own machinery, which is why it is not in the hand. The step
    CLOCKS live in the agent diagram (agentGraph.css) — nothing here invents a
    time for a step that never recorded one.
    ========================================================================== */
 
 .msg .agent-strip-caption {
-  font-family: var(--hand);
-  font-size: var(--fs-hand);
-  line-height: var(--lh-hand);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
   letter-spacing: 0;
   text-transform: none;
   color: var(--ink-2);
@@ -858,12 +853,12 @@
   color: var(--muted);
 }
 
-/* "Thinking locally…" is a short aside about nothing consequential — the hand
-   is exactly right for it. */
+/* "Thinking locally…" is the app reporting its own state. That is a fact it
+   computed, not an aside anyone wrote, so it takes the sans — quiet by ink and
+   size rather than by face. */
 .chat-route {
-  font-family: var(--hand);
-  font-size: var(--fs-hand);
-  line-height: var(--lh-hand);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
   color: var(--ink-2);
 }
 /* …and the cloud line is the opposite: it says room content is leaving this

@@ -718,6 +718,15 @@ pub struct Chat {
     pub id: String,
     pub title: String,
     pub created_at: String,
+    /// When this conversation was last spoken in — the newest message's stamp,
+    /// falling back to `created_at` for a chat nobody has written in yet.
+    ///
+    /// `created_at` alone answered the wrong question. The list is headed
+    /// "Continue where you left off", and unlock restores the first row, so a
+    /// chat opened weeks ago and used all morning sat below one started
+    /// yesterday and abandoned. There is no `updated_at` column and this needs
+    /// none: the messages already carry the answer.
+    pub last_at: String,
 }
 
 #[derive(Serialize, Clone)]

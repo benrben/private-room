@@ -364,6 +364,29 @@ pub(crate) fn spawn_summary_filler(app: tauri::AppHandle, room_path: String, del
         }
         let _reset = Reset(flag);
 
+        // Say so when this pass actually described something. The loop below
+        // writes `ai_summary` rows and emitted nothing, so descriptions
+        // appeared under filenames only on the next full reload — the most
+        // legible sign the room reads its own contents, invisible until
+        // something else happened to refresh.
+        //
+        // A Drop guard rather than an emit after the loop, for the same reason
+        // `Reset` is one: the dominant exits are the THREE early `return`s
+        // inside it (a question started, the room changed, the model went
+        // away), and bailing the instant the user speaks is the design. Once
+        // per pass, never per file.
+        struct AnnounceWritten(tauri::AppHandle, Arc<AtomicUsize>);
+        impl Drop for AnnounceWritten {
+            fn drop(&mut self) {
+                use tauri::Emitter;
+                if self.1.load(Ordering::SeqCst) > 0 {
+                    let _ = self.0.emit("room-files-changed", ());
+                }
+            }
+        }
+        let wrote = Arc::new(AtomicUsize::new(0));
+        let _announce = AnnounceWritten(app.clone(), wrote.clone());
+
         // Let the user's first question take priority.
         if delay_secs > 0 {
             tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
@@ -434,7 +457,9 @@ pub(crate) fn spawn_summary_filler(app: tauri::AppHandle, room_path: String, del
                 // Wave 3 (Idea 9): epoch pin — never write a one-liner into a
                 // room the rollback swapped out from under this pass.
                 Some(room) if room.path == room_path && state.room_epoch() == epoch => {
-                    let _ = db::set_file_ai_summary(&room.conn, &id, &liner);
+                    if db::set_file_ai_summary(&room.conn, &id, &liner).is_ok() {
+                        wrote.fetch_add(1, Ordering::SeqCst);
+                    }
                 }
                 _ => return,
             }

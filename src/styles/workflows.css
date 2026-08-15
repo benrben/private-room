@@ -372,9 +372,8 @@
   gap: 2px 6px;
 }
 .wf-cadence-note {
-  font-family: var(--hand);
-  font-size: var(--fs-hand);
-  line-height: var(--lh-hand);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
   color: var(--ink-2);
 }
 .wf-cadence-at {
@@ -383,11 +382,11 @@
   font-variant-numeric: tabular-nums;
   color: var(--muted);
 }
-/* A countdown is a duration — also the hand's job, one tier quieter. */
+/* A countdown is a duration the app is computing as you watch — the sans,
+   one tier quieter than the cadence it belongs to. */
 .wf-cadence-in {
-  font-family: var(--hand);
-  font-size: var(--fs-hand);
-  line-height: var(--lh-hand);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
   color: var(--faint);
 }
 
@@ -947,7 +946,7 @@
   color: var(--text-dim);
   background: transparent;
   border: 0;
-  border-radius: 6px 4px 7px 5px / 5px 7px 4px 6px;
+  border-radius: var(--radius-xs);
   box-shadow: none;
 }
 .wf-seg button + button {
@@ -1303,6 +1302,7 @@
 .wf-empty h3 {
   margin: 0 0 var(--sp-2);
   font-size: var(--fs-section);
+  font-family: var(--display);
   font-weight: 600;
   letter-spacing: -0.01em;
   line-height: 1.15;

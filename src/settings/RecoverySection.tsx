@@ -52,7 +52,7 @@ export default function RecoverySection({
                       }
                     }}
                   >
-                    {recoveryCopied ? (<><CircleCheckIcon size={13} /> Copied</>) : "Copy code"}
+                    {recoveryCopied ? (<><CircleCheckIcon size={14} /> Copied</>) : "Copy code"}
                   </button>
                   <button className="subtle" onClick={() => window.print()}>
                     Print

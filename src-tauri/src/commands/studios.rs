@@ -300,12 +300,14 @@ pub fn studio_prompts() -> StudioPrompts {
 ///
 /// This is the ONE prompt in the Studio pipeline allowed to talk about colour,
 /// and only because on this path the model IS the template: it authors the
-/// whole page and no Rust template gets to style it afterwards. The four hex
+/// whole page and no Rust template gets to style it afterwards. The six hex
 /// values are copies of `src/styles/tokens.css` (--page and --ink for both
-/// themes, plus --mk-pink-ink) and have to be kept in step with it, exactly
-/// like `NOTEBOOK_CSS` in docs_html.rs. The light accent was #c63a58, which is
-/// not a token from anywhere and measured 4.49:1 on the ivory page — under the
-/// 4.5:1 floor by a rounding error; it is tokens.css's --mk-pink-ink now.
+/// themes, plus --mk-berry-ink for both) and have to be kept in step with it,
+/// exactly like `NOTEBOOK_CSS` in docs_html.rs — `the_prompt_palette_matches_
+/// the_notebook` below is what ties them, because prose in a prompt is the one
+/// copy no stylesheet test can see. The light accent was #c63a58, which is not
+/// a token from anywhere and measured 4.49:1 on the ivory page — under the
+/// 4.5:1 floor by a rounding error.
 ///
 /// NO OTHER PROMPT IN THESE FILES NAMES A COLOUR OR A FONT, and none should.
 /// A `page_role` describes the page's STRUCTURE and BEHAVIOUR and then defers
@@ -324,7 +326,7 @@ any network request silently fails. For images use inline SVG or a data: URI onl
 Make it a polished, responsive page: ink on warm paper, light by default \
 (#f4f1e8 paper, #20221f ink) with a dark palette under the html[data-theme=\"dark\"] \
 selector (#151716 paper, #f0eee5 ink) — never a prefers-color-scheme media query — \
-and a muted marker accent (#be3754 light, #c87b91 dark). System font stack only. \
+and a muted marker accent (#a82fad light, #cc7ecf dark). System font stack only. \
 Add a @media print rule that puts the page back on white with black text and drops \
 any background pattern, because these pages get saved and printed. Write correct \
 JavaScript that runs on load with no errors.";
@@ -737,6 +739,41 @@ pub(crate) async fn run_studio_core(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_prompt_palette_matches_the_notebook() {
+        // On the self-contained path the MODEL is the template, so the palette
+        // reaches it as English rather than as CSS — which puts it outside
+        // every check that reads a stylesheet. It had already drifted before
+        // anyone looked: the accent pair here was #be3754/#c87b91, which was
+        // not the token the comment above claimed it was, in either theme.
+        //
+        // Read the expected values out of NOTEBOOK_CSS rather than restating
+        // them, or this test becomes a sixth copy of the thing it is policing.
+        let notebook = crate::commands::docs_html::NOTEBOOK_CSS;
+        // The opening brace, because the header comment names the selector too.
+        let light = &notebook[..notebook
+            .find("html[data-theme=\"dark\"]{")
+            .expect("NOTEBOOK_CSS lost its dark clause; this split is now wrong")];
+        let dark = &notebook[light.len()..];
+        let value = |block: &str, token: &str| -> String {
+            let at = block
+                .find(&format!("{token}:"))
+                .unwrap_or_else(|| panic!("NOTEBOOK_CSS no longer defines {token}"));
+            let rest = &block[at + token.len() + 1..];
+            rest[..rest.find(';').unwrap()].trim().to_string()
+        };
+        for (theme, block) in [("light", light), ("dark", dark)] {
+            for token in ["--page", "--ink", "--mk-berry-ink"] {
+                let hex = value(block, token);
+                assert!(
+                    SELF_CONTAINED_HTML_RULES.contains(&hex),
+                    "the prompt does not name {theme} {token} ({hex}), so a page the model \
+                     authors will not match one a template does"
+                );
+            }
+        }
+    }
 
     #[test]
     fn fill_template_never_rescans_what_it_substituted() {

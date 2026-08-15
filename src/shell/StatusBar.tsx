@@ -85,10 +85,10 @@ export default function StatusBar({
           title={`${trust.title} (${engineLabel})${cloud ? " Click to review." : ""}`}
           onClick={onOpenPrivacy}
         >
-          {cloud ? <CloudIcon size={11} /> : <ShieldIcon size={11} />} {trust.label}
+          {cloud ? <CloudIcon size={12} /> : <ShieldIcon size={12} />} {trust.label}
         </button>
         <span className="status-item" title="Files stored in this room">
-          <DatabaseIcon size={11} /> {fileCount} file{fileCount === 1 ? "" : "s"}
+          <DatabaseIcon size={12} /> {fileCount} file{fileCount === 1 ? "" : "s"}
         </span>
         {webOn || mcpToolCount > 0 ? (
           <span
@@ -102,11 +102,11 @@ export default function StatusBar({
                 .join(" · ") || undefined
             }
           >
-            <CloudIcon size={11} /> Internet tools on
+            <CloudIcon size={12} /> Internet tools on
           </span>
         ) : (
           <span className="status-item" title="No online search or connected tools">
-            <CloudOffIcon size={11} /> No external tools
+            <CloudOffIcon size={12} /> No external tools
           </span>
         )}
       </div>
@@ -116,7 +116,7 @@ export default function StatusBar({
             className="status-item warn"
             title="This Mac has no internet connection. Everything in the room still works; cloud models, web search, the browser and read-aloud need a connection."
           >
-            <CloudOffIcon size={11} /> Offline
+            <CloudOffIcon size={12} /> Offline
           </span>
         )}
         {pendingApprovals > 0 && (

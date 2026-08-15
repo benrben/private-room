@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactElement } from "react";
 import { api } from "../api";
+import { prefersReducedMotion } from "../rooms/helpers";
 import "./sketch.css";
 import {
   CANVAS_H,
@@ -116,6 +117,16 @@ const MAX_ZOOM = 6;
 
 /** How long each agent-drawn shape waits before it appears. */
 const REVEAL_STEP_MS = 260;
+/** The pace target: the reveal aims to finish inside this, and does until the
+ * floor below binds at ~100 elements — past that it stretches (400 shapes take
+ * about 16 s, against 104 s at one full step each). */
+const REVEAL_BUDGET_MS = 4000;
+/** …but never so fast that the staging is indistinguishable from a single
+ * repaint, which would spend the animation and buy nothing. */
+const REVEAL_MIN_STEP_MS = 40;
+/** How long the agent's new elements stay marked as theirs after the last one
+ * lands. */
+const FRESH_HOLD_MS = 1400;
 
 interface Props {
   fileId: string;
@@ -159,6 +170,8 @@ export default function SketchView({ fileId, text }: Props) {
   const drawingRef = useRef(false);
   const pendingAgent = useRef<{ doc: Sketch; added: string[]; removed: string[] } | null>(null);
   const saveTimer = useRef<number | null>(null);
+  /** Every pending reveal timer, so a new drawing or an unmount can drop them. */
+  const revealTimers = useRef<number[]>([]);
   const dirty = useRef(false);
   /** Version history is taken once per editing session, not once per stroke. */
   const snapshotted = useRef(false);
@@ -201,6 +214,9 @@ export default function SketchView({ fileId, text }: Props) {
     (next: Sketch) => {
       dirty.current = true;
       setSaveState("saving");
+      // The note occupies the same slot as the save state, so it has to stand
+      // down once the save state has something live to report.
+      setNote(null);
       if (saveTimer.current) window.clearTimeout(saveTimer.current);
       saveTimer.current = window.setTimeout(() => void flush(next), SAVE_IDLE_MS);
     },
@@ -218,17 +234,37 @@ export default function SketchView({ fileId, text }: Props) {
     [scheduleSave],
   );
 
+  /** Drop every pending reveal timer AND un-hide whatever they were going to
+   * reveal. Called before a new reveal starts and on unmount — up to one timer
+   * per element were being created and cleared nowhere, so closing a tab
+   * mid-reveal left them firing `setState` at a dead component.
+   *
+   * The two halves are one fact: cancelling the timers without clearing
+   * `hidden` leaves elements permanently invisible, because the only thing
+   * that would ever have shown them was the timer just cancelled. */
+  const dropRevealTimers = useCallback(() => {
+    for (const t of revealTimers.current) window.clearTimeout(t);
+    revealTimers.current = [];
+  }, []);
+  const clearReveal = useCallback(() => {
+    dropRevealTimers();
+    setHidden(new Set());
+  }, [dropRevealTimers]);
+
   // A drawing has no Save button, so an unmount mid-debounce is the one moment
   // work can be lost. Flush it.
   useEffect(
     () => () => {
       if (saveTimer.current) window.clearTimeout(saveTimer.current);
+      // Timers only, not `clearReveal`: there is no component left to un-hide
+      // anything in.
+      dropRevealTimers();
       // The one moment work can be lost: unmounting inside the idle window.
       if (dirty.current) {
         void api.saveSketch(fileId, serializeSketch(docRef.current), !snapshotted.current);
       }
     },
-    [fileId],
+    [fileId, dropRevealTimers],
   );
 
   // ------------------------------------------------- the agent drawing here
@@ -242,23 +278,51 @@ export default function SketchView({ fileId, text }: Props) {
       scheduleSave(merged);
     }
     if (!added.length) return;
-    // Reveal in the order the agent drew them.
+
+    // A second drawing arriving mid-reveal must not leave the first one's
+    // timers running: they would un-hide ids from a set that has been replaced.
+    clearReveal();
+
+    // Reduced motion means the drawing arrives WHOLE. The stylesheet can only
+    // switch off the colour fade; the staging is JS, so without this a reader
+    // who asked for less motion instead watched a diagram assemble itself —
+    // and, for a large one, sat in front of a half-drawn picture for a minute.
+    // Reduced motion must never mean reduced information. `fresh` still marks
+    // what the agent added (its animation is what the CSS turns off), so the
+    // attribution survives; only the staging goes.
+    if (prefersReducedMotion()) {
+      setFresh(new Set(added));
+      revealTimers.current.push(
+        window.setTimeout(() => setFresh(new Set()), FRESH_HOLD_MS),
+      );
+      return;
+    }
+
+    // Reveal in the order the agent drew them, inside a fixed budget: at one
+    // step per element a 400-shape diagram took over a minute and a half to
+    // finish appearing, with the page unusable-looking throughout. The floor
+    // keeps a big drawing from flickering in as a single frame.
+    const step = Math.max(
+      REVEAL_MIN_STEP_MS,
+      Math.min(REVEAL_STEP_MS, Math.floor(REVEAL_BUDGET_MS / added.length)),
+    );
     setHidden(new Set(added));
     setFresh(new Set(added));
     added.forEach((id, i) => {
-      window.setTimeout(() => {
-        setHidden((h) => {
-          const n = new Set(h);
-          n.delete(id);
-          return n;
-        });
-      }, i * REVEAL_STEP_MS);
+      revealTimers.current.push(
+        window.setTimeout(() => {
+          setHidden((h) => {
+            const n = new Set(h);
+            n.delete(id);
+            return n;
+          });
+        }, i * step),
+      );
     });
-    window.setTimeout(
-      () => setFresh(new Set()),
-      added.length * REVEAL_STEP_MS + 1400,
+    revealTimers.current.push(
+      window.setTimeout(() => setFresh(new Set()), added.length * step + FRESH_HOLD_MS),
     );
-  }, [scheduleSave]);
+  }, [scheduleSave, clearReveal]);
 
   useEffect(() => {
     let stop: (() => void) | undefined;
@@ -266,7 +330,20 @@ export default function SketchView({ fileId, text }: Props) {
       .onSketchDrawn((e) => {
         if (e.fileId !== fileId) return;
         const parsed = parseSketch(e.doc);
-        if (parsed.error) return;
+        if (parsed.error) {
+          // The agent drew something and the document would not parse. This
+          // returned in silence, so the drawing simply never appeared and the
+          // room looked like it had ignored the request. `note` is this view's
+          // own way of saying a document was not what it expected — the same
+          // line a bad file shows on open.
+          setNote(`The room drew something this page couldn't read: ${parsed.error}`);
+          return;
+        }
+        // The note shares its slot with the save state (`{note ?? saveWord}`),
+        // so a note that outlives its cause would silently mask "Saving…" and
+        // "Couldn't save" from then on. A drawing that parses is the answer to
+        // one that didn't.
+        setNote(null);
         // Mid-stroke, the merge would fight the gesture. Hold it until the
         // pointer lifts rather than dropping either side's work.
         if (drawingRef.current) {

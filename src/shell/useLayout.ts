@@ -19,20 +19,22 @@ export type SidePane = Exclude<PaneKey, "center">;
 
 export const PANE_ORDER: PaneKey[] = ["library", "center", "ai"];
 
-/** ⌘-number → the pane it shows or hides.
+/** ⌘-number → the pane it shows or hides — the ONE key this file still claims.
  *
- * This used to be `PANE_ORDER[n - 1]`, which quietly meant ⌘2 was "hide the
- * workspace" purely because the centre sat second in a rendering order. Two
- * of the three keys keep exactly the meaning they have always had — ⌘1 was
- * already the library and ⌘3 was already the assistant — so the remap costs
- * a user nothing but the one key whose old job no longer exists.
+ * ⌘1 and ⌘2 are not here. They are declared by the native View menu
+ * (src-tauri/src/menu.rs), which is the right owner for them: macOS hands a
+ * key equivalent to the menu bar before the event reaches the key window, so a
+ * listener here could only ever be a second owner for the same press — and a
+ * pane toggled twice is a pane that never moves. The menu also prints them,
+ * which is the whole reason a Mac user opens a menu they already know the
+ * contents of.
  *
- * ⌘3 stays as an alias for at least one release. It is not a compatibility
- * shim anyone has to maintain: it is the binding this app has always had,
- * left alone. */
+ * ⌘3 stays, because no menu row can express it: it is an ALIAS for ⌘2, and a
+ * row carries one key equivalent. It is not a shim anyone has to maintain —
+ * it is the binding this app has always had, left alone for at least one
+ * release so nobody's hands have to relearn anything. When it goes, this
+ * whole map goes with it. */
 export const PANE_KEYS: Record<string, SidePane> = {
-  "1": "library",
-  "2": "ai",
   "3": "ai",
 };
 
@@ -623,14 +625,14 @@ export function useLayout(roomPath: string) {
     [applyResize, ratios],
   );
 
-  // ⌘/Ctrl+1/2/3 show and hide the side panes; Escape leaves focus mode.
-  // Capture phase so the focus-Escape wins over the workspace's close-file
-  // Escape.
+  // ⌘/Ctrl+3 shows and hides the assistant; Escape leaves focus mode. Capture
+  // phase so the focus-Escape wins over the workspace's close-file Escape.
   //
-  // These three keys have exactly ONE meaning in this app — the one the Layout
-  // menu prints beside each row. The claim is settled here (capture +
-  // stopPropagation) so a second handler can never also act on the same press;
-  // tab-by-position lives on ⌥⌘1–⌥⌘9, which is why Option is excluded below.
+  // ⌘1 and ⌘2 used to be handled here too and are now the native View menu's
+  // (see PANE_KEYS). What is left is the alias no menu row can carry. The
+  // claim is still settled here (capture + stopPropagation) so a second
+  // handler can never also act on the same press; tab-by-position lives on
+  // ⌥⌘1–⌥⌘9, which is why Option is excluded below.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (

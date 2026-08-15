@@ -104,6 +104,29 @@ async def list_neural_voices() -> list[dict[str, str]]:
 # --- synthesis ---------------------------------------------------------------
 
 
+async def warm_import() -> None:
+    """Pull ``edge_tts`` into the interpreter off the request path.
+
+    The import below is deferred so this module stays offline-safe to import —
+    that part is right and stays. What was wrong is WHERE it was paid: the first
+    spoken sentence of a session ran it synchronously inside the asyncio loop
+    that also serves the chat stream, so every in-flight request stalled behind
+    a ~130 ms disk-and-bytecode load for a feature only one of them was using.
+
+    A secondary feature must never stall the primary path. Best-effort by
+    design: nothing here reaches the network (that is `Communicate`, at call
+    time, and pre-opening it would spend the room's internet switch before
+    anyone asked for speech). If the import fails, the call site fails exactly
+    as it does today and the webview reports it once per turn.
+    """
+    import importlib
+
+    try:
+        await asyncio.to_thread(importlib.import_module, "edge_tts")
+    except Exception:  # not installed, or a broken install — the call site says so
+        pass
+
+
 async def synthesize_mp3(text: str, voice: str, rate: str, pitch: str) -> bytes:
     """Fetch MP3 audio for ``text`` from the Edge neural TTS service."""
     import edge_tts  # deferred: keeps module import (and tests) offline-safe

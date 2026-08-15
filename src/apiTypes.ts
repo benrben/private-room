@@ -230,6 +230,10 @@ export interface Chat {
   id: string;
   title: string;
   createdAt: string;
+  /** When this conversation was last spoken in — the newest message's stamp,
+   *  or `createdAt` for one nobody has written in yet. The list is ordered by
+   *  this, so "Continue where you left off" means the thread you were in. */
+  lastAt: string;
 }
 
 export interface Message {
@@ -268,6 +272,10 @@ export interface PrivacyStatus {
   concepts: string[];
   pendingFiles: number;
   scanning: boolean;
+  /** Why the last scan stopped without finishing, if it did. The terminal
+   *  `privacy-scan` event says the same thing once; this survives for a window
+   *  that had not mounted its listener yet. */
+  lastScanError: string | null;
   /** Whether remote-connector arguments are masked right now. NOT implied by
    * `effectiveOn` — that seam is deliberately switch-blind, so the panel is
    * told rather than left to infer it. */
@@ -1866,4 +1874,29 @@ export interface SketchDrawn {
   steps: string[];
   /** The whole document after the write, as JSON. */
   doc: string;
+}
+
+/** What the native View menu should be showing (see `api.syncViewMenu`).
+ *
+ * Sent whole, and this is why: the four ticks and the enabled flag are one
+ * fact about one window. A `setCheck(id, bool)` per row would let the menu be
+ * observed halfway through a layout change — Assistant already ticked, Focus
+ * not yet — for no benefit, since every one of them changes on the same
+ * render anyway.
+ *
+ * `enabled` is false whenever no room is open. The menu bar outlives the room
+ * (it is there over the password gate), and a View menu that offers to hide a
+ * Library nobody is looking at is a dead control. */
+export interface ViewMenuState {
+  enabled: boolean;
+  library: boolean;
+  assistant: boolean;
+  focus: boolean;
+  railLabels: boolean;
+  /** False while the WINDOW, not the reader, is what took the sidebar's labels
+   * away — below 1180px the rail drops them on its own and the preference
+   * cannot put them back. The row greys out rather than ticking itself off and
+   * then refusing to tick back on. The rail's own expander hides for the same
+   * reason; a menu row cannot hide. */
+  railLabelsSettable: boolean;
 }

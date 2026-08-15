@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState, type CSSProperties } from "react";
+import { jobMeter } from "./jobProgress";
 import { RoomInfo } from "../api";
 import {
   ActivityIcon,
@@ -170,7 +171,7 @@ export default function AiPane({
               return (
                 <span className={`local-mini ${trust.tone}`} title={trust.title}>
                   {cloud ? (
-                    <CloudIcon size={11} />
+                    <CloudIcon size={12} />
                   ) : (
                     <span className="status-dot" aria-hidden />
                   )}
@@ -263,7 +264,7 @@ function StudioView({
         onClick={() => void a.startDeepSummary()}
       >
         <span className="studio-row-icon">
-          <SparkIcon size={15} />
+          <SparkIcon size={14} />
         </span>
         <span className="studio-row-text">
           <span className="studio-row-title">Summarize the room</span>
@@ -357,7 +358,13 @@ function ActivityPanel({
     runningJobCount(s) === 0 &&
     parked.length === 0 &&
     history.length === 0 &&
-    !s.importProgress;
+    !s.importProgress &&
+    // The privacy scanner has no job row, so nothing above can see it — and
+    // "The room is idle" is a flat claim this pane would otherwise make while
+    // the scanner is reading every file. It gets no row here on purpose (it is
+    // uncancellable and has nothing to show), so the honest move is to withhold
+    // the claim rather than invent a card for it.
+    !s.privacyScanning;
 
   return (
     <div className="activity-view">
@@ -470,7 +477,7 @@ function ActivityPanel({
             <div
               className={
                 s.studioStep.local
-                  ? "activity-copy ap-hand"
+                  ? "activity-copy ap-note"
                   : "activity-copy studio-running-cloud"
               }
             >
@@ -529,7 +536,7 @@ function ActivityPanel({
                 <span className="activity-state">{elapsedOf(s.recSave.startedAt)}</span>
               )}
             </div>
-            <div className="activity-copy ap-hand">
+            <div className="activity-copy ap-note">
               {s.recSave?.stage === "writing"
                 ? "Audio saved — writing into the room…"
                 : s.recSave && s.recSave.remaining > 0
@@ -599,12 +606,8 @@ function ActivityPanel({
 
       {nothing && (
         <div className="activity-empty">
-          <ActivityIcon size={18} />
-          <p>
-            Nothing running right now, and nothing finished yet. Studio jobs,
-            workflow runs, imports and approval requests appear here while they
-            run, then move down to History when they are done.
-          </p>
+          <ActivityIcon size={16} />
+          <p>The room is idle. Work you start will show its progress here.</p>
         </div>
       )}
     </div>
@@ -629,7 +632,7 @@ function HistoryRow({ j }: { j: WSState["jobs"][number] }) {
           {Number.isNaN(when) ? "" : new Date(when).toLocaleString()}
         </span>
       </div>
-      <div className="activity-copy ap-hand">
+      <div className="activity-copy ap-note">
         Finished
         {j.total > 0 ? ` — ${Math.min(j.cursor, j.total)} of ${j.total} steps` : ""}
       </div>
@@ -748,7 +751,7 @@ function HistoryGroupRow({ jobs, roomId }: { jobs: HistoryJob[]; roomId: string 
           {Number.isNaN(when) ? "" : new Date(when).toLocaleString()}
         </span>
       </div>
-      <div className="activity-copy ap-hand">{summary}</div>
+      <div className="activity-copy ap-note">{summary}</div>
       <div className="activity-row-actions">
         <button
           className="subtle"
@@ -791,8 +794,13 @@ function JobRow({
     ? s.jobs.filter((o) => o.status === "queued" && o.createdAt <= j.createdAt)
         .length
     : 0;
-  const done = live?.done ?? j.cursor;
-  const total = Math.max(live?.total ?? j.total, 1);
+  // The indeterminate bar means "running, and its position is not yet known".
+  // A QUEUED job is neither: it has not started, so it shows its real starting
+  // point — 0, or wherever a parked run left off — instead of an animation
+  // sliding over work that nothing is doing. Under reduced motion the same
+  // animation degrades to a FULL bar, which said a job that had not begun was
+  // finished. See jobProgress.ts for the rule and what it refuses to invent.
+  const meter = jobMeter(j.status, j.cursor, j.total, live);
   // Only meaningful while the job is stopped-but-resumable; a running job is
   // not being interrupted by anything, and the backend clears the column the
   // moment it moves off 'paused'.
@@ -820,7 +828,7 @@ function JobRow({
             aria-label="Dismiss this job"
             onClick={() => void a.dismissJob(j.id)}
           >
-            <CloseIcon size={11} />
+            <CloseIcon size={12} />
           </button>
         )}
       </div>
@@ -832,6 +840,10 @@ function JobRow({
           const nWin = Array.isArray(plan.windows) ? plan.windows.length : 0;
           if (nWin < 2) return null;
           const cells = Math.min(nWin, 192);
+          // The mosaic counts against the PLAN's own window count, which is a
+          // different quantity from the meter's total and known even when that
+          // one is not.
+          const done = live?.done ?? j.cursor;
           const mapsDone = Math.min(done, nWin);
           const cellsDone = Math.floor((mapsDone * cells) / nWin);
           const weaving = running && done >= nWin;
@@ -859,25 +871,19 @@ function JobRow({
       <div className="activity-meter">
         <div className="activity-progress">
           <span
-            className={running && !live ? "indeterminate" : undefined}
-            style={
-              running && !live
-                ? undefined
-                : {
-                    width: `${Math.min(100, Math.round((done / total) * 100))}%`,
-                  }
-            }
+            className={meter.indeterminate ? "indeterminate" : undefined}
+            style={meter.indeterminate ? undefined : { width: `${meter.percent}%` }}
           />
         </div>
-        {!(running && !live) && (
+        {meter.figure && (
           <span className="activity-figure">
-            {Math.min(done, total)}/{total}
+            {meter.figure.done}/{meter.figure.total}
           </span>
         )}
       </div>
       <div className="activity-row-foot">
         <span
-          className={`activity-copy${j.status === "error" ? "" : " ap-hand"}`}
+          className={`activity-copy${j.status === "error" ? "" : " ap-note"}`}
         >
           {queued
             ? `Waiting — ${queuePos}${queuePos === 1 ? "st" : queuePos === 2 ? "nd" : queuePos === 3 ? "rd" : "th"} in line`
@@ -892,8 +898,12 @@ function JobRow({
                   // checkpoint is still there, which is the whole reason Resume
                   // is worth pressing.
                   parkedReason
-                  ? `${parkedReason} Picks up at ${done} of ${total}.`
-                  : `Paused at ${done} of ${total}`}
+                  ? meter.figure
+                    ? `${parkedReason} Picks up at ${meter.figure.done} of ${meter.figure.total}.`
+                    : `${parkedReason} Picks up where it stopped.`
+                  : meter.figure
+                    ? `Paused at ${meter.figure.done} of ${meter.figure.total}`
+                    : "Paused"}
         </span>
         {queued ? (
           <button

@@ -110,7 +110,7 @@ export default function ModelSection({
                             )}
                             {cap.vision && (
                               <span className="model-badge" title="Can see and mark images">
-                                <EyeIcon size={11} className="model-badge-ic" /> vision
+                                <EyeIcon size={12} className="model-badge-ic" /> vision
                               </span>
                             )}
                           </span>
@@ -143,7 +143,7 @@ export default function ModelSection({
                           disabled={m === model}
                           onClick={() => askRemoveModel(m)}
                         >
-                          <TrashIcon size={13} />
+                          <TrashIcon size={14} />
                         </button>
                       )}
                     </>
@@ -230,14 +230,14 @@ export default function ModelSection({
             </p>
             {stt?.installed ? (
               <div className="model-row active is-ok">
-                <span className="btn-ic"><CircleCheckIcon size={13} /> Voice model installed</span>
+                <span className="btn-ic"><CircleCheckIcon size={14} /> Voice model installed</span>
                 <button
                   className="subtle btn-ic"
                   title="Delete the dictation model from disk"
                   aria-label="Delete the dictation model from disk"
                   onClick={removeStt}
                 >
-                  <TrashIcon size={13} />
+                  <TrashIcon size={14} />
                 </button>
               </div>
             ) : sttPercent != null || stt?.downloading ? (

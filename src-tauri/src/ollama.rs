@@ -533,7 +533,10 @@ pub async fn warm(model: &str) -> Result<(), String> {
     let body = serde_json::json!({
         "model": model,
         "base_url": resolved_base_url(),
-        "keep_alive": "30m",
+        // The constant, not a second literal: this is the same warm window
+        // `ollama_lifecycle::KEEP_ALIVE_WARM_WINDOW` sizes the idle backstop
+        // against, and two spellings of one policy is how they drift.
+        "keep_alive": crate::commands::KEEP_ALIVE_WARM,
     });
     // Fire-and-forget: the sidecar loads the weights (a no-prompt generate with a
     // small window) and we ignore the body — only a transport/engine failure surfaces.

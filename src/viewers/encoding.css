@@ -20,7 +20,7 @@
   margin: var(--sp-3) auto 0;
   padding: var(--sp-2) var(--sp-4);
   border: 1px solid var(--line);
-  border-radius: 10px 8px 11px 9px / 9px 11px 8px 10px;
+  border-radius: var(--radius);
   background: transparent;
   font-size: var(--fs-micro);
   line-height: var(--lh-body);

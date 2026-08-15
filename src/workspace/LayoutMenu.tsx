@@ -52,7 +52,7 @@ export default function LayoutMenu({
       >
         <PanelLeftIcon size={14} />
         <span>Layout</span>
-        <ChevronDownIcon size={11} className="pill-caret" />
+        <ChevronDownIcon size={12} className="pill-caret" />
       </button>
 
       {open && (
@@ -163,7 +163,7 @@ function MenuCheck({
       onClick={onClick}
     >
       <span className="pop-tick" aria-hidden>
-        {checked && <CheckIcon size={13} />}
+        {checked && <CheckIcon size={14} />}
       </span>
       <span className="pop-glyph" aria-hidden>
         {icon}

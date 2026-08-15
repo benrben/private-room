@@ -33,10 +33,9 @@
   font-size: var(--fs-body);
   color: var(--text-strong);
 }
-/* "4 of 21" is a count pencilled beside the title — exactly what the hand is
-   reserved for. */
+/* "4 of 21" is a position the reader is at, counted by the app — the sans,
+   beside the title rather than competing with it. */
 .book-of {
-  font-family: var(--hand);
   font-size: var(--fs-meta);
   color: var(--muted);
 }

@@ -117,6 +117,7 @@ import type {
   PrivacyStatus,
   BrowserTab,
   SketchDrawn,
+  ViewMenuState,
 } from "./apiTypes";
 
 /** The wire shape of every `ask-*` event: the payload the listener wants, in
@@ -887,11 +888,15 @@ export const api = {
   deleteMessage: (id: string) => invoke<void>("delete_message", { id }),
   // ADD-7: each ask carries an id so it can be cancelled mid-stream.
   // PRIV-1: `privacyBypass` is the confirmed "send real details this once".
+  /** `viewing` is the NAME of the file open in the viewer as the question is
+   *  sent, so "summarize this" can mean what the user is pointing at. Names
+   *  only — the content still travels only through the paperclip. */
   ask: (
     chatId: string,
     question: string,
     attachments: string[],
     askId: string,
+    viewing?: string | null,
     privacyBypass?: boolean,
   ) =>
     invoke<Message>("ask", {
@@ -899,6 +904,7 @@ export const api = {
       question,
       attachments,
       askId,
+      viewing: viewing ?? null,
       privacyBypass: privacyBypass ?? null,
     }),
   /** Stop this run — and everything it had started. Answers with what it
@@ -1141,6 +1147,11 @@ export const api = {
     listen("workflows-changed", () => cb()),
   onSkillsChanged: (cb: () => void): Promise<UnlistenFn> =>
     listen("skills-changed", () => cb()),
+  /** The agent added, corrected or forgot a memory. Emitted by every writer,
+   * including the ones with no chat turn to end (workflow nodes, scheduled
+   * runs, an outside agent on the room bridge). */
+  onMemoriesChanged: (cb: () => void): Promise<UnlistenFn> =>
+    listen("memories-changed", () => cb()),
   // Wave 5 (Idea 13): the backend is about to run a script from this room and
   // needs the user's consent (SEC-1 — the card is data-agent-blocked).
   onScriptApproveRequest: (
@@ -1350,6 +1361,17 @@ export const api = {
    *  OWNS finishing the quit — Rust will not hold the next one. */
   onQuitRequested: (cb: () => void): Promise<UnlistenFn> =>
     listen("quit-requested", () => cb()),
+
+  /** A row of the native View menu was chosen; the payload is its id.
+   *  One event for the whole menu — see src-tauri/src/menu.rs. */
+  onMenuAction: (cb: (id: string) => void): Promise<UnlistenFn> =>
+    listen<string>("menu-action", (e) => cb(e.payload)),
+  /** What the native View menu should be showing. Sent whole rather than a
+   *  tick at a time so the menu is never caught halfway through a layout
+   *  change, and once more with `enabled: false` when the room closes — the
+   *  menu bar outlives the room, and a row that cannot act must not look
+   *  like it can. Cosmetic by design: it never rejects into the UI. */
+  syncViewMenu: (view: ViewMenuState) => invoke<void>("menu_sync", { view }),
 
   /** ADD-26 / BROWSE-2: download a video or audio page into the room via
    *  yt-dlp (fetched on first use), YouTube included. Emits ytdlp-progress. */

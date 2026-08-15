@@ -155,7 +155,7 @@ export default function FeedbackModal({ s }: { s: WSState }) {
             title="The local model turns your words into a clear issue title and body — nothing leaves this Mac"
             onClick={() => void draftWithAi()}
           >
-            {drafting ? "Drafting…" : (<><SparklesIcon size={13} /> Draft it for me</>)}
+            {drafting ? "Drafting…" : (<><SparklesIcon size={14} /> Draft it for me</>)}
           </button>
         </div>
 

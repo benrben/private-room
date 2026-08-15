@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../api";
 import { useFrameTheme, withFrameTheme } from "./frameTheme";
+import { withSelectionReporter } from "./frameSelection";
+import { textOf } from "./htmlText";
 
 /**
  * In-app "browser" for self-contained HTML files. The page is staged with the
@@ -64,7 +66,7 @@ export default function HtmlView({ source, name }: Props) {
       // the attribute — a page that themed itself keeps its own choice, which
       // is what stops a saved article being repainted into something its
       // author never wrote.
-      .stagePreviewHtml(withFrameTheme(source))
+      .stagePreviewHtml(withSelectionReporter(withFrameTheme(source)))
       .then((token) => {
         if (alive) setUrl(`roomdoc://localhost/${token}`);
       })
@@ -158,7 +160,7 @@ export default function HtmlView({ source, name }: Props) {
           className="html-view-frame"
           hidden={mode !== "page"}
           sandbox="allow-scripts allow-modals"
-          srcDoc={withFrameTheme(source)}
+          srcDoc={withSelectionReporter(withFrameTheme(source))}
           title="HTML preview"
         />
       ) : null}
@@ -183,79 +185,4 @@ export default function HtmlView({ source, name }: Props) {
       )}
     </div>
   );
-}
-
-/** Contents that are code, not words. A stylesheet shown as the page's text
- * would read as something the page said. */
-const TEXT_SKIP = new Set(["script", "style", "noscript", "template"]);
-
-/** Elements that start their own line. Without these the whole page arrives
- * as one paragraph with words fused across every tag boundary. */
-const TEXT_BLOCK = new Set([
-  "address", "article", "aside", "blockquote", "dd", "div", "dl", "dt",
-  "fieldset", "figcaption", "figure", "footer", "form", "h1", "h2", "h3",
-  "h4", "h5", "h6", "header", "hr", "li", "main", "nav", "ol", "p", "pre",
-  "section", "table", "tr", "ul",
-]);
-
-/**
- * The page's words, with its markup taken off.
- *
- * `DOMParser` builds an INERT document: it has no browsing context, so nothing
- * in it executes and nothing in it fetches — the same primitive every HTML
- * sanitiser is built on, and the reason this mode does not weaken the sandbox
- * one bit. Nothing is ever assigned to `innerHTML`; the only things read back
- * out are text nodes.
- *
- * Nothing is summarised, filtered by "importance", or reordered: what comes
- * out is the document's own text in the document's own order. Runs of
- * whitespace collapse the way a browser collapses them when it lays the page
- * out — EXCEPT inside `<pre>`, where the author's spacing IS the content and
- * is passed through untouched.
- */
-function textOf(html: string): string {
-  let doc: Document;
-  try {
-    doc = new DOMParser().parseFromString(html, "text/html");
-  } catch {
-    return "";
-  }
-
-  const out: string[] = [];
-  /** One blank line between blocks, never a stack of them. */
-  const newline = () => {
-    let run = 0;
-    for (let i = out.length - 1; i >= 0 && out[i] === "\n"; i--) run++;
-    if (run < 2) out.push("\n");
-  };
-
-  const walk = (node: Node, inPre: boolean): void => {
-    if (node.nodeType === Node.TEXT_NODE) {
-      const raw = node.nodeValue ?? "";
-      if (inPre) {
-        out.push(raw);
-        return;
-      }
-      const collapsed = raw.replace(/\s+/g, " ");
-      // A lone space straight after a line break is layout, not text.
-      if (collapsed === " " && (out.length === 0 || out[out.length - 1] === "\n")) return;
-      if (collapsed) out.push(collapsed);
-      return;
-    }
-    if (node.nodeType !== Node.ELEMENT_NODE) return;
-    const tag = (node as Element).tagName.toLowerCase();
-    if (TEXT_SKIP.has(tag)) return;
-    if (tag === "br") {
-      out.push("\n");
-      return;
-    }
-    const block = TEXT_BLOCK.has(tag);
-    if (block) newline();
-    const pre = inPre || tag === "pre";
-    for (const child of Array.from(node.childNodes)) walk(child, pre);
-    if (block) newline();
-  };
-
-  walk(doc.body ?? doc.documentElement, false);
-  return out.join("").trim();
 }

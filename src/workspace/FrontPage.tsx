@@ -1,4 +1,4 @@
-import { ReactNode, useEffect, useId, useState } from "react";
+import { ReactNode, useId, useState } from "react";
 import { api, FrontPage as FrontPageData, fileKindLabel, RoomInfo } from "../api";
 import {
   BookOpenIcon,
@@ -56,18 +56,6 @@ const TONE_WORD: Partial<Record<BriefTone, string>> = {
  * review, failed runs, drafts to activate. Every row resolves its own issue in
  * one click. Renders nothing when the room is clear, so Home stays calm. */
 function RoomBrief({ s, a }: { s: WSState; a: WSActions }) {
-  const [pendingScan, setPendingScan] = useState(0);
-  useEffect(() => {
-    let live = true;
-    api
-      .privacyStatus()
-      .then((st) => live && setPendingScan(st.pendingFiles))
-      .catch(() => {});
-    return () => {
-      live = false;
-    };
-  }, [s.files.length]);
-
   const openPrivacy = () => {
     s.setSettingsSection("set-cloud-privacy");
     s.setShowSettings(true);
@@ -83,14 +71,25 @@ function RoomBrief({ s, a }: { s: WSState; a: WSActions }) {
       run: openPrivacy,
     });
   }
-  if (pendingScan > 0) {
+  if (s.privacyPending > 0) {
+    // While a scan is already running, "Scan now" is a button that does
+    // nothing: `start_privacy_scan` returns Ok after the running flag turns it
+    // away. Say what is happening instead, and offer the place to watch it.
+    const scanning = s.privacyScanning;
     items.push({
       key: "scan",
       tone: "warn",
-      text: `${pendingScan} file${pendingScan === 1 ? "" : "s"} haven't been scanned for private details yet.`,
-      cta: "Scan now",
+      text: scanning
+        ? `Scanning ${s.privacyPending} file${s.privacyPending === 1 ? "" : "s"} for private details.`
+        : `${s.privacyPending} file${s.privacyPending === 1 ? "" : "s"} haven't been scanned for private details yet.`,
+      cta: scanning ? "Watch progress" : "Scan now",
       run: () => {
-        api.startPrivacyScan().catch(() => {});
+        // The command now answers when it will not act — a door-off room says
+        // so instead of returning Ok and starting nothing. Swallowing that
+        // would put the dead button back.
+        if (!scanning) {
+          api.startPrivacyScan().catch((e) => s.pushToast("error", String(e)));
+        }
         openPrivacy();
       },
     });
@@ -181,7 +180,16 @@ function RoomStamp({ page, s }: { page: FrontPageData; s: WSState }) {
         ? { word: "Recording paused", mark: "nb-sem-pending" }
         : busy > 0
           ? { word: `${busy} running`, mark: "nb-sem-linked" }
-          : { word: "All quiet", mark: "nb-sem-done" };
+          : // The privacy scanner is real work with no job row, so
+            // `runningJobCount` cannot see it and Home said "All quiet" while
+            // the fans were up. Deliberately NOT folded into `runningJobCount`:
+            // the status bar renders that number as a button that opens
+            // Activity, and a scan has no card there — the button would open a
+            // pane showing nothing. The actionable count and the room's mood
+            // are two different readouts.
+            s.privacyScanning
+            ? { word: "Scanning files", mark: "nb-sem-pending" }
+            : { word: "All quiet", mark: "nb-sem-done" };
   return (
     <div className="rh-stamp">
       <span className="rh-stamp-date">{today}</span>
@@ -272,7 +280,10 @@ function timeline(
       icon: <ChatBubbleIcon size={14} />,
       title: c.title,
       kind: "Chat",
-      at: c.createdAt,
+      // When you last SPOKE in it, not when it was started — the same fact the
+      // chat list is now ordered by, so Home's timeline and the list agree
+      // about which conversation is recent.
+      at: c.lastAt,
       hint: c.title,
       open: () => {
         s.setActiveChatId(c.id);
@@ -369,7 +380,7 @@ function AreaChip({
           screen-reader description the rest of the time. */}
       <span
         id={describedBy}
-        className={unavailable ? "rh-chip-why nb-hand" : "rh-chip-why sr-only"}
+        className={unavailable ? "rh-chip-why" : "rh-chip-why sr-only"}
       >
         {note}
       </span>
@@ -508,21 +519,21 @@ export default function FrontPage({
               area="Recordings"
               title="Record and transcribe"
               copy="Microphone, Mac audio, live translation, editing, export"
-              icon={<MicIcon size={17} />}
+              icon={<MicIcon size={16} />}
               onClick={() => goArea("recordings")}
             />
             <ActionCard
               area="Workflows"
               title="Automate repeated work"
               copy="Visual pipelines, schedules, file actions, run history"
-              icon={<WorkflowsIcon size={17} />}
+              icon={<WorkflowsIcon size={16} />}
               onClick={() => a.openWorkflows()}
             />
             <ActionCard
               area="Studio"
               title="Transform your sources"
               copy="Flashcards, mind maps, podcast scripts, room summary"
-              icon={<SparkIcon size={17} />}
+              icon={<SparkIcon size={16} />}
               onClick={() => {
                 s.setAiTab("studio");
                 layout.showPane("ai");
@@ -532,7 +543,7 @@ export default function FrontPage({
               area="Browser"
               title="Read the web privately"
               copy="A browser that keeps no history, with search and downloads straight into the room"
-              icon={<GlobeIcon size={17} />}
+              icon={<GlobeIcon size={16} />}
               onClick={() => a.revealBrowser()}
             />
           </div>
@@ -546,13 +557,13 @@ export default function FrontPage({
             <AreaChip
               label="Scripts"
               hint="Run a room script — Python or JavaScript with explicit inputs, outputs, and consent"
-              icon={<ScriptIcon size={13} />}
+              icon={<ScriptIcon size={14} />}
               onClick={() => a.openScripts()}
             />
             <AreaChip
               label="Room Map"
               hint="See how files connect — the Room Map of files, notes, and their relationships"
-              icon={<GraphIcon size={13} />}
+              icon={<GraphIcon size={14} />}
               unavailable={
                 s.files.length === 0
                   ? "Add a file first — the map draws the connections between them"
@@ -566,7 +577,7 @@ export default function FrontPage({
             <AreaChip
               label="Memory"
               hint="Manage memory and scratch notes — durable facts and preferences, always visible and editable"
-              icon={<MemoryIcon size={13} />}
+              icon={<MemoryIcon size={14} />}
               onClick={() => goArea("memory")}
             >
               {/* A count is the handwriting's natural home, and the ring keeps
@@ -580,13 +591,13 @@ export default function FrontPage({
             <AreaChip
               label="Skills"
               hint="Teach the AI a skill — reusable instructions and resources, stored encrypted in this room"
-              icon={<BookOpenIcon size={13} />}
+              icon={<BookOpenIcon size={14} />}
               onClick={() => goArea("skills")}
             />
             <AreaChip
               label="Connectors"
               hint="Connect outside tools — MCP connectors, every call asks first"
-              icon={<LinkIcon size={13} />}
+              icon={<LinkIcon size={14} />}
               onClick={() => goArea("connectors")}
             />
           </div>

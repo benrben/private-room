@@ -39,7 +39,7 @@ export default function StudioShelf({
         onClick={() => a.openStudioPrompt("flashcards", scope)}
       >
         <span className="studio-row-icon">
-          <StudioIcon size={15} />
+          <StudioIcon size={14} />
         </span>
         <span className="studio-row-text">
           <span className="studio-row-title">Flashcards</span>
@@ -52,7 +52,7 @@ export default function StudioShelf({
         onClick={() => a.openStudioPrompt("mindmap", scope)}
       >
         <span className="studio-row-icon">
-          <GraphIcon size={15} />
+          <GraphIcon size={14} />
         </span>
         <span className="studio-row-text">
           <span className="studio-row-title">Mind map</span>
@@ -65,7 +65,7 @@ export default function StudioShelf({
         onClick={() => a.openStudioPrompt("podcast", scope)}
       >
         <span className="studio-row-icon">
-          <PodcastIcon size={15} />
+          <PodcastIcon size={14} />
         </span>
         <span className="studio-row-text">
           <span className="studio-row-title">Podcast script</span>

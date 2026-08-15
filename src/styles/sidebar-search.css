@@ -117,11 +117,10 @@
   text-transform: uppercase;
 }
 
-/* The per-group tally, in the hand — a count pencilled beside a heading is
-   exactly what Kalam is reserved for. */
+/* The per-group tally. A count the app made, so the sans — set a tier under
+   the heading it sits beside. */
 .search-count {
-  font-family: var(--hand);
-  font-size: var(--fs-hand);
+  font-size: var(--fs-meta);
   font-weight: 400;
   letter-spacing: 0;
   text-transform: none;

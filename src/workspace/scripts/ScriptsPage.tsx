@@ -13,11 +13,11 @@ export function ScriptsPage({ s, a }: Props) {
     <div className="scripts-page">
       <div className="viewer-head">
         <span className="viewer-title">
-          <ScriptIcon size={15} /> Scripts
+          <ScriptIcon size={14} /> Scripts
         </span>
         <span className="viewer-actions">
           <button className="btn-ic script-go" onClick={() => void a.createNewScript()}>
-            <PlusIcon size={13} /> New script
+            <PlusIcon size={14} /> New script
           </button>
           <button className="subtle btn-ic" onClick={() => a.closeScripts()}>
             <CloseIcon size={12} /> Close
@@ -50,7 +50,7 @@ export function ScriptsPage({ s, a }: Props) {
               inputs, outputs and dependencies in a short header:
             </p>
             <button className="primary" style={{ margin: "0.4rem 0" }} onClick={() => void a.createNewScript()}>
-              <PlusIcon size={13} /> New script
+              <PlusIcon size={14} /> New script
             </button>
             <pre className="scripts-manifest-example">{`# /// script
 # dependencies = ["yfinance", "pandas"]

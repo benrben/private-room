@@ -180,9 +180,10 @@ function RecordingCard({
         <span className="rec-home-card-main">
           <span className="rec-home-card-title">{displayName(file.name)}</span>
           <span className="rec-home-card-meta">
-            {/* A date is a date: handwritten, as everywhere else in the
-                product. The size is a figure, so it is mono and tabular. */}
-            <span className="nb-hand rec-home-when">
+            {/* Both are facts the room recorded — the date in the sans at the
+                metadata rung, the size in mono and tabular because it is a
+                figure that has to line up down the column. */}
+            <span className="rec-home-when">
               {formatWhen(file.createdAt)}
             </span>
             <span className="nb-num">{formatSize(file.sizeBytes)}</span>

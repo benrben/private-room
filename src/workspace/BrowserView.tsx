@@ -598,7 +598,7 @@ export function BrowserView({
               aria-label={schemeLabel}
               title={schemeLabel}
             >
-              {secure ? <LockIcon size={13} /> : <AlertIcon size={14} />}
+              {secure ? <LockIcon size={14} /> : <AlertIcon size={14} />}
             </span>
           ) : (
             /* No page, or a results page: the label is a search box right

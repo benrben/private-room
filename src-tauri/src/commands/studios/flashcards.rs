@@ -162,7 +162,7 @@ h1{font-family:var(--sans);font-weight:700;font-size:var(--fs-page);line-height:
 /* The standfirst carries the deck's only instruction, so it is set at reading
    size rather than at the metadata rung — an instruction is never set small. */
 .sub{color:var(--ink-2);font-size:var(--fs-body);margin:0}
-.rule{height:3px;width:66px;border-radius:3px 2px 4px 2px / 2px 4px 2px 3px;background:linear-gradient(90deg,var(--accent-fill),color-mix(in srgb,var(--mk-pink) 30%,transparent));margin:1rem 0 1.9rem}
+.rule{height:3px;width:66px;border-radius:3px 2px 4px 2px / 2px 4px 2px 3px;background:linear-gradient(90deg,var(--accent-fill),color-mix(in srgb,var(--mk-berry) 30%,transparent));margin:1rem 0 1.9rem}
 /* `min(15rem,100%)`, not a bare 15rem: an auto-fill floor wider than the deck
    still lays out ONE 15rem column, which then runs past the right edge instead
    of collapsing to a single readable column. The deck is read inside the

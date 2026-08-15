@@ -26,7 +26,6 @@ import {
   handTokens,
   isCloudRoute,
   isHandwritten,
-  isLatinScript,
   isModelReady,
   lostReplyAdvice,
   lostReplyNotice,
@@ -296,7 +295,7 @@ export default function ChatPane({
           disabled={s.asking || !s.activeChatId || s.renaming}
           onClick={a.startRename}
         >
-          <PencilIcon size={13} />
+          <PencilIcon size={14} />
         </button>
         <button className="subtle" title="New chat ⌘N" onClick={a.newChat}>
           ＋ New
@@ -450,7 +449,7 @@ export default function ChatPane({
                       className="subtle btn-ic model-pick-get"
                       onClick={() => a.pickAndDownload(m.name)}
                     >
-                      <DownloadIcon size={13} /> Download
+                      <DownloadIcon size={14} /> Download
                     </button>
                   </div>
                 ))}
@@ -560,20 +559,12 @@ export default function ChatPane({
           // to pass the hand test, so it is excluded by name rather than by
           // length.
           const hand = lostReply === null && isHandwritten(text);
-          // A LONG answer goes to the sans but keeps handwritten headings, per
-          // the brief. That only works while the hand has the glyphs — Kalam
-          // bundles latin + latin-ext only — so a Hebrew or CJK answer must
-          // keep its headings in the sans too. `is-hand` cannot carry this:
-          // these are exactly the messages that are NOT handwritten.
-          const latin = isLatinScript(text);
           const clock = messageClock(m.createdAt);
           return (
           <div
             key={m.id}
             id={`msg-${m.id}`}
-            className={`msg ${m.role}${hand ? " is-hand" : ""}${
-              latin ? " is-latin" : ""
-            }${m.id === lastAssistantId ? " is-latest" : ""}`}
+            className={`msg ${m.role}${hand ? " is-hand" : ""}${m.id === lastAssistantId ? " is-latest" : ""}`}
           >
             <div className="msg-label">
               <span className="msg-avatar" aria-hidden>
@@ -666,9 +657,9 @@ export default function ChatPane({
                         }
                       >
                         {annotVerified ? (
-                          <CheckIcon size={13} />
+                          <CheckIcon size={14} />
                         ) : (
-                          <EyeIcon size={13} />
+                          <EyeIcon size={14} />
                         )}{" "}
                         {annotation.note ||
                           annotation.quote ||
@@ -676,7 +667,7 @@ export default function ChatPane({
                         — {annotation.name}
                         {annotVerified && (
                           <span className="receipt-badge">
-                            <CheckIcon size={11} /> Verified
+                            <CheckIcon size={12} /> Verified
                           </span>
                         )}
                         {annotation.approx && (
@@ -848,7 +839,7 @@ export default function ChatPane({
                     disabled={s.asking}
                     onClick={() => a.undoEdits(m.id)}
                   >
-                    <UndoIcon size={13} /> Undo{" "}
+                    <UndoIcon size={14} /> Undo{" "}
                     {s.undoByMsg[m.id].length > 1 ? `${s.undoByMsg[m.id].length} edits` : "edit"}
                   </button>
                 )}
@@ -1034,7 +1025,7 @@ export default function ChatPane({
           // driver must not be able to click "Save to memory" for them.
           <div className="memory-suggestion" data-agent-blocked>
             <div className="memory-suggestion-head">
-              <MemoryIcon size={13} /> Worth remembering?
+              <MemoryIcon size={14} /> Worth remembering?
             </div>
             <div className="memory-suggestion-fact">
               {s.memSuggestion.fact}

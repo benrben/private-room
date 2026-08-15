@@ -132,31 +132,44 @@ body {
    entire irregularity budget.
 
    Four fixed signatures so a run of sibling cards does not look stamped;
-   `nb-frame` cycles them by position, which keeps it deterministic. */
+   `nb-frame` cycles them by position, which keeps it deterministic.
+
+   THE SPREAD NARROWED IN THE VISUAL PASS, from 9-12px to 9-11px around the
+   10px `--radius`. The frames are now the ONLY asymmetric corners in the app
+   — `--radius` and its siblings went symmetric, taking ~225 controls with
+   them — so what used to be one wobble among many is now the whole of the
+   drawn identity, and it has to carry that without a grid of eight cards
+   reading as unstable. ±1px is enough to see up close on a single frame and
+   not enough to notice as a pattern across a page.
+
+   These are literals rather than calc() off `--radius`, because eight nested
+   calc()s per rule is a real cost to every future reader and the tie is worth
+   less than the legibility. `visualRegister.test.mjs` is what holds them
+   within 1px of the token — the guarantee lives there instead. */
 .nb-frame {
   border: var(--stroke-w) solid var(--sketch);
-  border-radius: 11px 9px 12px 10px / 10px 12px 9px 11px;
+  border-radius: 11px 9px 11px 10px / 10px 11px 9px 11px;
   position: relative;
 }
 .nb-frame--b {
-  border-radius: 9px 12px 10px 11px / 12px 10px 11px 9px;
+  border-radius: 9px 11px 10px 11px / 11px 10px 11px 9px;
 }
 .nb-frame--c {
-  border-radius: 12px 10px 9px 12px / 9px 11px 12px 10px;
+  border-radius: 11px 10px 9px 11px / 9px 11px 11px 10px;
 }
 .nb-frame--d {
-  border-radius: 10px 11px 12px 9px / 11px 9px 10px 12px;
+  border-radius: 10px 11px 11px 9px / 11px 9px 10px 11px;
 }
 /* On a container of frames: rotates the four signatures by position, so the
    author does not have to hand-label every child. 4n+1 keeps the base. */
 .nb-frame-set > *:nth-child(4n + 2) {
-  border-radius: 9px 12px 10px 11px / 12px 10px 11px 9px;
+  border-radius: 9px 11px 10px 11px / 11px 10px 11px 9px;
 }
 .nb-frame-set > *:nth-child(4n + 3) {
-  border-radius: 12px 10px 9px 12px / 9px 11px 12px 10px;
+  border-radius: 11px 10px 9px 11px / 9px 11px 11px 10px;
 }
 .nb-frame-set > *:nth-child(4n + 4) {
-  border-radius: 10px 11px 12px 9px / 11px 9px 10px 12px;
+  border-radius: 10px 11px 11px 9px / 11px 9px 10px 11px;
 }
 
 /* A quieter frame for dense chrome: pencil weight rather than pen. --rule is
@@ -165,12 +178,18 @@ body {
    which are drawn in --rule-strong and clear 3:1. */
 .nb-frame-soft {
   border: 1px solid var(--line);
-  border-radius: 10px 8px 11px 9px / 9px 11px 8px 10px;
+  border-radius: 9px 8px 9px 8px / 8px 9px 8px 9px;
 }
 
 /* The redraw: a second stroke offset a couple of px, as though the pen went
    round twice. Decorative only. Occasional by design — a page where every
-   box is redrawn reads as noise. */
+   box is redrawn reads as noise.
+
+   NOTHING WEARS THIS CLASS. The three redraws in the app each hand-roll the
+   same ::after locally (gate.css, browser.css, marketplace.css), which is why
+   the visual pass found no global doubled-outline motif to remove: there never
+   was one. Kept as the library's statement of the recipe those three follow —
+   if a fourth is ever wanted, it belongs here rather than in a fourth copy. */
 .nb-redraw::after {
   content: "";
   position: absolute;
@@ -334,8 +353,8 @@ body {
    five token-budget categories, the seven search engines. If the colour is
    saying something, use the semantic class above instead. */
 .nb-mark-pink {
-  --mk: var(--mk-pink);
-  --mk-ink: var(--mk-pink-ink);
+  --mk: var(--mk-berry);
+  --mk-ink: var(--mk-berry-ink);
 }
 .nb-mark-yellow {
   --mk: var(--mk-yellow);
@@ -446,7 +465,7 @@ body {
    carry a state. A fill this thin cannot clear 3:1 in light mode, so it is
    ALWAYS paired with a word — never the only signal. */
 .nb-edge {
-  box-shadow: inset 3px 0 0 var(--mk, var(--mk-pink));
+  box-shadow: inset 3px 0 0 var(--mk, var(--mk-berry));
 }
 
 /* ----- taped label -----
@@ -467,16 +486,19 @@ body {
 }
 
 /* ----- circled count -----
-   Notification counts as a hand-circled number: an ellipse that is not quite
+   Notification counts in a hand-circled ring: an ellipse that is not quite
    closed to the same radius on any corner. Drawn in --mk-ink (never a fill),
-   because the ring is the boundary AND the number is text. */
+   because the ring is the boundary AND the number is text.
+
+   The RING is the hand; the digit inside it is not. A count is a fact the app
+   arrived at, and the reserve list below keeps computed facts in the sans —
+   the pen drew the circle, nobody wrote the number. */
 .nb-circled {
   display: inline-grid;
   place-items: center;
   min-width: 18px;
   height: 18px;
   padding: 0 4px;
-  font-family: var(--hand);
   font-size: 12px;
   color: var(--mk-ink, var(--accent));
   border: 1.5px solid var(--mk-ink, var(--accent));
@@ -497,10 +519,26 @@ body {
 
 /* ==========================================================================
    3. HANDWRITING AND NOTES
-   Kalam is reserved. Annotations, dates, counts, durations, short labels,
-   margin notes, empty-state directions, short conversational lines. NEVER
-   instructions, settings copy, transcripts, articles, tables, code, URLs,
-   paths, long answers, or anything the user typed into a field.
+
+   ONE RULE, and it is a rule about AUTHORSHIP rather than about length:
+
+     The hand is for words a PERSON wrote, and for the app speaking in its own
+     voice at an empty moment. It is never for a fact the app computed.
+
+   So: margin notes, the wordmark, empty-state directions, the composer's own
+   prompt, a short conversational message, text a person typed onto a sketch.
+   NEVER a date, a count, a duration, a timestamp, a speaker the diarizer
+   named, a progress line, a heading a model wrote — and never instructions,
+   settings copy, transcripts, articles, tables, code, URLs, paths or long
+   answers, which were already out.
+
+   WHY IT CHANGED. The older rule read "annotations, dates, counts, durations,
+   short labels…", which is a rule about how MUCH text there is. Under it the
+   hand reached 71 sites and stopped saying anything by being everywhere: a
+   duration rendered in handwriting claims a person noted it down, and no
+   person did. Authorship is the distinction the reader can actually see, and
+   it is the one that keeps the hand meaning something where it survives — 27
+   sites, each of them words somebody wrote.
    ========================================================================== */
 
 .nb-hand {

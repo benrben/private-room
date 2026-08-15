@@ -197,7 +197,7 @@ export default function LibraryPane({
       {((fileArea && s.libraryTab !== "trash") || area === "recordings") && (
         <div className="source-tools">
           <label className="search-field">
-            <SearchIcon size={13} />
+            <SearchIcon size={14} />
             <input
               type="search"
               placeholder={
@@ -214,7 +214,7 @@ export default function LibraryPane({
                 aria-label="Clear the filter"
                 onClick={() => s.setFileFilter("")}
               >
-                <CloseIcon size={11} />
+                <CloseIcon size={12} />
               </button>
             )}
           </label>
@@ -497,28 +497,28 @@ function SelectionBar({ s, a }: { s: WSState; a: WSActions }) {
             s.setMoveMenuFor({ ids, x: r.left, y: r.bottom + 4 });
           }}
         >
-          <FolderIcon size={13} /> Move
+          <FolderIcon size={14} /> Move
         </button>
         <button
           className="chip-btn"
           title="Pin all of these into your next question"
           onClick={() => a.attachFiles(picked)}
         >
-          <PaperclipIcon size={13} /> Attach
+          <PaperclipIcon size={14} /> Attach
         </button>
         <button
           className="chip-btn"
           title="Export copies of all of these out of the room"
           onClick={() => void a.exportFiles(picked)}
         >
-          <DownloadIcon size={13} /> Export
+          <DownloadIcon size={14} /> Export
         </button>
         {/* Same armed confirm as one file's Remove — a set of files must never
             be easier to delete than one of them. The question names the count,
             because "Move to the trash?" over seven files is a different act. */}
         <DeleteControl
           k="selection-remove"
-          trigger={<TrashIcon size={13} />}
+          trigger={<TrashIcon size={14} />}
           question={`Move ${n} file${n === 1 ? "" : "s"} to the trash?`}
           title={`Move ${n} file${n === 1 ? "" : "s"} to the trash`}
           onConfirm={() => void a.removeFiles(ids)}
@@ -713,7 +713,7 @@ function BrowsePanel({
                     s.setRenamingFolder({ id: folder.id, name: folder.name })
                   }
                 >
-                  <PencilIcon size={13} />
+                  <PencilIcon size={14} />
                 </button>
                 <DeleteControl
                   k={`folder:${folder.id}`}
@@ -858,7 +858,7 @@ function RecordingsNav({
         onClick={() => void a.startLiveRecording()}
       >
         <span className="browse-icon">
-          <MicIcon size={15} />
+          <MicIcon size={14} />
         </span>
         <span className="area-nav-main">
           <span className="area-nav-title">New live recording</span>
@@ -871,7 +871,7 @@ function RecordingsNav({
         onClick={() => a.recordVoiceNote()}
       >
         <span className="browse-icon">
-          <MicIcon size={15} />
+          <MicIcon size={14} />
         </span>
         <span className="area-nav-main">
           <span className="area-nav-title">Voice note</span>
@@ -906,7 +906,7 @@ function WorkflowsNav({ s, a }: { s: WSState; a: WSActions }) {
       </p>
       <button className="area-nav-row" onClick={() => a.openWorkflows()}>
         <span className="browse-icon">
-          <PlusIcon size={15} />
+          <PlusIcon size={14} />
         </span>
         <span className="area-nav-main">
           <span className="area-nav-title">New workflow</span>
@@ -927,7 +927,7 @@ function WorkflowsNav({ s, a }: { s: WSState; a: WSActions }) {
           onClick={() => a.openWorkflowDetail(w.id)}
         >
           <span className="browse-icon">
-            {w.emoji ? <span aria-hidden>{w.emoji}</span> : <WorkflowsIcon size={15} />}
+            {w.emoji ? <span aria-hidden>{w.emoji}</span> : <WorkflowsIcon size={14} />}
           </span>
           <span className="area-nav-main">
             <span className="area-nav-title">{w.name}</span>
@@ -970,7 +970,7 @@ function ScriptsNav({ s, a }: { s: WSState; a: WSActions }) {
           title={`Open ${sc.name}`}
         >
           <span className="browse-icon">
-            <ScriptIcon size={15} />
+            <ScriptIcon size={14} />
           </span>
           <span className="area-nav-main">
             <span className="area-nav-title">{sc.name}</span>
@@ -1015,7 +1015,7 @@ function SkillsNav({ s, a }: { s: WSState; a: WSActions }) {
           onClick={() => a.openSkill(skill.id)}
           title={skill.description}
         >
-          <span className="browse-icon"><BookOpenIcon size={15} /></span>
+          <span className="browse-icon"><BookOpenIcon size={14} /></span>
           <span className="area-nav-main">
             <span className="area-nav-title">{skill.name}</span>
             <span className="area-nav-copy">
@@ -1119,7 +1119,7 @@ function MemoryNav({ s, a }: { s: WSState; a: WSActions }) {
         title='Shared working notes — you and the AI both write "Scratch pad.md"'
       >
         <span className="browse-icon">
-          <PencilIcon size={15} />
+          <PencilIcon size={14} />
         </span>
         <span className="area-nav-main">
           <span className="area-nav-title">Scratch pad</span>
@@ -1129,7 +1129,7 @@ function MemoryNav({ s, a }: { s: WSState; a: WSActions }) {
       <div className="group-heading">Saved memory</div>
       <div className="area-nav-row is-static">
         <span className="browse-icon">
-          <MemoryIcon size={15} />
+          <MemoryIcon size={14} />
         </span>
         <span className="area-nav-main">
           <span className="area-nav-title">All memory</span>

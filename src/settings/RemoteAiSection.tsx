@@ -56,7 +56,7 @@ export default function RemoteAiSection({
                 {closetTesting ? "Testing\u2026" : "Test connection"}
               </button>
               <button className="primary btn-ic" onClick={saveOllamaUrl}>
-                {closetSaved ? (<><CircleCheckIcon size={13} /> Saved</>) : "Save"}
+                {closetSaved ? (<><CircleCheckIcon size={14} /> Saved</>) : "Save"}
               </button>
             </div>
             {closetTestResult && (

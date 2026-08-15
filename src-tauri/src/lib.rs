@@ -7,6 +7,10 @@ pub mod extraction;
 pub mod formats;
 pub mod mcp;
 pub mod media_probe;
+/// The native menu bar. Owns ⌘1/⌘2 and re-declares every predefined row the
+/// stock menu had — `set_menu` replaces rather than merges, and the Edit
+/// submenu is what makes ⌘C/⌘V work anywhere in the app.
+pub mod menu;
 mod model_limits;
 pub mod obs;
 mod ocr;
@@ -74,6 +78,12 @@ pub fn run() {
     // force-quit session before anything else runs.
     commands::cleanup_browser_previews();
     tauri::Builder::default()
+        // The native menu bar, in place of tauri's stock one. `menu::build`
+        // re-declares every predefined row the stock menu had — see that
+        // module's header for why forgetting one breaks ⌘V in the password
+        // gate — and adds the View menu that drives the room's layout.
+        .menu(menu::build)
+        .on_menu_event(|app, event| menu::dispatch(app, event.id().as_ref()))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -476,6 +486,9 @@ pub fn run() {
             // Owner replacement #1: point the user at the log folder.
             obs::reveal_logs,
             commands::set_unsaved_edits,
+            // The native View menu's ticks and its enabled state, pushed from
+            // the window that owns the layout.
+            menu::menu_sync,
         ])
         // Where the window was, and how big. Noted from the event rather than
         // written per event: dragging emits hundreds, and the file is written

@@ -90,7 +90,7 @@ export default function MicSection() {
       <div className="settings-actions">
         {saved && (
           <span className="settings-confirm btn-ic" role="status">
-            <CircleCheckIcon size={13} /> Saved
+            <CircleCheckIcon size={14} /> Saved
           </span>
         )}
       </div>

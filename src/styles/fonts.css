@@ -4,16 +4,24 @@
    text, which matters for a product whose promise is that a room can stay
    entirely on this Mac.
 
-   Three roles, one family each:
-     Manrope       interface - every functional label, control and body run
-     Kalam         the hand - annotations, dates, counts, short notes only
+   Four roles, one family each:
+     Figtree       interface - every functional label, control and body run
+     Space Grotesk display - page and section titles, h1 and h2
+     Kalam         the hand - see the reserve list in tokens.css
      IBM Plex Mono code, timestamps, paths, technical data
 
+   Figtree and Space Grotesk are both VARIABLE: one file per subset covers
+   300-900 and 300-700 respectively, which is why swapping Manrope's two files
+   for four cost ~31 KB rather than doubling the bundle. Both are SIL Open
+   Font License, like the two faces that were already here.
+
    Only the latin and latin-ext subsets are bundled. Turkish lives in
-   latin-ext, so the QA fixtures (ISTANBUL, CAGRI, GUNES) render in Manrope.
+   latin-ext, so the QA fixtures (ISTANBUL, CAGRI, GUNES) render in Figtree.
    Hebrew, CJK and everything else fall through to the system stack by design
    - per-glyph fallback keeps them in a face that actually has the glyphs
-   rather than showing tofu, and adds nothing to the bundle.
+   rather than showing tofu, and adds nothing to the bundle. Space Grotesk
+   also publishes a vietnamese subset upstream; it is deliberately NOT
+   bundled, so Vietnamese headings resolve the same way Hebrew ones do.
 
    font-display: block, not swap. The whole interface is these faces; a swap
    flash would repaint every label in the app a beat after launch. The files
@@ -22,20 +30,38 @@
    Generated from the upstream faces - if you add a weight, add the file too. */
 
 @font-face {
-  font-family: "Manrope";
+  font-family: "Figtree";
   font-style: normal;
-  font-weight: 400 800;
+  font-weight: 300 900;
   font-display: block;
-  src: url("../assets/fonts/Manrope-400_800-normal-latin.woff2") format("woff2");
+  src: url("../assets/fonts/Figtree-300_900-normal-latin.woff2") format("woff2");
   unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
 }
 
 @font-face {
-  font-family: "Manrope";
+  font-family: "Figtree";
   font-style: normal;
-  font-weight: 400 800;
+  font-weight: 300 900;
   font-display: block;
-  src: url("../assets/fonts/Manrope-400_800-normal-latin-ext.woff2") format("woff2");
+  src: url("../assets/fonts/Figtree-300_900-normal-latin-ext.woff2") format("woff2");
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+
+@font-face {
+  font-family: "Space Grotesk";
+  font-style: normal;
+  font-weight: 300 700;
+  font-display: block;
+  src: url("../assets/fonts/SpaceGrotesk-300_700-normal-latin.woff2") format("woff2");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
+@font-face {
+  font-family: "Space Grotesk";
+  font-style: normal;
+  font-weight: 300 700;
+  font-display: block;
+  src: url("../assets/fonts/SpaceGrotesk-300_700-normal-latin-ext.woff2") format("woff2");
   unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
 }
 

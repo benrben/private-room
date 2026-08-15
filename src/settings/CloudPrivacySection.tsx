@@ -325,7 +325,13 @@ export default function CloudPrivacySection() {
           disabled={scan?.running === true || status?.scanning === true}
           onClick={() => {
             setScan({ running: true, done: 0, total: 0 });
-            api.startPrivacyScan().catch((e) => setErr(String(e)));
+            // Clear the optimistic "running" if the scan never starts. It used
+            // to be painted unconditionally and no event ever took it back, so
+            // a refusal left the panel saying a scan was under way forever.
+            api.startPrivacyScan().catch((e) => {
+              setScan(null);
+              setErr(String(e));
+            });
           }}
         >
           Scan now

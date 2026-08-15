@@ -37,7 +37,7 @@ button {
   color: var(--text);
   background: transparent;
   border: 1px solid var(--rule-strong);
-  border-radius: 9px 7px 10px 8px / 8px 10px 7px 9px;
+  border-radius: var(--radius-sm);
   padding: 6px var(--sp-3);
   cursor: pointer;
   position: relative;
@@ -150,7 +150,7 @@ select {
   color: var(--text);
   background: color-mix(in srgb, var(--raised) 62%, transparent);
   border: 1px solid var(--rule-strong);
-  border-radius: 8px 6px 9px 7px / 7px 9px 6px 8px;
+  border-radius: var(--radius-sm);
   padding: 7px 10px;
   outline: none;
   transition:

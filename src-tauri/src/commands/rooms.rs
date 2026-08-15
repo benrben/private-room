@@ -539,6 +539,9 @@ pub(crate) fn teardown_open_room<R: tauri::Runtime>(app: &tauri::AppHandle<R>, s
     // Closed BEFORE the room handle drops, for exactly that reason.
     let _ = crate::browser::close(app);
     park_inflight_jobs_for_teardown(state);
+    // The warm window is for someone who stepped away from an open room, not
+    // for a locked one — see `note_room_closed`.
+    crate::ollama_lifecycle::note_room_closed();
     *state.room_guard() = None;
     // PRIV-1: the cached privacy policy holds the room's protected strings —
     // it must not outlive the room handle (same invariant as the MCP token).

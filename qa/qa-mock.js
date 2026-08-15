@@ -222,9 +222,12 @@
     { id: "m3", content: "Ben reads Hebrew sources; keep RTL rendering intact", category: "fact", createdAt: iso(2000) },
   ];
 
+  // `lastAt` is when the conversation was last spoken in — what `list_chats`
+  // now orders by. c1 is the older chat still in use, which is exactly the case
+  // ordering by `createdAt` used to get wrong.
   const chats = [
-    { id: "c1", title: "Core interaction model", createdAt: iso(30) },
-    { id: "c2", title: "Apollo dataset questions", createdAt: iso(500) },
+    { id: "c1", title: "Core interaction model", createdAt: iso(30), lastAt: iso(16) },
+    { id: "c2", title: "Apollo dataset questions", createdAt: iso(500), lastAt: iso(500) },
   ];
 
   const messages = [
@@ -835,6 +838,9 @@
       concepts: ["my health"],
       pendingFiles: 0,
       scanning: false,
+      // The harness room's last scan finished cleanly. A non-null value here
+      // would raise an error toast at mount in every UI run.
+      lastScanError: null,
       connectorArgsMasked: true,
     }),
     set_privacy_room: () => null,
@@ -1726,6 +1732,12 @@
     // Owner replacement #1: Settings → Updates & version reveals the log folder.
     // The mock returns the path the real command returns without touching Finder.
     reveal_logs: () => "/var/folders/qa/T",
+    // The native View menu's ticks. There is no menu bar in a browser, so the
+    // honest fake is the same one the real command gives a platform without
+    // one: accept the state and do nothing. Faked rather than left to the
+    // fallback because the room pushes it on every layout change, and an
+    // unfixtured command puts the harness's gap banner on every screenshot.
+    menu_sync: () => null,
     feedback_draft: (a2) => ({
       title: (a2?.text ?? "").slice(0, 48) || "Untitled issue",
       body: `## What happened\n\n${a2?.text ?? ""}`,
@@ -1738,6 +1750,15 @@
     room_server_status: () => ({ running: false, url: "", config: "", scope: "files", stable: false, allowCloud: false }),
     // The Settings picker's live catalog (dynamic in the real app — a tiny
     // fixed sample here keeps the grouped select renderable offline).
+    // The room's RECOGNISED voices — the people it can name in a recording.
+    // Unfaked, this returned the fallback and Settings → Spoken voice threw on
+    // `.length` of null, so the whole sheet drew its error boundary instead:
+    // every screenshot of Settings in the vision dataset was a picture of a
+    // crash. Two entries so the list has a plural to render.
+    voices_list: () => [
+      { name: "Dana", seconds: 412, takes: 6, corrections: 0, updatedAt: iso(2880) },
+      { name: "Yonatan", seconds: 96, takes: 2, corrections: 1, updatedAt: iso(10080) },
+    ],
     list_neural_voices: () => [
       { id: "en-US-AndrewMultilingualNeural", gender: "Male", locale: "en-US" },
       { id: "en-US-AvaMultilingualNeural", gender: "Female", locale: "en-US" },

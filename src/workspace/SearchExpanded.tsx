@@ -733,7 +733,7 @@ export function SearchResultRows({
                   }
                 >
                   <span className="find-row-ico" aria-hidden>
-                    <FileTypeIcon file={shape} size={17} />
+                    <FileTypeIcon file={shape} size={16} />
                   </span>
                   <span className="find-row-main">
                     <span className="find-row-title" dir="auto">
@@ -793,7 +793,7 @@ export function SearchResultRows({
                   }
                 >
                   <span className="find-row-ico" aria-hidden>
-                    <ChatBubbleIcon size={17} />
+                    <ChatBubbleIcon size={16} />
                   </span>
                   <span className="find-row-main">
                     <span className="find-row-snippet find-row-lead" dir="auto">
@@ -831,7 +831,7 @@ export function SearchResultRows({
                   onClick={() => onOpenResult({ kind: "memory", id: m.id, snippet: m.snippet })}
                 >
                   <span className="find-row-ico" aria-hidden>
-                    <MemoryIcon size={17} />
+                    <MemoryIcon size={16} />
                   </span>
                   <span className="find-row-main">
                     <span className="find-row-snippet find-row-lead" dir="auto">

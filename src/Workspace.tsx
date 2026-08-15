@@ -24,6 +24,7 @@ import ViewerPane from "./workspace/ViewerPane";
 import AiPane from "./workspace/AiPane";
 import Toasts from "./workspace/Toasts";
 import { useLayout } from "./shell/useLayout";
+import { useNativeMenu } from "./shell/useNativeMenu";
 import ActivityRail from "./shell/ActivityRail";
 import CustomizeSidebar from "./shell/CustomizeSidebar";
 import Splitter from "./shell/Splitter";
@@ -95,6 +96,9 @@ export default function Workspace({ info, onLock, onRenamed }: Props) {
   // name lands in plain browser storage and two same-named rooms in different
   // folders stop sharing (and overwriting) one layout.
   const layout = useLayout(info.path);
+  // …and the same layout on the menu bar, where macOS users look for it. Owns
+  // ⌘1 and ⌘2 outright — see PANE_KEYS.
+  useNativeMenu(layout);
   // The "Customize sidebar" sheet. Local to the shell rather than in
   // `useWorkspaceState`: nothing outside this component raises it, and the
   // preferences it edits are their own device-wide store (shell/navPrefs).

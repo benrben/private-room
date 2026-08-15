@@ -139,13 +139,13 @@ export default function TrashPanel({
                 void a.restoreFiles(ids);
               }}
             >
-              <UndoIcon size={13} /> Restore
+              <UndoIcon size={14} /> Restore
             </button>
             {/* Its own confirm key and its own question: this one ends the
                 files, unlike the library's Remove which lands them here. */}
             <DeleteControl
               k="trash-destroy-selection"
-              trigger={<TrashIcon size={13} />}
+              trigger={<TrashIcon size={14} />}
               question={`Delete ${picked.length} file${picked.length === 1 ? "" : "s"} for good? This cannot be undone.`}
               title={`Delete ${picked.length} selected file${picked.length === 1 ? "" : "s"} for good`}
               onConfirm={() => {
@@ -196,7 +196,7 @@ export default function TrashPanel({
               aria-label={`Restore ${displayName(f.name)}`}
               onClick={() => void a.restoreFile(f.id)}
             >
-              <UndoIcon size={13} />
+              <UndoIcon size={14} />
             </button>
             {/* The armed confirm is a consent surface — ADD-25 blocks the
                 agent driver from clicking ✓ on a destruction it didn't earn.
@@ -206,7 +206,7 @@ export default function TrashPanel({
                 irreversible click look like the recoverable one. */}
             <DeleteControl
               k={`trash-destroy-${f.id}`}
-              trigger={<TrashIcon size={13} />}
+              trigger={<TrashIcon size={14} />}
               question="Delete for good? This cannot be undone."
               title={`Delete "${displayName(f.name)}" for good`}
               onConfirm={() => void a.destroyFile(f.id)}
@@ -246,7 +246,7 @@ export default function TrashPanel({
             className="qa-btn danger"
             onClick={() => a.askConfirm("trash-empty-all")}
           >
-            <TrashIcon size={13} /> Empty the trash
+            <TrashIcon size={14} /> Empty the trash
           </button>
         )}
       </div>

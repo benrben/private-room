@@ -27,7 +27,7 @@
   padding: var(--sp-3) var(--sp-4);
   border: 1px solid var(--line);
   /* Drawn, not computed — the asymmetric radius is the hand-made rectangle. */
-  border-radius: 10px 8px 11px 9px / 9px 11px 8px 10px;
+  border-radius: var(--radius);
   background: transparent;
   font-size: var(--fs-micro);
   color: var(--muted);
@@ -64,13 +64,11 @@
   color: var(--text);
 }
 
-/* A date, pencilled in beside the clipping. Kalam sits high and runs small
-   for its nominal size, so it is set at the metadata floor rather than at
-   --fs-micro, where it would fall under it. */
+/* A date beside the clipping — recorded by the room, so the sans, at the
+   metadata floor rather than under it. */
 .page-source-when {
-  font-family: var(--hand);
   font-size: var(--fs-meta);
-  line-height: var(--lh-hand);
+  line-height: var(--lh-body);
 }
 
 /* A URL is the one field that can be arbitrarily long; it gets to shrink, and

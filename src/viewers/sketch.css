@@ -97,7 +97,7 @@
 }
 
 /* One rule pair per pen, used by both the toolbar and the canvas. */
-.sk-ink-pink { color: var(--mk-pink-ink); }
+.sk-ink-pink { color: var(--mk-berry-ink); }
 .sk-ink-yellow { color: var(--mk-yellow-ink); }
 .sk-ink-green { color: var(--mk-green-ink); }
 .sk-ink-blue { color: var(--mk-blue-ink); }
@@ -204,7 +204,7 @@
 }
 @keyframes sk-land {
   from {
-    stroke: var(--mk-pink-ink);
+    stroke: var(--mk-berry-ink);
     opacity: 0.35;
   }
   to {
@@ -237,8 +237,7 @@
   font-size: var(--fs-meta);
 }
 .sk-hint {
-  font-family: var(--hand);
-  font-size: var(--fs-hand);
+  font-size: var(--fs-meta);
   color: var(--muted);
 }
 .sk-label-edit {
@@ -281,6 +280,7 @@
 }
 .sk-gallery-head h1 {
   font-size: var(--fs-section);
+  font-family: var(--display);
   margin: 0;
 }
 .sk-gallery-head p {
@@ -316,7 +316,6 @@
   font-size: var(--fs-card);
 }
 .sk-card-meta {
-  font-family: var(--hand);
   font-size: var(--fs-meta);
   color: var(--muted);
 }

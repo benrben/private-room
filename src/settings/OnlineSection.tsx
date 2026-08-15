@@ -163,7 +163,7 @@ export default function OnlineSection({
                 className="primary btn-ic"
                 onClick={() => void saveWebAccess().catch(() => {})}
               >
-                {webSaved ? (<><CircleCheckIcon size={13} /> Saved</>) : "Save"}
+                {webSaved ? (<><CircleCheckIcon size={14} /> Saved</>) : "Save"}
               </button>
             </div>
             {/* Unticking the internet switch and closing Settings used to

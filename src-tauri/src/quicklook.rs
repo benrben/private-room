@@ -200,7 +200,13 @@ mod tests {
         let a = temp_path_for("noext");
         let b = temp_path_for("noext");
         assert_ne!(a, b, "two renders of the same name reused one temp path");
-        assert!(preview_png("noext", b"hello").is_none() || true);
+        // Render an extension-less name for real. Whether QuickLook produces a
+        // thumbnail for it is the environment's business and not what this test
+        // is about — what matters is that the call cannot leave a decrypted
+        // copy behind, which the assertion below is the one that states.
+        // (This was `assert!(… .is_none() || true)`, which asserts nothing:
+        // `|| true` is true whatever the call returns.)
+        let _ = preview_png("noext", b"hello");
         assert_eq!(leftovers("-noextprobe"), 0);
     }
 

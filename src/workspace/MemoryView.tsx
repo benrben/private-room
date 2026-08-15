@@ -262,7 +262,7 @@ export default function MemoryView({
         {s.memories.length > 0 && (
           <div className="mem-tools">
             <label className="search-field">
-              <SearchIcon size={13} />
+              <SearchIcon size={14} />
               <input
                 type="search"
                 placeholder="Filter memories"
@@ -277,7 +277,7 @@ export default function MemoryView({
                   aria-label="Clear the filter"
                   onClick={() => setFilter("")}
                 >
-                  <CloseIcon size={11} />
+                  <CloseIcon size={12} />
                 </button>
               )}
             </label>
@@ -396,7 +396,7 @@ export default function MemoryView({
                       </select>
                       <span className="mem-actions">
                         <button className="chip-btn" title="Save" aria-label="Save" onClick={a.saveMemoryEdit}>
-                          <CheckIcon size={13} />
+                          <CheckIcon size={14} />
                         </button>
                         <button
                           className="chip-btn"
@@ -404,7 +404,7 @@ export default function MemoryView({
                           aria-label="Cancel"
                           onClick={() => s.setEditingMemory(null)}
                         >
-                          <CloseIcon size={13} />
+                          <CloseIcon size={14} />
                         </button>
                       </span>
                     </li>
@@ -434,7 +434,7 @@ export default function MemoryView({
                             })
                           }
                         >
-                          <PencilIcon size={13} />
+                          <PencilIcon size={14} />
                         </button>
                         <DeleteControl
                           k={`mem:${m.id}`}
@@ -475,7 +475,7 @@ export default function MemoryView({
               never becomes memory automatically.
             </p>
             <button className="subtle btn-ic" onClick={() => void a.openScratchPad()}>
-              <PencilIcon size={13} /> Open the scratch pad
+              <PencilIcon size={14} /> Open the scratch pad
             </button>
           </div>
         </section>

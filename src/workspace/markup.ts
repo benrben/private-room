@@ -255,17 +255,12 @@ const HAND_STOPPERS: RegExp[] = [
   NON_LATIN,
 ];
 
-/** Can the handwriting face render this text at all?
- *
- * Separate from `isHandwritten` because the two questions come apart on LONG
- * answers: the brief asks for a long reply to be clean body text with
- * handwritten HEADINGS, so the message goes to the sans while its headings
- * still take the hand. A Hebrew or CJK heading inside such an answer would
- * then be drawn in a face with none of its glyphs — so the heading rule is
- * gated on this instead of on `isHandwritten`. */
-export function isLatinScript(text: string): boolean {
-  return !NON_LATIN.test(text);
-}
+/* `isLatinScript` used to live here, and it answered one question for one
+ * caller: a LONG answer went to the sans but kept handwritten HEADINGS, and a
+ * Hebrew or CJK heading would then have been drawn in a face with none of its
+ * glyphs. Model-written headings are set in the sans now (chat.css §7), so
+ * there is no face left to keep them out of and nothing to gate. NON_LATIN
+ * stays — `isHandwritten` below still needs it, for the same reason. */
 
 /** Should this message be set in the hand? Length first, then kind. */
 export function isHandwritten(text: string): boolean {

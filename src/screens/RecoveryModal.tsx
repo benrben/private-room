@@ -58,7 +58,7 @@ export function RecoveryModal({
         <div className="recovery-sheet nb-float nb-float-draw">
           <div className="recovery-sheet-title" id="recovery-modal-title">
             <span className="gate-sheet-title">
-              <RecoveryKeyIcon size={18} /> Your recovery code
+              <RecoveryKeyIcon size={16} /> Your recovery code
             </span>
           </div>
           <div className="recovery-code">{recoveryCode}</div>
@@ -81,7 +81,7 @@ export function RecoveryModal({
                 }
               }}
             >
-              {recoveryCopied ? (<><CircleCheckIcon size={13} /> Copied</>) : "Copy code"}
+              {recoveryCopied ? (<><CircleCheckIcon size={14} /> Copied</>) : "Copy code"}
             </button>
             <button type="button" onClick={() => window.print()}>
               Print

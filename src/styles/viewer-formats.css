@@ -127,8 +127,7 @@
   overflow-wrap: anywhere;
 }
 .doc-source-when {
-  font-family: var(--hand);
-  font-size: var(--fs-hand);
+  font-size: var(--fs-meta);
   line-height: 1;
   color: var(--ink-2);
 }
@@ -215,7 +214,7 @@
 .sheet-tabs button {
   font-size: 12px;
   padding: 4px 12px;
-  border-radius: 6px 4px 7px 5px / 5px 7px 4px 6px;
+  border-radius: var(--radius-xs);
 }
 
 .sheet-tabs button.active {
@@ -314,7 +313,7 @@
 .md-body pre {
   background: color-mix(in srgb, var(--page) 55%, transparent);
   border: 1px solid var(--line);
-  border-radius: 8px 6px 9px 7px / 7px 9px 6px 8px;
+  border-radius: var(--radius-sm);
   padding: 10px 13px;
   overflow-x: auto;
 }
@@ -480,14 +479,18 @@
 /* Source and text-only modes are documents in their own right: the same sheet
    every other reader gets, and mono ONLY for the raw markup. */
 .html-view .html-src,
-.html-view .html-text {
+.html-view .html-text,
+.book-view .book-text,
+.odoc-view .odoc-text {
   flex: 1;
   min-height: 0;
   overflow: auto;
   margin: 0;
   padding: var(--sp-6) var(--sp-6) var(--sp-8);
 }
-.html-view .html-doc {
+.html-view .html-doc,
+.book-view .html-doc,
+.odoc-view .html-doc {
   max-width: var(--doc-measure);
   margin: 0 auto;
   padding: var(--doc-pad-b) var(--doc-pad-i) calc(var(--doc-pad-b) * 2);
@@ -506,7 +509,9 @@
 }
 /* The page's own words are prose — interface face, page measure, and the
    fallback chain that keeps Hebrew and CJK rendering. */
-.html-view .html-text .html-doc {
+.html-view .html-text .html-doc,
+.book-view .book-text .html-doc,
+.odoc-view .odoc-text .html-doc {
   font-family: var(--sans);
   font-size: var(--fs-lead);
   line-height: 1.7;
@@ -560,7 +565,7 @@
 .img-wrap img {
   display: block;
   max-width: 100%;
-  border-radius: 8px 6px 9px 7px / 7px 9px 6px 8px;
+  border-radius: var(--radius-sm);
 }
 
 .img-box {
@@ -602,7 +607,7 @@
   margin: 8px 0 0;
   padding: var(--sp-2) 10px;
   border: 1px solid var(--border);
-  border-radius: 8px 6px 9px 7px / 7px 9px 6px 8px;
+  border-radius: var(--radius-sm);
   background: var(--surface-2, transparent);
 }
 .img-ocr > summary {

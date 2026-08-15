@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { FileContent, RoomInfo, formatSize } from "../api";
 import {
   ChevronLeftIcon,
@@ -23,6 +23,8 @@ import RoomMap from "../viewers/RoomMap";
 import { fileLabel, formatWhen, provenanceLine } from "./composer";
 import ViewerRouter from "./ViewerRouter";
 import CloudView from "../viewers/CloudView";
+import { frameSelectionOf } from "../viewers/frameSelection";
+import { textOf } from "../viewers/htmlText";
 import FrontPage from "./FrontPage";
 import MemoryView from "./MemoryView";
 import RecordingsPage from "./RecordingsPage";
@@ -33,6 +35,15 @@ import {
   ReadingProgress,
   useReadingProgress,
 } from "./ReaderShell";
+import {
+  inExcludedSurface,
+  inQuotableDocument,
+  quotableText,
+  searchableDocument,
+  verifiedFrameQuote,
+  type SearchableDocument,
+  withQuote,
+} from "./quoteSelection";
 import ConnectorsView from "./ConnectorsView";
 import { BrowserView } from "./BrowserView";
 import { WSState } from "./state";
@@ -154,6 +165,136 @@ export default function ViewerPane({
   // twice (the header used to ask `editModeOf` separately for the Edit
   // button and for Duplicate's own condition).
   const mode = openFile ? a.editModeOf(openFile.content) : null;
+
+  // "Quote this in chat": selecting text is the most natural way a person
+  // points at a passage, and until now the app dropped that gesture on the
+  // floor — the reader had to retype or copy-paste what was already under
+  // their cursor. Reading kinds only, never while editing, and never inside a
+  // surface that owns its own selection (see quoteSelection.ts).
+  const [quote, setQuote] = useState<{ text: string; top: number; left: number } | null>(
+    null,
+  );
+  useEffect(() => {
+    let raf = 0;
+    const read = () => {
+      raf = 0;
+      const sel = window.getSelection();
+      if (!sel || sel.isCollapsed || sel.rangeCount === 0) {
+        setQuote(null);
+        return;
+      }
+      // Both ends, not just the anchor: a drag that starts in the document and
+      // ends outside it is not a quote of the document.
+      if (
+        !inQuotableDocument(sel.anchorNode) ||
+        !inQuotableDocument(sel.focusNode) ||
+        inExcludedSurface(sel.anchorNode)
+      ) {
+        setQuote(null);
+        return;
+      }
+      const text = quotableText(
+        sel.toString(),
+        openFile?.content.kind ?? null,
+        s.editMode,
+      );
+      if (!text) {
+        setQuote(null);
+        return;
+      }
+      const r = sel.getRangeAt(0).getBoundingClientRect();
+      if (r.width === 0 && r.height === 0) {
+        setQuote(null);
+        return;
+      }
+      setQuote({ text, top: r.top, left: r.left + r.width / 2 });
+    };
+    // selectionchange fires continuously during a drag; one read per frame.
+    const onSel = () => {
+      if (raf) return;
+      raf = requestAnimationFrame(read);
+    };
+    // The coordinates come from a viewport-relative rect that nothing
+    // recomputes on scroll, so the button would sit over an unrelated
+    // paragraph the moment the reader moved. Dismissing rather than tracking
+    // is the honest choice AND the cheaper one: a control that appears exactly
+    // when it is wanted does not need to follow you around the page.
+    // Capturing, because the document scrolls inside `.viewer-body`, not the
+    // window, and scroll does not bubble.
+    const clear = () => setQuote(null);
+    document.addEventListener("selectionchange", onSel);
+    document.addEventListener("scroll", clear, true);
+    window.addEventListener("resize", clear);
+    return () => {
+      document.removeEventListener("selectionchange", onSel);
+      document.removeEventListener("scroll", clear, true);
+      window.removeEventListener("resize", clear);
+      if (raf) cancelAnimationFrame(raf);
+    };
+  }, [openFile?.content.kind, s.editMode]);
+  // A file swap leaves a stale button pinned over the new document.
+  useEffect(() => setQuote(null), [openFile?.id]);
+
+  /* THE SAME GESTURE, FROM INSIDE A SANDBOXED FRAME.
+     A saved page renders in an opaque `roomdoc://` frame, so the selection
+     above cannot see it: `selectionchange` never fires on this document and
+     `getSelection()` returns nothing. The frame reports its own selection
+     instead (see frameSelection.ts) — which makes the text a claim by an
+     untrusted document rather than something the app observed, so it is
+     checked three ways before it can be quoted: the sender must be a frame
+     inside the document being attributed to, that frame must be the one on
+     screen, and the passage must actually occur in the file the app holds.
+
+     The last check costs a page that BUILDS its text with script: the app has
+     no copy of what that page generated, so it cannot vouch for it and does
+     not offer it. Refusing to quote what cannot be verified is the point. */
+  /* Parsed on FIRST REPORT and cached per file, never on open.
+     Taking the document's text is a full parse of the page, and the reader it
+     was lifted from is explicit that most pages are never read that way — so
+     doing it eagerly here would charge every HTML file the cost of a feature
+     it may never use. The cache is a ref rather than state because producing
+     it must not re-render anything. */
+  const searchable = useRef<{ id: string; doc: SearchableDocument } | null>(null);
+  useEffect(() => {
+    const onMessage = (e: MessageEvent) => {
+      const report = frameSelectionOf(e.data);
+      if (!report) return;
+      const file = s.openFileRef.current;
+      if (!file || file.content.kind !== "html") return;
+      const frame = Array.from(document.querySelectorAll("iframe")).find(
+        (f) => f.contentWindow === e.source,
+      );
+      // `hidden` matters: the reader keeps the frame mounted across mode
+      // switches, and a stale selection inside an invisible page would put the
+      // button over whatever is on screen instead.
+      if (!frame || frame.hidden || !inQuotableDocument(frame)) return;
+      if (searchable.current?.id !== file.id) {
+        searchable.current = {
+          id: file.id,
+          doc: searchableDocument(textOf(file.content.text ?? "")),
+        };
+      }
+      const text = verifiedFrameQuote(
+        report.text,
+        searchable.current.doc,
+        file.content.kind,
+        s.editMode,
+      );
+      if (!text || !report.rect) {
+        setQuote(null);
+        return;
+      }
+      // The frame reports its own viewport; the button lives in ours.
+      const box = frame.getBoundingClientRect();
+      setQuote({
+        text,
+        top: box.top + report.rect.top,
+        left: box.left + report.rect.left + report.rect.width / 2,
+      });
+    };
+    window.addEventListener("message", onMessage);
+    return () => window.removeEventListener("message", onMessage);
+  }, [s.editMode]);
   // P1-4: lifted out of ViewerRouter, which used to own this hook entirely,
   // so the header's overflow menu can draw the same picker — see
   // TextEncoding.tsx. `enc` (not `encoding`) on purpose: ViewerRouter passes
@@ -236,6 +377,38 @@ export default function ViewerPane({
     s.ctxMenu !== null;
   return (
     <section className="viewer" aria-label="Workspace">
+      {quote && openFile && (
+        // Positioned over the selection, dismissed by the next selection
+        // change. `onMouseDown` with preventDefault, not onClick: a click
+        // would clear the selection before the handler could read it.
+        <button
+          className="quote-selection-btn"
+          style={{ top: quote.top, left: quote.left }}
+          onMouseDown={(e) => {
+            e.preventDefault();
+            s.setQuestion(withQuote(s.question, quote.text, openFile.content.name));
+            setQuote(null);
+            window.getSelection()?.removeAllRanges();
+            // The Assistant is hidden in two of the layout presets, and a quote
+            // landing in a box nobody can see is the same as no quote at all.
+            layout.showPane("ai");
+          }}
+        >
+          Quote in chat
+        </button>
+      )}
+      {s.openingFileId && s.openingFileId !== openFile?.id && (
+        // An overlay, not a branch in the ternary below. As a branch it did the
+        // opposite of its job twice over: it never appeared in the common case
+        // (opening a file while another is on screen, where `openFile` is still
+        // set), and on a FAILED open it unmounted and remounted whatever area
+        // page was showing — throwing away, for instance, a Create page's
+        // half-written prompt. Nothing that reports a wait should be able to
+        // destroy work.
+        <div className="viewer-opening" role="status">
+          Opening…
+        </div>
+      )}
       <div className="editor-breadcrumb-bar">
         <div className="editor-breadcrumb" title={openFile?.content.name}>
           <strong>{info.name}</strong>
@@ -345,7 +518,7 @@ export default function ViewerPane({
                   })
                 }
               >
-                <PencilIcon size={13} />
+                <PencilIcon size={14} />
               </button>
             )}
             <span className="viewer-actions">
@@ -372,7 +545,7 @@ export default function ViewerPane({
                       title={title}
                       onClick={() => s.setEditMode(!s.editMode)}
                     >
-                      {s.editMode ? <EyeIcon size={13} /> : <PencilIcon size={13} />}
+                      {s.editMode ? <EyeIcon size={14} /> : <PencilIcon size={14} />}
                       {s.editMode ? "Preview" : mode === "copy" ? "Edit as text" : "Edit"}
                     </button>
                   );
@@ -396,7 +569,7 @@ export default function ViewerPane({
                         void a.runScript(openFile.id);
                       }}
                     >
-                      <PlayIcon size={13} /> Run
+                      <PlayIcon size={14} /> Run
                     </button>
                   );
                 })()}
@@ -410,7 +583,7 @@ export default function ViewerPane({
                     disabled={s.asking}
                     onClick={a.makeMinutes}
                   >
-                    <SparkIcon size={13} /> Minutes
+                    <SparkIcon size={14} /> Minutes
                   </button>
                 )}
               {(() => {
@@ -430,7 +603,7 @@ export default function ViewerPane({
                   .map((sc) => ({
                     id: sc.fileId,
                     label: sc.name,
-                    icon: <PlayIcon size={13} />,
+                    icon: <PlayIcon size={14} />,
                     hint: `Run ${sc.name}`,
                     onRun: () => void a.runScript(sc.fileId),
                   }));
@@ -440,7 +613,7 @@ export default function ViewerPane({
                     open={s.qaScriptMenuOpen ?? false}
                     onOpenChange={(o) => s.setQaScriptMenuOpen(o)}
                     buttonLabel="Scripts"
-                    buttonIcon={<ScriptIcon size={13} />}
+                    buttonIcon={<ScriptIcon size={14} />}
                   />
                 );
               })()}
@@ -461,7 +634,7 @@ export default function ViewerPane({
                   .map((w) => ({
                     id: w.id,
                     label: w.name,
-                    icon: <WorkflowGlyph emoji={w.emoji} size={15} />,
+                    icon: <WorkflowGlyph emoji={w.emoji} size={14} />,
                     onRun: () =>
                       void a.runWorkflowOn(w.id, openFile.id, openFile.content.name),
                   }));
@@ -471,7 +644,7 @@ export default function ViewerPane({
                     open={s.qaFileMenuOpen ?? false}
                     onOpenChange={(o) => s.setQaFileMenuOpen(o)}
                     buttonLabel="Actions"
-                    buttonIcon={<SparkIcon size={13} />}
+                    buttonIcon={<SparkIcon size={14} />}
                   />
                 );
               })()}
@@ -481,7 +654,7 @@ export default function ViewerPane({
                 data-agent-blocked
                 onClick={() => a.exportOne(openFile.id, openFile.content.name)}
               >
-                <DownloadIcon size={13} /> Export
+                <DownloadIcon size={14} /> Export
               </button>
               {/* P1-4: everything else — the cloud-payload preview, Duplicate,
                   Copy all text, Dictate, History and the encoding picker that
@@ -537,7 +710,7 @@ export default function ViewerPane({
                             void a.duplicateOpenFile();
                           }}
                         >
-                          <PlusIcon size={13} /> Duplicate
+                          <PlusIcon size={14} /> Duplicate
                         </button>
                       )}
                       {openFile.content.text && (
@@ -579,7 +752,7 @@ export default function ViewerPane({
                           a.openHistory();
                         }}
                       >
-                        <TimeMachineIcon size={13} /> History
+                        <TimeMachineIcon size={14} /> History
                       </button>
                       {/* The encoding picker never shows here while editing:
                           picking a different encoding re-reads the file's raw
@@ -908,7 +1081,7 @@ export default function ViewerPane({
           </p>
           <div className="viewer-empty-actions">
             <button className="qa-btn primary" onClick={a.importFiles}>
-              <PlusIcon size={15} /> Add a file
+              <PlusIcon size={14} /> Add a file
             </button>
             <button
               className="qa-btn"
@@ -921,7 +1094,7 @@ export default function ViewerPane({
               }
               onClick={() => void a.startDeepSummary()}
             >
-              <SparkIcon size={15} /> Summarize room
+              <SparkIcon size={14} /> Summarize room
             </button>
             <button
               className="qa-btn"

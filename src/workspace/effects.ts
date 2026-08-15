@@ -221,6 +221,31 @@ export function useWorkspaceEffects(
     const unlistenImport = api.onImportProgress((p) => {
       s.setImportProgress(p.done >= p.total ? null : p);
     });
+    // PRIV-2: the room-wide half of the privacy scan. Settings renders the
+    // progress bar; this is for everyone who is NOT in Settings — Home's brief,
+    // and the person whose scan could not run at all.
+    //
+    // A scan that fails is the one background failure in this app that has to
+    // be heard: it is what stands between this room's real names and a cloud
+    // model, and until now its error rendered only inside a Settings section
+    // nobody had open. One terminal event per scan, so there is no cadence to
+    // manage — the same shape the failed-job branch above uses.
+    const unlistenScan = api.onPrivacyScan((p) => {
+      s.setPrivacyScanning(p.running);
+      if (p.running) return;
+      if (p.error) {
+        s.pushToast(
+          "error",
+          `Couldn't scan for private details — ${p.error}`,
+          { label: "Open privacy", run: () => {
+            s.setSettingsSection("set-cloud-privacy");
+            s.setShowSettings(true);
+          } },
+        );
+      }
+      // Finished, either way: the unscanned count has moved.
+      a.refreshPrivacy();
+    });
     // ADD-30: background-job cards — live counts, and on any terminal flag
     // re-read the job list so the card flips to Resume / disappears.
     // Job ids we've already pulled into `s.jobs`. A running tick for an id NOT in
@@ -243,8 +268,23 @@ export function useWorkspaceEffects(
         void a.refreshJobs();
         if (p.finished) {
           // The label names what finished ("Summary ready", "Full pass of …").
-          s.pushToast("success", p.label || "Background job finished.");
-          if (p.fileId) void a.viewFile(p.fileId);
+          //
+          // Opening what it produced is the right ending, but not ON TOP of the
+          // answer the reader is in the middle of: this fired unconditionally,
+          // so a summary landing mid-turn replaced the page under them. An
+          // interruption delivered during primary work costs measurably more
+          // than the same one delivered at a boundary, so a turn in flight
+          // downgrades the jump to an offer the toast carries — the same shape
+          // the mid-edit reload below uses, where a choice banner stands in for
+          // a remount that would have thrown work away.
+          const open = p.fileId ? () => void a.viewFile(p.fileId as string) : null;
+          const midTurn = s.askingRef.current;
+          s.pushToast(
+            "success",
+            p.label || "Background job finished.",
+            open && midTurn ? { label: "Open", run: open } : undefined,
+          );
+          if (open && !midTurn) open();
         } else if (p.paused) {
           s.pushToast("info", "Paused — resume it any time from the sidebar.");
         } else if (p.failed) {
@@ -292,6 +332,9 @@ export function useWorkspaceEffects(
     });
     const unlistenSkillsChanged = api.onSkillsChanged(() => {
       void a.refreshSkills();
+    });
+    const unlistenMemories = api.onMemoriesChanged(() => {
+      api.listMemories().then(s.setMemories).catch(readFailed("memories"));
     });
     const unlistenPull = listen<{ status: string; percent: number | null }>(
       "pull-progress",
@@ -386,6 +429,25 @@ export function useWorkspaceEffects(
     a.refreshWebAccess();
     a.refreshAutolock();
     a.refreshPrivacy();
+    // A scan scheduled at room-open can finish BEFORE this window mounts the
+    // listener above, and its terminal event is emitted once. The backend parks
+    // the reason; collect it here, at the one moment the event could have been
+    // missed. Read directly rather than through `refreshPrivacy` so it stays a
+    // one-shot: that function runs on every file change, and an error repeated
+    // on every import would be its own kind of noise.
+    api
+      .privacyStatus()
+      .then((st) => {
+        if (!st.lastScanError) return;
+        s.pushToast("error", `Couldn't scan for private details — ${st.lastScanError}`, {
+          label: "Open privacy",
+          run: () => {
+            s.setSettingsSection("set-cloud-privacy");
+            s.setShowSettings(true);
+          },
+        });
+      })
+      .catch(() => {});
     // GH #4: microphone clean-up is on unless the user opted out. Cached in
     // liveRec because acquireMic can't await IPC without losing the gesture.
     void api
@@ -507,6 +569,12 @@ export function useWorkspaceEffects(
       // Wave 5: scripts ARE files — a new/edited/imported script updates the
       // index (and a script that just ran wrote its outputs here).
       void a.refreshScripts();
+      // …and the unscanned-file count, which is a fact ABOUT the file list.
+      // Home used to fetch it itself, keyed on `files.length`; consolidating
+      // that into `refreshPrivacy` removed the trigger along with the
+      // duplicate call, and left the count frozen from mount in any room where
+      // no scan happens to finish (notably one with the privacy door off).
+      a.refreshPrivacy();
     });
     api
       .mcpStatus()
@@ -622,12 +690,14 @@ export function useWorkspaceEffects(
       unlistenPrivacy.then((fn) => fn());
       unlistenTokenUsage.then((fn) => fn());
       unlistenImport.then((fn) => fn());
+      unlistenScan.then((fn) => fn());
       unlistenJobs.then((fn) => fn());
       unlistenStudioStep.then((fn) => fn());
       unlistenWfNode.then((fn) => fn());
       unlistenWfChanged.then((fn) => fn());
       unlistenScriptApprove.then((fn) => fn());
       unlistenSkillsChanged.then((fn) => fn());
+      unlistenMemories.then((fn) => fn());
       unlistenPull.then((fn) => fn());
       unlistenDrop.then((fn) => fn());
       unlistenOpen.then((fn) => fn());

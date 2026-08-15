@@ -64,7 +64,7 @@ export default function HelpersSection({
                      draws — green means installed, pink means chosen. */
                   <div className="model-row active is-ok">
                     <span className="btn-ic">
-                      <CircleCheckIcon size={13} /> Ready — the AI can see and mark images
+                      <CircleCheckIcon size={14} /> Ready — the AI can see and mark images
                       {groundingModel ? <> (<code>{groundingModel}</code>)</> : null}.
                     </span>
                   </div>
@@ -101,7 +101,7 @@ export default function HelpersSection({
                 </label>
                 {embedInstalled ? (
                   <div className="model-row active is-ok">
-                    <span className="btn-ic"><CircleCheckIcon size={13} /> On — search understands meaning, not just words.</span>
+                    <span className="btn-ic"><CircleCheckIcon size={14} /> On — search understands meaning, not just words.</span>
                   </div>
                 ) : (
                   <>

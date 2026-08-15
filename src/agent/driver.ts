@@ -167,10 +167,16 @@ function uiSnapshot(): Record<string, unknown> {
   let summary = `${elements.length} interactive elements across ${
     regions.join("/") || "app"
   }`;
-  const viewerTitle = document
-    .querySelector(".viewer .viewer-title")
-    ?.textContent?.trim();
-  if (viewerTitle) summary += `; file viewer open: ${viewerTitle}`;
+  // There was a "; file viewer open: X" clause here, read from
+  // `.viewer .viewer-title`. The navigation redesign moved the file header off
+  // that class, and the only `.viewer-title` elements left inside `.viewer`
+  // belong to the Workflows and Scripts pages — which render ONLY when no file
+  // is open. So it announced "file viewer open: Workflows", a file that does
+  // not exist, in exactly the state it should have called empty. The model has
+  // no way to tell a fabricated file from a real one, and this file spends its
+  // length making sure it never has to. What the agent is looking at now
+  // travels with the question instead (`viewing`, in `ask`), which reaches
+  // every engine rather than only the local one.
   if (overflow > 0) summary += `; …and ${overflow} more (scroll to reveal)`;
 
   return { summary, count: elements.length, elements };
@@ -210,10 +216,33 @@ function truncate(s: string, max: number): string {
   return s.length > max ? `${s.slice(0, max - 1)}…` : s;
 }
 
+/** The element's text the way a screen reader takes it: a subtree marked
+ * `aria-hidden` is decoration and contributes nothing.
+ *
+ * `textContent` does not know that, and the tab strip is where it showed. A tab
+ * renders a short — sometimes model-generated — title in an `aria-hidden` span
+ * and the real file name in an `sr-only` one beside it, so the naive read
+ * glued them into "lease.pdflease.pdf", or welded an invented label onto a real
+ * name. The agent then handed that back to `open_file` as if it were a
+ * filename. Every icon in the app is `aria-hidden` too, so this is the correct
+ * reading everywhere, not a special case for tabs. */
+function visibleText(el: Element): string {
+  let out = "";
+  for (const node of Array.from(el.childNodes)) {
+    if (node.nodeType === Node.TEXT_NODE) {
+      out += node.nodeValue ?? "";
+    } else if (node instanceof Element) {
+      if (node.getAttribute("aria-hidden") === "true") continue;
+      out += visibleText(node);
+    }
+  }
+  return out;
+}
+
 function labelFor(el: Element): string {
   const aria = el.getAttribute("aria-label")?.trim();
   if (aria) return truncate(aria, 60);
-  const text = (el.textContent ?? "").replace(/\s+/g, " ").trim();
+  const text = visibleText(el).replace(/\s+/g, " ").trim();
   if (text) return truncate(text, 60);
   const placeholder = el.getAttribute("placeholder")?.trim();
   if (placeholder) return truncate(placeholder, 60);
@@ -360,6 +389,20 @@ function uiAct(args: Record<string, unknown>): Record<string, unknown> {
 
   const label = labelFor(el);
   const where = `${roleFor(el)}, ${regionFor(el)}`;
+
+  // The badges belong to the snapshot they were drawn for, and acting is what
+  // ends that snapshot: every branch below scrolls or types, so the numbers
+  // would sit pinned to coordinates the page has just moved out from under
+  // them. Only `uiSnapshot` cleared the layer, and its 2.5 s self-clear is long
+  // enough for the user to watch the marks lie. Clearing here keeps the
+  // strongest signal the agent has — "these are the things I can see" — true
+  // for exactly as long as it is true.
+  //
+  // Ahead of the switch, so the two argument guards below clear it too. That is
+  // deliberate and harmless: a call the agent got wrong is still the end of the
+  // snapshot it was reading, and the alternative is repeating this line in
+  // every acting branch.
+  removeSomLayer();
 
   switch (action) {
     case "click": {

@@ -89,6 +89,7 @@
   margin: 0 0 var(--sp-2);
   color: var(--text-strong);
   font-size: var(--fs-section);
+  font-family: var(--display);
   font-weight: 600;
   letter-spacing: -0.01em;
 }
@@ -110,7 +111,7 @@
   margin: var(--sp-3) 0;
   padding: var(--sp-3) var(--sp-4);
   border: 1px solid var(--line);
-  border-radius: 8px 6px 9px 7px / 7px 9px 6px 8px;
+  border-radius: var(--radius-sm);
   background: transparent;
   color: var(--text);
   font-family: var(--mono);
@@ -143,13 +144,13 @@
 /* Four fixed radius signatures rotated by position, so a column of rows does
    not look stamped from one die. Deterministic — position, never random. */
 .scripts-list > .script-row:nth-child(4n + 2) {
-  border-radius: 9px 12px 10px 11px / 12px 10px 11px 9px;
+  border-radius: var(--radius);
 }
 .scripts-list > .script-row:nth-child(4n + 3) {
-  border-radius: 12px 10px 9px 12px / 9px 11px 12px 10px;
+  border-radius: var(--radius);
 }
 .scripts-list > .script-row:nth-child(4n + 4) {
-  border-radius: 10px 11px 12px 9px / 11px 9px 10px 12px;
+  border-radius: var(--radius);
 }
 
 /* "Needs review" is a state the eye has to find across a long page, so the

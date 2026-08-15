@@ -606,7 +606,7 @@ export default function SkillsView({ s, a, info }: Props) {
                 <div className="sk-source-chips" aria-label="Skill source files">
                   {composeSourceFiles.map((file) => (
                     <span key={file.id} className="sk-source-chip">
-                      <FileTypeIcon file={file} size={13} />
+                      <FileTypeIcon file={file} size={14} />
                       <span title={file.name}>{displayName(file.name)}</span>
                       <button
                         type="button"
@@ -653,7 +653,7 @@ export default function SkillsView({ s, a, info }: Props) {
                     className={`subtle btn-ic${sourcePickerOpen ? " active" : ""}`}
                     onClick={() => setSourcePickerOpen((open) => !open)}
                   >
-                    <PaperclipIcon size={13} />
+                    <PaperclipIcon size={14} />
                     {composeSourceIds.length > 0
                       ? `${composeSourceIds.length} source${composeSourceIds.length === 1 ? "" : "s"}`
                       : "Add room files"}
@@ -690,7 +690,7 @@ export default function SkillsView({ s, a, info }: Props) {
                                 disabled={disabled}
                                 onChange={() => toggleComposeSource(file.id)}
                               />
-                              <FileTypeIcon file={file} size={15} />
+                              <FileTypeIcon file={file} size={14} />
                               <span>
                                 <strong title={file.name}>{displayName(file.name)}</strong>
                                 <small>{file.hasText ? `${file.mimeType || "file"} · ${formatSize(file.sizeBytes)}` : "No readable text yet"}</small>
@@ -713,8 +713,8 @@ export default function SkillsView({ s, a, info }: Props) {
             <div className="sk-section-head">
               <h2>In this room</h2>
               <div className="sk-section-actions">
-                <button className="subtle btn-ic" onClick={() => void importFolder()}><DownloadIcon size={13} /> Import folder</button>
-                <button className="subtle btn-ic" onClick={startNew}><PlusIcon size={13} /> New skill</button>
+                <button className="subtle btn-ic" onClick={() => void importFolder()}><DownloadIcon size={14} /> Import folder</button>
+                <button className="subtle btn-ic" onClick={startNew}><PlusIcon size={14} /> New skill</button>
               </div>
             </div>
 
@@ -780,8 +780,8 @@ export default function SkillsView({ s, a, info }: Props) {
       <div className="sk-editor-head">
         <button className="subtle" onClick={() => void leaveEditor()}>← All skills</button>
         <div className="sk-editor-actions">
-          {bundle && <button className="subtle btn-ic" onClick={() => void exportFolder()}><FolderIcon size={13} /> Export folder</button>}
-          <button className="primary btn-ic" disabled={!dirty || busy} onClick={() => void saveMetadata()}><SaveIcon size={13} /> {busy ? "Saving…" : "Save SKILL.md"}</button>
+          {bundle && <button className="subtle btn-ic" onClick={() => void exportFolder()}><FolderIcon size={14} /> Export folder</button>}
+          <button className="primary btn-ic" disabled={!dirty || busy} onClick={() => void saveMetadata()}><SaveIcon size={14} /> {busy ? "Saving…" : "Save SKILL.md"}</button>
         </div>
       </div>
 
@@ -862,7 +862,7 @@ export default function SkillsView({ s, a, info }: Props) {
               {confirmDelete ? (
                 <span>Delete this skill and every bundled resource? <button className="danger" onClick={() => void removeSkill()}>Delete permanently</button> <button className="subtle" onClick={() => setConfirmDelete(false)}>Cancel</button></span>
               ) : (
-                <button className="subtle btn-ic danger" onClick={() => setConfirmDelete(true)}><TrashIcon size={13} /> Delete skill</button>
+                <button className="subtle btn-ic danger" onClick={() => setConfirmDelete(true)}><TrashIcon size={14} /> Delete skill</button>
               )}
             </div>
           )}

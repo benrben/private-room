@@ -105,7 +105,7 @@ function Group({
                     disabled={i === 0}
                     onClick={() => nav.move(key, -1)}
                   >
-                    <ChevronUpIcon size={13} />
+                    <ChevronUpIcon size={14} />
                   </button>
                   <button
                     type="button"
@@ -114,7 +114,7 @@ function Group({
                     disabled={i === keys.length - 1}
                     onClick={() => nav.move(key, 1)}
                   >
-                    <ChevronDownIcon size={13} />
+                    <ChevronDownIcon size={14} />
                   </button>
                 </span>
                 {/* `switch`, not a checkbox: the row is not being SELECTED for

@@ -65,7 +65,7 @@ export default function SettingsModals({
           <div className="settings mcp-approve">
             <div className="settings-head">
               <span className="badge-label">
-                <LockIcon size={15} /> This room wants to start programs
+                <LockIcon size={14} /> This room wants to start programs
               </span>
             </div>
             <div className="settings-body">
@@ -251,7 +251,7 @@ function AddLinkModal({ s, a }: { s: WSState; a: WSActions }) {
           <span className="badge-label">
             {/* The sheet renames itself the moment a YouTube URL is
                 recognized — the mental model must never change mid-form. */}
-            <LinkIcon size={15} />{" "}
+            <LinkIcon size={14} />{" "}
             {isYoutube ? "Import YouTube video" : "Add a web link"}
           </span>
           <button

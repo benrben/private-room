@@ -20,8 +20,26 @@ const SILENCE_RMS = 0.02;
 /** How long the user has to stay quiet, AFTER having said something, before
  * hands-free treats the turn as finished and sends it — long enough to
  * survive a mid-sentence breath, short enough to still feel like a live
- * conversation. */
-const SILENCE_MS = 1500;
+ * conversation.
+ *
+ * 900 ms, not 1,500: batches land ~250 ms apart (liveRec's makeSink), so the
+ * real fire point is a granule later than whatever is written here, and the old
+ * value put it at 1.5–1.75 s — roughly a second past where voice interfaces
+ * end a turn. Not lower than 900 either: there is no semantic turn detector
+ * here, only energy, so the pause inside "the thing is… it depends" has to
+ * survive.
+ *
+ * What a premature cut costs, stated because it is not obvious from the call
+ * site: `dictStreamRef` stops the mic tracks, so anything said after the cut is
+ * never captured and never reported — the user simply finds half their sentence
+ * in the composer.
+ *
+ * Coupled to `SILENCE_RMS` above, which is calibrated with WebKit's voice
+ * processing ON (`liveRec.micConstraints`). A design that turns
+ * `echoCancellation` off changes the noise floor this threshold sits above, and
+ * the pair has to be re-measured together — see
+ * `pm-request/personalization-session-2026-08-14.md` §4.1. */
+const SILENCE_MS = 900;
 
 function rms(floats: Float32Array): number {
   let sum = 0;
@@ -32,7 +50,8 @@ function rms(floats: Float32Array): number {
 /** Wraps a dictation push callback with an energy-based "the user stopped
  * talking" watch: once real speech has been heard, SILENCE_MS of quiet
  * fires `onSilence` (once, ever, for this session). Batches land ~250ms
- * apart (liveRec's makeSink), plenty of resolution for a ~1.5s threshold.
+ * apart (liveRec's makeSink), so the real fire point is one granule past
+ * SILENCE_MS — see its doc for what that costs.
  * Decoding the batch back out of base64 is wasteful-looking but avoids
  * threading a second callback through createPcmTap for one caller. */
 function withSilenceGate(

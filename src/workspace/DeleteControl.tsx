@@ -70,10 +70,10 @@ export default function DeleteControl({
             onConfirm();
           }}
         >
-          <CheckIcon size={13} />
+          <CheckIcon size={14} />
         </button>
         <button className="chip-btn confirm-no" title="Keep" aria-label="Keep" onClick={cancelConfirm}>
-          <CloseIcon size={13} />
+          <CloseIcon size={14} />
         </button>
       </span>
     );

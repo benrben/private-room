@@ -108,7 +108,7 @@ export default function BehaviorSection({
             />
             <div className="settings-actions">
               <button className="primary btn-ic" onClick={saveTuning}>
-                {saved ? (<><CircleCheckIcon size={13} /> Saved</>) : "Save"}
+                {saved ? (<><CircleCheckIcon size={14} /> Saved</>) : "Save"}
               </button>
             </div>
             <label className="settings-label">

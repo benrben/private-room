@@ -151,7 +151,7 @@ export function EmptyChatArt() {
       {/* the room's own marker, under its middle line */}
       <path
         d="M22 70.5 L101 70 L101 80.5 L22.5 82 Z"
-        fill="var(--mk-pink)"
+        fill="var(--mk-berry)"
         fillOpacity="0.5"
       />
 

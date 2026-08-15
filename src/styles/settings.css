@@ -175,13 +175,15 @@
      shorter than 900px. */
   height: min(900px, 90vh);
   max-height: min(900px, 90vh);
+  /* NO PAPER TEXTURE, as of the visual pass, and this is the one surface in
+     the app where that is a statement rather than an omission. Settings is a
+     modal sheet — it FLOATS above the notebook rather than being a page of it,
+     which is why it is the only thing here with an opaque fill at all (see
+     paper.css's opening note). Printing the page's tooth onto something
+     stacked on top of the page is the single place the metaphor contradicted
+     itself, and it did so on the densest, most label-heavy surface the app
+     has, where the grain costs the most and reads as least deliberate. */
   background-color: var(--raised);
-  background-image: radial-gradient(
-    circle at 1px 1px,
-    var(--grid-dot) 1.1px,
-    transparent 1.2px
-  );
-  background-size: var(--grid-gap) var(--grid-gap);
 }
 
 .settings-sheet .settings-head {
@@ -200,6 +202,7 @@
    Home's alone. */
 .settings-sheet .settings-head-title {
   font-size: var(--fs-section);
+  font-family: var(--display);
   font-weight: 600;
   letter-spacing: -0.01em;
   line-height: 1.15;
@@ -375,7 +378,7 @@
   position: relative;
   padding: var(--sp-4) var(--sp-4) var(--sp-6);
   border: var(--stroke-w) solid color-mix(in srgb, var(--sketch) 62%, transparent);
-  border-radius: 11px 9px 12px 10px / 10px 12px 9px 11px;
+  border-radius: var(--radius);
   /* Transparent: the group is a FRAME on the sheet, so the dots keep running
      through it. This is the difference between the notebook and a stack of
      grey boxes. */
@@ -389,13 +392,13 @@
    .nb-frame-set does it, so a column of six groups does not look stamped from
    one template. Deterministic — a frame draws identically on every render. */
 .settings-sheet .settings-page > section:nth-of-type(4n + 2) {
-  border-radius: 9px 12px 10px 11px / 12px 10px 11px 9px;
+  border-radius: var(--radius);
 }
 .settings-sheet .settings-page > section:nth-of-type(4n + 3) {
-  border-radius: 12px 10px 9px 12px / 9px 11px 12px 10px;
+  border-radius: var(--radius);
 }
 .settings-sheet .settings-page > section:nth-of-type(4n + 4) {
-  border-radius: 10px 11px 12px 9px / 11px 9px 10px 12px;
+  border-radius: var(--radius);
 }
 
 /* Deep-link flash: when the status-bar trust chip (or any jump) opens Settings

@@ -27,7 +27,7 @@
   color: var(--text-dim);
   background: var(--panel-2);
   border: 1px solid var(--border);
-  border-radius: 6px 4px 7px 5px / 5px 7px 4px 6px;
+  border-radius: var(--radius-xs);
   cursor: pointer;
   opacity: 0;
   transition: opacity 0.12s ease, color 0.12s ease, border-color 0.12s ease;
@@ -55,7 +55,7 @@
   text-align: center;
   background: var(--panel-2);
   border: 1.5px solid var(--sketch);
-  border-radius: 12px 10px 13px 11px / 11px 13px 10px 12px;
+  border-radius: var(--radius-lg);
 }
 .pdf-failed-title {
   font-weight: 650;
@@ -81,7 +81,7 @@
   padding: 4px 6px;
   background: var(--panel-2);
   border: 1px solid var(--border);
-  border-radius: 8px 6px 9px 7px / 7px 9px 6px 8px;
+  border-radius: var(--radius-sm);
   box-shadow: 0 2px 10px rgba(0, 0, 0, 0.4);
 }
 
@@ -209,7 +209,7 @@
   width: 100%;
   padding: 10px 12px;
   border: 1px solid var(--rule-strong);
-  border-radius: 8px 6px 9px 7px / 7px 9px 6px 8px;
+  border-radius: var(--radius-sm);
   background: transparent;
   color: var(--text);
   font-weight: 600;

@@ -1499,7 +1499,7 @@ pub(crate) fn to_svg(doc: &Sketch) -> String {
                 let mut d = String::new();
                 if let Some(first) = points.first() {
                     let _ = write!(d, "M{} {}", first[0], first[1]);
-                    for win in points.windows(2).skip(0) {
+                    for win in points.windows(2) {
                         let (a, b) = (win[0], win[1]);
                         let _ = write!(
                             d,

@@ -221,6 +221,13 @@ export function useWorkspaceState(_info: RoomInfo) {
   // PRIV-1: is the cloud-privacy door effectively ON for this room? null =
   // not loaded yet. Drives the loud OFF banner and the composer badge truth.
   const [privacyOn, setPrivacyOn] = useState<boolean | null>(null);
+  // The other two facts the SAME `privacyStatus()` call already returns. Home
+  // used to fetch them again on its own, keyed on the file count, so the count
+  // froze for as long as no file was added and the scan state was never read
+  // at all — while a second IPC round trip asked for everything and kept one
+  // field. One call, one place, every reader.
+  const [privacyPending, setPrivacyPending] = useState(0);
+  const [privacyScanning, setPrivacyScanning] = useState(false);
   // PRIV-1: what the door did on the latest finished turn (the chat chip),
   // per conversation — it describes THAT chat's last turn, and survives the
   // turn ending, so it cannot live in `runs`.
@@ -406,6 +413,14 @@ export function useWorkspaceState(_info: RoomInfo) {
   const errorLogRef = useRef<{ at: string; text: string }[]>([]);
   const openFileRef = useRef<OpenFile | null>(null);
   openFileRef.current = openFile;
+  // A file whose bytes are still being fetched. `viewFile` awaits
+  // `get_file_content` — a synchronous command that takes the room mutex —
+  // BEFORE it sets `openFile`, so the most-used action in the app showed
+  // nothing at all until the bytes landed and read as a dead click. Deliberately
+  // a separate flag rather than making `openFile.content` optional: that shape
+  // is read across the whole viewer pane, and duplicating one id is cheaper
+  // than reshaping a type for one call site.
+  const [openingFileId, setOpeningFileId] = useState<string | null>(null);
   // Wave 1b (idea 10): the mount-once onFileUpdated listener captures the
   // first render's closure, so it reads edit state through refs (the
   // openFileRef pattern above). editorDirtyRef mirrors the Monaco buffer's
@@ -622,7 +637,11 @@ export function useWorkspaceState(_info: RoomInfo) {
         const victim = oldestChatty >= 0 ? oldestChatty : 0;
         return next.filter((_, i) => i !== victim);
       });
-      if (kind === "error") return;
+      // A toast carrying an ACTION waits too. It is not a notice, it is an
+      // offer — the only route to something the app deliberately did not do
+      // for you (open the file a background job just produced, while you were
+      // mid-answer). Five seconds turns "later" into "never", silently.
+      if (kind === "error" || action) return;
       window.setTimeout(
         () => setToasts((t) => t.filter((x) => x.id !== id)),
         5000,
@@ -652,7 +671,8 @@ export function useWorkspaceState(_info: RoomInfo) {
     dragOver, setDragOver, renaming, setRenaming,
     renameDraft, setRenameDraft, pullingModel, setPullingModel, pullingModelRef,
     pullStatus, setPullStatus, pullPercent, setPullPercent, pullError, setPullError,
-    openFile, setOpenFile, viewerRev, setViewerRev, editMode, setEditMode,
+    openFile, setOpenFile, openingFileId, setOpeningFileId,
+    viewerRev, setViewerRev, editMode, setEditMode,
     staleFile, setStaleFile, editModeRef, editorDirtyRef, memAutoSaveRef,
     editorSaveRef, pendingLeave, setPendingLeave,
     memoryDraft, setMemoryDraft, memoryDraftCat, setMemoryDraftCat,
@@ -662,7 +682,8 @@ export function useWorkspaceState(_info: RoomInfo) {
     mcpDialogDismissed, setMcpDialogDismissed, approvingMcp, setApprovingMcp,
     showAddLink, setShowAddLink, linkUrl, setLinkUrl, importingLink, setImportingLink,
     webOn, setWebOn, advisorToolsOn, setAdvisorToolsOn,
-    privacyOn, setPrivacyOn, askPrivacy, setAskPrivacy,
+    privacyOn, setPrivacyOn, privacyPending, setPrivacyPending,
+    privacyScanning, setPrivacyScanning, askPrivacy, setAskPrivacy,
     tokenUsage, setChatUsage, handoffStarting, setHandoffStarting,
     showHistory, setShowHistory, versions, setVersions, versionsKept, setVersionsKept,
     headProvenance, setHeadProvenance,

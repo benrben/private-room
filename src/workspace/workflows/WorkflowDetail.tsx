@@ -303,7 +303,7 @@ export function WorkflowDetail({ s, a, workflow }: Props) {
             aria-label="Choose an icon for this workflow"
             onClick={() => setShowIconPicker((v) => !v)}
           >
-            <WorkflowGlyph emoji={emoji} size={18} />
+            <WorkflowGlyph emoji={emoji} size={16} />
           </button>
           {showIconPicker && (
             <>
@@ -324,7 +324,7 @@ export function WorkflowDetail({ s, a, workflow }: Props) {
                       /* dirty is derived from a diff */
                     }}
                   >
-                    <WorkflowGlyph emoji={c.key} size={18} />
+                    <WorkflowGlyph emoji={c.key} size={16} />
                   </button>
                 ))}
               </div>

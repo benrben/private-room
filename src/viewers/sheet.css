@@ -72,7 +72,7 @@
   background: transparent;
   border: 1px solid transparent;
   /* Drawn on top, open at the bottom onto the rule. */
-  border-radius: 8px 6px 0 0 / 7px 9px 0 0;
+  border-radius: var(--radius-sm);
   font-size: var(--fs-meta);
   max-width: 26ch;
   overflow: hidden;
@@ -391,7 +391,7 @@
 }
 
 /* Figures keep the interface face on purpose. `.num` cells already carry
-   `font-variant-numeric: tabular-nums`, which gives Manrope a fixed digit
+   `font-variant-numeric: tabular-nums`, which gives Figtree a fixed digit
    advance — so the column lines up — and the mono face would change the
    advance instead. With `table-layout: fixed` plus `text-overflow:
    ellipsis`, a wider glyph means a number that fits today gets clipped to
@@ -532,15 +532,15 @@
   letter-spacing: 0.12em;
   text-transform: uppercase;
 }
-/* Counts, in the hand — a margin annotation on the sheet, not a heading. */
+/* The glance: counts the sheet worked out. Sans, and a tier under the label
+   beside it, so it reads as data rather than as a second heading. */
 .sheet-notes-glance {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-family: var(--hand);
-  font-size: var(--fs-hand);
-  line-height: var(--lh-hand);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
   color: var(--faint);
 }
 

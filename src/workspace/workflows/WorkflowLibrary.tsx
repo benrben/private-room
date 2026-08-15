@@ -69,7 +69,7 @@ function ComposeBar({ s, a }: Props) {
           the hand: handwriting is reserved for asides, not for directions. */}
       <div className="wf-compose-head">
         <span className="wf-compose-spark" aria-hidden="true">
-          <SparklesIcon size={17} />
+          <SparklesIcon size={16} />
         </span>
         <span>Describe a workflow and let the assistant build it</span>
       </div>
@@ -222,7 +222,7 @@ export function WorkflowLibrary({ s, a }: Props) {
           >
             <div className="wf-card-top">
               <span className="wf-card-emoji">
-                <WorkflowGlyph emoji={t.emoji} size={17} />
+                <WorkflowGlyph emoji={t.emoji} size={16} />
               </span>
               <span className="wf-card-name">{t.name}</span>
             </div>
@@ -237,7 +237,7 @@ export function WorkflowLibrary({ s, a }: Props) {
       <div className="wf-card wf-card-blank" {...cardButton(() => void a.createBlankWorkflow())}>
         <div className="wf-card-top">
           <span className="wf-card-emoji">
-            <PlusIcon size={17} />
+            <PlusIcon size={16} />
           </span>
           <span className="wf-card-name">Blank workflow</span>
         </div>
@@ -273,10 +273,10 @@ export function WorkflowLibrary({ s, a }: Props) {
           aria-pressed={showTemplates}
           onClick={() => setShowTemplates((v) => !v)}
         >
-          <SparklesIcon size={13} /> {showTemplates ? "Hide templates" : "From template"}
+          <SparklesIcon size={14} /> {showTemplates ? "Hide templates" : "From template"}
         </button>
         <button className="nb-btn wf-new-btn btn-ic" onClick={() => void a.createBlankWorkflow()}>
-          <PlusIcon size={13} /> New workflow
+          <PlusIcon size={14} /> New workflow
         </button>
       </div>
       {showTemplates && (
@@ -302,12 +302,12 @@ export function WorkflowLibrary({ s, a }: Props) {
             >
               <div className="wf-card-top">
                 <span className="wf-card-emoji">
-                  <WorkflowGlyph emoji={w.emoji} size={17} />
+                  <WorkflowGlyph emoji={w.emoji} size={16} />
                 </span>
                 <span className="wf-card-name">{w.name}</span>
                 {w.pinned && (
                   <span className="wf-card-pin" title="Pinned to the top bar" aria-label="Pinned to the top bar">
-                    <PinIcon size={13} />
+                    <PinIcon size={14} />
                   </span>
                 )}
               </div>

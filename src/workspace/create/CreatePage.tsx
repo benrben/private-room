@@ -222,7 +222,7 @@ export function CreatePage({ s, a }: { s: WSState; a: WSActions }) {
                   </div>
                   {surface !== "story" && (
                     <label className="cr-search">
-                      <SearchIcon size={13} />
+                      <SearchIcon size={14} />
                       <input
                         type="search"
                         value={query}
@@ -840,7 +840,7 @@ function Bench({
                 className={`cr-opt${seconds === v ? " is-on pick-on" : ""}`}
                 onClick={() => onSeconds(seconds === v ? null : v)}
               >
-                {seconds === v && <CheckIcon size={10} />}
+                {seconds === v && <CheckIcon size={12} />}
                 {v}s
               </button>
             ))}
@@ -907,7 +907,7 @@ function Bench({
               className={`cr-opt${variations === n ? " is-on pick-on" : ""}`}
               onClick={() => onVariations(n)}
             >
-              {variations === n && <CheckIcon size={10} />}
+              {variations === n && <CheckIcon size={12} />}
               {n}
             </button>
           ))}
@@ -921,7 +921,7 @@ function Bench({
           consent, and this is the only thing that opens the privacy door. */}
       {selected && !selected.local && (
         <div className="cr-seam">
-          <LockIcon size={13} />
+          <LockIcon size={14} />
           <p>
             This runs on {selected.engineLabel}, so the words you type leave this
             Mac — the room’s privacy door redacts them first.

@@ -204,7 +204,7 @@
      mixed down into the rule colour: this badge is how the room states where
      its content goes, and a hairline nobody can see is not a statement. */
   border: 1px solid var(--green);
-  border-radius: 6px 4px 7px 5px / 5px 7px 4px 6px;
+  border-radius: var(--radius-xs);
   color: var(--green);
   background: transparent;
   font-size: var(--fs-micro);
@@ -251,7 +251,7 @@
   color: var(--muted);
   background: transparent;
   border: 1px solid transparent;
-  border-radius: 6px 4px 7px 5px / 5px 7px 4px 6px;
+  border-radius: var(--radius-xs);
   white-space: nowrap;
   font-size: var(--fs-micro);
 }
@@ -332,7 +332,7 @@
   margin-left: 3px;
   background: transparent;
   border: 1px solid var(--rule-strong);
-  border-radius: 6px 4px 7px 5px / 5px 7px 4px 6px;
+  border-radius: var(--radius-xs);
   color: var(--text);
   font-size: var(--fs-micro);
   transition: background var(--dur-fast) var(--ease-pen),
@@ -646,7 +646,7 @@
   color: var(--text);
   background: var(--raised);
   border: 1px solid var(--sketch);
-  border-radius: 6px 4px 7px 5px / 5px 7px 4px 6px;
+  border-radius: var(--radius-xs);
   padding: 5px 8px;
   white-space: nowrap;
   font-size: var(--fs-micro);
@@ -824,11 +824,12 @@ body.resizing-col * {
   font-weight: 500;
   letter-spacing: 0.01em;
 }
-/* A count, circled by hand — the same mark paper.css's .nb-circled makes, in
+/* A count in a drawn ring — the same mark paper.css's .nb-circled makes, in
    the pane header's neutral ink rather than a semantic one, because "how many
-   files are in this room" is a fact and not a state. Kept in step with that
-   primitive's geometry so two circled numbers on screen at once (this and the
-   rail's) read as the same pen. */
+   files are in this room" is a fact and not a state. The RING is the notebook
+   here; the number inside it is a total the app counted and reads in the sans.
+   Kept in step with that primitive's geometry so two circled numbers on screen
+   at once (this and the rail's) read as the same pen. */
 .count-badge {
   display: inline-grid;
   place-items: center;
@@ -838,7 +839,6 @@ body.resizing-col * {
   background: transparent;
   border: 1.5px solid var(--rule-strong);
   border-radius: 60% 55% 58% 62% / 58% 62% 55% 60%;
-  font-family: var(--hand);
   font-size: var(--fs-micro);
   line-height: 1.15;
   padding: 0 5px;
@@ -1131,7 +1131,7 @@ button.status-trust.danger:hover {
   color: var(--muted);
   background: var(--panel-2);
   border: 1px solid var(--line);
-  border-radius: 6px 4px 7px 5px / 5px 7px 4px 6px;
+  border-radius: var(--radius-xs);
 }
 .file-sort select:focus-visible {
   border-color: var(--accent);
@@ -1148,7 +1148,7 @@ button.status-trust.danger:hover {
   color: var(--muted);
   background: var(--panel-2);
   border: 1px solid var(--line);
-  border-radius: 6px 4px 7px 5px / 5px 7px 4px 6px;
+  border-radius: var(--radius-xs);
 }
 .search-field:focus-within {
   border-color: var(--accent);
@@ -1241,7 +1241,7 @@ button.status-trust.danger:hover {
   color: var(--text);
   background: var(--panel-2);
   border: 1px solid var(--line);
-  border-radius: 6px 4px 7px 5px / 5px 7px 4px 6px;
+  border-radius: var(--radius-xs);
   font-size: var(--fs-micro);
   padding: 0;
 }
@@ -1259,7 +1259,7 @@ button.status-trust.danger:hover {
   align-items: center;
   gap: 2px;
   padding: 2px 5px;
-  border-radius: 6px 4px 7px 5px / 5px 7px 4px 6px;
+  border-radius: var(--radius-xs);
   color: var(--muted);
 }
 .source-row:hover {
@@ -1375,7 +1375,7 @@ button.status-trust.danger:hover {
   color: var(--muted);
   background: transparent;
   border: 0;
-  border-radius: 6px 4px 7px 5px / 5px 7px 4px 6px;
+  border-radius: var(--radius-xs);
   text-align: left;
 }
 .area-nav-row:hover {
@@ -1472,7 +1472,7 @@ button.status-trust.danger:hover {
   padding: 2px 9px 2px 6px;
   border: 1px solid var(--line);
   /* The same uneven pen-drawn radius the other small paper controls use. */
-  border-radius: 7px 4px 8px 5px / 5px 8px 4px 7px;
+  border-radius: var(--radius-xs);
   background: transparent;
   color: var(--muted);
   font-size: var(--fs-micro);
@@ -1578,7 +1578,7 @@ button.status-trust.danger:hover {
   color: var(--muted);
   background: transparent;
   border: 1px solid transparent;
-  border-radius: 6px 4px 7px 5px / 5px 7px 4px 6px;
+  border-radius: var(--radius-xs);
   font-size: var(--fs-meta);
   line-height: 1;
 }
@@ -1640,7 +1640,7 @@ button.status-trust.danger:hover {
   margin: var(--sp-2) 10px 0;
   padding: 7px 9px;
   border: 1px solid var(--line);
-  border-radius: 6px 4px 7px 5px / 5px 7px 4px 6px;
+  border-radius: var(--radius-xs);
   background: var(--panel-2);
   font-size: 11px;
   color: var(--muted);
@@ -1689,7 +1689,7 @@ button.status-trust.danger:hover {
   color: var(--text);
   background: transparent;
   border: 0;
-  border-radius: 7px 5px 8px 6px / 6px 8px 5px 7px;
+  border-radius: var(--radius-xs);
   border-bottom: 1px solid var(--line-soft);
 }
 .studio-row:hover:not(:disabled) {
@@ -1702,7 +1702,7 @@ button.status-trust.danger:hover {
 .studio-row-icon {
   width: 27px;
   height: 27px;
-  border-radius: 6px 4px 7px 5px / 5px 7px 4px 6px;
+  border-radius: var(--radius-xs);
   display: grid;
   place-items: center;
   color: var(--accent-2);
@@ -1732,7 +1732,7 @@ button.status-trust.danger:hover {
   margin-top: 18px;
   padding: 11px;
   border: 1px solid var(--line);
-  border-radius: 7px 5px 8px 6px / 6px 8px 5px 7px;
+  border-radius: var(--radius-xs);
   color: var(--muted);
   background: var(--panel-2);
   font-size: 11px;
@@ -1791,7 +1791,7 @@ button.status-trust.danger:hover {
 
 /* Compact, calm library file rows. */
 .file-row {
-  border-radius: 6px 4px 7px 5px / 5px 7px 4px 6px;
+  border-radius: var(--radius-xs);
   min-height: 33px;
 }
 .file-row.selected {
@@ -1857,7 +1857,7 @@ button.status-trust.danger:hover {
   font-size: var(--fs-body);
 }
 .search-result {
-  border-radius: 6px 4px 7px 5px / 5px 7px 4px 6px;
+  border-radius: var(--radius-xs);
   padding: 7px 10px;
 }
 .search-result.sel {
@@ -1961,7 +1961,10 @@ button.status-trust.danger:hover {
 @media (prefers-reduced-motion: reduce) {
   .activity-progress span.indeterminate {
     animation: none;
-    width: 100%;
+    /* Keep the 40% stub. `width: 100%` filled the track for a job whose
+       position is precisely what is NOT known, so the one reader who cannot
+       see the animation was shown a finished bar over work that had barely
+       started. Reduced motion removes the movement, never the meaning. */
     opacity: 0.5;
   }
 }
@@ -2037,7 +2040,7 @@ button.status-trust.danger:hover {
   gap: 10px;
   padding: 10px var(--sp-3);
   border: 1px solid var(--line-soft);
-  border-radius: 8px 6px 9px 7px / 7px 9px 6px 8px;
+  border-radius: var(--radius-sm);
   background: var(--panel-2);
   font-size: var(--fs-meta);
   color: var(--text);
@@ -2243,7 +2246,7 @@ button.status-trust.danger:hover {
   padding: 0 6px 0 11px;
   border: none;
   background: transparent;
-  border-radius: 8px 10px 0 0 / 9px 7px 0 0;
+  border-radius: var(--radius-sm);
   color: var(--muted);
   font-size: var(--fs-meta);
   cursor: default;

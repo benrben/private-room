@@ -53,7 +53,7 @@ export function ScriptRow({ sc, s, a }: { sc: ScriptInfo; s: WSState; a: WSActio
     <div className={`script-row${sc.changedSinceApproval ? " needs-review" : ""}`}>
       <div className="script-row-main">
         <span className="script-row-title" title={sc.name}>
-          <ScriptIcon size={15} /> {sc.name}
+          <ScriptIcon size={14} /> {sc.name}
           <span className="script-lang">{sc.lang}</span>
         </span>
         {sc.changedSinceApproval && (
@@ -214,7 +214,7 @@ export function ScriptRow({ sc, s, a }: { sc: ScriptInfo; s: WSState; a: WSActio
           disabled={!!live}
           onClick={() => void a.runScript(sc.fileId)}
         >
-          <PlayIcon size={13} /> {sc.approved ? "Run" : "Review script"}
+          <PlayIcon size={14} /> {sc.approved ? "Run" : "Review script"}
         </button>
         {/* Scheduling requires an approved script (the executor parks a scheduled
             run whose content isn't approved on this Mac). */}
@@ -225,7 +225,7 @@ export function ScriptRow({ sc, s, a }: { sc: ScriptInfo; s: WSState; a: WSActio
               title="Schedule this script"
               onClick={() => setSchedOpen((o) => !o)}
             >
-              <ClockIcon size={13} />
+              <ClockIcon size={14} />
               {sc.schedule?.enabled ? `${sc.schedule.kind}` : "Schedule"}
             </button>
             {schedOpen && (
@@ -249,7 +249,7 @@ export function ScriptRow({ sc, s, a }: { sc: ScriptInfo; s: WSState; a: WSActio
             title="Run this script once and choose “Always allow” — then you can schedule it."
           >
             <button className="subtle btn-ic" disabled aria-disabled="true">
-              <ClockIcon size={13} /> Schedule
+              <ClockIcon size={14} /> Schedule
             </button>
           </span>
         )}

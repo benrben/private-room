@@ -80,11 +80,11 @@ export function StartScreen({
           className="gate-action gate-action-lead nb-btn-go"
           onClick={onCreate}
         >
-          <PlusIcon size={18} />
+          <PlusIcon size={16} />
           Create New Room
         </button>
         <button className="gate-action" onClick={onOpen}>
-          <FolderIcon size={18} />
+          <FolderIcon size={16} />
           Open Room…
         </button>
         <button className="subtle gate-demo" onClick={onDemo}>

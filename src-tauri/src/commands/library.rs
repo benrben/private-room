@@ -31,7 +31,7 @@ pub fn add_memory(
 ) -> Result<Memory, String> {
     state.with_room(|room| {
         // CHG-7: cap length so injected memories stay within the prompt budget.
-        let content = clamp_bytes(content, MAX_MEMORY_CONTENT_CHARS);
+        let content = clamp_chars(content, MAX_MEMORY_CONTENT_CHARS);
         // UX-5: never store an exact duplicate; hand back the existing entry
         // instead (callers can tell by its old created_at).
         if let Some(existing) = duplicate_memory(&room.conn, &content)? {
@@ -56,7 +56,7 @@ pub fn update_memory(
     category: Option<String>,
 ) -> Result<(), String> {
     state.with_room(|room| {
-        let content = clamp_bytes(content, MAX_MEMORY_CONTENT_CHARS);
+        let content = clamp_chars(content, MAX_MEMORY_CONTENT_CHARS);
         let category = category.as_deref().and_then(normalize_category);
         db::update_memory(&room.conn, &id, &content, category)
     })
@@ -134,6 +134,35 @@ pub fn set_setting(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The memory commands take a `State` and so cannot be called from a unit
+    /// test; what CAN be pinned is that neither of them goes back to counting
+    /// bytes against a cap stated in characters, which silently ate half of a
+    /// note typed in Hebrew while the same note in English went through whole.
+    ///
+    /// A textual assertion is this repo's own answer for a seam a test cannot
+    /// reach (see `ollama_lifecycle`'s `include_str!` guard), and unlike a test
+    /// of `clamp_chars` itself it is red on the revert that actually matters.
+    #[test]
+    fn the_memory_length_cap_is_counted_in_characters_at_both_call_sites() {
+        let source = include_str!("library.rs");
+        // Split so this test's own text is not one of the matches it counts —
+        // `concat!` rebuilds the needle at compile time while the source line
+        // stays broken in two.
+        let good = concat!("clamp_", "chars(content, MAX_MEMORY_CONTENT_CHARS)");
+        let bad = concat!("clamp_", "bytes(content, MAX_MEMORY_CONTENT_CHARS)");
+        assert_eq!(
+            source.matches(good).count(),
+            2,
+            "add_memory and update_memory must both clamp CHARACTERS"
+        );
+        assert_eq!(
+            source.matches(bad).count(),
+            0,
+            "clamping BYTES against a cap stated in characters truncates a note typed \
+             in Hebrew at half its length, silently"
+        );
+    }
 
     #[test]
     fn a_trashed_memory_does_not_block_re_adding_the_same_text() {

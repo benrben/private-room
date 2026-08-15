@@ -312,7 +312,7 @@ export default function CodeEditor({
           {/* Saving is the one action in this bar, so it is drawn as a real
               outlined control rather than as a third flat link. */}
           <button className="nb-btn btn-ic" onClick={() => void saveNow()}>
-            <SaveIcon size={13} /> {saveLabel ?? "Save"} ⌘S
+            <SaveIcon size={14} /> {saveLabel ?? "Save"} ⌘S
           </button>
         </div>
       )}

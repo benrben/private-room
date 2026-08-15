@@ -65,7 +65,7 @@
   background-position: left center;
   background-size: 0% 100%;
   border: 1px solid var(--rule-strong);
-  border-radius: 6px 4px 7px 5px / 5px 7px 4px 6px;
+  border-radius: var(--radius-xs);
   cursor: pointer;
   transition:
     background-size var(--dur) var(--ease-pen),
@@ -161,7 +161,7 @@
   max-height: 86vh;
   background: var(--raised);
   border: var(--stroke-w) solid var(--sketch);
-  border-radius: 14px 12px 15px 13px / 13px 15px 12px 14px;
+  border-radius: 14px;
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -309,7 +309,7 @@
   text-align: start;
   font: inherit;
   padding: 5px 9px;
-  border-radius: 9px 7px 10px 8px / 8px 10px 7px 9px;
+  border-radius: var(--radius-sm);
   border: 1px solid var(--rule-strong);
   background: var(--surface);
   color: var(--text);
@@ -328,7 +328,7 @@
   background: var(--raised);
   border-color: var(--sketch);
   border-width: var(--stroke-w);
-  border-radius: 10px 12px 9px 11px / 11px 9px 12px 10px;
+  border-radius: var(--radius);
 }
 .agraph-node:hover {
   border-color: var(--sketch);
@@ -503,7 +503,7 @@
   font-size: var(--fs-meta);
   cursor: pointer;
   padding: 0 var(--sp-1);
-  border-radius: 6px 4px 7px 5px / 5px 7px 4px 6px;
+  border-radius: var(--radius-xs);
 }
 .agraph-inspect-close:hover {
   color: var(--text);
@@ -614,7 +614,7 @@
   overflow: auto;
   padding: var(--sp-2) var(--sp-3);
   border: 1px solid var(--rule-strong);
-  border-radius: 8px 6px 9px 7px / 7px 9px 6px 8px;
+  border-radius: var(--radius-sm);
   background: color-mix(in srgb, var(--raised) 62%, transparent);
   color: var(--text);
   font-size: var(--fs-meta);

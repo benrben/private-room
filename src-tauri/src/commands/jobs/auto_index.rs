@@ -36,8 +36,8 @@ pub(crate) const QUIET_FILLER_MAX: usize = 5;
 pub(crate) enum AutoIndexDecision {
     /// Nothing to do (or nothing can be done); the next ingest re-arms.
     Skip,
-    /// Run the legacy opportunistic filler — silent, non-durable. Used when
-    /// the feature is toggled off (today's behavior) and for tiny drops.
+    /// Run the legacy opportunistic filler — silent, non-durable. For tiny
+    /// drops, where a job card would be more noise than the work is worth.
     QuietFiller,
     /// Start one durable, visible "Indexing new files" job.
     StartJob,
@@ -57,9 +57,14 @@ pub(crate) fn auto_index_decision(
     models_available: bool,
 ) -> AutoIndexDecision {
     if !setting_on {
-        // Off = byte-for-byte today's behavior: the opportunistic filler,
-        // which yields to streaming answers internally.
-        return AutoIndexDecision::QuietFiller;
+        // Off means off. This returned `QuietFiller` — introduced as "byte-for-
+        // byte today's behavior" so adding the toggle changed nothing — with
+        // the result that the switch labelled "Describe new files automatically
+        // with the local AI" went on describing new files automatically with
+        // the local AI. A setting that does not do what it says is worse than
+        // no setting, and this one also spends the room's single model lane
+        // behind the back of someone who asked for it not to be.
+        return AutoIndexDecision::Skip;
     }
     if asking || job_running {
         return AutoIndexDecision::Retry;
@@ -135,7 +140,13 @@ pub(crate) fn schedule_auto_index(app: &tauri::AppHandle, room_path: String) {
             // ONE recording per tick. The queue serializes them anyway, and the
             // next ingest (or the next recording stopped) re-arms the waiter,
             // so an unread backlog drains steadily instead of all at once.
-            if models_available && !job_running && !asking {
+            // `setting_on` gates this arm too. Reading a recording the room has
+            // never read IS describing a new file with the local AI, which is
+            // exactly what the switch says it controls — so leaving it out
+            // meant the box could be off while the same tick still spent the
+            // room's one model lane. Half a switch is the same defect as no
+            // switch, only harder to notice.
+            if setting_on && models_available && !job_running && !asking {
                 let unread = {
                     let state = app.state::<AppState>();
                     let guard = state.room.lock().unwrap();
@@ -208,8 +219,11 @@ mod tests {
 
     #[test]
     fn auto_index_decision_covers_all_branches() {
-        // Toggled off → today's quiet filler, regardless of everything else.
-        assert_eq!(auto_index_decision(false, 100, true, true, false), QuietFiller);
+        // Toggled off → nothing happens, regardless of everything else. The
+        // switch says "Describe new files automatically with the local AI", so
+        // OFF has to mean no describing — not a quieter kind of describing.
+        assert_eq!(auto_index_decision(false, 100, true, true, false), Skip);
+        assert_eq!(auto_index_decision(false, 1, false, false, true), Skip);
         // Busy (a streaming answer or a live job) → bounded retry.
         assert_eq!(auto_index_decision(true, 10, true, false, true), Retry);
         assert_eq!(auto_index_decision(true, 10, false, true, true), Retry);

@@ -107,6 +107,7 @@
   margin: 0 0 var(--sp-2);
   color: var(--text-strong);
   font-size: var(--fs-page);
+  font-family: var(--display);
   font-weight: 600;
   letter-spacing: -0.02em;
   line-height: 1.08;
@@ -132,10 +133,9 @@
   text-align: right;
   padding-top: 6px;
 }
-/* A count is exactly what the hand is for. */
+/* A count is a fact the app arrived at, so it stays in the sans. */
 .sk-stamp-count {
-  font-family: var(--hand);
-  font-size: var(--fs-hand-lg);
+  font-size: var(--fs-card);
   line-height: 1.15;
   color: var(--muted);
   white-space: nowrap;
@@ -470,7 +470,7 @@
   border: var(--stroke-w) solid;
   border-bottom: 0;
   border-color: inherit;
-  border-radius: 6px 8px 0 0 / 7px 6px 0 0;
+  border-radius: var(--radius-xs);
   pointer-events: none;
 }
 .sk-card-head {
@@ -713,6 +713,7 @@
   margin: 6px 0 var(--sp-2);
   color: var(--text-strong);
   font-size: var(--fs-section);
+  font-family: var(--display);
   font-weight: 600;
   letter-spacing: -0.01em;
   line-height: 1.15;
@@ -1154,6 +1155,7 @@
   margin: 0 0 var(--sp-2);
   color: var(--text-strong);
   font-size: var(--fs-page);
+  font-family: var(--display);
   font-weight: 600;
   letter-spacing: -0.02em;
   line-height: 1.08;
@@ -1170,8 +1172,7 @@
 .mem-stamp {
   flex: none;
   padding-top: 6px;
-  font-family: var(--hand);
-  font-size: var(--fs-hand-lg);
+  font-size: var(--fs-card);
   line-height: 1.15;
   color: var(--muted);
   white-space: nowrap;
@@ -1326,12 +1327,11 @@
   color: var(--sem-saved);
   border-color: var(--sem-saved);
 }
-/* A date is exactly what the hand is for. --faint clears 4.5:1 on every
-   ground in both themes, and at --fs-hand this is not small text. */
+/* A date the room recorded, in the sans. --faint clears 4.5:1 on every ground
+   in both themes, and --fs-meta is the metadata floor rather than small text. */
 .mem-when {
-  font-family: var(--hand);
-  font-size: var(--fs-hand);
-  line-height: var(--lh-hand);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
   color: var(--faint);
   white-space: nowrap;
 }

@@ -110,7 +110,7 @@ export function FilmReview({
                 picture cannot be redacted — so what leaves the room is named
                 before the button, not after the bill. */}
             <div className="cr-seam">
-              <LockIcon size={13} />
+              <LockIcon size={14} />
               <p>
                 Each part is sent to the provider on its own: its prompt above,
                 and any picture shown with it. A hero’s written backstory is

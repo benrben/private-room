@@ -109,7 +109,19 @@ let problemReported = false;
 const irCache = new Map<string, AudioBuffer>();
 
 const MIN_CHUNK_CHARS = 60;
+/** The FIRST chunk of a turn may be shorter.
+ *
+ * Sixty characters is what makes the voice sound like prose rather than a list
+ * of fragments, and it stays the rule for everything after the opening. But it
+ * also holds a short opener — "Sure, let me check that." — silent until a
+ * second sentence arrives to pad it, which spends the one moment the wait is
+ * most felt. Trading intonation on the opening line for a faster first word is
+ * the right way round; trading it on every line is not. */
+const MIN_FIRST_CHUNK_CHARS = 25;
 const FORCE_FLUSH_CHARS = 300;
+/** Has this turn already sent a chunk to synthesis? Only the first one gets
+ * the lower floor above. */
+let firstChunkSent = false;
 
 // ---- context / gesture unlock --------------------------------------------
 
@@ -165,6 +177,7 @@ export function beginTurn(chatId: string | null = null): void {
   pending = "";
   carry = "";
   sentenceQueue = [];
+  firstChunkSent = false;
   deltasFed = false;
   turnEnded = false;
   streamedTurn = true;
@@ -200,6 +213,8 @@ export function roundBoundary(): void {
   pending = "";
   carry = "";
   sentenceQueue = [];
+  // A new round replaces the text, so its opening line is a first word again.
+  firstChunkSent = false;
 }
 
 /** Feed one ask-delta. No-ops when auto-speak is off or the turn is dead.
@@ -240,6 +255,7 @@ export function cancelAll(): void {
   pending = "";
   carry = "";
   sentenceQueue = [];
+  firstChunkSent = false;
   turnEnded = false;
   streamedTurn = false;
   overrides = null;
@@ -311,25 +327,40 @@ export function setVoiceProblemListener(
 
 /** At most once per turn — one answer that cannot be spoken is ONE problem,
  * not one per sentence. */
-function reportVoiceProblem(reason?: string): void {
+function reportVoiceProblem(message: string): void {
   if (problemReported) return;
   problemReported = true;
-  // The room's internet switch is its OWN answer, not a service failure: the
-  // host refuses before anything leaves (speech_cmds::SPEECH_OFFLINE_MESSAGE),
-  // and "the voice service didn't answer" would blame the wrong thing and hide
-  // the one-click fix. Matched on the settings path the host names.
-  if (reason && reason.includes("Online features")) {
-    onVoiceProblem?.(
-      "Couldn't read that aloud — spoken answers use an online voice service, and this room's internet switch is off (Settings → Online features). The answer is still on screen.",
-    );
-    return;
-  }
-  onVoiceProblem?.(
-    navigator.onLine
-      ? "Couldn't read that aloud — the voice service didn't answer. The answer is still on screen."
-      : "Couldn't read that aloud — reading answers aloud needs an internet connection. The answer is still on screen.",
-  );
+  onVoiceProblem?.(message);
 }
+
+/** Why the synthesis call itself failed, in the words that fit what happened.
+ *
+ * The room's internet switch is its OWN answer, not a service failure: the host
+ * refuses before anything leaves (speech_cmds::SPEECH_OFFLINE_MESSAGE), and
+ * "the voice service didn't answer" would blame the wrong thing and hide the
+ * one-click fix. Matched on the settings path the host names. */
+function synthesisProblem(reason: string): string {
+  if (reason.includes("Online features")) {
+    return "Couldn't read that aloud — spoken answers use an online voice service, and this room's internet switch is off (Settings → Online features). The answer is still on screen.";
+  }
+  return navigator.onLine
+    ? "Couldn't read that aloud — the voice service didn't answer. The answer is still on screen."
+    : "Couldn't read that aloud — reading answers aloud needs an internet connection. The answer is still on screen.";
+}
+
+/** WKWebView keeps an AudioContext created or resumed outside a user gesture
+ * suspended (see ensureUnlocked). Hands-free is where this actually bites: from
+ * the second turn on, `send()` is called from a dictation callback rather than
+ * a click, so a context that never got its gesture can never resume — and this
+ * used to `continue` without a word, in the one mode built for a user who is
+ * not watching the screen. Play is a real gesture and unlocks it. */
+const AUDIO_LOCKED_MESSAGE =
+  "Couldn't read that aloud — this Mac only starts audio from a click. Press Play on the answer to switch the voice back on. The answer is still on screen.";
+
+/** The service answered and the bytes would not decode. Rare, and nothing the
+ * user can act on — but silence here is indistinguishable from a mute app. */
+const AUDIO_UNREADABLE_MESSAGE =
+  "Couldn't read that aloud — the audio came back unreadable. The answer is still on screen.";
 
 function activeArchetype(): VoiceArchetype {
   return overrides?.archetype ?? cfg.archetype;
@@ -453,13 +484,15 @@ function emit(raw: string): void {
 function queueChunk(piece: string): void {
   if (!piece) return;
   carry = carry ? `${carry} ${piece}` : piece;
-  if (carry.length >= MIN_CHUNK_CHARS) flushCarry();
+  const floor = firstChunkSent ? MIN_CHUNK_CHARS : MIN_FIRST_CHUNK_CHARS;
+  if (carry.length >= floor) flushCarry();
 }
 
 function flushCarry(): void {
   if (!carry) return;
   sentenceQueue.push(carry);
   carry = "";
+  firstChunkSent = true;
   void pump();
 }
 
@@ -486,17 +519,21 @@ async function pump(): Promise<void> {
         // Offline / sidecar down / this room's internet switch off: skip this
         // sentence and try the next — but say so, once, in the words that fit
         // what actually happened. Silence is indistinguishable from a broken app.
-        reportVoiceProblem(String(e));
+        reportVoiceProblem(synthesisProblem(String(e)));
         continue;
       }
       if (epoch !== myEpoch) return;
       const c = ctx;
-      if (!c || c.state !== "running") continue; // no gesture unlock — drop silently
+      if (!c || c.state !== "running") {
+        reportVoiceProblem(AUDIO_LOCKED_MESSAGE);
+        continue;
+      }
       let buf: AudioBuffer;
       try {
         const bytes = base64ToBytes(b64);
         buf = await c.decodeAudioData(bytes.buffer.slice(0) as ArrayBuffer);
       } catch {
+        reportVoiceProblem(AUDIO_UNREADABLE_MESSAGE);
         continue;
       }
       if (epoch !== myEpoch) return;

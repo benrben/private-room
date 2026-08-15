@@ -32,11 +32,10 @@
 }
 /* Where you are in the deck: a count, which is exactly what the hand is
    reserved for. Set at the metadata floor rather than smaller — Kalam has a
-   small x-height and reads a tier down from Manrope at the same nominal size. */
+   position the deck counted, not a note anyone wrote. */
 .sl-where {
-  font-family: var(--hand);
   font-size: var(--fs-meta);
-  line-height: var(--lh-hand);
+  line-height: var(--lh-body);
   color: var(--muted);
   padding: 0;
 }

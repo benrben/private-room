@@ -193,7 +193,7 @@ export default function VoiceSection({
           )}
         </button>
         <button className="primary btn-ic" onClick={save}>
-          {saved ? (<><CircleCheckIcon size={13} /> Saved</>) : "Save"}
+          {saved ? (<><CircleCheckIcon size={14} /> Saved</>) : "Save"}
         </button>
       </div>
       {/* A save that fails used to look exactly like a click that did nothing. */}

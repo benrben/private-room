@@ -16,12 +16,15 @@
 
      ACTIVITY is a journal. A ruled log, an entry per event, timestamps and
      counts in the mono face so a column of them lines up, and short
-     descriptions of what happened in the hand. State is a strip of tape
+     descriptions of what happened in the sans — the app is describing its own
+     work there, and the hand is for words a person wrote. State is a strip of tape
      carrying a WORD — running / queued / paused / failed / done — because
      this is the surface a person audits background work from, and an audit
      that needs colour vision to read is not an audit. Instructions
-     ("review the open consent card"), filenames and error text stay in the
-     interface sans: the hand is for the aside, never for the directive.
+     ("review the open consent card"), filenames and error text are in the
+     interface sans too. The one place the hand still speaks on this tab is the
+     empty state, where the app has nothing to report and says so in its own
+     voice.
 
    WHY THESE SELECTORS ARE TWO CLASSES DEEP
 
@@ -169,20 +172,20 @@
   /* Drawn, not computed. Four fixed signatures, assigned in the markup by
      `ap-sig-*` rather than by nth-child, so a card keeps its shape when the
      shelf grows a row and nothing re-rotates between renders. */
-  border-radius: 11px 9px 12px 10px / 10px 12px 9px 11px;
+  border-radius: var(--radius);
   transition:
     border-color var(--dur-fast) var(--ease-pen),
     transform var(--dur-fast) var(--ease-pen),
     box-shadow var(--dur-fast) var(--ease-pen);
 }
 .pane-ai .studio-row.ap-sig-b {
-  border-radius: 9px 12px 10px 11px / 12px 10px 11px 9px;
+  border-radius: var(--radius);
 }
 .pane-ai .studio-row.ap-sig-c {
-  border-radius: 12px 10px 9px 12px / 9px 11px 12px 10px;
+  border-radius: var(--radius);
 }
 .pane-ai .studio-row.ap-sig-d {
-  border-radius: 10px 11px 12px 9px / 11px 9px 10px 12px;
+  border-radius: var(--radius);
 }
 .pane-ai .studio-row:hover:not(:disabled) {
   background: transparent;
@@ -224,7 +227,7 @@
     color-mix(in srgb, var(--mk, transparent) 26%, transparent) 100%
   );
   box-shadow: inset 0 0 0 1.5px var(--mk-ink, var(--rule-strong));
-  border-radius: 7px 5px 8px 6px / 6px 8px 5px 7px;
+  border-radius: var(--radius-xs);
 }
 
 .pane-ai .studio-row-text {
@@ -276,24 +279,22 @@
   margin: 0 0 var(--sp-4);
   padding: var(--sp-2) var(--sp-3);
   border: 1px solid color-mix(in srgb, var(--sem-pending) 55%, transparent);
-  border-radius: 10px 8px 11px 9px / 9px 11px 8px 10px;
+  border-radius: var(--radius);
 }
-/* A LOCAL stage — "a local model can take a few minutes…" — is an aside about
-   nothing consequential, and the hand is right for it. */
+/* A LOCAL stage — "a local model can take a few minutes…" — is the app saying
+   where a job has got to. Machine progress, so the sans. */
 .pane-ai .studio-running-step {
   min-width: 0;
   flex: 1 1 auto;
   color: var(--ink-2);
-  font-family: var(--hand);
-  font-size: var(--fs-hand);
-  line-height: var(--lh-hand);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
 }
 /* …and a CLOUD stage is the opposite: it says room content is leaving this
    Mac. Sans, at reading size, in the reading ink, with the caution marker on
    its edge — the same treatment chat.css gives .chat-route-cloud for exactly
-   the same fact, and the same reason: a privacy consequence set in a
-   handwriting face is decoration wearing the clothes of the product's core
-   promise. Which one applies comes from the event's `local` flag, never from
+   the same fact, and the same reason: a privacy consequence must never be
+   decoration wearing the clothes of the product's core promise. Which one applies comes from the event's `local` flag, never from
    reading the sentence. */
 .pane-ai .studio-running-cloud {
   min-width: 0;
@@ -318,7 +319,7 @@
   color: var(--muted);
   background: transparent;
   border: 1px solid var(--line);
-  border-radius: 10px 8px 11px 9px / 9px 11px 8px 10px;
+  border-radius: var(--radius);
   font-size: var(--fs-meta);
   line-height: var(--lh-body);
 }
@@ -407,12 +408,11 @@
   line-height: var(--lh-body);
 }
 /* …and the descriptive half: what a job is doing, how far it got, why it
-   stopped. Short notes about what happened, so they take the hand. */
-.pane-ai .activity-copy.ap-hand {
+   stopped. Every word of it is the app describing its own work, so the sans. */
+.pane-ai .activity-copy.ap-note {
   color: var(--ink-2);
-  font-family: var(--hand);
-  font-size: var(--fs-hand);
-  line-height: var(--lh-hand);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
 }
 
 /* ----- progress -----
@@ -487,7 +487,7 @@
   flex: none;
   min-height: 24px;
   padding: 3px 8px;
-  border-radius: 6px 4px 7px 5px / 5px 7px 4px 6px;
+  border-radius: var(--radius-xs);
 }
 .pane-ai .activity-row-head .chip-btn {
   min-width: 24px;
@@ -532,12 +532,11 @@
 .pane-ai .activity-history .activity-group-title::before {
   margin-inline-end: 0;
 }
-/* The "showing 25 of 30" aside — a margin note about the list, in the hand.
-   text-transform is cleared because the heading it sits inside is uppercase
-   and a run of handwriting in capitals is unreadable. */
+/* The "showing 25 of 30" aside — a count the list worked out, so the sans.
+   text-transform is cleared because the heading it sits inside is uppercase,
+   and a tally shouted in capitals reads as a heading of its own. */
 .pane-ai .activity-history-note {
   color: var(--ink-2);
-  font-family: var(--hand);
   font-size: var(--fs-micro);
   letter-spacing: 0;
   text-transform: none;

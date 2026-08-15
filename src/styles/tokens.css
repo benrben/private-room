@@ -32,11 +32,15 @@
       --danger and friends, so every pre-notebook rule resolves onto the
       same palette. New CSS should use canonical names only.
 
-   Accent is the PINK pen (active, selected, AI attribution). Danger is the
-   RED ink (destructive, error, recording). They are close in hue by design
-   of the source palette, so they are separated by TREATMENT — accent is a
-   translucent wash behind things, danger is an outline or underline on them
-   — and per the spec, status is never signalled by colour alone. */
+   Accent is the BERRY pen (active, selected, AI attribution). Danger is the
+   RED ink (destructive, error, recording). The accent used to be pink, which
+   sat four degrees of hue from the danger red — close enough that the two were
+   separated by TREATMENT alone (accent a translucent wash behind things,
+   danger an outline or underline on them). That separation still holds and is
+   still the rule, but it is no longer the ONLY thing keeping a selection from
+   reading as an error: berry is ~50 degrees away, on the other side of the
+   wheel from the red. Per the spec, status is never signalled by colour
+   alone. */
 
 :root {
   /* ----- paper: a black sketchbook, not a cyberpunk surface ----- */
@@ -77,12 +81,33 @@
      defaults in base.css fill themselves from --raised, so a field's border
      failed against its own interior. 3.13:1 worst case now. */
   --rule-strong: #787e77;
-  --stroke-w: 1.5px; /* spec: 1.5-2px hand-drawn stroke */
-  --redraw: 2px; /* offset of the second "quick pen redraw" outline */
+  /* 1px, down from 1.5. At 1.5 on a 2x display the stroke lands on a half
+     pixel and WebKit renders it as a soft two-pixel smear, so 58 frames read
+     as slightly out of focus rather than as drawn. 1px is one device pixel
+     per side and crisp. */
+  --stroke-w: 1px;
+  /* Offset of the second "quick pen redraw" outline.
+     LEFT AT 2px, and the reason is worth writing down because the obvious
+     change here is wrong twice over. The visual pass set out to turn this
+     motif off globally by taking the token to 0 — but 0 does not turn it off,
+     it lays the second stroke exactly on top of the first, which reads as one
+     slightly heavier border and costs an extra paint to get there. And there
+     was no global motif to turn off: `.nb-redraw`, the primitive this token
+     was written for, has no consumers at all. The only three redraws in the
+     app hand-roll their own pseudo-element and are deliberate, single-element
+     decisions — the gate card (gate.css), the browser chrome (browser.css)
+     and the remote-install badge (marketplace.css). Those three read this
+     value for their geometry, so it stays. */
+  --redraw: 2px;
 
-  /* ----- markers: FILL track (spec values, absorbed ink) ----- */
-  --mk-pink: #c77a90;
-  --mk-yellow: #c2a84f;
+  /* ----- markers: FILL track (spec values, absorbed ink) -----
+     Berry and gold are hue-shifted from the pink and yellow they replace with
+     their LIGHTNESS AND SATURATION HELD: a pen that changes colour must not
+     also change weight, or every wash it sits behind moves with it. Berry is
+     hue 298 (was 343), gold 40 (was 46) with saturation up a tenth to keep it
+     from reading as olive at the warmer angle. */
+  --mk-berry: #c47ac7;
+  --mk-yellow: #c99e48;
   --mk-green: #719c75;
   --mk-blue: #6896b2;
   --mk-red: #bb6661;
@@ -95,8 +120,8 @@
      comment claimed they cleared 4.5, which is the worst kind of wrong: an
      invariant stated as verified fact that a reader would reasonably build on.
      Lightness moves only; hue and saturation are the spec's. */
-  --mk-pink-ink: #d1849a;
-  --mk-yellow-ink: #baa457;
+  --mk-berry-ink: #cc7ecf;
+  --mk-yellow-ink: #bb9444;
   --mk-green-ink: #79a47d;
   --mk-blue-ink: #73a0bc;
   --mk-red-ink: #cf8883;
@@ -107,8 +132,8 @@
      saying something — then "yellow means pending" is a fact the stylesheet
      enforces rather than a convention a reviewer has to police.
 
-       saved    pink    personal, saved, editorial, AI attribution
-       pending  yellow  pending, notable, needs review, caution
+       saved    berry   personal, saved, editorial, AI attribution
+       pending  gold    pending, notable, needs review, caution
        done     green   complete, verified, approved, positive
        linked   blue    linked, informational, active, connected
        urgent   red     recording, urgent, failed, error
@@ -116,8 +141,8 @@
      -fill is the translucent marker (washes, edges, highlights); plain is
      the ink that can carry a word. Per the spec these ALWAYS ride with a
      word or an icon — colour is never the only signal. */
-  --sem-saved: var(--mk-pink-ink);
-  --sem-saved-fill: var(--mk-pink);
+  --sem-saved: var(--mk-berry-ink);
+  --sem-saved-fill: var(--mk-berry);
   --sem-pending: var(--mk-yellow-ink);
   --sem-pending-fill: var(--mk-yellow);
   --sem-done: var(--mk-green-ink);
@@ -150,16 +175,16 @@
      a hand — not a different surface colour. Dark mode separates surfaces
      rather than leaning on shadow, per the spec. */
   --hover: #2e322e;
-  --selected: color-mix(in srgb, var(--mk-pink) 20%, transparent);
-  --selected-strong: color-mix(in srgb, var(--mk-pink) 32%, transparent);
+  --selected: color-mix(in srgb, var(--mk-berry) 20%, transparent);
+  --selected-strong: color-mix(in srgb, var(--mk-berry) 32%, transparent);
 
   /* ----- the pen (accent) ----- */
-  --accent: var(--mk-pink-ink);
-  --accent-2: #dda0b0; /* lifted pen: hover on an accent-coloured label */
-  --accent-fill: var(--mk-pink); /* the marker swash behind active things */
+  --accent: var(--mk-berry-ink);
+  --accent-2: #dba0dd; /* lifted pen: hover on an accent-coloured label */
+  --accent-fill: var(--mk-berry); /* the marker swash behind active things */
   --accent-ink: var(--page); /* text on a filled-accent ground */
-  --accent-soft: color-mix(in srgb, var(--mk-pink) 18%, transparent);
-  --accent-ghost: color-mix(in srgb, var(--mk-pink) 9%, transparent);
+  --accent-soft: color-mix(in srgb, var(--mk-berry) 18%, transparent);
+  --accent-ghost: color-mix(in srgb, var(--mk-berry) 9%, transparent);
 
   /* ----- primary button: filled ink, per spec -----
      Dark mode fills with warm ivory and labels in charcoal — 15.49:1. */
@@ -182,7 +207,7 @@
      ink outline plus a label, so category and status never collide. */
   --tok-system: var(--mk-blue);
   --tok-history: var(--mk-green);
-  --tok-tools: var(--mk-pink);
+  --tok-tools: var(--mk-berry);
   --tok-skills: var(--mk-yellow);
   --tok-files: #7d8279; /* graphite — the fifth mark, deliberately neutral */
 
@@ -191,27 +216,45 @@
      colour together. Drawn from the marker family plus two neutrals, since
      the palette has five markers and this needs seven slots. */
   --eng-duckduckgo: var(--mk-blue-ink);
-  --eng-brave: var(--mk-pink-ink);
+  --eng-brave: var(--mk-berry-ink);
   --eng-mojeek: var(--mk-green-ink);
   --eng-marginalia: var(--mk-yellow-ink);
   --eng-wikipedia: #93a0ae; /* slate graphite */
   --eng-ddgia: var(--mk-red-ink);
   --eng-news: #b3a68e; /* warm sepia */
 
-  /* ----- type: three faces, three jobs -----
-     All three are BUNDLED (see fonts.css) — the app renders text without
+  /* ----- type: four faces, four jobs -----
+     All four are BUNDLED (see fonts.css) — the app renders text without
      touching the network, which is the whole promise of a local room.
 
-       Manrope        every functional label, control, and body run
-       Kalam          the hand. Annotations, dates, counts, short notes ONLY
+       Figtree        every functional label, control, and body run
+       Space Grotesk  display. Page and section titles, h1 and h2
+       Kalam          the hand. See the reserve list below
        IBM Plex Mono  code, timestamps, paths, sizes, technical data
+
+     WHAT --display IS FOR. A title set in the same face as the row of
+     metadata beneath it is only bigger, not different, and the app had 45
+     ad-hoc sizes precisely because size was carrying all the hierarchy on its
+     own. Space Grotesk's flat terminals and squared bowls read as a decision
+     at 26px and up; below that it is merely idiosyncratic, which is why the
+     reserve stops at --fs-section and does not reach --fs-card.
+
+     THE HAND'S RESERVE. Kalam is for words a PERSON wrote, and for the app
+     speaking in its own voice at an empty moment. It is never for
+     machine-generated metadata — a duration, a file count, a timestamp and a
+     model name are facts the app computed, and setting a computed fact in a
+     handwriting face says a human noted it down. That rule replaces the older
+     and looser "annotations, dates, counts, short labels", under which the
+     hand had spread to 71 sites and stopped meaning anything by being
+     everywhere.
 
      The system fallbacks are not decoration: only latin + latin-ext are
      bundled, so Hebrew, CJK and the rest fall through per-glyph to a face
      that actually has them. Turkish is inside latin-ext and stays in
-     Manrope. Never collapse these stacks to a single family. */
-  --sans: Manrope, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+     Figtree. Never collapse these stacks to a single family. */
+  --sans: Figtree, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
     sans-serif;
+  --display: "Space Grotesk", var(--sans);
   --hand: Kalam, "Bradley Hand", "Noteworthy", "Chalkboard SE", cursive;
   --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo,
     monospace;
@@ -234,13 +277,37 @@
   --lh-hand: 1.45;
   --lh-body: 1.55;
 
-  /* ----- shape + rhythm ----- */
-  /* Drawn, not computed: the corner radii are deliberately asymmetric so any
-     rule that says `border-radius: var(--radius)` gets a hand-made rectangle
-     for free. Fixed values, so a box draws identically on every render. */
-  --radius-sm: 6px 5px 7px 5px / 5px 7px 5px 6px;
-  --radius: 9px 7px 10px 8px / 8px 10px 7px 9px; /* spec: 8-14px */
-  --radius-lg: 13px 11px 14px 12px / 12px 14px 11px 13px;
+  /* ----- shape + rhythm -----
+     SYMMETRIC, as of the visual pass. These were four-corner asymmetric
+     values, so every `border-radius: var(--radius)` produced a hand-made
+     rectangle for free — 230 of them. At one or two boxes that reads as a
+     drawn edge; at 230 it reads as a rendering fault, and it was the single
+     loudest thing about the app. The notebook is carried by the drawn frames,
+     the marker inks and the paper itself; it does not need every corner of
+     every control to wobble as well.
+
+     CHANGING THE TOKEN WAS ONLY HALF THE JOB, and the half that is easy to
+     mistake for all of it: 90 further rules hand-wrote their own four-corner
+     radius instead of reading a token, so a token-only change would have left
+     the app split down the middle — half its corners symmetric and half still
+     wobbling, which is worse than either. Those 90 now read the tokens below.
+     Marks are untouched: a strip of tape, an underline, a progress bar and a
+     category edge all keep their 2-5px wobble, because a mark is drawn and a
+     box corner is not.
+
+     The four asymmetric signatures survive where they were always the point —
+     .nb-frame and its variants in paper.css, which are drawn ON the sheet and
+     are meant to look pen-made. They are now the whole of the drawn identity
+     rather than one wobble among many, which is why their spread narrowed.
+
+     --radius-xs is NEW, and it is not an invention: 37 of those 90 rules had
+     already converged on a ~6px corner for chips and small controls and were
+     each writing their own four-value approximation of it. Naming the rung
+     they were all aiming at is what let those 37 stop guessing. */
+  --radius-xs: 6px;
+  --radius-sm: 8px;
+  --radius: 10px; /* spec: 8-14px */
+  --radius-lg: 12px;
   --sp-1: 4px;
   --sp-2: 8px;
   --sp-3: 12px;
@@ -316,26 +383,26 @@
 
   /* Markers: fills are the spec's light track. The ink track is derived —
      these hues are unreadable as text on paper at their fill values. */
-  --mk-pink: #e9a4b3;
-  --mk-yellow: #e6cc70;
+  --mk-berry: #e7a4e9;
+  --mk-yellow: #edc169;
   --mk-green: #9fc59d;
   --mk-blue: #8eb8d2;
   --mk-red: #dc8179;
 
   /* Same correction as the dark track: solved against --hover #EBE7DA, the
      darkest ground light mode puts text on, rather than against --page. */
-  --mk-pink-ink: #ba3350;
-  --mk-yellow-ink: #786420;
+  --mk-berry-ink: #a82fad;
+  --mk-yellow-ink: #83601c;
   --mk-green-ink: #447142;
   --mk-blue-ink: #366b8d;
   --mk-red-ink: #b53c32;
 
   --line-soft: #e0dccf;
   --hover: #ebe7da;
-  --selected: color-mix(in srgb, var(--mk-pink) 24%, transparent);
-  --selected-strong: color-mix(in srgb, var(--mk-pink) 38%, transparent);
+  --selected: color-mix(in srgb, var(--mk-berry) 24%, transparent);
+  --selected-strong: color-mix(in srgb, var(--mk-berry) 38%, transparent);
 
-  --accent-2: #8f2740; /* pressed / deeper pen */
+  --accent-2: #8c278f; /* pressed / deeper pen */
 
   /* Light mode fills the primary button with charcoal — 14.19:1. */
   --btn-ink: var(--ink);

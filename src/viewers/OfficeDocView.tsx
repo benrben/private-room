@@ -35,6 +35,10 @@ export default function OfficeDocView({
   const [url, setUrl] = useState("");
   const [state, setState] = useState<"loading" | "ready" | "none" | "error">("loading");
   const [message, setMessage] = useState("");
+  // The formatted document renders in an opaque frame, so a selection made in
+  // it never reaches the app. This second reading is the same one the page and
+  // book readers offer, and the only way this document's words can be quoted.
+  const [mode, setMode] = useState<"page" | "text">("page");
 
   useEffect(() => {
     let alive = true;
@@ -66,9 +70,34 @@ export default function OfficeDocView({
   if (state === "ready" && url) {
     return (
       <div className="odoc-view">
+        <div className="odoc-bar rdr-bar">
+          <span className="rdr-modes" role="group" aria-label="How to read this document">
+            <button
+              type="button"
+              className="rdr-mode"
+              aria-pressed={mode === "page"}
+              title="The document with its real formatting"
+              onClick={() => setMode("page")}
+            >
+              Page
+            </button>
+            <button
+              type="button"
+              className="rdr-mode"
+              aria-pressed={mode === "text"}
+              title="The document's words — selectable, and quotable in chat"
+              onClick={() => setMode("text")}
+            >
+              Text
+            </button>
+          </span>
+        </div>
+        {/* Hidden rather than unmounted: remounting reloads the staged
+            document and throws away the reader's scroll position. */}
         <iframe
           key={url}
           className="odoc-frame"
+          hidden={mode !== "page"}
           // No allow-scripts: a document is prose. The sandbox's CSP already
           // forbids script; withholding the permission too means the frame is
           // opaque even if that CSP ever changed.
@@ -76,6 +105,19 @@ export default function OfficeDocView({
           src={url}
           title="Document"
         />
+        {mode === "text" && (
+          <div className="odoc-text">
+            {text?.trim() ? (
+              <pre className="html-doc" dir="auto">
+                {text}
+              </pre>
+            ) : (
+              <div className="empty-hint">
+                No text could be read out of this document.
+              </div>
+            )}
+          </div>
+        )}
       </div>
     );
   }
