@@ -177,8 +177,21 @@ export function BrowserView({
   // its parked refusal, or measured the page at one CSS pixel and returned the
   // fragment that reflow produces, reported as the whole page.
   const [extracting, setExtracting] = useState(0);
+  // The gap between deciding to read and the read starting.
+  //
+  // The reader's first extraction begins in an effect, which React runs AFTER
+  // paint — so without this the stage would park for one frame and be handed
+  // straight back, a 320px sliver flashing in and out beside a panel that was
+  // still drawing. `openReader` used to cover that by taking a BORROW, which
+  // was the wrong instrument: the reader's own extraction then took a second
+  // one and released only its own, so the count never returned to zero and the
+  // reading view never actually replaced the page. It looked right in every
+  // test and was 320px wide in the rendered app.
+  const [priming, setPriming] = useState(false);
   const borrowStage = useCallback((on: boolean) => {
     setExtracting((n) => Math.max(0, n + (on ? 1 : -1)));
+    // A real extraction has taken over; the placeholder has done its job.
+    if (on) setPriming(false);
   }, []);
   const [announce, setAnnounce] = useState("");
   const lastInfoRef = useRef<BrowserInfo | null>(null);
@@ -204,9 +217,10 @@ export function BrowserView({
       searchOpen,
       // An extraction is the one moment the page is handed its viewport back,
       // so it is not parked then even though the reader is showing.
-      readerHasTheFloor: readerOpen && !comparing && extracting === 0,
+      readerHasTheFloor:
+        readerOpen && !comparing && extracting === 0 && !priming,
     }),
-    [parked, blank, searchOpen, readerOpen, comparing, extracting],
+    [parked, blank, searchOpen, readerOpen, comparing, extracting, priming],
   );
 
   // --- bounds: keep the native view glued to the placeholder ---------------
@@ -332,6 +346,7 @@ export function BrowserView({
     setReaderOpen(CLOSED_VIEW.readerOpen);
     setComparing(CLOSED_VIEW.comparing);
     setExtracting(CLOSED_VIEW.extracting);
+    setPriming(false);
     setSearchOpen(CLOSED_VIEW.searchOpen);
     setSearch(CLOSED_VIEW.search);
     setError(CLOSED_VIEW.error);
@@ -553,8 +568,8 @@ export function BrowserView({
     // the reader's very first effect. Starting at `false` would park the page
     // for one frame and then hand it straight back — a visible flinch, and a
     // window in which Rust could measure a stage that is about to grow. The
-    // reader's first extraction returns this borrow.
-    borrowStage(true);
+    // reader's first extraction takes over from it.
+    setPriming(true);
   }, []);
 
   /** Leave the reading view. Focus must land somewhere the user chose, not
@@ -562,6 +577,7 @@ export function BrowserView({
   const closeReader = useCallback(() => {
     setReaderOpen(false);
     setComparing(false);
+    setPriming(false);
     addressRef.current?.focus();
   }, []);
 
@@ -697,7 +713,7 @@ export function BrowserView({
   // storage-ephemerality probe, which knows nothing about blocking — so a
   // browser whose block list had failed to compile looked exactly like one
   // where it had worked. `privacyClaim` takes the weaker of the two facts.
-  const claim = privacyClaim(ephemeral, info.protection);
+  const claim = privacyClaim(ephemeral, info.protection, info.open === true);
   // The button is a JOURNAL toggle that happens to state a privacy fact. Name
   // the action first: a control whose only label is a claim gives no hint that
   // pressing it does anything.

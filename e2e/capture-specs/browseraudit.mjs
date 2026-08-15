@@ -65,6 +65,21 @@ async function goBrowser(theme = "dark") {
   await browser.pause(600);
 }
 
+/** Get a real page on screen.
+ *
+ * Almost every claim in this file is a claim ABOUT a page — the shield's two
+ * checks, the reader, the Save strip — and the fixture starts with none open.
+ * Walking without this photographs the start screen four times and proves
+ * nothing. */
+async function openPage(url = "https://en.wikipedia.org/wiki/Speaker_diarisation") {
+  const input = await $(".browser-address input");
+  await input.click();
+  await input.setValue(url);
+  await browser.keys("Enter");
+  await browser.pause(1800); // the chrome polls at 1.2s
+  return (await $(".browser-start").isExisting()) === false;
+}
+
 /** Click the control whose visible text matches, within a scope. */
 async function clickText(scope, label) {
   const buttons = await $$(`${scope} button`);
@@ -89,6 +104,12 @@ describe("the private browser's trust states, photographed", () => {
   it("says nothing it has not checked, and photographs each state", async () => {
     await goBrowser();
     await shot("01-browser-arrived");
+    const chipEmpty = await text(".browser-shield");
+    note(`shield with NO page open: ${JSON.stringify(chipEmpty)}`);
+    expect(chipEmpty).toBe("No page");
+
+    note(`page opened: ${await openPage()}`);
+    await browser.pause(1200);
 
     // ---- the shield, with the block list FAILED (the audit's P0) ----------
     const chip = await text(".browser-shield");
@@ -114,6 +135,7 @@ describe("the private browser's trust states, photographed", () => {
     // LIGHT THEME is where the audit saw the chrome dissolve into a white page.
     // The strip is opaque now; this is the picture that says whether it reads.
     await goBrowser("light");
+    await openPage();
     await shot("02b-chrome-light");
     const chromeBg = await browser.execute(() => {
       const el = document.querySelector(".browser-chrome");
@@ -125,6 +147,7 @@ describe("the private browser's trust states, photographed", () => {
     // Transparent chrome over an arbitrary web page is the defect itself.
     expect(chromeBg && chromeBg.background).not.toBe("rgba(0, 0, 0, 0)");
     await goBrowser("dark");
+    await openPage();
 
     // ---- Retry recovers it ------------------------------------------------
     if (await clickText(".browser-banner.error", "Retry")) {
@@ -141,6 +164,7 @@ describe("the private browser's trust states, photographed", () => {
 
   it("shows the journal as sittings rather than a dump", async () => {
     await goBrowser();
+    await openPage();
     await clickText(".browser-chrome", "Journal");
     const panel = await $(".browser-journal");
     expect(await panel.isExisting()).toBe(true);
@@ -175,6 +199,7 @@ describe("the private browser's trust states, photographed", () => {
 
   it("gives the reading view the pane, and the page back only to compare", async () => {
     await goBrowser();
+    await openPage();
     const opened = await clickText(".browser-chrome", "Read as text");
     if (!opened) {
       note("READ AS TEXT WAS DISABLED — no readable page in the fixture");
@@ -190,11 +215,16 @@ describe("the private browser's trust states, photographed", () => {
     const stage = await $(".browser-stage");
     const w = (await stage.getSize()).width;
     note(`stage width while reading (expect ~0): ${w}`);
+    // THE ASSERTION THIS WHOLE RUN EXISTS FOR. Every unit test agreed the
+    // reading view replaced the page; the rendered app kept a 320px sliver,
+    // because the borrow `openReader` took was never returned.
+    expect(w).toBeLessThan(8);
 
     if (await clickText(".browser-reader-tools", "Compare with page")) {
       await browser.pause(700);
       const w2 = (await (await $(".browser-stage")).getSize()).width;
       note(`stage width while comparing (expect ~320): ${w2}`);
+      expect(w2).toBeGreaterThan(280);
       await shot("07-reader-comparing");
       await clickText(".browser-reader-tools", "Hide the live page");
     } else {
@@ -205,6 +235,7 @@ describe("the private browser's trust states, photographed", () => {
 
   it("stops describing a page once the last one closes", async () => {
     await goBrowser();
+    await openPage();
     await shot("08-before-close");
 
     // Close every private page from the sidebar's own rows.

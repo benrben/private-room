@@ -120,31 +120,66 @@ const TRACKER_DOMAINS: &[&str] = &[
     "lijit.com",
 ];
 
-/// Private/loopback/link-local destinations, as `url-filter` regexes.
+/// THE ONLY REGEX WebKit's url-filter compiler is known to accept.
+///
+/// `WKContentRuleListStore` does not run a general regex engine. It compiles
+/// each `url-filter` into a DFA through WebKit's own `URLFilterParser`, which
+/// takes a small subset and rejects the whole list — every rule in it — the
+/// moment one pattern uses something outside that subset. There is no partial
+/// success and no diagnostic naming the pattern: the completion handler is
+/// called with a null list and `WKErrorDomain` code 6, and the browser runs
+/// with no blocking at all.
+///
+/// That is what shipped. Two constructs in the list below were outside the
+/// subset, and both are ordinary regex that any other engine takes:
+///
+///   * `([:/]|$)` — an alternation with `$` INSIDE a group. The parser accepts
+///     `$` only as the final term of a pattern.
+///   * `([^/]*\.)?` — a QUANTIFIED group. Quantifiers are accepted on a single
+///     character or character class, not on a parenthesised subpattern.
+///
+/// So every pattern here is now built from that subset and nothing else: `^`,
+/// a trailing `$`, literal characters, `\` escapes, `[…]` classes, and `*`/`?`
+/// applied to ONE character or class. Where a pattern needed alternation it
+/// became several rules, which costs a slightly longer list and buys a list
+/// that compiles. Keep it that way — the failure mode is silent and total.
 ///
 /// These MUST stay in step with [`crate::web::guard::check_public_http_url`] —
 /// the guard is the authority for navigation, this is the same policy for
 /// sub-resources. A test below asserts every family the guard blocks has a
 /// rule here.
 const PRIVATE_URL_FILTERS: &[&str] = &[
-    r"^https?://localhost([:/]|$)",
-    r"^https?://[^/]*\.local([:/]|$)",
+    // `localhost` and `*.local`, with the host either ended by a delimiter or
+    // ending the URL. Two rules apiece rather than one `([:/]|$)`.
+    r"^https?://localhost[:/]",
+    r"^https?://localhost$",
+    r"^https?://[^/]*\.local[:/]",
+    r"^https?://[^/]*\.local$",
     r"^https?://127\.",
     r"^https?://10\.",
     r"^https?://192\.168\.",
-    r"^https?://172\.(1[6-9]|2[0-9]|3[01])\.",
+    // 172.16.0.0/12, one rule per decade of the second octet.
+    r"^https?://172\.1[6-9]\.",
+    r"^https?://172\.2[0-9]\.",
+    r"^https?://172\.3[01]\.",
     r"^https?://169\.254\.",
     // CGNAT / Tailscale 100.64.0.0/10
-    r"^https?://100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.",
+    r"^https?://100\.6[4-9]\.",
+    r"^https?://100\.[7-9][0-9]\.",
+    r"^https?://100\.1[01][0-9]\.",
+    r"^https?://100\.12[0-7]\.",
     // "this network" 0.0.0.0/8
     r"^https?://0\.",
     // IETF protocol assignments 192.0.0.0/24
     r"^https?://192\.0\.0\.",
     // Benchmarking 198.18.0.0/15
-    r"^https?://198\.(18|19)\.",
+    r"^https?://198\.18\.",
+    r"^https?://198\.19\.",
     // Multicast 224.0.0.0/4, reserved 240.0.0.0/4 and the broadcast address —
     // everything from 224 up, which is what the guard's `o[0] >= 224` means.
-    r"^https?://(22[4-9]|2[34][0-9]|25[0-5])\.",
+    r"^https?://22[4-9]\.",
+    r"^https?://2[34][0-9]\.",
+    r"^https?://25[0-5]\.",
     // IPv6 loopback, unspecified, and unique-local/link-local literals
     r"^https?://\[::1\]",
     r"^https?://\[::\]",
@@ -172,29 +207,43 @@ pub fn rules_json() -> String {
     }
 
     for domain in TRACKER_DOMAINS {
-        rules.push(serde_json::json!({
-            "trigger": {
-                "url-filter": domain_filter(domain),
-                "load-type": ["third-party"]
-            },
-            "action": { "type": "block" }
-        }));
+        for filter in domain_filters(domain) {
+            rules.push(serde_json::json!({
+                "trigger": {
+                    "url-filter": filter,
+                    "load-type": ["third-party"]
+                },
+                "action": { "type": "block" }
+            }));
+        }
     }
 
     serde_json::to_string(&rules).expect("rule list serializes")
 }
 
-/// `example.com` → a url-filter matching that host and any subdomain of it.
+/// `example.com` → the url-filters matching that host and any subdomain of it.
+///
+/// TWO patterns, not one. The single pattern this replaces used an optional
+/// GROUP — `([^/]*\.)?` — to make the subdomain part skippable, and a
+/// quantified group is one of the two constructs WebKit's url-filter compiler
+/// rejects (see [`PRIVATE_URL_FILTERS`]). Splitting the choice into two rules
+/// says exactly the same thing with only the operators the compiler takes.
+///
 /// Dots are escaped so `google-analytics.com` cannot match
-/// `google-analyticsXcom`.
-fn domain_filter(domain: &str) -> String {
-    format!("^https?://([^/]*\\.)?{}[:/]", domain.replace('.', "\\."))
+/// `google-analyticsXcom`, and the leading `\.` on the subdomain form is what
+/// stops `notexample.com` matching `example.com`.
+fn domain_filters(domain: &str) -> [String; 2] {
+    let escaped = domain.replace('.', "\\.");
+    [
+        format!("^https?://{escaped}[:/]"),
+        format!("^https?://[^/]*\\.{escaped}[:/]"),
+    ]
 }
 
 /// Identifier the compiled list is cached under inside WebKit's store. Bump
 /// the suffix whenever the rules change, or WebKit serves the previously
 /// compiled list from its cache and edits here silently do nothing.
-pub const RULE_LIST_ID: &str = "arcelle-browse-v2";
+pub const RULE_LIST_ID: &str = "arcelle-browse-v3";
 
 #[cfg(test)]
 mod tests {
@@ -223,10 +272,36 @@ mod tests {
 
     #[test]
     fn domain_filter_escapes_dots_and_anchors_the_host() {
-        let f = domain_filter("google-analytics.com");
-        assert_eq!(f, r"^https?://([^/]*\.)?google-analytics\.com[:/]");
-        // The escaped dot must be present so a dot cannot match any character.
-        assert!(f.contains(r"\."));
+        let [exact, sub] = domain_filters("google-analytics.com");
+        assert_eq!(exact, r"^https?://google-analytics\.com[:/]");
+        assert_eq!(sub, r"^https?://[^/]*\.google-analytics\.com[:/]");
+        // The escaped dot must be present so a dot cannot match any character,
+        // and the subdomain form's LEADING dot is what stops the filter
+        // matching `notgoogle-analytics.com`.
+        assert!(exact.contains(r"\."));
+        assert!(sub.contains(r"\.google-analytics"));
+    }
+
+    /// EVERY pattern must stay inside the subset WebKit's url-filter compiler
+    /// accepts, because one that does not takes the whole list down with it —
+    /// silently, with no blocking at all and a bare "WKErrorDomain error 6".
+    ///
+    /// The two constructs that shipped and did exactly that are named here so a
+    /// future edit reintroducing either fails in a unit test rather than in a
+    /// user's browser: a quantified GROUP, and `$` anywhere but the very end.
+    #[test]
+    fn no_filter_uses_a_construct_webkit_refuses_to_compile() {
+        let parsed: serde_json::Value = serde_json::from_str(&rules_json()).unwrap();
+        for rule in parsed.as_array().unwrap() {
+            let f = rule["trigger"]["url-filter"].as_str().unwrap();
+            // A quantifier may follow a character or a `]`, never a `)`.
+            for q in [")?", ")*", ")+"] {
+                assert!(!f.contains(q), "quantified group in {f}");
+            }
+            if let Some(at) = f.find('$') {
+                assert_eq!(at, f.len() - 1, "`$` must end the pattern: {f}");
+            }
+        }
     }
 
     /// Every private-range filter must actually reach the compiled list, and

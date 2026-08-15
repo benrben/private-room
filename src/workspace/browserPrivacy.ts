@@ -115,7 +115,22 @@ export function protectionAlert(
 export function privacyClaim(
   ephemeral: boolean | null,
   protection: BrowserProtection | undefined,
+  /** Is there a page to make a claim ABOUT? With none open, both checks are
+   *  unasked rather than unanswered, and there is nothing in flight. */
+  open = true,
 ): PrivacyClaim {
+  if (!open) {
+    // "Checking" is what an unanswered check looks like, and it never resolves
+    // when nothing is being checked — the chip sat on it indefinitely on the
+    // start screen (seen rendered, 2026-08-15). A browser with no page open has
+    // made no claim yet, and says so.
+    return {
+      tone: "checking",
+      chip: "No page",
+      detail: `No private page is open. ${EPHEMERAL_VS_ROOM} ${NOT_ANONYMOUS}`,
+      alert: null,
+    };
+  }
   if (ephemeral === false) {
     return {
       tone: "breached",
@@ -159,9 +174,17 @@ export function privacyClaim(
 /** The start screen's paragraph, which has to make the same two-sided promise
  *  as the chip — and must not claim blocking that is not running. */
 export function startScreenCopy(protection: BrowserProtection | undefined): string {
+  // `EPHEMERAL_VS_ROOM` already says what clears and when, so the opening
+  // clause states only what this screen adds: whether blocking is running. The
+  // first draft ran both, and the rendered page read "A browser that keeps
+  // nothing: no history, no cookies, no cache. Page history, cookies and cache
+  // clear when the last private page closes." — the same promise twice in two
+  // consecutive sentences, which reads as padding and buries the third.
   const blocking =
     protectionTone(protection) === "verified"
-      ? "no history, no cookies, no cache, and known trackers blocked"
-      : "no history, no cookies, no cache";
-  return `A browser that keeps nothing: ${blocking}. ${EPHEMERAL_VS_ROOM} ${NOT_ANONYMOUS}`;
+      ? "Known trackers are blocked."
+      : "";
+  return [EPHEMERAL_VS_ROOM, blocking, NOT_ANONYMOUS]
+    .filter((part) => part !== "")
+    .join(" ");
 }

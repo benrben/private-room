@@ -3,6 +3,73 @@
 All notable, user-facing changes to Arcelle. Versions follow
 [semver](https://semver.org); dates are the GitHub release dates.
 
+## 0.24.0 — 2026-08-16
+
+### Tracker blocking actually works
+
+The private browser has been saying **Tracker blocking is OFF** and meaning it.
+The rule list is compiled by WebKit itself, and WebKit does not run an ordinary
+regular-expression engine over it — it accepts a narrow subset and throws out
+the **whole list** if one pattern falls outside it, without saying which. Two
+patterns did. Both are unremarkable regular expressions that any other engine
+takes, which is why they looked right and why the tests covering them passed:
+those tests check the patterns against a real regex engine, and a real regex
+engine agreeing proves nothing about WebKit's.
+
+Every pattern is now written in the subset WebKit documents, and a test refuses
+the two constructs that broke it, so this cannot come back quietly. When a
+compile does fail, the journal now records the reason instead of a bare error
+number.
+
+### The browser stops crying wolf on the first page you open
+
+Type an address into a new page, press Return, and the page loaded — while the
+toolbar said *"This page is not answering."* Reload was the only cure.
+
+The browser asks each page how it is doing about once a second. A navigation
+takes the page out from under that question, which is the strongest possible
+sign that a navigation is happening — and it was being reported as the page
+failing to answer. Only the case where a page waits for its content blocker had
+been fixed, so the case everybody meets first was untouched.
+
+Private pages are also named after themselves now. The page list said **New
+page** over a loaded site while the toolbar beside it already showed the site's
+real title: one answer carrying both facts, with the title thrown away. A page
+that moves loses the old name immediately rather than wearing it into the next
+site.
+
+### Recordings is a review screen again
+
+**One player.** There were two — a transport at the top and a second, plain
+audio player further down, with nothing saying which was in charge. The second
+one only existed because the first had no volume, speed or scrubbing. It has
+all three now, plus a seek bar marked with the highlights and chapters worth
+scrubbing to, and the second player is gone.
+
+**Recording settings stopped following you into playback.** A finished
+recording permanently showed *Continue recording*, the Mac's-audio switch,
+speaker handling and Live translate. Those are choices about capturing, not
+about reviewing, so they now appear when you choose to continue recording and
+not before. Nothing was removed.
+
+**A transcript you can work with.** It was one dense block of speech. It is a
+line per phrase now, each with its own timestamp you can play from, the line at
+the playhead marked as you listen, and a search that says how many matches it
+found — including when it found none.
+
+**Highlights say what they are.** A highlight used to be a bare time range. It
+now carries a title and a quotation drawn from the words actually spoken in that
+stretch, with a way to play it and a way to find it in the transcript. A mark
+over a stretch nobody transcribed says so, rather than showing an empty quote.
+
+**The Recordings overview stopped repeating the sidebar.** It listed every
+recording and offered the same two capture buttons the sidebar already has.
+Instead it now shows what is recording or saving right now, what is on the
+shelf, the most recent recording, and any recording still waiting on a
+transcript — with the reason for each. It deliberately does not show total
+length or your capture devices: nothing in the app can currently state either
+without guessing.
+
 ## 0.23.0 — 2026-08-15
 
 ### Sketch becomes an editor

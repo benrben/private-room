@@ -676,6 +676,15 @@
   min-width: 0;
 }
 
+/* The hole must not reserve half the pane for a webview that is parked at 1x1.
+   Whenever a React surface has taken the pane — the start screen or the results
+   list — the stage yields to it, exactly as it does for the reading view. */
+.browser-body:has(> .browser-start) .browser-stage,
+.browser-body:has(> .bsearch) .browser-stage {
+  flex: 0 0 0;
+  min-width: 0;
+}
+
 /* ==========================================================================
    5. THE START PAGE — a ruled sheet
    Shown only while no page is loaded, so it is never underneath the webview:
@@ -688,9 +697,20 @@
    and nothing that can move.
    ========================================================================== */
 
+/* A FLEX ITEM, not an `inset: 0` overlay.
+   It was absolute so it could fill the pane while the native page sits parked
+   at 1x1 behind it. But `.browser-body` also holds the journal and the reading
+   view as flex SIBLINGS, and both are transparent by design — so an overlay
+   spanning the whole body was drawn straight through them: the record and the
+   start screen's prose rendered on top of each other, each unreadable (seen in
+   a rendered screenshot, 2026-08-15; no layout test could catch it, because
+   every box was exactly where it had been asked to go).
+
+   As a flex item it simply takes the room the panels leave. */
 .browser-start {
-  position: absolute;
-  inset: 0;
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 0;
   overflow: auto;
   padding: var(--sp-6) var(--sp-6) var(--sp-8);
   color: var(--text);
@@ -832,12 +852,33 @@
 }
 
 /* The armed "Erase this record?" question, in the header slot Clear vacated. */
+/* THE CONFIRMATION GETS ITS OWN ROW.
+   It sat in the header's second flex cell — about 130px in a 320px panel —
+   which wrapped "Erase 9 entries and 42 cached items (searches, page text and
+   previews)?" into five lines beside a heading that had itself wrapped to
+   three. That sentence exists to be READ before something irreversible
+   happens, so it takes the full width and the two answers sit under it.
+   `flex-basis: 100%` makes the header wrap it onto its own line rather than
+   needing a second element around it. */
 .browser-journal-confirm {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
+  flex: 1 0 100%;
   gap: 6px;
+  margin-top: var(--sp-2);
   color: var(--text);
   font-size: var(--fs-micro);
+  line-height: var(--lh-body);
+}
+
+.browser-journal-confirm > span:first-child {
+  flex: 1 1 100%;
+}
+
+/* The heading must not wrap to three lines to make room for a button. */
+.browser-journal header {
+  flex-wrap: wrap;
 }
 
 /* An explanation of what the journal IS — sans, at the metadata rung. */
@@ -1389,9 +1430,11 @@
    sheet instead of filled boxes.
    ========================================================================== */
 
+/* A flex item for the same reason as `.browser-start` — see the note there. */
 .bsearch {
-  position: absolute;
-  inset: 0;
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 0;
   overflow-y: auto;
   padding: 22px 26px var(--sp-8);
   display: flex;

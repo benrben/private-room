@@ -1,4 +1,4 @@
-import { Fragment, KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
+import { KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import Waveform, {
   SPEAKER_TONES,
@@ -8,7 +8,24 @@ import Waveform, {
 import { api, By, NoteKind, RecMeta, RecSegment, RecWord } from "../api";
 import { PauseIcon, PlayIcon, StopIcon } from "../icons";
 import { liveSttOn, micMuted, noteLiveStt, setMicMuted } from "../workspace/liveRec";
+import { prefersReducedMotion } from "../rooms/helpers";
 import { cutShiftBefore } from "./recTiming";
+import {
+  CaptureStage,
+  PLAYBACK_RATES,
+  Quote,
+  captureStage,
+  clampVolume,
+  formatTimestamp,
+  highlightQuote,
+  needsPreflight,
+  rateLabel,
+  searchTranscript,
+  seekLabel,
+  seekMarks,
+  segmentAt,
+  showsChoicesInline,
+} from "./recReview";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 
 /** How far back "Mark this moment" reaches while recording. You press it AFTER
@@ -36,12 +53,20 @@ const SCREEN_CAPTURE_SETTINGS_URL =
  *
  * ----- how the page is laid out -----
  *
- * The audio is the subject, so the page opens with it: one transport cluster,
+ * The audio is the subject, so the page opens with it: ONE transport cluster,
  * then the wave at full size with its tick scale and a lane per voice. Reading
  * comes below that, split into tabs, with the clips beside it — and everything
  * technical (translate, re-transcribe, the three exports) lives in a closed
  * drawer at the foot, because those are things you do to a recording ONCE and
  * the toolbar they used to share was seven controls wide over every reading.
+ *
+ * "One transport" is load-bearing. QA 2026-08-15 found two: this cluster AND a
+ * native `<audio controls>` further down the page, kept for the volume, speed
+ * and keyboard scrubbing the cluster lacked. Two players on one screen leave
+ * nobody able to say which one owns playback, so the missing controls were
+ * built here instead and the element stays in the DOM UNRENDERED — it is still
+ * the single truth the wave, the transcript, the cut-skipping and the clock all
+ * drive, and now nothing draws a second set of buttons on top of it.
  */
 
 export interface RecordingLiveState {
@@ -241,9 +266,11 @@ const NOTE_ORDER: NoteKind[] = ["decision", "action", "question", "point"];
 function ReadPanel({
   kind,
   meta,
+  quotes,
   reading,
   onRead,
   onSeek,
+  onJump,
   onAddChapter,
   onDelete,
   empty,
@@ -251,9 +278,17 @@ function ReadPanel({
 }: {
   kind: "notes" | "highlights" | "chapters";
   meta: RecMeta | null;
+  /** The transcript phrases a highlight is quoted FROM. Passed in rather than
+   * read off `meta.segments` so the words here are the ones on screen — the
+   * deleted ones already applied — and so this panel cannot make up a
+   * sentence: with no overlapping phrase it says so instead. */
+  quotes: readonly Quote[];
   reading: boolean;
   onRead: () => void;
   onSeek: (cs: number) => void;
+  /** Show this moment in the transcript WITHOUT starting playback — the other
+   * half of reviewing a mark, and the reason the row has two actions. */
+  onJump: (cs: number) => void;
   onAddChapter: (title: string) => void;
   onDelete: (kind: "note" | "chapter" | "highlight", id: string) => void;
   empty: string;
@@ -362,6 +397,8 @@ function ReadPanel({
     by: By | undefined,
     lead: React.ReactNode,
     body: React.ReactNode,
+    /** Extra acts for this kind of item, before the remove button. */
+    actions?: React.ReactNode,
   ) => {
     const guessed = (by ?? "room") === "room";
     return (
@@ -374,7 +411,11 @@ function ReadPanel({
         <button
           className="rec-found-at nb-num"
           onClick={() => onSeek(t0)}
-          title="Jump to this moment"
+          // It seeks AND plays, which "jump" did not say. This is the row's
+          // one play control: a second button doing the same thing is the
+          // two-transports mistake in miniature.
+          title="Play from this moment"
+          aria-label={`Play from ${formatTimestamp(t0)}`}
         >
           {formatTimestamp(t0)}
         </button>
@@ -389,6 +430,7 @@ function ReadPanel({
             </span>
           )}
         </span>
+        {actions}
         <button
           className="rec-found-x"
           data-testid="rec-found-remove"
@@ -422,18 +464,47 @@ function ReadPanel({
       <ul className="rec-found-list">
         {kind === "chapters" &&
           chapters.map((c) => row(c.id, c.t0, c.by, null, <b dir="auto">{c.title}</b>))}
+        {/* QA 2026-08-15 (P1): a highlight row was a time range and a remove
+            button — nothing said what had been marked, so a list of the
+            moments that mattered was a list of numbers. The words are quoted
+            from the transcript phrases the mark overlaps and from nowhere
+            else; a mark over a stretch nobody transcribed says that, rather
+            than showing an empty quotation. */}
         {kind === "highlights" &&
-          highlights.map((h) =>
-            row(
+          highlights.map((h) => {
+            const quote = highlightQuote(quotes, h.t0, h.t1);
+            return row(
               h.id,
               h.t0,
               h.by,
               null,
-              <span className="rec-found-span">
-                {formatTimestamp(h.t0)}–{formatTimestamp(h.t1)}
+              <span className="rec-hl">
+                <b
+                  className={`rec-hl-title${quote ? "" : " is-silent"}`}
+                  dir="auto"
+                  data-testid="rec-hl-title"
+                >
+                  {quote ? quote.title : "Nothing transcribed in this stretch"}
+                </b>
+                {quote?.excerpt && (
+                  <span className="rec-hl-quote" dir="auto">
+                    {quote.excerpt}
+                  </span>
+                )}
+                <span className="rec-found-span nb-num">
+                  {formatTimestamp(h.t0)}–{formatTimestamp(h.t1)}
+                </span>
               </span>,
-            ),
-          )}
+              <button
+                className="nb-btn nb-btn-quiet rec-found-act"
+                data-testid="rec-hl-jump"
+                title="Show these words in the transcript, without playing"
+                onClick={() => onJump(h.t0)}
+              >
+                Show in transcript
+              </button>,
+            );
+          })}
         {kind === "notes" &&
           NOTE_ORDER.flatMap((k) =>
             notes
@@ -458,10 +529,14 @@ function ReadPanel({
 
 /** One phrase inside a turn. `visible` is the words to draw ("Show deleted"
  * already applied); null means the segment has no word timings — draw its
- * plain text. */
+ * plain text. `text` is that same phrase as a plain string — computed once
+ * here because the search, the clips panel and the highlight quotes all need
+ * it, and three places deriving "what this phrase says" is three places that
+ * can disagree about a deleted word. */
 interface TurnSeg {
   seg: RecSegment;
   visible: RecWord[] | null;
+  text: string;
 }
 
 /** A run of consecutive same-speaker segments, shown as one block: timestamp
@@ -482,16 +557,6 @@ function strongDir(text: string): "rtl" | "ltr" | null {
   const m = text.match(/\p{L}/u);
   if (!m) return null;
   return /[\u0591-\u08FF\uFB1D-\uFDFD\uFE70-\uFEFC]/.test(m[0]) ? "rtl" : "ltr";
-}
-
-function formatTimestamp(centiseconds: number): string {
-  const s = Math.max(0, Math.floor(centiseconds / 100));
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  const sec = s % 60;
-  return h > 0
-    ? `${h}:${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}`
-    : `${m}:${String(sec).padStart(2, "0")}`;
 }
 
 export default function RecordingView({
@@ -553,6 +618,22 @@ export default function RecordingView({
   const [tab, setTab] = useState<TabId>("transcript");
   const [playing, setPlaying] = useState(false);
   const [playCs, setPlayCs] = useState(0);
+  // Volume and speed used to belong to the native `<audio controls>`. They are
+  // mirrors of the element, exactly like `playing`: the control asks the
+  // element and the element's own event writes these back, so a slider can
+  // never claim a level the audio is not at.
+  const [volume, setVolume] = useState(1);
+  const [rate, setRate] = useState(1);
+  /** The capture choices, while a finished recording is being CONTINUED. Off
+   * until the user presses Continue, because until then they are choices about
+   * a session that does not exist. */
+  const [preflight, setPreflight] = useState(false);
+  /** Find a phrase in the transcript. */
+  const [query, setQuery] = useState("");
+  /** The phrase "Show in transcript" asked for: scrolled to, and marked until
+   * the next jump. Held apart from `activeSeg` because it is not the playhead
+   * — the whole point of that action is to read a moment without playing it. */
+  const [findSeg, setFindSeg] = useState<string | null>(null);
 
   // The sys-lane failure toast fires once per outage, not on every event.
   const sysToastedRef = useRef(false);
@@ -695,6 +776,13 @@ export default function RecordingView({
     if (!recordingNow) setPartials({});
   }, [recordingNow]);
 
+  // A live transcript is a moving target, and a filter over one hides the
+  // words arriving. Searching is for reading a recording back, so it stands
+  // down while one is being made.
+  useEffect(() => {
+    if (recordingNow) setQuery("");
+  }, [recordingNow]);
+
   // Pause/stop tears the mic tap down, which resets the mute — re-read the
   // module truth whenever the session status moves.
   useEffect(() => {
@@ -737,17 +825,13 @@ export default function RecordingView({
       // a dangling speaker header over an empty paragraph.
       if (visible && visible.length === 0) continue;
       if (!visible && !seg.text) continue;
+      const phrase = { seg, visible, text: visible ? visible.map((w) => w.w).join(" ") : seg.text };
       const last = out[out.length - 1];
-      if (last && last.speaker === seg.speaker) last.segs.push({ seg, visible });
-      else out.push({ key: seg.id, speaker: seg.speaker, t0: seg.t0, dir: "auto", segs: [{ seg, visible }] });
+      if (last && last.speaker === seg.speaker) last.segs.push(phrase);
+      else out.push({ key: seg.id, speaker: seg.speaker, t0: seg.t0, dir: "auto", segs: [phrase] });
     }
     for (const t of out) {
-      t.dir =
-        strongDir(
-          t.segs
-            .map(({ seg, visible }) => (visible ? visible.map((w) => w.w).join(" ") : seg.text))
-            .join(" "),
-        ) ?? "auto";
+      t.dir = strongDir(t.segs.map((s) => s.text).join(" ")) ?? "auto";
     }
     return out;
   }, [segments, showDeleted]);
@@ -791,14 +875,25 @@ export default function RecordingView({
           t0: t.t0,
           t1: Math.max(last.t1 ?? t.t0, t.t0),
           dir: t.dir,
-          text: t.segs
-            .map(({ seg, visible }) =>
-              visible ? visible.map((w) => w.w).join(" ") : seg.text,
-            )
-            .join(" ")
-            .trim(),
+          text: t.segs.map((s) => s.text).join(" ").trim(),
         };
       }),
+    [turns],
+  );
+
+  /** The transcript, filtered to the phrases the search box asked for. Empty
+   * box = the whole transcript, and the same array, so nothing re-renders for
+   * a search nobody is running. */
+  const found = useMemo(() => searchTranscript(turns, query), [turns, query]);
+
+  /** Every phrase on screen, with its own timing — what a highlight is quoted
+   * from. Taken off the turns so it carries the same words the transcript
+   * shows (deleted ones out), never `seg.text`, which still holds them. */
+  const quotes = useMemo<Quote[]>(
+    () =>
+      turns.flatMap((t) =>
+        t.segs.map(({ seg, text }) => ({ t0: seg.t0, t1: Math.max(seg.t1, seg.t0), text })),
+      ),
     [turns],
   );
 
@@ -847,6 +942,28 @@ export default function RecordingView({
   // A deleted span added or removed while the file is open re-arms the timer.
   useEffect(armCutSkip, [cuts]);
 
+  // A fresh element (a new media token, or the file reopening) starts at
+  // volume 1 and 1×. Put the transport's own settings back on it, or the two
+  // sliders would describe a player that is no longer at those values.
+  useEffect(() => {
+    if (!mediaEl) return;
+    mediaEl.volume = volume;
+    mediaEl.playbackRate = rate;
+  }, [mediaEl, volume, rate]);
+
+  // "Show in transcript" — bring the asked-for phrase into view once the
+  // transcript is the tab on screen. Reduced motion gets the jump, not the
+  // travel; nothing here animates on its own.
+  useEffect(() => {
+    if (!findSeg || tab !== "transcript") return;
+    listRef.current
+      ?.querySelector<HTMLElement>(`[data-seg="${CSS.escape(findSeg)}"]`)
+      ?.scrollIntoView({
+        block: "center",
+        behavior: prefersReducedMotion() ? "auto" : "smooth",
+      });
+  }, [findSeg, tab]);
+
   function onTime() {
     const el = mediaRef.current;
     if (!el) return;
@@ -863,11 +980,7 @@ export default function RecordingView({
         return;
       }
     }
-    let current: string | null = null;
-    for (const seg of segments) {
-      if (seg.t0 <= cs) current = seg.id;
-      else break;
-    }
+    const current = segmentAt(segments, cs);
     if (current !== activeSeg) setActiveSeg(current);
   }
 
@@ -876,6 +989,39 @@ export default function RecordingView({
     if (!el) return;
     el.currentTime = cs / 100;
     void el.play().catch(() => {});
+  }
+
+  /** Move the playhead WITHOUT starting playback — what the seek slider does,
+   * and what "Show in transcript" needs. `seek` above always plays, which is
+   * right for a timestamp you clicked and wrong for a bar you are dragging. */
+  function scrubTo(cs: number) {
+    const el = mediaRef.current;
+    if (!el) return;
+    el.currentTime = cs / 100;
+    // timeupdate does not fire while paused, so the clock and the active
+    // phrase would sit on the old moment until playback resumed.
+    setPlayCs(Math.floor(cs / 100) * 100);
+    setActiveSeg(segmentAt(segments, cs));
+  }
+
+  /** Read a moment in the transcript instead of listening to it: the tab, the
+   * phrase, and no playback. Any search in force is dropped first — a jump
+   * into a phrase the current filter hides would land on nothing. */
+  function showInTranscript(cs: number) {
+    setQuery("");
+    setTab("transcript");
+    setFindSeg(segmentAt(segments, cs));
+  }
+
+  // The element is the truth; these two ask it, and its own volumechange /
+  // ratechange events (below) set the state back.
+  function askVolume(v: number) {
+    const el = mediaRef.current;
+    if (el) el.volume = clampVolume(v);
+  }
+  function askRate(r: number) {
+    const el = mediaRef.current;
+    if (el) el.playbackRate = r;
   }
 
   /** The transport's play/pause. The <audio> element stays the single truth —
@@ -1349,6 +1495,13 @@ export default function RecordingView({
   const canRetranscribe = !isLive && (durationCs > 0 || !!mediaToken);
   const canPlay = !!src && durationCs > 0;
   const voices = new Set(segments.map((s) => s.speaker)).size;
+  // Anything already in this file: audio, or — for a file whose meta lost its
+  // duration — transcribed words. The button's label and the capture stage
+  // read the SAME fact, so "Continue recording" can never sit above a page
+  // that thinks nothing has been recorded here yet.
+  const everRecorded = hasAudio || segments.length > 0;
+  const stage: CaptureStage = captureStage(status, everRecorded);
+  const marks = seekMarks(durationCs, meta?.highlights ?? [], meta?.chapters ?? []);
   /** The one-word state of the transcript, drawn as a tape label. Colour rides
    * with the word, never instead of it. */
   const state = recordingNow
@@ -1379,25 +1532,90 @@ export default function RecordingView({
   const standaloneGhosts = ghosts.filter((g) => !attachedGhosts.includes(g));
 
   /** The transport's primary control is always about the SESSION — start it,
-   * or stop it — and it is the one place in this view that wears red. */
+   * or stop it — and it is the one place in this view that wears red.
+   *
+   * On a finished recording it opens the capture choices instead of starting
+   * straight away: those choices (the Mac's audio, live translate) apply to
+   * the session it is about to begin, and leaving them on screen for a
+   * recording that ended was the P1 — review controls and capture controls
+   * side by side, with nothing to say which was which. */
   const primary = recordingNow || status === "paused"
     ? {
         cls: "rec-record is-stopping",
         label: "Stop & save",
         title: "Stop recording and save this file",
         glyph: <StopIcon size={14} />,
+        expands: false,
         run: () => void onStop(),
       }
     : {
         cls: "rec-record",
-        label: segments.length || hasAudio ? "Continue recording" : "Start recording",
-        title:
-          segments.length || hasAudio
-            ? "Keep recording into this file — nothing already recorded is lost"
-            : "Record the microphone, and the Mac's own audio, into this file",
+        label: everRecorded ? "Continue recording" : "Start recording",
+        title: everRecorded
+          ? "Keep recording into this file — nothing already recorded is lost"
+          : "Record the microphone, and the Mac's own audio, into this file",
         glyph: null,
-        run: () => void start(),
+        expands: needsPreflight(stage),
+        run: () => {
+          if (needsPreflight(stage)) setPreflight((open) => !open);
+          else void start();
+        },
       };
+
+  /** The choices a capture STARTS with. Written once and drawn in exactly one
+   * of two places — inline on a file nobody has recorded into yet, or inside
+   * the preflight when a finished recording is being continued. Two copies of
+   * a checkbox bound to one state is two controls that can look different. */
+  const captureChoices = (
+    <>
+      <label
+        className="rec-opt"
+        title="Hear whatever the Mac plays — Google Meet, Zoom, Teams, Slack calls, videos"
+      >
+        <input
+          type="checkbox"
+          checked={withSystem}
+          onChange={(e) => setWithSystem(e.target.checked)}
+        />
+        Include the Mac’s audio (meetings)
+      </label>
+      <span
+        className="rec-opt rec-opt-note"
+        title="Voices are told apart as people talk, and the labels correct themselves as the meeting goes on — nothing to set up. Afterwards, click a speaker's name to say who they were."
+      >
+        Speakers detected automatically — name them later
+      </span>
+    </>
+  );
+
+  const liveTranslateOpt = (
+    <label
+      className="rec-opt"
+      // Live translation runs on the ROOM's chosen model, exactly like the
+      // Translate box in the drawer (recording.rs `room_translation_model`).
+      // This used to say "(on this Mac)", which is the opposite of what happens
+      // in a cloud room: there, every finished sentence of a live meeting is
+      // sent to the provider for as long as the box is set. The status bar's
+      // trust chip says which kind of room this is; the control must not
+      // contradict it.
+      title="Translate each phrase as it lands — any language, on the room's AI model, the same as the Translate box below. In a cloud room that means each sentence is sent to the provider as it lands."
+    >
+      Live translate
+      <input
+        list="rec-langs"
+        placeholder="off"
+        value={liveLang}
+        onChange={(e) => setLiveLang(e.target.value)}
+        onBlur={() => void commitLiveLang()}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") {
+            e.preventDefault();
+            void commitLiveLang();
+          }
+        }}
+      />
+    </label>
+  );
 
   return (
     <div className="rec-view">
@@ -1496,7 +1714,15 @@ export default function RecordingView({
               </button>
             )}
             {status !== "saving" && (
-              <button className={primary.cls} title={primary.title} onClick={primary.run}>
+              <button
+                className={primary.cls}
+                title={primary.title}
+                onClick={primary.run}
+                // On a finished recording this button reveals the preflight
+                // rather than acting, and it has to say so.
+                aria-expanded={primary.expands ? preflight : undefined}
+                aria-controls={primary.expands ? "rec-preflight" : undefined}
+              >
                 {/* The rings are decoration on a control, so they are drawn as
                     pseudo-elements of this span and never reach the tree. */}
                 <span className="rec-record-ring" aria-hidden="true">
@@ -1553,70 +1779,134 @@ export default function RecordingView({
                 </span>
               </>
             )}
+            {/* Volume and speed. They were the reason a second, native player
+                was kept on the page; they are controls of THIS transport now,
+                each a real form control with its own name and its own
+                keyboard. */}
+            {!isLive && canPlay && (
+              <>
+                <span className="rec-dial" title="Playback volume">
+                  <i aria-hidden="true">🔈</i>
+                  <input
+                    type="range"
+                    className="rec-vol"
+                    min={0}
+                    max={1}
+                    step={0.05}
+                    value={volume}
+                    aria-label="Volume"
+                    aria-valuetext={`${Math.round(volume * 100)}%`}
+                    onChange={(e) => askVolume(Number(e.target.value))}
+                  />
+                </span>
+                <span className="rec-dial" title="Playback speed">
+                  <select
+                    className="rec-speed"
+                    aria-label="Playback speed"
+                    value={rate}
+                    onChange={(e) => askRate(Number(e.target.value))}
+                  >
+                    {PLAYBACK_RATES.map((r) => (
+                      <option key={r} value={r}>
+                        {rateLabel(r)}
+                      </option>
+                    ))}
+                  </select>
+                </span>
+              </>
+            )}
           </div>
+
+          {/* Seeking, with the marks on it. A transport that owns playback owns
+              the timeline too — this is the scrubbing the native player was
+              being kept for, and unlike it, it shows what is worth scrubbing
+              TO. A range input, so arrows, Page keys and Home/End all work
+              without a line of key handling. */}
+          {!isLive && canPlay && (
+            <div className="rec-scrub">
+              <span className="rec-seekmarks" aria-hidden="true">
+                {marks.map((m) => (
+                  <span
+                    key={m.key}
+                    className={`rec-seekmark is-${m.kind}`}
+                    style={{ left: `${m.atPct}%` }}
+                    title={m.title}
+                  />
+                ))}
+              </span>
+              <input
+                type="range"
+                className="rec-seek"
+                min={0}
+                max={Math.max(1, durationCs)}
+                step={100}
+                value={Math.min(playCs, durationCs)}
+                aria-label="Seek in the recording"
+                aria-valuetext={seekLabel(playCs, durationCs)}
+                // Moves the playhead WITHOUT playing: dragging the bar of a
+                // paused recording to look at a moment must not start it.
+                onChange={(e) => scrubTo(Number(e.target.value))}
+              />
+            </div>
+          )}
         </div>
 
         {/* Session options. Kept off the transport line so the one thing the
-            page is FOR stays the biggest thing on it. */}
-        <div className="rec-options">
-          {status === "idle" && (
-            <>
-              <label className="rec-opt" title="Hear whatever the Mac plays — Google Meet, Zoom, Teams, Slack calls, videos">
+            page is FOR stays the biggest thing on it.
+
+            QA 2026-08-15 (P1): "review is mixed with capture configuration" —
+            a finished recording showed the Mac's-audio checkbox, the speaker
+            note and the live-translate box for ever, beside a transcript none
+            of them could touch. Nothing is deleted: on a finished file this
+            row moves inside the preflight below, which the record button
+            opens, so the settings appear exactly where they are about to be
+            used. A file that has never been recorded still shows them here —
+            there is nothing else on that page to bury them under, and they are
+            the only thing it is asking for. */}
+        {showsChoicesInline(stage) && (
+          <div className="rec-options">
+            {status === "idle" && captureChoices}
+            {isLive && (
+              <label
+                className="rec-opt"
+                title="Turn off to keep recording audio without writing live text — rebuild the missing part later with Re-transcribe"
+              >
                 <input
                   type="checkbox"
-                  checked={withSystem}
-                  onChange={(e) => setWithSystem(e.target.checked)}
+                  checked={liveStt}
+                  onChange={(e) => void toggleLiveStt(e.target.checked)}
                 />
-                Include the Mac’s audio (meetings)
+                Live transcription
               </label>
-              <span
-                className="rec-opt rec-opt-note"
-                title="Voices are told apart as people talk, and the labels correct themselves as the meeting goes on — nothing to set up. Afterwards, click a speaker's name to say who they were."
-              >
-                Speakers detected automatically — name them later
-              </span>
-            </>
-          )}
-          {isLive && (
-            <label
-              className="rec-opt"
-              title="Turn off to keep recording audio without writing live text — rebuild the missing part later with Re-transcribe"
-            >
-              <input
-                type="checkbox"
-                checked={liveStt}
-                onChange={(e) => void toggleLiveStt(e.target.checked)}
-              />
-              Live transcription
-            </label>
-          )}
-          <label
-            className="rec-opt"
-            // Live translation runs on the ROOM's chosen model, exactly like
-            // the Translate box in the drawer (recording.rs
-            // `room_translation_model`). This used to say "(on this Mac)",
-            // which is the opposite of what happens in a cloud room: there,
-            // every finished sentence of a live meeting is sent to the provider
-            // for as long as the box is set. The status bar's trust chip says
-            // which kind of room this is; the control must not contradict it.
-            title="Translate each phrase as it lands — any language, on the room's AI model, the same as the Translate box below. In a cloud room that means each sentence is sent to the provider as it lands."
-          >
-            Live translate
-            <input
-              list="rec-langs"
-              placeholder="off"
-              value={liveLang}
-              onChange={(e) => setLiveLang(e.target.value)}
-              onBlur={() => void commitLiveLang()}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") {
-                  e.preventDefault();
-                  void commitLiveLang();
-                }
-              }}
-            />
-          </label>
-        </div>
+            )}
+            {liveTranslateOpt}
+          </div>
+        )}
+
+        {/* The preflight: the same choices, at the moment they mean something.
+            It is opened by "Continue recording" and its own button is what
+            actually starts the session, so the settings above it are read
+            after they have been seen rather than before. */}
+        {needsPreflight(stage) && preflight && (
+          <div className="rec-preflight" id="rec-preflight" data-testid="rec-preflight">
+            <p className="rec-preflight-lead">
+              Continue recording into this file — nothing already recorded is
+              lost. These apply to the new stretch:
+            </p>
+            <div className="rec-options">
+              {captureChoices}
+              {liveTranslateOpt}
+            </div>
+            <div className="rec-preflight-go">
+              <button className="nb-btn" data-testid="rec-preflight-start" onClick={() => void start()}>
+                Continue recording
+              </button>
+              <button className="nb-btn nb-btn-quiet" onClick={() => setPreflight(false)}>
+                Cancel
+              </button>
+            </div>
+          </div>
+        )}
 
         {/* The Mac-audio lane died (in practice: the Screen & System Audio
             Recording permission) — say so where it can't be missed, with the
@@ -1700,9 +1990,15 @@ export default function RecordingView({
             </span>
           )}
           <span className={`nb-tape rec-state ${state.mark}`}>{state.word}</span>
-          {/* The full player keeps volume, speed and keyboard scrubbing — the
-              transport above is a shortcut to it, not a replacement, so it is
-              quietened rather than removed. Both drive the same element. */}
+          {/* THE PLAYER. It is the single truth the waveform, the transcript,
+              the cut-skipping and the clock all drive — and it is not drawn.
+              It used to carry `controls`, which put a second, native transport
+              on the page below the app's own (QA 2026-08-15, P1): two players,
+              neither of them obviously the one in charge. The controls it was
+              kept for — volume, speed, keyboard scrubbing — are up in
+              .rec-transport now, so what remains here is the element, doing
+              the one job nothing else can do. It must stay in the DOM: taking
+              it out is what would actually stop the audio. */}
           {canPlay && (
             <audio
               ref={(el) => {
@@ -1711,8 +2007,6 @@ export default function RecordingView({
               }}
               className="rec-player"
               src={src ?? undefined}
-              controls
-              aria-label="Recording player — volume, speed and scrubbing"
               onTimeUpdate={() => {
                 onTime();
                 armCutSkip();
@@ -1722,7 +2016,14 @@ export default function RecordingView({
                 armCutSkip();
               }}
               onSeeked={armCutSkip}
-              onRateChange={armCutSkip}
+              // The element's own report of what it is doing, which is what
+              // the two new controls read back — they ask it, they never
+              // assume it took the value.
+              onVolumeChange={(e) => setVolume(clampVolume(e.currentTarget.volume))}
+              onRateChange={(e) => {
+                setRate(e.currentTarget.playbackRate);
+                armCutSkip();
+              }}
               onPause={() => {
                 setPlaying(false);
                 window.clearTimeout(skipTimerRef.current);
@@ -1762,16 +2063,42 @@ export default function RecordingView({
             </button>
           ))}
         </div>
-        {hasWords && tab === "transcript" && (
-          <label className="rec-opt rec-tabbar-opt">
-            <input
-              type="checkbox"
-              checked={showDeleted}
-              onChange={(e) => setShowDeleted(e.target.checked)}
-            />
-            Show deleted
-          </label>
-        )}
+        <div className="rec-tabbar-end">
+          {/* Finding a sentence in a transcript. QA 2026-08-15 (P1): the
+              transcript was "one dense speaker turn" with nothing to search
+              it by — on an hour-long meeting the only way to a moment was the
+              eye. The count is stated so a search that found nothing says so
+              rather than looking like an empty recording. */}
+          {tab === "transcript" && !recordingNow && turns.length > 0 && (
+            <span className="rec-opt rec-search">
+              <input
+                type="search"
+                value={query}
+                placeholder="Find in transcript…"
+                aria-label="Find in the transcript"
+                data-testid="rec-search"
+                onChange={(e) => setQuery(e.target.value)}
+              />
+              {found.searching && (
+                <span className="rec-search-count" role="status">
+                  {found.phrases === 0
+                    ? "no matches"
+                    : `${found.phrases} phrase${found.phrases === 1 ? "" : "s"}`}
+                </span>
+              )}
+            </span>
+          )}
+          {hasWords && tab === "transcript" && (
+            <label className="rec-opt">
+              <input
+                type="checkbox"
+                checked={showDeleted}
+                onChange={(e) => setShowDeleted(e.target.checked)}
+              />
+              Show deleted
+            </label>
+          )}
+        </div>
       </div>
 
       <div className="rec-body">
@@ -1802,8 +2129,12 @@ export default function RecordingView({
                         <strong>This file records and understands speech — live.</strong>
                       </p>
                       <p>
-                        Press <em>{hasAudio ? "Continue recording" : "Start recording"}</em>: your
-                        words (and, if you leave the checkbox on,
+                        {/* Not "the checkbox": on a recording that has already
+                            been made, the Mac's-audio choice is inside the
+                            preflight that button opens, and there is no
+                            checkbox on screen to leave anything on. */}
+                        Press <em>{everRecorded ? "Continue recording" : "Start recording"}</em>:
+                        your words (and, with the Mac’s-audio option on,
                         whatever the Mac plays — a Google Meet, Zoom, Teams or Slack call) appear here
                         as text while people are still speaking, with speakers told apart.
                       </p>
@@ -1819,81 +2150,114 @@ export default function RecordingView({
                   )}
                 </div>
               )}
-              {turns.map((turn, ti) => {
+              {found.searching && found.turns.length === 0 && segments.length > 0 && (
+                <p className="rec-find-none" data-testid="rec-find-none">
+                  No phrase in this transcript contains “{query.trim()}”.
+                </p>
+              )}
+              {/* QA 2026-08-15 (P1): a turn used to be one paragraph of run-on
+                  phrases with a single timestamp at the top, so the phrase
+                  being played could only be told apart by a marker inside a
+                  wall of text, and there was no way to start from any other
+                  one. A turn is now its speaker followed by its phrases, each
+                  a line with its own time and its own play — which is also
+                  what makes "Show in transcript" able to land somewhere. */}
+              {found.turns.map((turn) => {
                 // The still-speaking (partial) line joins the last turn when it
                 // is the same voice continuing; otherwise it gets its own ghost.
-                const inlineGhosts = ti === turns.length - 1 ? attachedGhosts : [];
+                // Against the FULL list, never the filtered one — the newest
+                // words are not a search result.
+                const inlineGhosts = turn.key === lastTurn?.key ? attachedGhosts : [];
                 return (
-                  <div
-                    key={turn.key}
-                    className={`rec-turn ${turn.segs.some(({ seg }) => seg.id === activeSeg) ? "active" : ""}`}
-                  >
-                    <button
-                      className="rec-stamp nb-num"
-                      title="Jump to this moment"
-                      onClick={() => seek(turn.t0)}
-                    >
-                      {formatTimestamp(turn.t0)}
-                    </button>
-                    <div className="rec-turn-main">
-                      <div className="rec-turn-head">
-                        <SpeakerChip
-                          label={turn.speaker}
-                          name={speakerName(turn.speaker)}
-                          tone={speakerTone(turn.speaker)}
-                          guessed={speakerGuessed(turn.speaker)}
-                          onRename={(next) => void renameSpeaker(turn.speaker, next)}
-                        />
-                      </div>
-                      <div className="rec-turn-body" dir={turn.dir}>
-                        {turn.segs.map(({ seg, visible }) => {
-                          const translation = liveTranslations[seg.id];
-                          return (
-                            <Fragment key={seg.id}>
-                              <span
-                                className={`rec-seg ${activeSeg === seg.id ? "active" : ""}`}
-                                dir="auto"
-                              >
-                                {visible
-                                  ? visible.map((w, i) => (
-                                      <span
-                                        key={i}
-                                        data-t0={w.t0}
-                                        data-t1={w.t1}
-                                        className={w.del ? "rec-word deleted" : "rec-word"}
-                                        onClick={() => {
-                                          // A drag is a delete-selection, not a seek.
-                                          if (window.getSelection()?.isCollapsed) seek(w.t0);
-                                        }}
-                                      >
-                                        {w.w}{" "}
-                                      </span>
-                                    ))
-                                  : seg.text}
-                                {translation && <span className="rec-translation" dir="auto">{translation}</span>}
-                              </span>{" "}
-                            </Fragment>
-                          );
-                        })}
-                        {inlineGhosts.map((g) => (
-                          <span key={g.lane} className="rec-seg ghost" dir="auto">{g.text}</span>
-                        ))}
-                      </div>
+                  <div key={turn.key} className="rec-turn">
+                    <div className="rec-turn-head">
+                      <SpeakerChip
+                        label={turn.speaker}
+                        name={speakerName(turn.speaker)}
+                        tone={speakerTone(turn.speaker)}
+                        guessed={speakerGuessed(turn.speaker)}
+                        onRename={(next) => void renameSpeaker(turn.speaker, next)}
+                      />
                     </div>
+                    {turn.segs.map(({ seg, visible, text }) => {
+                      const translation = liveTranslations[seg.id];
+                      return (
+                        <div
+                          key={seg.id}
+                          data-seg={seg.id}
+                          className={`rec-line${activeSeg === seg.id ? " is-active" : ""}${
+                            found.hits.has(seg.id) ? " is-hit" : ""
+                          }${findSeg === seg.id ? " is-found" : ""}`}
+                        >
+                          <button
+                            className="rec-stamp nb-num"
+                            title="Play from here"
+                            aria-label={`Play from ${formatTimestamp(seg.t0)}`}
+                            onClick={() => seek(seg.t0)}
+                          >
+                            {formatTimestamp(seg.t0)}
+                          </button>
+                          <div className="rec-line-text" dir={turn.dir}>
+                            <span
+                              className={`rec-seg ${activeSeg === seg.id ? "active" : ""}`}
+                              dir="auto"
+                            >
+                              {visible
+                                ? visible.map((w, i) => (
+                                    <span
+                                      key={i}
+                                      data-t0={w.t0}
+                                      data-t1={w.t1}
+                                      className={w.del ? "rec-word deleted" : "rec-word"}
+                                      onClick={() => {
+                                        // A drag is a delete-selection, not a seek.
+                                        if (window.getSelection()?.isCollapsed) seek(w.t0);
+                                      }}
+                                    >
+                                      {w.w}{" "}
+                                    </span>
+                                  ))
+                                : text}
+                              {translation && (
+                                <span className="rec-translation" dir="auto">
+                                  {translation}
+                                </span>
+                              )}
+                            </span>
+                          </div>
+                        </div>
+                      );
+                    })}
+                    {inlineGhosts.map((g) => (
+                      <div key={g.lane} className="rec-line">
+                        <span className="rec-stamp nb-num" aria-hidden="true">
+                          …
+                        </span>
+                        <div className="rec-line-text" dir="auto">
+                          <span className="rec-seg ghost" dir="auto">
+                            {g.text}
+                          </span>
+                        </div>
+                      </div>
+                    ))}
                   </div>
                 );
               })}
               {standaloneGhosts.map((g) => (
                 <div key={g.lane} className="rec-turn ghost">
-                  <span className="rec-stamp nb-num" aria-hidden="true">…</span>
-                  <div className="rec-turn-main">
-                    <div className="rec-turn-head">
-                      <span className={`rec-speaker ${speakerTone(g.speaker)}`} dir="auto">
-                        {speakerName(g.speaker)}
+                  <div className="rec-turn-head">
+                    <span className={`rec-speaker ${speakerTone(g.speaker)}`} dir="auto">
+                      {speakerName(g.speaker)}
+                    </span>
+                  </div>
+                  <div className="rec-line">
+                    <span className="rec-stamp nb-num" aria-hidden="true">
+                      …
+                    </span>
+                    <div className="rec-line-text" dir="auto">
+                      <span className="rec-seg ghost" dir="auto">
+                        {g.text}
                       </span>
-                    </div>
-                    <div className="rec-turn-body" dir="auto">
-                      <span className="rec-seg ghost" dir="auto">{g.text}</span>
                     </div>
                   </div>
                 </div>
@@ -1912,9 +2276,11 @@ export default function RecordingView({
             <ReadPanel
               kind="notes"
               meta={meta}
+              quotes={quotes}
               reading={reading}
               onRead={() => void startReading()}
               onSeek={seek}
+              onJump={showInTranscript}
               onAddChapter={(t) => void addChapterHere(t)}
               onDelete={(k, i) => void deleteItem(k, i)}
               empty="Nothing to note in this recording."
@@ -1925,9 +2291,11 @@ export default function RecordingView({
             <ReadPanel
               kind="highlights"
               meta={meta}
+              quotes={quotes}
               reading={reading}
               onRead={() => void startReading()}
               onSeek={seek}
+              onJump={showInTranscript}
               onAddChapter={(t) => void addChapterHere(t)}
               onDelete={(k, i) => void deleteItem(k, i)}
               empty="Nothing marked in this recording."
@@ -1938,9 +2306,11 @@ export default function RecordingView({
             <ReadPanel
               kind="chapters"
               meta={meta}
+              quotes={quotes}
               reading={reading}
               onRead={() => void startReading()}
               onSeek={seek}
+              onJump={showInTranscript}
               onAddChapter={(t) => void addChapterHere(t)}
               onDelete={(k, i) => void deleteItem(k, i)}
               empty="This recording has no chapters."
@@ -2284,6 +2654,9 @@ export default function RecordingView({
   );
 
   async function start() {
+    // The preflight asked its question and got an answer; leaving it open
+    // would put capture settings back beside a running capture's transport.
+    setPreflight(false);
     // Session controls reset with the session: live transcription is ON at
     // every rec_start (the actions layer syncs the module mirror).
     setLiveStt(true);

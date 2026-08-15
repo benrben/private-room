@@ -117,10 +117,17 @@ pub enum Protection {
 /// `deferred_since` is the other half of the same story: while it is set, this
 /// page is parked on [`START_BLANK`] waiting for its rule list, and everything
 /// the page says about itself is about a document that is on its way out.
+/// `title` is the document's own `<title>`, learned from the info poll and
+/// empty until it is. The strip used to be labelled from the URL alone, on the
+/// reasoning that reading a title costs a round trip per page per poll — true,
+/// and beside the point: the poll for the SHOWING page already carries its
+/// title and was throwing it away. So the page the user is reading is named
+/// after itself, and the ones in the background keep the cheap host label.
 #[derive(Debug, Clone)]
 struct Page {
     id: String,
     url: String,
+    title: String,
     protection: Protection,
     deferred_since: Option<Instant>,
 }
@@ -150,6 +157,24 @@ const EVAL_TIMED_OUT: &str = "The page did not answer in time.";
 /// through whatever `browser_info` poll happened to be in flight — and the
 /// toolbar reported a dead browser for a page that was loading normally.
 const EVAL_LOST: &str = "The page was replaced while it was answering.";
+
+/// Did this round trip fail because A NAVIGATION TOOK THE DOCUMENT out from
+/// under it?
+///
+/// Asked by `browser_info`, which polls the page every 1200 ms and therefore
+/// lands inside a navigation sooner or later — and, for the FIRST navigation of
+/// a page, very nearly always: the user types an address into a page parked on
+/// `about:blank`, the document commits, and whichever poll was in flight loses
+/// its callback.
+///
+/// [`readiness_from_probe_error`] already reads this as `Loading` for the
+/// readiness probe. The poll one level up did not, so the same evidence — the
+/// strongest there is that a navigation is happening — reached the toolbar as
+/// "This page is not answering", over a page that had just finished loading
+/// perfectly well. The only cure the user had was to press Reload.
+pub fn eval_lost_to_navigation(err: &str) -> bool {
+    err == EVAL_LOST
+}
 
 /// Poll interval while waiting on an async page ticket.
 const POLL_INTERVAL: Duration = Duration::from_millis(60);
@@ -313,7 +338,7 @@ pub fn tab_list(app: &tauri::AppHandle) -> Vec<TabInfo> {
         .filter(|p| webview_of(app, &p.id).is_some())
         .map(|p| TabInfo {
             id: p.id.clone(),
-            title: page_title(&p.url),
+            title: page_label(&p.title, &p.url),
             url: p.url.clone(),
             active: p.id == active,
         })
@@ -330,6 +355,22 @@ fn page_title(url: &str) -> String {
         .and_then(|u| u.host_str().map(|h| h.trim_start_matches("www.").to_string()))
         .filter(|h| !h.is_empty())
         .unwrap_or_else(|| "New page".to_string())
+}
+
+/// What one row in the strip is called: the document's own title while it is
+/// known, else the host, else `New page`.
+///
+/// Three fallbacks because all three states are real and the reader can tell
+/// them apart: a page still opening has neither, a page whose script has not
+/// answered yet has only the host, and a loaded page has both. The row said
+/// "New page" over a loaded example.com because the only one of the three ever
+/// consulted was the last resort.
+fn page_label(title: &str, url: &str) -> String {
+    let named = title.trim();
+    if !named.is_empty() {
+        return named.to_string();
+    }
+    page_title(url)
 }
 
 /// Open a page in a NEW tab and show it.
@@ -421,11 +462,37 @@ pub fn record_active_url(app: &tauri::AppHandle, url: &str) {
 /// Remember where a page went. The strip's title comes from here, and so does
 /// the answer to "what is this tab" — never from `Webview::url()`, which
 /// aborts the process on a page with no committed document (see `Page`).
+///
+/// A recorded title belongs to the URL it was read from, so moving the page
+/// DROPS it. Keeping it would leave the last site's name over the next one for
+/// as long as the new document takes to answer — which is exactly the window
+/// where a reader is looking to see where they have landed.
 fn record_url(app: &tauri::AppHandle, id: &str, url: &str) {
     let state = app.state::<BrowserState>();
     let mut tabs = state.tabs.lock().unwrap();
     if let Some(page) = tabs.iter_mut().find(|p| p.id == id) {
+        if page.url != url {
+            page.title.clear();
+        }
         page.url = url.to_string();
+    }
+}
+
+/// The showing page's own `<title>`, as the info poll just read it.
+///
+/// Only ever the ACTIVE page: it is the one whose poll we already pay for. An
+/// empty answer is not written — a document that has not set a title yet must
+/// fall back to the host, not blank the row it already filled in.
+pub fn record_active_title(app: &tauri::AppHandle, title: &str) {
+    let named = title.trim();
+    if named.is_empty() {
+        return;
+    }
+    let Some(id) = active_id(app) else { return };
+    let state = app.state::<BrowserState>();
+    let mut tabs = state.tabs.lock().unwrap();
+    if let Some(page) = tabs.iter_mut().find(|p| p.id == id) {
+        page.title = named.to_string();
     }
 }
 
@@ -618,6 +685,9 @@ fn register_page(app: &tauri::AppHandle, id: &str, url: &str) {
     app.state::<BrowserState>().add_page(Page {
         id: id.to_string(),
         url: url.to_string(),
+        // Unknown until the page answers for itself; the host carries the row
+        // until then.
+        title: String::new(),
         protection: Protection::Unknown,
         deferred_since: None,
     });
@@ -1623,10 +1693,27 @@ fn attach_rules(app: &tauri::AppHandle, id: &str, then: ThenGo) {
                     journal(&app2, "blocker", "", "Content blocking active.");
                     Protection::Active
                 } else {
+                    // WebKit rejects the WHOLE list for one unsupported
+                    // pattern and says only "WKErrorDomain error 6" — which is
+                    // what the journal carried, and it names nothing. The
+                    // domain and code are added because they are the only
+                    // things that distinguish a compile rejection (code 6)
+                    // from a store that could not be written to, and a failure
+                    // reason is included when WebKit troubles to give one.
                     let msg = if err.is_null() {
                         "unknown error".to_string()
                     } else {
-                        (*err).localizedDescription().to_string()
+                        let e = &*err;
+                        let mut msg = e.localizedDescription().to_string();
+                        if let Some(why) = e.localizedFailureReason() {
+                            msg.push_str(&format!(" — {why}"));
+                        }
+                        msg.push_str(&format!(
+                            " [{} code {}]",
+                            e.domain(),
+                            e.code()
+                        ));
+                        msg
                     };
                     journal(
                         &app2,
@@ -1806,6 +1893,50 @@ mod tests {
         // rendering an empty strip entry the user cannot click meaningfully.
         assert_eq!(page_title("about:blank"), "New page");
         assert_eq!(page_title(""), "New page");
+    }
+
+    /// …AND BY ITS OWN NAME ONCE IT HAS ONE (regression QA, 2026-08-15). The
+    /// strip read "New page" over a loaded example.com while the toolbar, from
+    /// the very same poll, was already calling it "Example Domain": one answer
+    /// carrying both facts, with the title thrown away and only the last-resort
+    /// label ever consulted.
+    #[test]
+    fn a_page_that_has_told_us_its_name_is_called_by_it() {
+        assert_eq!(
+            page_label("Example Domain", "https://example.com/"),
+            "Example Domain"
+        );
+        // Falling back in order: host while the title is unknown, then the
+        // honest placeholder. All three states are real and distinguishable.
+        assert_eq!(page_label("", "https://example.com/"), "example.com");
+        assert_eq!(page_label("   ", "https://example.com/"), "example.com");
+        assert_eq!(page_label("", "about:blank"), "New page");
+    }
+
+    /// A title belongs to the URL it was read from. Carrying it across a move
+    /// would leave the last site's name over the next one for exactly as long
+    /// as a reader is looking to see where they have landed.
+    #[test]
+    fn moving_a_page_drops_the_name_the_old_document_gave_it() {
+        let mut page = Page {
+            id: "0".into(),
+            url: "https://example.com/".into(),
+            title: "Example Domain".into(),
+            protection: Protection::Unknown,
+            deferred_since: None,
+        };
+        // Re-reporting the SAME url is what every poll does; it must not blank
+        // the row on a page that is sitting still.
+        if page.url != "https://example.com/" {
+            page.title.clear();
+        }
+        assert_eq!(page.title, "Example Domain");
+        // A real move drops it, and the label falls back to the new host.
+        if page.url != "https://other.test/" {
+            page.title.clear();
+        }
+        page.url = "https://other.test/".into();
+        assert_eq!(page_label(&page.title, &page.url), "other.test");
     }
 
     /// The cap refuses; it does not silently close a page the user was reading.
@@ -2228,6 +2359,7 @@ mod tests {
         let page = |id: &str| Page {
             id: id.to_string(),
             url: "https://example.com/".to_string(),
+            title: String::new(),
             protection: Protection::Unknown,
             deferred_since: None,
         };
@@ -2276,6 +2408,7 @@ mod tests {
         state.add_page(Page {
             id: "0".into(),
             url: "https://example.com/".into(),
+            title: String::new(),
             protection: Protection::Active,
             deferred_since: None,
         });
@@ -2369,6 +2502,7 @@ mod tests {
         state.add_page(Page {
             id: "0".into(),
             url: "https://example.com/".into(),
+            title: String::new(),
             protection: Protection::Unknown,
             deferred_since: None,
         });

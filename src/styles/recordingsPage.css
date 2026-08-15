@@ -1,0 +1,131 @@
+/* ==========================================================================
+   THE RECORDINGS OVERVIEW — the centre pane of the Recordings destination.
+
+   Imported by workspace/RecordingsPage.tsx rather than from App.css, because
+   these rules exist only while that page is on screen and belong beside it.
+   The page's shell, its shelf headings and its cards are still the `.rec-home*`
+   composition in recording.css: this file adds ONLY the three things the
+   overview gained when it stopped repeating the sidebar — the live-status
+   panel, the figures row, and the reason line on a waiting recording.
+
+   Nothing here animates. Ambient motion on this surface has been reverted
+   twice and is a standing rule; the live panel earns attention with a marker
+   tape and a word, which is what the rest of the product does.
+   ========================================================================== */
+
+/* ----- happening now -----
+   The one thing the contextual sidebar structurally cannot say. Drawn as a
+   panel (a region of the sheet) rather than a card (an item on it), because it
+   describes the room's state, not an object you can open — the button inside
+   it is what opens the object. */
+.rec-over-now {
+  padding: var(--sp-4);
+  margin-bottom: var(--sp-6);
+}
+/* Two lines can be true at once — a live capture AND imported media being
+   written up — so they stack with a rule between rather than competing for one
+   row. */
+.rec-over-now-line + .rec-over-now-line {
+  margin-top: var(--sp-4);
+  padding-top: var(--sp-4);
+  border-top: 1px solid var(--line-soft);
+}
+.rec-over-now-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-3);
+}
+.rec-over-now-title {
+  font-size: var(--fs-card);
+  font-weight: 600;
+  color: var(--text-strong);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* An instruction, so it takes the interface face at body size — §4/§25 keep
+   instructions out of the hand. */
+.rec-over-now-copy {
+  margin: var(--sp-2) 0 0;
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
+  color: var(--ink-2);
+  max-width: 62ch;
+}
+.rec-over-now-actions {
+  margin-top: var(--sp-3);
+  display: flex;
+  gap: var(--sp-2);
+}
+
+/* ----- what is here -----
+   Three figures the file list can answer for. Auto-fit so the row becomes a
+   column in a narrow workspace instead of crushing the numbers. */
+.rec-over-figs {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: var(--sp-4);
+  margin-bottom: var(--sp-6);
+}
+.rec-over-fig {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+/* Mono and tabular: these are computed facts, and the reserve keeps computed
+   facts out of the hand. Deliberately NOT set at a display rung either —
+   --fs-page and --fs-section belong to the display face (typography.test.mjs
+   pins that), and a summed byte count is not a title. It earns its weight from
+   the strong ink and the mono column instead of from size. */
+.rec-over-fig-value {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-size: var(--fs-card);
+  line-height: 1.25;
+  color: var(--text-strong);
+}
+.rec-over-fig-label {
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+  color: var(--ink-muted);
+}
+
+/* ----- waiting on a transcript -----
+   The reason sits on the card's metadata rung beside the date, in the same ink
+   as the date: it explains the chip, it is not a second title. */
+.rec-over-why {
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+  color: var(--ink-muted);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* The overflow count. An aside pointing at the sidebar, not a row of the list —
+   but NOT `.nb-note` either, however much it reads like a margin remark: the
+   sentence states a number this app computed, and paper.css §3 keeps the hand
+   for words a person wrote. */
+.rec-over-more {
+  margin: var(--sp-3) 0 0;
+  max-width: 46ch;
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+  color: var(--ink-muted);
+}
+
+/* ----- the empty state's single way in -----
+   One button, left-aligned at its natural width. The two-column
+   `.rec-home-start` grid it used to sit in was the shape of a CHOICE between
+   two captures; that choice belongs to the sidebar now, and stretching one
+   button across the grid would still read as half of a missing pair. */
+.rec-over-empty-cta {
+  display: flex;
+  margin-top: var(--sp-4);
+}
+.rec-over-empty-cta .rec-home-action {
+  max-width: 420px;
+}

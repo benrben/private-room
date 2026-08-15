@@ -112,14 +112,30 @@ test("every privacy state carries its own word, not just its own colour", () => 
 });
 
 test("the start screen stops promising blocking when blocking is off", () => {
-  assert.match(
-    privacy.startScreenCopy({ state: "active" }),
-    /trackers blocked/i,
-  );
+  assert.match(privacy.startScreenCopy({ state: "active" }), /trackers are blocked/i);
   assert.doesNotMatch(
     privacy.startScreenCopy({ state: "failed", reason: "x" }),
-    /trackers blocked/i,
+    /trackers/i,
   );
+});
+
+test("the start screen does not make the same promise twice", () => {
+  // It read "A browser that keeps nothing: no history, no cookies, no cache.
+  // Page history, cookies and cache clear when the last private page closes."
+  // — one promise, stated twice, in consecutive sentences. Only visible once
+  // rendered, which is why it survived a green suite.
+  const copy = privacy.startScreenCopy({ state: "active" });
+  assert.equal(copy.match(/cookies/gi).length, 1, `"cookies" repeats: ${copy}`);
+  assert.equal(copy.match(/cache/gi).length, 1, `"cache" repeats: ${copy}`);
+});
+
+test("with no page open the shield claims nothing and stops 'checking'", () => {
+  // "Checking" is what an UNANSWERED check looks like. With nothing open there
+  // is no check in flight, so the chip sat on that word forever.
+  const claim = privacy.privacyClaim(null, undefined, false);
+  assert.equal(claim.chip, "No page");
+  assert.equal(claim.alert, null);
+  assert.match(claim.detail, /No private page is open/);
 });
 
 test("privacy copy names both sides of the ephemeral/durable line", () => {

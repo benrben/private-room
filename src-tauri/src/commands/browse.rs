@@ -916,8 +916,13 @@ pub async fn browser_info(app: tauri::AppHandle) -> Result<serde_json::Value, St
         Err(e) => (serde_json::Value::Null, Some(e)),
     };
     let deferred = browser::navigation_deferred(&app);
+    // A lost round trip IS a navigation — the same evidence the readiness probe
+    // already reads that way, applied to the poll that reports it.
+    let navigating = error
+        .as_deref()
+        .is_some_and(browser::eval_lost_to_navigation);
     let (ready, error) = reportable_page_state(
-        deferred,
+        deferred || navigating,
         info.get("ready").cloned().unwrap_or(serde_json::Value::Null),
         error,
     );
@@ -927,6 +932,14 @@ pub async fn browser_info(app: tauri::AppHandle) -> Result<serde_json::Value, St
     // wrong tab title (or, before `is_recordable_url`, a vanished page).
     if let Some(url) = info.get("url").and_then(|u| u.as_str()) {
         browser::record_active_url(&app, url);
+    }
+    // …and what the page calls itself, from the same answer. The strip was
+    // labelled from the URL alone, so a page the toolbar was already calling
+    // "Example Domain" sat in the sidebar as "New page" — one poll carrying
+    // both facts, one of them thrown away. Written AFTER the URL: a move clears
+    // the old title, and this is the new one.
+    if let Some(title) = info.get("title").and_then(|t| t.as_str()) {
+        browser::record_active_title(&app, title);
     }
     // With no answer from the page — or while it is still parked on the blank
     // start document waiting for its blocker, where the address it reports is
@@ -978,24 +991,32 @@ pub async fn browser_info(app: tauri::AppHandle) -> Result<serde_json::Value, St
     Ok(out)
 }
 
-/// What the toolbar may be told about a page that still has a navigation
-/// deferred behind its content blocker: it is LOADING, and nothing it just said
-/// about itself is news.
+/// What the toolbar may be told about a page with a navigation in flight: it is
+/// LOADING, and nothing it just said about itself is news.
 ///
 /// Neither half of the page's answer describes the page the user asked for
-/// while that is true. A SUCCESS describes the blank start document the page is
-/// parked on, so `ready` would be `true` for a page that has not begun loading.
-/// A FAILURE is the round trip the deferred navigation itself interrupted —
-/// `EVAL_LOST` — which the toolbar rendered as "this page is not answering".
-/// The first page of every launch hit exactly that, because the first compile
-/// of the rule list is the uncached one, and the only cure the user had was to
-/// press Reload on a page that was loading perfectly well.
+/// while that is true. A SUCCESS describes the document being navigated away
+/// from — the blank start page, when the wait is the content blocker's — so
+/// `ready` would be `true` for a page that has not begun loading. A FAILURE is
+/// the round trip the navigation itself interrupted, which the toolbar rendered
+/// as "This page is not answering. The page was replaced while it was
+/// answering." over a page that was loading perfectly well.
+///
+/// TWO WAITS REACH THIS, and only one of them was covered when the sentence was
+/// first written. A page parked behind its blocker's compile is the launch case
+/// (the first compile is the uncached one, so the real navigation fires late).
+/// The other is every ordinary navigation: the poll runs on a 1200 ms beat and
+/// a document commit takes far less than that, so landing inside one is a
+/// matter of time — and on a page's FIRST navigation, where the user types into
+/// a page parked on `about:blank`, it is very nearly certain. Fixing only the
+/// blocker case left the defect fully intact for the case the user meets first
+/// and most often, with Reload as the only cure.
 fn reportable_page_state(
-    deferred: bool,
+    mid_navigation: bool,
     ready: serde_json::Value,
     error: Option<String>,
 ) -> (serde_json::Value, Option<String>) {
-    if deferred {
+    if mid_navigation {
         return (serde_json::Value::Bool(false), None);
     }
     (ready, error)
@@ -1144,6 +1165,47 @@ mod tests {
         // …and an ordinary healthy poll is passed through untouched.
         let (r, e) = reportable_page_state(false, ready.clone(), None);
         assert_eq!((r, e), (ready, None));
+    }
+
+    /// THE SAME BANNER, ON THE PATH THE USER ACTUALLY MEETS (regression QA,
+    /// 2026-08-15). The fix above covered only the blocker's deferral, so it
+    /// left the defect fully intact for every ordinary navigation: type an
+    /// address into a page parked on `about:blank`, press Return, and the poll
+    /// in flight loses its document to the commit. The page loads; the toolbar
+    /// says it is not answering; Reload is the only cure — exactly the report.
+    #[test]
+    fn a_lost_round_trip_is_a_navigation_wherever_it_happens() {
+        let lost = "The page was replaced while it was answering.";
+        assert!(
+            browser::eval_lost_to_navigation(lost),
+            "the poll must read a lost document the way the readiness probe does"
+        );
+        // …and the wiring in `browser_info` puts that answer into the same
+        // argument the deferral uses, so the two waits get one treatment.
+        //
+        // Read from the code ABOVE this module, never the whole file: these
+        // assertions are themselves text in it, so a search of the file always
+        // finds its own literal and the test can never fail. (It could not, and
+        // a mutation is what said so.)
+        let src = include_str!("browse.rs");
+        let code = &src[..src.find("\nmod tests {").expect("the test module")];
+        assert!(
+            code.contains("deferred || navigating"),
+            "browser_info must suppress the banner for BOTH waits"
+        );
+
+        // Everything else still reaches the toolbar. A page that genuinely
+        // stopped answering is this app's only report that it did.
+        for other in [
+            "The page did not answer in time.",
+            "The browser could not run the page script: no view",
+            "",
+        ] {
+            assert!(
+                !browser::eval_lost_to_navigation(other),
+                "a navigation is not the only way a poll fails: {other}"
+            );
+        }
     }
 
     #[test]

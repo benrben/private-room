@@ -203,6 +203,98 @@
   outline-offset: 2px;
 }
 
+/* ----- volume and speed -----
+   These were the reason a second, native <audio controls> was kept on the
+   page (QA 2026-08-15). They are controls of this transport now: two real
+   form elements, each with its own accessible name, each keyboard-operable
+   without a line of key handling. Quiet by design — the record button and the
+   seek bar are what the eye should land on. */
+.rec-dial {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--fs-meta);
+  color: var(--muted);
+}
+.rec-dial i {
+  font-style: normal;
+}
+.rec-vol {
+  width: 74px;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+.rec-speed {
+  min-height: 24px;
+  padding: 2px 6px;
+  font: inherit;
+  color: var(--text);
+  background: none;
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+.rec-speed:hover {
+  border-color: var(--sketch);
+}
+.rec-vol:focus-visible,
+.rec-speed:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* ----- the seek bar -----
+   Full width under the three transport columns, because seeking is the widest
+   act on this page and a 200px native slider tucked into a player was the
+   whole of it before. The marks are drawn ON the track: a transport that owns
+   the timeline has to say what is worth seeking to. They are decoration of a
+   control the Highlights and Chapters tabs already list in full, so they are
+   aria-hidden and take no pointer. */
+.rec-scrub {
+  grid-column: 1 / -1;
+  position: relative;
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  padding-top: 2px;
+}
+.rec-seek {
+  width: 100%;
+  min-width: 0;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+.rec-seek:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+.rec-seekmarks {
+  position: absolute;
+  /* Inset by half a thumb at each end, so a mark sits over the position the
+     thumb can actually reach rather than over the track's raw edge. */
+  inset-inline: 8px;
+  top: 50%;
+  height: 15px;
+  transform: translateY(-50%);
+  pointer-events: none;
+}
+.rec-seekmark {
+  position: absolute;
+  top: 0;
+  width: 2px;
+  height: 100%;
+  margin-inline-start: -1px;
+  border-radius: 1px;
+}
+/* The same two inks these things wear everywhere else on the page: the marker
+   yellow for a highlight, the pen for a chapter's edge. */
+.rec-seekmark.is-highlight {
+  background-color: var(--sem-pending);
+}
+.rec-seekmark.is-chapter {
+  background-color: var(--sketch);
+}
+
 /* ----- live state chips ----- */
 .rec-live-chip {
   display: inline-flex;
@@ -384,6 +476,32 @@
   width: 128px;
 }
 
+/* ----- the preflight -----
+   The capture choices, shown only while a finished recording is being
+   continued (QA 2026-08-15: they used to sit on the review screen for ever).
+   A framed aside rather than a floating panel: it belongs to the button above
+   it, and it must not cover the transcript it is being read next to. */
+.rec-preflight {
+  margin: 0 var(--sp-4) var(--sp-3);
+  padding: var(--sp-3) var(--sp-4);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius-sm);
+  background-color: var(--hover);
+}
+.rec-preflight-lead {
+  margin: 0 0 var(--sp-2);
+  font-size: var(--fs-meta);
+  color: var(--text);
+}
+.rec-preflight .rec-options {
+  padding: 0 0 var(--sp-2);
+}
+.rec-preflight-go {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+}
+
 /* ----- the source-failed banner -----
    The Mac-audio lane died (almost always the Screen & System Audio Recording
    permission). A marker strip, not a filled alert box: a 3px urgent edge, a
@@ -472,14 +590,14 @@
   white-space: nowrap;
 }
 
-/* The full player. It keeps volume, playback speed and keyboard scrubbing —
-   the transport above is a shortcut into it, not a replacement — so it is
-   quietened and moved to the end of the facts line rather than removed. Both
-   drive the same <audio> element, so they can never disagree. */
+/* THE PLAYER, undrawn. It carried `controls` until QA 2026-08-15 found two
+   transports on one screen — this native one and .rec-transport above it,
+   neither obviously in charge. Volume, speed and scrubbing were rebuilt up
+   there; what is left here is the element itself, which every other part of
+   the page drives and which has to STAY IN THE DOM (removing it is what would
+   stop the audio). display:none does not pause a media element. */
 .rec-player {
-  margin-inline-start: auto;
-  width: min(260px, 100%);
-  height: 34px;
+  display: none;
 }
 
 /* ==========================================================================
@@ -567,9 +685,28 @@
 .rec-tab-count {
   transform: translateY(-1px);
 }
-.rec-tabbar-opt {
+/* Everything the transcript is read WITH, held together at the far end of the
+   tab row: the search box and "Show deleted". Two controls each pushing
+   themselves right with their own auto margin would drift apart as the pane
+   resized. */
+.rec-tabbar-end {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-3);
   margin-inline-start: auto;
   flex: none;
+}
+.rec-search input {
+  width: 168px;
+  max-width: 40vw;
+}
+/* The count of what a search found — including, deliberately, that it found
+   nothing. role="status" carries the same sentence to a screen reader. */
+.rec-search-count {
+  font-size: var(--fs-micro);
+  color: var(--faint);
+  white-space: nowrap;
 }
 
 .rec-body {
@@ -615,33 +752,53 @@
   color: var(--text-strong);
 }
 
-/* One turn = one speaker's run of consecutive phrases. The timestamp is a
-   MONO gutter down the left — a column you read past, the same idea as line
-   numbers beside code — and the speaker and their words share the second
-   column. Read as data, not as an annotation, so never the hand. */
+/* One turn = one speaker's run of consecutive phrases: the name once, then a
+   LINE PER PHRASE. QA 2026-08-15 found the old shape unreadable for review —
+   the phrases ran together into one block under a single timestamp, so the
+   phrase being played could only be told apart by a marker inside a wall of
+   text and no other one could be started from.
+
+   The timestamp is a MONO gutter down the left of every line — a column you
+   read past, the same idea as line numbers beside code. Its width is a
+   variable because the speaker's name has to hang over the same edge as the
+   words, and the narrow layout narrows both together. */
 .rec-turn {
-  display: grid;
-  grid-template-columns: 62px minmax(0, 1fr);
-  gap: var(--sp-3);
+  --rec-gutter: 62px;
+  --rec-gap: var(--sp-3);
   padding: 6px 8px;
-  border-radius: var(--radius-sm);
 }
 .rec-turn + .rec-turn {
-  margin-top: 4px;
-}
-/* The turn being played. A wash, with the phrase inside it carrying the
-   marker — two steps of the same signal, not two different ones. */
-.rec-turn.active {
-  background-color: var(--accent-ghost);
-}
-.rec-turn-main {
-  grid-column: 2;
-  min-width: 0;
+  margin-top: var(--sp-3);
 }
 .rec-turn-head {
   margin-bottom: 3px;
+  padding-inline-start: calc(var(--rec-gutter) + var(--rec-gap));
 }
-.rec-turn-body {
+.rec-line {
+  display: grid;
+  grid-template-columns: var(--rec-gutter) minmax(0, 1fr);
+  gap: var(--rec-gap);
+  padding: 1px 4px;
+  border-radius: var(--radius-sm);
+}
+/* The phrase being played. A wash, with the words inside it carrying the
+   marker — two steps of the same signal, not two different ones. */
+.rec-line.is-active {
+  background-color: var(--accent-ghost);
+}
+/* A phrase the search box matched, and the one "Show in transcript" asked
+   for. Both are said with an edge rather than a fill: the fill is spoken for
+   by the playhead above, and a reader must be able to see at a glance which
+   of the three a line is. */
+.rec-line.is-hit {
+  box-shadow: inset 2px 0 0 var(--sem-pending);
+}
+.rec-line.is-found {
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+.rec-line-text {
+  grid-column: 2;
+  min-width: 0;
   font-size: var(--fs-body);
   /* Airier than the old 1.6. A transcript is read in long runs and this is
      the single cheapest thing that makes one readable. */
@@ -885,6 +1042,44 @@
 .rec-found-span {
   color: var(--ink-soft);
 }
+
+/* ----- a highlight row -----
+   QA 2026-08-15: it was a time range and a remove button, so a list of the
+   moments that mattered was a list of numbers. The words come from the
+   transcript phrases the mark overlaps (recReview.highlightQuote) — inline so
+   the "?" that says the room wrote it still sits beside them rather than
+   dropping onto a line of its own. */
+.rec-hl {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 2px;
+  max-width: 100%;
+  vertical-align: top;
+}
+.rec-hl-title {
+  font-weight: 600;
+  line-height: var(--lh-body);
+}
+/* A mark over silence, over music, or over a stretch recorded with live
+   transcription off. Set apart from a real quotation and said in words: a row
+   that looked the same would read as a transcript that lost the sentence. */
+.rec-hl-title.is-silent {
+  font-weight: 400;
+  font-style: italic;
+  color: var(--faint);
+}
+.rec-hl-quote {
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+  color: var(--muted);
+}
+/* The row's second act — hearing it is the timestamp's job, reading it is
+   this one's. Never hidden until hover the way the remove button is: it is
+   the whole reason the mark is worth keeping. */
+.rec-found-act {
+  flex: none;
+  font-size: var(--fs-micro);
+}
 .rec-found-mark {
   margin-inline-start: 6px;
   opacity: 0.75;
@@ -913,6 +1108,16 @@
   font-style: italic;
   color: var(--muted);
   margin-top: 2px;
+}
+
+/* A search that matched nothing. Stated where the phrases would have been,
+   because an empty transcript pane and a filter that hides all of it look
+   identical otherwise. */
+.rec-find-none {
+  margin: var(--sp-6) 0;
+  text-align: center;
+  font-size: var(--fs-meta);
+  color: var(--muted);
 }
 
 /* Lined up with the transcript column, not the stamp gutter: 8px of turn
@@ -1337,9 +1542,12 @@
   .rec-tabs {
     gap: var(--sp-3);
   }
+  /* One variable, so the stamp gutter, the speaker's hanging indent and the
+     phrase column all narrow together — they are one edge, and the layout
+     that narrows two of the three is the one that looks broken. */
   .rec-turn {
-    grid-template-columns: 54px minmax(0, 1fr);
-    gap: var(--sp-2);
+    --rec-gutter: 54px;
+    --rec-gap: var(--sp-2);
   }
   .rec-read-note {
     padding-inline-start: 70px;
@@ -1563,17 +1771,13 @@
   margin: 2px 0 0;
 }
 
-/* ----- the two ways in -----
-   Side by side down to a narrow pane, then stacked. Each is a real target
-   with its own explanation, because the difference between them (one takes
-   the Mac's own output as well as the mic) is the thing a reader has to know
-   before choosing, and nowhere else in the app says it. */
-.rec-home-start {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(270px, 1fr));
-  gap: var(--sp-4);
-  margin-bottom: var(--sp-6);
-}
+/* ----- the way in -----
+   ONE now, not two side by side: the overview used to repeat the contextual
+   sidebar's capture buttons, and the sidebar is where they live. What is left
+   is the empty state's single call to action, so the grid that laid the pair
+   out (`.rec-home-start`) went with them rather than sitting here styling
+   nothing. A real target with its own explanation, because the difference
+   between the captures is the thing a reader has to know before choosing. */
 .rec-home-action {
   align-items: flex-start;
   gap: var(--sp-4);
@@ -1605,24 +1809,10 @@
   color: var(--ink-2);
   white-space: normal;
 }
-/* The voice note takes the mic glyph inside a quieter ring — it is the same
-   family of control, drawn with less pressure, because it captures less. */
-.rec-record-ring.is-quiet {
-  color: var(--ink-2);
-  border-color: var(--rule-strong);
-}
-.rec-record-ring.is-quiet::before {
-  border-color: color-mix(in srgb, var(--rule-strong) 46%, transparent);
-}
-.rec-record-ring.is-quiet::after {
-  border-color: color-mix(in srgb, var(--rule-strong) 20%, transparent);
-}
-.rec-home-action:hover:not(:disabled) .rec-record-ring.is-quiet::before {
-  border-color: color-mix(in srgb, var(--rule-strong) 78%, transparent);
-}
-.rec-home-action:hover:not(:disabled) .rec-record-ring.is-quiet::after {
-  border-color: color-mix(in srgb, var(--rule-strong) 42%, transparent);
-}
+/* `.rec-record-ring.is-quiet` — the voice note's quieter ring — lived here to
+   tell the two capture buttons apart. Only one of them is on this page now, so
+   there is nothing left for it to contrast with, and five rules that style no
+   element are five rules the next reader has to disprove. */
 
 /* ----- the shelf ----- */
 .rec-home-shelf-head {
