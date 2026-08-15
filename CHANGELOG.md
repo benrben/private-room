@@ -3,6 +3,69 @@
 All notable, user-facing changes to Arcelle. Versions follow
 [semver](https://semver.org); dates are the GitHub release dates.
 
+## 0.22.0 — 2026-08-15
+
+### Quote from anything you can read
+
+Selecting a sentence in a document offers to send it to the chat, with the
+file's name attached. That used to work only for plain documents. Saved web
+pages, e-books and old Word files were left out — not on purpose, but because
+the rule that decided it was borrowing a list built to answer a different
+question. Three of the formats people most want to quote from were quietly
+excluded.
+
+Now they all work. Highlight a sentence on a rendered web page and the quote
+button appears over it. E-books and `.doc`/`.rtf` files gained a **Text** view
+beside the formatted one — the document's words, selectable and quotable.
+Those two render with scripting completely switched off for safety, and that
+isn't being loosened to sell a quote button, so **Text** is where you quote
+them.
+
+The room will not quote something it cannot find in the file. A web page that
+writes its own text with a script has nothing the app can check against, so no
+quote is offered rather than one it can't stand behind. Selecting the room's
+own reply in the chat, a chapter title in a book's contents, or a label on a
+toolbar offers nothing either — none of those are the document.
+
+### The room stops saying things it doesn't know
+
+A wave of small honesty fixes, each removing a claim the app couldn't back up.
+
+A job waiting its turn used to animate as though it were working; it now sits
+still and says it's queued. A job that had just started showed "0 of 1 steps" —
+one step, none of them done, both invented — and a finished deck kept saying it
+in the history forever. Studio runs report their phase instead, because that is
+what they actually know.
+
+Turning off automatic file descriptions now turns them off. "Scan now" with
+cloud privacy switched off explains why it can't, instead of doing nothing.
+Speech that fails says so rather than going quiet, and no longer speaks a
+two-word fragment before pausing. Error messages stay until you dismiss them.
+Opening a file no longer discards a prompt you were half-way through typing,
+and a background job finishing while you're reading an answer waits with an
+"Open" button instead of jumping you away.
+
+Hebrew and other non-Latin text was getting about a third of the working memory
+it should have — the room was counting bytes where it meant characters.
+
+### A real View menu, and a new face
+
+The layouts, panes and sidebar options that lived only in on-screen controls
+are now in the Mac's own **View** menu, where you can search them from Help and
+see their keyboard shortcuts written down. ⌘1 and ⌘2 show and hide the Library
+and the Assistant.
+
+The room also reads a little differently: a new typeface for the interface and
+another for headings, warmer accent colours, and corners and icons that are
+consistent from one surface to the next.
+
+### Quieter and quicker
+
+The room was shutting its local model down inside the very window it had asked
+it to stay warm, so the next question paid a cold start for nothing. Locking
+the room now releases that memory instead of holding it behind the password
+screen.
+
 ## 0.21.0 — 2026-08-13
 
 ### A page for drawing
