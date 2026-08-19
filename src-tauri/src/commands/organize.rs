@@ -44,8 +44,15 @@ use super::*;
 /// for the same reason the bulk verbs are best-effort: one hallucinated
 /// filename in a plan of thirty must not discard the twenty-nine real ones.
 struct Resolved {
-    hits: Vec<(String, String)>, // (id, real name)
+    /// (index in `names`, id, real name) — the pairing is carried out of the
+    /// resolve rather than recovered later, because the loop that consumes it
+    /// RENAMES and MOVES files: a second lookup of the same name runs against a
+    /// database the caller has already changed, and matches something else or
+    /// nothing at all.
+    hits: Vec<(usize, String, String)>,
     misses: Vec<BulkFailure>,
+    /// Names that resolved to a file an earlier name already claimed.
+    dupes: Vec<BulkFailure>,
 }
 
 /// Resolve the names in a plan, in order, dropping duplicates.
@@ -57,12 +64,16 @@ struct Resolved {
 /// De-duplication is by resolved ID, not by the string the model wrote: a plan
 /// that names the same file twice, once as `q3.pdf` and once as
 /// `Invoices/q3.pdf`, is one file. Left in, the second entry would either
-/// double-apply a move or report a bogus failure.
+/// double-apply a move or report a bogus failure. The duplicate is REPORTED
+/// (`dupes`) rather than dropped in silence — for the verbs where a second
+/// entry carried instructions of its own, saying nothing about it is a receipt
+/// that claims a plan was carried out whole when part of it never ran.
 fn resolve(conn: &Connection, names: &[String]) -> Resolved {
-    let mut hits: Vec<(String, String)> = Vec::new();
+    let mut hits: Vec<(usize, String, String)> = Vec::new();
     let mut misses: Vec<BulkFailure> = Vec::new();
+    let mut dupes: Vec<BulkFailure> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
-    for raw in names {
+    for (at, raw) in names.iter().enumerate() {
         let name = raw.trim();
         if name.is_empty() {
             continue;
@@ -70,7 +81,12 @@ fn resolve(conn: &Connection, names: &[String]) -> Resolved {
         match db::find_file_like_qualified(conn, name) {
             Ok((id, real)) => {
                 if seen.insert(id.clone()) {
-                    hits.push((id, real));
+                    hits.push((at, id, real));
+                } else {
+                    dupes.push(BulkFailure {
+                        name: name.to_string(),
+                        error: "names the same file as an earlier entry".into(),
+                    });
                 }
             }
             Err(e) => misses.push(BulkFailure {
@@ -79,7 +95,7 @@ fn resolve(conn: &Connection, names: &[String]) -> Resolved {
             }),
         }
     }
-    Resolved { hits, misses }
+    Resolved { hits, misses, dupes }
 }
 
 /// Does this name mean "the top level" rather than a folder?
@@ -102,32 +118,26 @@ fn existing_folder(conn: &Connection, name: &str) -> Option<Folder> {
         .find(|f| f.name.eq_ignore_ascii_case(name.trim()))
 }
 
-/// Find a folder by name, or make one — unless `create` is false.
+/// Find a folder by name, or make one.
 ///
-/// `create` exists because of a bug this module's own test caught: a DRY RUN
-/// resolved every destination through here, and resolving used to mean
-/// creating. So previewing "file these under Invoices, Receipts and Tax"
-/// silently left three real folders in the room. A preview that mutates is
-/// worse than no preview, because it is the one the user trusted.
+/// ONLY the real run may call this. A DRY RUN used to resolve every destination
+/// through here, and resolving meant creating — so previewing "file these under
+/// Invoices, Receipts and Tax" silently left three real folders in the room. A
+/// preview that mutates is worse than no preview, because it is the one the
+/// user trusted; the dry-run branches report the destination by NAME and never
+/// reach this function.
 ///
-/// Get-or-create when `create` IS set is deliberate and unchanged: the agent's
-/// `move_file` has always made a folder on the way into it, and "file these
-/// under Invoices" before an Invoices folder exists is what the request means.
-fn folder_id_for(
-    conn: &Connection,
-    name: &str,
-    create: bool,
-) -> Result<Option<String>, String> {
+/// Get-or-create is deliberate and unchanged: the agent's `move_file` has
+/// always made a folder on the way into it, and "file these under Invoices"
+/// before an Invoices folder exists is what the request means.
+fn folder_id_for(conn: &Connection, name: &str) -> Result<Option<String>, String> {
     if means_top_level(name) {
         return Ok(None);
     }
     let name = name.trim();
     match existing_folder(conn, name) {
         Some(f) => Ok(Some(f.id)),
-        None if create => Ok(Some(db::create_folder(conn, name)?.id)),
-        // A preview names the folder it WOULD make. The empty id is never used
-        // — every dry-run branch reports and returns before touching it.
-        None => Ok(Some(String::new())),
+        None => Ok(Some(db::create_folder(conn, name)?.id)),
     }
 }
 
@@ -243,15 +253,21 @@ pub(crate) fn organize(
     remove_folders: &[String],
     dry_run: bool,
 ) -> Result<OrganizeReport, String> {
+    // Every list in one call carries the same ceiling. Folder maintenance used
+    // to have none, so one call could create — or delete — thousands of
+    // folders, and the receipt said nothing had been held back because nothing
+    // had been.
     let mut report = OrganizeReport {
-        capped: entries.len().saturating_sub(MAX_BULK_FILES),
+        capped: entries.len().saturating_sub(MAX_BULK_FILES)
+            + make_folders.len().saturating_sub(MAX_BULK_FILES)
+            + remove_folders.len().saturating_sub(MAX_BULK_FILES),
         ..Default::default()
     };
 
     // Folders are created FIRST so an empty folder can be made in the same call
     // that files are moved into it, and so `folder:` on an entry below finds a
     // folder this very plan asked for rather than making a second one.
-    for name in make_folders {
+    for name in make_folders.iter().take(MAX_BULK_FILES) {
         let name = name.trim();
         if name.is_empty() || means_top_level(name) {
             continue;
@@ -279,16 +295,14 @@ pub(crate) fn organize(
     let names: Vec<String> = plan.iter().map(|e| e.name.clone()).collect();
     let resolved = resolve(conn, &names);
     report.failed.extend(resolved.misses);
-    // Resolution de-duplicates, so walk the RESOLVED list and pair each hit
-    // back to its entry by name — the plan's own order is preserved.
-    for (id, real_name) in &resolved.hits {
-        let Some(entry) = plan.iter().find(|e| {
-            db::find_file_like_qualified(conn, e.name.trim())
-                .map(|(hit, _)| &hit == id)
-                .unwrap_or(false)
-        }) else {
-            continue;
-        };
+    report.failed.extend(resolved.dupes);
+    // Each hit carries the index of the entry it came from. Looking the name up
+    // a SECOND time here would search a room this very loop is renaming: an
+    // entry that moves "final.md" after an earlier entry renamed something else
+    // to "final.md" would find the wrong file, or none — and a hit with no
+    // entry was silently skipped, done nowhere and reported nowhere.
+    for (at, id, real_name) in &resolved.hits {
+        let entry = plan[*at];
         if let Some(folder) = &entry.folder {
             let where_to = if means_top_level(folder) {
                 "the top level".to_string()
@@ -300,7 +314,7 @@ pub(crate) fn organize(
                 // left folders behind is the bug this branch exists for.
                 report.moved.push(format!("\"{real_name}\" → {where_to}"));
             } else {
-                match folder_id_for(conn, folder, true)
+                match folder_id_for(conn, folder)
                     .and_then(|fid| db::move_file_to_folder(conn, id, fid.as_deref()))
                 {
                     Ok(()) => report.moved.push(format!("\"{real_name}\" → {where_to}")),
@@ -347,7 +361,7 @@ pub(crate) fn organize(
     // it does both in the right order. `db::delete_folder` never deletes files
     // — they return to the top level (ADD-16) — which is what makes this safe
     // to give a model at all.
-    for name in remove_folders {
+    for name in remove_folders.iter().take(MAX_BULK_FILES) {
         let name = name.trim();
         if name.is_empty() {
             continue;
@@ -386,7 +400,7 @@ pub(crate) fn organize(
 /// that will eventually disagree about what deleting means.
 pub(crate) fn trash_named(conn: &Connection, names: &[String]) -> (BulkReport, Vec<BulkFailure>) {
     let resolved = resolve(conn, names);
-    let ids: Vec<String> = resolved.hits.into_iter().map(|(id, _)| id).collect();
+    let ids: Vec<String> = resolved.hits.into_iter().map(|(_, id, _)| id).collect();
     let report = super::bulk::trash_files_in(conn, &ids, db::TrashActor::Agent("trash_files"));
     (report, resolved.misses)
 }
@@ -433,7 +447,7 @@ pub(crate) fn merge(
 
     let mut body = String::new();
     let mut merged: Vec<String> = Vec::new();
-    for (id, name) in &resolved.hits {
+    for (_, id, name) in &resolved.hits {
         // A file whose text the room never extracted (a PDF that failed OCR, a
         // recording with no transcript, an image) has nothing to contribute.
         // Skipping it SILENTLY would produce a merge that looks complete and
@@ -473,6 +487,13 @@ pub(crate) fn merge(
     } else {
         into.to_string()
     };
+    // `into` names a NEW file (so says the tool's own schema), and the default
+    // is the app's own — so neither may land on a name already in use. Merging
+    // twice with no `into` produced a second "Merged notes.md" beside the
+    // first, same name and different content, and every name-based verb after
+    // that reached only the newest one. The receipt reports `meta.name`, so it
+    // keeps telling the truth about which file was written.
+    let name = db::available_name(conn, &name)?;
     let mime = mime_guess::from_path(&name)
         .first_or(mime_guess::mime::TEXT_PLAIN)
         .essence_str()
@@ -486,8 +507,8 @@ pub(crate) fn merge(
         let ids: Vec<String> = resolved
             .hits
             .iter()
-            .filter(|(_, n)| merged.contains(n))
-            .map(|(id, _)| id.clone())
+            .filter(|(_, _, n)| merged.contains(n))
+            .map(|(_, id, _)| id.clone())
             .collect();
         let trashed =
             super::bulk::trash_files_in(conn, &ids, db::TrashActor::Agent("merge_files"));
@@ -583,6 +604,80 @@ mod tests {
     }
 
     #[test]
+    fn an_entry_is_not_lost_when_an_earlier_rename_takes_its_name() {
+        // The plan renames draft.md to final.md and then files the ORIGINAL
+        // final.md away. Re-resolving "final.md" after the rename finds the
+        // wrong row (or two candidates), so the second entry used to be done
+        // nowhere and reported nowhere.
+        let conn = room();
+        let final_id = add(&conn, "final.md", "the real one");
+        add(&conn, "draft.md", "a draft");
+        let entries = vec![
+            OrganizeEntry {
+                name: "draft.md".into(),
+                new_name: Some("final.md".into()),
+                ..Default::default()
+            },
+            OrganizeEntry {
+                name: "final.md".into(),
+                folder: Some("Archive".into()),
+                ..Default::default()
+            },
+        ];
+        let r = organize(&conn, &entries, &[], &[], false).unwrap();
+        assert_eq!(r.renamed.len(), 1);
+        assert_eq!(r.moved.len(), 1, "the second entry was attempted: {:?}", r.sentence(false));
+        assert!(r.failed.is_empty(), "{:?}", r.sentence(false));
+        // …and it moved the file the plan named, not the renamed draft.
+        let archive = existing_folder(&conn, "Archive").expect("Archive exists");
+        let meta = db::get_file_meta(&conn, &final_id).unwrap();
+        assert_eq!(meta.folder_id.as_deref(), Some(archive.id.as_str()));
+    }
+
+    #[test]
+    fn naming_one_file_twice_is_reported_rather_than_dropped() {
+        let conn = room();
+        let id = add(&conn, "q3.pdf", "body");
+        let entries = vec![
+            OrganizeEntry {
+                name: "q3.pdf".into(),
+                folder: Some("Invoices".into()),
+                ..Default::default()
+            },
+            OrganizeEntry {
+                name: "q3".into(),
+                new_name: Some("Q3 report".into()),
+                ..Default::default()
+            },
+        ];
+        let r = organize(&conn, &entries, &[], &[], false).unwrap();
+        assert_eq!(r.moved.len(), 1);
+        assert!(r.renamed.is_empty(), "the second entry names the same file");
+        assert_eq!(r.failed.len(), 1);
+        assert!(r.failed[0].error.contains("earlier entry"), "{}", r.failed[0].error);
+        // The rename it asked for did not happen, and the receipt says so.
+        assert_eq!(db::get_file_meta(&conn, &id).unwrap().name, "q3.pdf");
+        assert!(r.sentence(false).contains("could not be done"));
+    }
+
+    #[test]
+    fn folder_maintenance_is_capped_like_everything_else() {
+        // One call used to be able to create — or delete — an unbounded number
+        // of folders, with the receipt reporting nothing held back.
+        let conn = room();
+        let many: Vec<String> = (0..MAX_BULK_FILES + 3).map(|i| format!("F{i}")).collect();
+        let r = organize(&conn, &[], &many, &[], false).unwrap();
+        assert_eq!(r.folders_made.len(), MAX_BULK_FILES);
+        assert_eq!(r.capped, 3);
+        assert!(r.sentence(false).contains("were not attempted"));
+        assert_eq!(db::list_folders(&conn).unwrap().len(), MAX_BULK_FILES);
+        // Removal is bounded by the same ceiling.
+        let r = organize(&conn, &[], &[], &many, false).unwrap();
+        assert_eq!(r.folders_removed.len(), MAX_BULK_FILES);
+        assert_eq!(r.capped, 3);
+    }
+
+    #[test]
     fn a_dry_run_changes_nothing_and_says_so() {
         // A PREVIEW THAT MUTATES IS WORSE THAN NO PREVIEW, because it is the
         // one the user trusted. This caught a real defect: resolving a
@@ -674,6 +769,28 @@ mod tests {
         let err = merge(&conn, &["only.md".into(), "scan.pdf".into()], "x", true, false)
             .unwrap_err();
         assert!(err.contains("readable text"), "{err}");
+    }
+
+    #[test]
+    fn a_second_merge_does_not_reuse_the_first_ones_name() {
+        // Two files called "Merged notes.md" with different content is a room
+        // where the first merge can never be opened by name again.
+        let conn = room();
+        add(&conn, "a.md", "First.");
+        add(&conn, "b.md", "Second.");
+        add(&conn, "c.md", "Third.");
+        add(&conn, "d.md", "Fourth.");
+        let (first, _, _) = merge(&conn, &["a.md".into(), "b.md".into()], "", false, false).unwrap();
+        let (second, receipt, _) =
+            merge(&conn, &["c.md".into(), "d.md".into()], "", false, false).unwrap();
+        assert_eq!(first, "Merged notes.md");
+        assert_ne!(second, first, "the second merge took a free name");
+        // The receipt names the file that was actually written.
+        assert!(receipt.contains(&second), "{receipt}");
+        // …and the first merge is still reachable by its own name.
+        let (id, _) = db::find_file_like(&conn, &first).unwrap();
+        let text = db::get_file_extracted_text(&conn, &id).unwrap();
+        assert!(text.contains("First."), "got: {text}");
     }
 
     #[test]

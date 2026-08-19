@@ -148,49 +148,78 @@ const TRACKER_DOMAINS: &[&str] = &[
 /// the guard is the authority for navigation, this is the same policy for
 /// sub-resources. A test below asserts every family the guard blocks has a
 /// rule here.
-const PRIVATE_URL_FILTERS: &[&str] = &[
+///
+/// Written host-first: [`PRIVATE_SCHEME_PREFIXES`] supplies the anchored scheme
+/// each one is paired with, because the same host families have to be refused
+/// over more than one scheme.
+const PRIVATE_HOST_FILTERS: &[&str] = &[
     // `localhost` and `*.local`, with the host either ended by a delimiter or
     // ending the URL. Two rules apiece rather than one `([:/]|$)`.
-    r"^https?://localhost[:/]",
-    r"^https?://localhost$",
-    r"^https?://[^/]*\.local[:/]",
-    r"^https?://[^/]*\.local$",
-    r"^https?://127\.",
-    r"^https?://10\.",
-    r"^https?://192\.168\.",
+    r"localhost[:/]",
+    r"localhost$",
+    r"[^/]*\.local[:/]",
+    r"[^/]*\.local$",
+    r"127\.",
+    r"10\.",
+    r"192\.168\.",
     // 172.16.0.0/12, one rule per decade of the second octet.
-    r"^https?://172\.1[6-9]\.",
-    r"^https?://172\.2[0-9]\.",
-    r"^https?://172\.3[01]\.",
-    r"^https?://169\.254\.",
+    r"172\.1[6-9]\.",
+    r"172\.2[0-9]\.",
+    r"172\.3[01]\.",
+    r"169\.254\.",
     // CGNAT / Tailscale 100.64.0.0/10
-    r"^https?://100\.6[4-9]\.",
-    r"^https?://100\.[7-9][0-9]\.",
-    r"^https?://100\.1[01][0-9]\.",
-    r"^https?://100\.12[0-7]\.",
+    r"100\.6[4-9]\.",
+    r"100\.[7-9][0-9]\.",
+    r"100\.1[01][0-9]\.",
+    r"100\.12[0-7]\.",
     // "this network" 0.0.0.0/8
-    r"^https?://0\.",
+    r"0\.",
     // IETF protocol assignments 192.0.0.0/24
-    r"^https?://192\.0\.0\.",
+    r"192\.0\.0\.",
     // Benchmarking 198.18.0.0/15
-    r"^https?://198\.18\.",
-    r"^https?://198\.19\.",
+    r"198\.18\.",
+    r"198\.19\.",
     // Multicast 224.0.0.0/4, reserved 240.0.0.0/4 and the broadcast address —
     // everything from 224 up, which is what the guard's `o[0] >= 224` means.
-    r"^https?://22[4-9]\.",
-    r"^https?://2[34][0-9]\.",
-    r"^https?://25[0-5]\.",
+    r"22[4-9]\.",
+    r"2[34][0-9]\.",
+    r"25[0-5]\.",
     // IPv6 loopback, unspecified, and unique-local/link-local literals
-    r"^https?://\[::1\]",
-    r"^https?://\[::\]",
-    r"^https?://\[f[cd]",
-    r"^https?://\[fe[89ab]",
+    r"\[::1\]",
+    r"\[::\]",
+    r"\[f[cd]",
+    r"\[fe[89ab]",
     // IPv4-mapped IPv6 literals. The guard classifies these by the IPv4 they
     // embed, so `[::ffff:127.0.0.1]` is a loopback address written the long
     // way; a url-filter cannot reach inside the mapping, so the whole (never
     // legitimately used) form is blocked rather than half of it.
-    r"^https?://\[::ffff:",
+    r"\[::ffff:",
 ];
+
+/// Every scheme a page can reach a local service over, anchored.
+///
+/// `http(s)` is the sub-resource case the module comment describes. `ws(s)` is
+/// the same reach by another name: script that gets no rule for it can open
+/// `ws://127.0.0.1:PORT/` against every port on this Mac and time the failures
+/// to enumerate what is listening — `on_navigation` never sees a WebSocket, and
+/// an `^https?` pattern does not match a `ws://` URL.
+///
+/// `s?` is a quantifier on ONE character, which is inside the subset
+/// `URLFilterParser` accepts; anything richer here would take the whole list
+/// down (see [`PRIVATE_HOST_FILTERS`]).
+const PRIVATE_SCHEME_PREFIXES: &[&str] = &[r"^https?://", r"^wss?://"];
+
+/// The private-range url-filters: every host family, over every scheme.
+fn private_url_filters() -> Vec<String> {
+    PRIVATE_SCHEME_PREFIXES
+        .iter()
+        .flat_map(|scheme| {
+            PRIVATE_HOST_FILTERS
+                .iter()
+                .map(move |host| format!("{scheme}{host}"))
+        })
+        .collect()
+}
 
 /// The JSON WebKit compiles. Apple's format: an array of
 /// `{trigger:{url-filter,…}, action:{type}}`.
@@ -199,7 +228,7 @@ pub fn rules_json() -> String {
 
     // The private-network block comes FIRST so it is unmistakable in a dump of
     // the list; WebKit evaluates all rules regardless of order for `block`.
-    for filter in PRIVATE_URL_FILTERS {
+    for filter in private_url_filters() {
         rules.push(serde_json::json!({
             "trigger": { "url-filter": filter },
             "action": { "type": "block" }
@@ -226,7 +255,7 @@ pub fn rules_json() -> String {
 /// TWO patterns, not one. The single pattern this replaces used an optional
 /// GROUP — `([^/]*\.)?` — to make the subdomain part skippable, and a
 /// quantified group is one of the two constructs WebKit's url-filter compiler
-/// rejects (see [`PRIVATE_URL_FILTERS`]). Splitting the choice into two rules
+/// rejects (see [`PRIVATE_HOST_FILTERS`]). Splitting the choice into two rules
 /// says exactly the same thing with only the operators the compiler takes.
 ///
 /// Dots are escaped so `google-analytics.com` cannot match
@@ -243,11 +272,57 @@ fn domain_filters(domain: &str) -> [String; 2] {
 /// Identifier the compiled list is cached under inside WebKit's store. Bump
 /// the suffix whenever the rules change, or WebKit serves the previously
 /// compiled list from its cache and edits here silently do nothing.
-pub const RULE_LIST_ID: &str = "arcelle-browse-v3";
+pub const RULE_LIST_ID: &str = "arcelle-browse-v4";
+
+/// Digest of the rules the id above currently names, checked by
+/// `a_rule_edit_fails_until_the_digest_pinned_to_the_cache_key_is_reset`
+/// below. The two are edited together or not at all.
+#[cfg(test)]
+const RULES_DIGEST: u64 = 0x6eba_1037_832f_5c62;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// WebKit hands back whatever it compiled under [`RULE_LIST_ID`] and never
+    /// looks at the rules again, so a rule edit that leaves the id alone ships
+    /// the PREVIOUS list while the browser reports the attach as successful and
+    /// the chip still reads "Private". No other test can see that: they all read
+    /// the freshly generated JSON, which is always correct.
+    ///
+    /// What this can enforce is that a rule edit STOPS here and says so; it
+    /// cannot read the id the author then types, so the name says pinned, not
+    /// proved.
+    #[test]
+    fn a_rule_edit_fails_until_the_digest_pinned_to_the_cache_key_is_reset() {
+        let parsed: serde_json::Value = serde_json::from_str(&rules_json()).unwrap();
+        // Over the fields that decide what gets blocked, not over the serialized
+        // bytes — a digest that also moves when serde reorders a key would send
+        // people bumping the cache key for nothing.
+        let mut canonical = String::new();
+        for rule in parsed.as_array().unwrap() {
+            let trigger = &rule["trigger"];
+            canonical.push_str(trigger["url-filter"].as_str().unwrap());
+            canonical.push('|');
+            if trigger.get("load-type").is_some() {
+                canonical.push_str("3p");
+            }
+            canonical.push('|');
+            canonical.push_str(rule["action"]["type"].as_str().unwrap());
+            canonical.push('\n');
+        }
+        // FNV-1a, hand-rolled for the same reason `simple_regex_matches` is: a
+        // stable digest is not worth a dependency.
+        let mut digest: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in canonical.as_bytes() {
+            digest ^= u64::from(*byte);
+            digest = digest.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        assert_eq!(
+            digest, RULES_DIGEST,
+            "the rules changed: bump RULE_LIST_ID's suffix, then set RULES_DIGEST to {digest:#018x}"
+        );
+    }
 
     #[test]
     fn rules_are_valid_apple_content_blocker_json() {
@@ -314,11 +389,12 @@ mod tests {
     fn private_ranges_all_reach_the_compiled_list_and_come_first() {
         let parsed: serde_json::Value = serde_json::from_str(&rules_json()).unwrap();
         let arr = parsed.as_array().unwrap();
-        assert!(arr.len() > PRIVATE_URL_FILTERS.len());
-        for (i, filter) in PRIVATE_URL_FILTERS.iter().enumerate() {
+        let filters = private_url_filters();
+        assert!(arr.len() > filters.len());
+        for (i, filter) in filters.iter().enumerate() {
             assert_eq!(
                 arr[i]["trigger"]["url-filter"].as_str(),
-                Some(*filter),
+                Some(filter.as_str()),
                 "private-range filter {i} missing or out of order"
             );
             // Private-range rules must apply to FIRST-party loads too: a page
@@ -332,7 +408,7 @@ mod tests {
     }
 
     /// The two protection layers must agree, and this is what makes the claim
-    /// in `PRIVATE_URL_FILTERS`' doc comment true.
+    /// in `PRIVATE_HOST_FILTERS`' doc comment true.
     ///
     /// It used to be a hand-picked list of eleven addresses, which is why four
     /// whole families the navigation guard rejects had NO sub-resource rule:
@@ -387,7 +463,7 @@ mod tests {
             // The url-filter subset WebKit accepts is a plain regex for
             // everything we use here, so `regex`-free matching is enough:
             // compile with the same semantics via a tiny shim.
-            let filter_blocks = PRIVATE_URL_FILTERS
+            let filter_blocks = private_url_filters()
                 .iter()
                 .any(|f| simple_regex_matches(f, url));
             assert_eq!(
@@ -399,8 +475,38 @@ mod tests {
         }
     }
 
+    /// A WebSocket reaches a local service exactly as an `<img>` does, and
+    /// nothing else looks at it: `on_navigation` is never called for one, so
+    /// these filters are the only layer. Kept apart from the guard-equivalence
+    /// test above deliberately — `check_public_http_url` refuses EVERY `ws://`
+    /// URL on its scheme alone, public host or not, so equating the two layers
+    /// here would demand blocking the ordinary web's WebSockets.
+    #[test]
+    fn websocket_urls_to_private_hosts_are_blocked_and_public_ones_are_not() {
+        let filters = private_url_filters();
+        let blocks = |url: &str| filters.iter().any(|f| simple_regex_matches(f, url));
+        for url in [
+            "ws://127.0.0.1:11434/",
+            "wss://127.0.0.1:8443/socket",
+            "ws://localhost:6379/",
+            "ws://[::1]:9229/",
+            "ws://192.168.1.1/ws",
+            "wss://printer.local/stream",
+            "ws://169.254.169.254/",
+        ] {
+            assert!(blocks(url), "{url}: a local WebSocket must be blocked");
+        }
+        for url in [
+            "wss://example.com/socket",
+            "ws://8.8.8.8/",
+            "wss://chat.example.com:443/ws",
+        ] {
+            assert!(!blocks(url), "{url}: a public WebSocket must still connect");
+        }
+    }
+
     /// Minimal regex matcher covering exactly the constructs used in
-    /// `PRIVATE_URL_FILTERS`: literals, `\.`, `[...]` classes with ranges,
+    /// [`PRIVATE_HOST_FILTERS`]: literals, `\.`, `[...]` classes with ranges,
     /// `(a|b)` alternation of literal/class sequences, `?` on `s`, and `$`.
     /// Written out rather than pulling in a regex dependency for one test.
     fn simple_regex_matches(pattern: &str, text: &str) -> bool {

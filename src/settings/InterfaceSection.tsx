@@ -93,9 +93,9 @@ export default function InterfaceSection({
           would make the rough spots read as bugs rather than as the known
           edge of a setting. */}
       <p className="settings-hint">
-        Compact tightens spacing and type across the app. The densest pages —
-        Settings, Connectors, Workflows — are tuned for Comfortable and give
-        back less room than the rest.
+        Compact tightens spacing and type across the app. The sidebar, the tab
+        strip and the Create page are tuned for Comfortable and give back less
+        room than the rest.
       </p>
 
       <label className="settings-label">Canvas texture</label>
@@ -120,9 +120,11 @@ export default function InterfaceSection({
 
       <label className="settings-label">Reset</label>
       <p className="settings-hint">
-        Puts the sidebar, the density, the texture and every room’s saved pane
-        layout back to how Arcelle ships. It changes nothing inside your rooms
-        — no file, note, chat or setting in a room is touched.
+        Puts the sidebar, the density and the texture back to how Arcelle
+        ships, and forgets every room’s saved pane layout — rooms you already
+        have open keep their current panes until you reopen them. It changes
+        nothing inside your rooms — no file, note, chat or setting in a room is
+        touched.
       </p>
       {/* NOT `button.danger`. The red outline in this app means "this destroys
           something", and reset destroys no content whatsoever — it puts four

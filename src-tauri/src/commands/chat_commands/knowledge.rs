@@ -44,6 +44,34 @@ pub(crate) async fn cmd_remember(ctx: &CmdCtx<'_>) -> Result<CommandResult, Stri
     })
 }
 
+/// How many matches `#find` prints.
+///
+/// `#find` asks retrieval for EVERY match rather than the six a prompt can
+/// afford, which is right — it is a result list, not context. What it is not is
+/// a licence to paste a book into the chat: an embedded room answers a common
+/// word with hundreds of chunks, and each one is copied whole out of the
+/// database and formatted into a single message. More than this many is a
+/// scroll nobody reads, so the rest is COUNTED instead of printed — a silent
+/// cut would read as "that was all of them".
+const MAX_FIND_MATCHES: usize = 50;
+
+/// The match list `#find` prints, and what it says about the matches it left
+/// out. Separate from the command so the cut can be tested without a room.
+fn find_body(query: &str, chunks: &[ScoredChunk]) -> String {
+    let mut body = format!("Matches for **{query}** ({}):\n\n", chunks.len());
+    for c in chunks.iter().take(MAX_FIND_MATCHES) {
+        let snippet = make_snippet(&c.text, query, 140);
+        body.push_str(&format!("- **{}** — {snippet}\n", c.file_name));
+    }
+    if let Some(rest) = chunks.len().checked_sub(MAX_FIND_MATCHES).filter(|n| *n > 0) {
+        body.push_str(&format!(
+            "\n…and {rest} more — narrow the search to see them.\n"
+        ));
+    }
+    body.push_str("\n_Click a file below to open it._");
+    body
+}
+
 pub(crate) async fn cmd_find(ctx: &CmdCtx<'_>) -> Result<CommandResult, String> {
     let query = ctx.args.trim();
     if query.is_empty() {
@@ -62,17 +90,16 @@ pub(crate) async fn cmd_find(ctx: &CmdCtx<'_>) -> Result<CommandResult, String> 
             ..Default::default()
         });
     }
-    let mut body = format!("Matches for **{query}** ({}):\n\n", chunks.len());
+    // The chips name the files whose matches are actually ON SCREEN: a chip for
+    // a match the list didn't print is an invitation to look for something that
+    // isn't there.
     let mut sources: Vec<String> = Vec::new();
-    for c in chunks.iter() {
-        let snippet = make_snippet(&c.text, query, 140);
-        body.push_str(&format!("- **{}** — {snippet}\n", c.file_name));
+    for c in chunks.iter().take(MAX_FIND_MATCHES) {
         if !sources.contains(&c.file_name) {
             sources.push(c.file_name.clone());
         }
     }
-    body.push_str("\n_Click a file below to open it._");
-    Ok(CommandResult { content: body, sources, ..Default::default() })
+    Ok(CommandResult { content: find_body(query, &chunks), sources, ..Default::default() })
 }
 
 pub(crate) async fn cmd_add_file(ctx: &CmdCtx<'_>) -> Result<CommandResult, String> {
@@ -568,6 +595,42 @@ mod tests {
         // Exactly at the cap is not "over".
         let exact: Vec<String> = (0..MAX_FAN_OUT_FILES).map(|i| format!("i{i}")).collect();
         assert_eq!(cap_fan_out(exact).1, 0);
+    }
+
+    fn chunks(n: usize) -> Vec<ScoredChunk> {
+        (0..n)
+            .map(|i| ScoredChunk {
+                rowid: i as i64,
+                file_name: format!("book{}.txt", i % 3),
+                text: format!("the deposit clause, paragraph {i}"),
+                score: 1.0,
+            })
+            .collect()
+    }
+
+    /// `#find` asks for every match on purpose, but an embedded room answers a
+    /// common word with hundreds of chunks and each one was copied whole into a
+    /// single chat message. The list is cut — and the cut is COUNTED, because a
+    /// silent one reads as the whole result.
+    #[test]
+    fn find_prints_a_bounded_list_and_admits_what_it_left_out() {
+        let body = find_body("deposit", &chunks(200));
+        assert!(body.starts_with("Matches for **deposit** (200):"), "{body}");
+        assert_eq!(
+            body.lines().filter(|l| l.starts_with("- **")).count(),
+            MAX_FIND_MATCHES,
+            "the whole room is still being printed"
+        );
+        assert!(body.contains(&format!("…and {} more", 200 - MAX_FIND_MATCHES)), "{body}");
+
+        // A list that fits says nothing about a remainder that does not exist.
+        let body = find_body("deposit", &chunks(3));
+        assert_eq!(body.lines().filter(|l| l.starts_with("- **")).count(), 3);
+        assert!(!body.contains("more"), "{body}");
+
+        // Exactly at the cap is not "over".
+        let body = find_body("deposit", &chunks(MAX_FIND_MATCHES));
+        assert!(!body.contains("…and"), "{body}");
     }
 
     #[test]

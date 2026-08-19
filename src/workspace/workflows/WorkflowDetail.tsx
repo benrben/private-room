@@ -18,6 +18,7 @@ import { NodeParamSheet } from "./NodeParamSheet";
 import { SchedulePopover } from "./SchedulePopover";
 import { RunHistory } from "./RunHistory";
 import { branchFor } from "./selectors";
+import { nodeTitle } from "./kinds";
 import { WorkflowGlyph, WORKFLOW_ICON_CHOICES } from "./workflowGlyph";
 import { PlayIcon, PinIcon, CalendarClockIcon } from "../../icons";
 import { coveredKinds } from "../../viewers/registry";
@@ -118,6 +119,15 @@ export function WorkflowDetail({ s, a, workflow }: Props) {
   const [schedAnchor, setSchedAnchor] = useState<{ top: number; right: number } | null>(null);
   const [showIconPicker, setShowIconPicker] = useState(false);
   const [runs, setRuns] = useState<WorkflowRun[]>([]);
+  const stepHeadRef = useRef<HTMLHeadingElement>(null);
+
+  // Selecting a step opens the inspector BELOW the canvas, which on a pipeline
+  // of more than a few steps is below the fold — the node took an outline and
+  // the panel that answered the click was off-screen. `nearest` moves nothing
+  // when it is already visible.
+  useEffect(() => {
+    if (selected) stepHeadRef.current?.scrollIntoView({ block: "nearest" });
+  }, [selected]);
 
   // Re-seed from the store when the selected workflow, or its saved form,
   // changes.
@@ -176,6 +186,29 @@ export function WorkflowDetail({ s, a, workflow }: Props) {
   const liveStatus = runningJobId ? s.wfNodeStatus[runningJobId] : undefined;
   const isFileScoped = binding.scope === "file";
   const valid = !checking && errors.length === 0;
+  const isDraft = workflow.status === "draft";
+  /** Why Run now cannot fire, in the words shown on the button — or null.
+   *
+   * A draft has never been refused by the backend: `start_workflow_run` does
+   * not look at status, and the loop after "Compose with AI" is read → try →
+   * fix. What IS refused is a run with no input file, which is every workflow
+   * bound to a chosen file — the sentence below is the one the scheduler
+   * already gives for the same rule. An active workflow keeps running from its
+   * SAVED definition, so unsaved edits do not block it.
+   *
+   * A draft's test run is the one place that would MISLEAD: the whole point is
+   * edit → try → fix, and the run reads the stored definition, so an unsaved
+   * edit would be tested by running the version without it. Say so rather than
+   * run the wrong thing — Save is enabled in exactly this state. */
+  const runBlocked = isFileScoped
+    ? "This workflow runs on a chosen file — start it from that file's Actions menu."
+    : isDraft && checking
+      ? "Checking this workflow…"
+      : isDraft && errors.length
+        ? `Can't run yet — ${errors[0]}`
+        : isDraft && dirty
+          ? "Save your changes first — a test run uses the saved version."
+          : null;
 
   const nodeCount = useMemo(() => def.nodes.length, [def]);
 
@@ -247,9 +280,44 @@ export function WorkflowDetail({ s, a, workflow }: Props) {
     await a.saveWorkflowEdits(workflow.id, { name, emoji, definition: def, binding });
     /* dirty is derived from a diff */
   }
+  /** Activate = save, THEN flip the status — and only if the save landed.
+   *
+   * `saveWorkflowEdits` reports a failure as a toast and resolves anyway, so
+   * awaiting it told us nothing: a failed save still flipped the workflow to
+   * active, which then ran the PREVIOUS stored definition while the editor on
+   * screen showed the edits the user believed they had just activated. The
+   * save runs here rather than through the action for exactly that reason —
+   * the failure has to reach this function. */
   async function saveAndActivate() {
-    await save();
+    try {
+      await api.updateWorkflow({ id: workflow.id, name, emoji, definition: def, binding });
+    } catch (e) {
+      s.pushToast("error", String(e));
+      return;
+    }
+    // The save landed, so the list has to say so BEFORE the status flip is
+    // attempted: `setWorkflowStatus` swallows its own failure, and if it fails
+    // nothing else would refresh — the form would keep reporting edits that are
+    // already stored, and leaving the pane would raise the unsaved-work prompt
+    // over nothing. This is the refresh `saveWorkflowEdits` used to do.
+    await a.refreshWorkflows();
     await a.setWorkflowStatus(workflow.id, "active");
+  }
+
+  /** Run now, then re-read the run list so the canvas has a live job id.
+   *
+   * The pipeline's badges are keyed on the running run's `jobId`; the backend
+   * mints that row before `run_workflow` resolves, but nothing re-fetched it
+   * here, so a run started from this pane animated nothing until it finished
+   * and `workflows-changed` finally refreshed the list. */
+  async function runNow() {
+    await a.runWorkflowNow(workflow.id);
+    try {
+      setRuns(await api.getWorkflowRuns(workflow.id));
+    } catch {
+      // The run itself already reported anything that went wrong; the history
+      // head simply stays as it was until the next refresh.
+    }
   }
 
   /** Back to the library. The form lives only in this component and Save is off
@@ -345,8 +413,19 @@ export function WorkflowDetail({ s, a, workflow }: Props) {
           }}
         />
         <span className="viewer-actions wf-detail-actions">
-          <button className="subtle btn-ic" disabled={workflow.status !== "active"} onClick={() => void a.runWorkflowNow(workflow.id)}>
-            <PlayIcon size={12} /> Run now
+          <button
+            className="subtle btn-ic"
+            disabled={runBlocked !== null}
+            aria-disabled={runBlocked !== null}
+            title={
+              runBlocked ??
+              (isDraft
+                ? "Run this draft once now, without activating it"
+                : "Run this workflow now")
+            }
+            onClick={() => void runNow()}
+          >
+            <PlayIcon size={12} /> {isDraft ? "Test run" : "Run now"}
           </button>
           {workflow.status === "active" ? (
             <button className="subtle" onClick={() => void a.setWorkflowStatus(workflow.id, "draft")}>
@@ -439,7 +518,11 @@ export function WorkflowDetail({ s, a, workflow }: Props) {
       <div className="wf-body">
         {workflow.status === "draft" && (
           <div className="wf-badges wf-detail-badges">
-            <span className="wf-badge draft">Draft — activate to run on schedule</span>
+            <span className="wf-badge draft">
+              {isFileScoped
+                ? "Draft — activate it to appear in a file's Actions menu"
+                : "Draft — you can test-run it now; activate it to run on a schedule"}
+            </span>
             {workflow.createdBy === "agent" && <span className="wf-badge agent">Drafted by the agent</span>}
           </div>
         )}
@@ -482,18 +565,25 @@ export function WorkflowDetail({ s, a, workflow }: Props) {
         />
 
         {selectedNode && (
-          <NodeParamSheet
-            node={selectedNode}
-            onChange={updateNode}
-            onDelete={() => deleteNode(selectedNode.id)}
-            edges={def.edges}
-            allNodes={def.nodes}
-            onEdgesChange={updateEdges}
-            files={s.files}
-          />
+          <>
+            <h3 className="wf-sec-head" ref={stepHeadRef}>
+              Step: {nodeTitle(selectedNode)}
+            </h3>
+            <NodeParamSheet
+              node={selectedNode}
+              onChange={updateNode}
+              onDelete={() => deleteNode(selectedNode.id)}
+              edges={def.edges}
+              allNodes={def.nodes}
+              onEdgesChange={updateEdges}
+              files={s.files}
+            />
+          </>
         )}
 
-        {/* Binding editor */}
+        {/* Binding editor — named, because it is a second panel drawn exactly
+            like the step inspector above it and about a different subject. */}
+        <h3 className="wf-sec-head">Where this workflow appears</h3>
         <div className="node-param-sheet">
           <label>
             Where it appears

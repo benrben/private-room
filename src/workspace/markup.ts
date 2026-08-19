@@ -275,10 +275,15 @@ export function isHandwritten(text: string): boolean {
  *
  * One definition, read by the on-screen speaker label AND by the copied
  * transcript, so the two can never drift apart — they were separate string
- * literals in two files before, which is how "Room AI" on screen becomes
- * something else in the clipboard the first time anyone renames it. */
+ * literals in two files before, which is how a rename on screen becomes
+ * something else in the clipboard.
+ *
+ * "Assistant", because that is what the control the reader pressed to get here
+ * says: the top-bar pill, its ⌘2 shortcut and the layout presets all call this
+ * actor the assistant. The label used to read "Room AI", a name carried on no
+ * control anywhere in the app. */
 export function speakerName(role: string): string {
-  return role === "assistant" ? "Room AI" : "You";
+  return role === "assistant" ? "Assistant" : "You";
 }
 
 /** One run of a handwritten message. `mono` runs are PRINTED. */
@@ -343,10 +348,23 @@ export function handTokens(text: string): HandToken[] {
  * A time, not a relative age: this is the log line of a notebook page, and
  * "14:32" stays true where "2 minutes ago" silently goes stale on screen. The
  * stored value is ISO-8601 UTC (`strftime('%Y-%m-%dT%H:%M:%SZ')`), so the
- * conversion to the reader's own clock is the browser's. */
+ * conversion to the reader's own clock is the browser's.
+ *
+ * THE DAY COMES WITH IT once the message is not from today. Chats persist and
+ * "Show earlier messages" pages back through months, so a transcript routinely
+ * spans weeks — and a bare "09:14" on every row of it suggests a recency it
+ * cannot support. Same convention as AiPane's `dayLabelOf`: the year is added
+ * only when it is not this one. */
 export function messageClock(createdAt: string): string {
   if (!createdAt) return "";
   const d = new Date(createdAt);
   if (Number.isNaN(d.getTime())) return "";
-  return d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+  const time = d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+  const now = new Date();
+  if (d.toDateString() === now.toDateString()) return time;
+  const opts: Intl.DateTimeFormatOptions =
+    d.getFullYear() === now.getFullYear()
+      ? { month: "short", day: "numeric" }
+      : { month: "short", day: "numeric", year: "numeric" };
+  return `${d.toLocaleDateString(undefined, opts)}, ${time}`;
 }

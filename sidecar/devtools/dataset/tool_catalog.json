@@ -410,7 +410,7 @@
       "openWorldHint": false,
       "readOnlyHint": false
     },
-    "description": "Draw on a room sketch. Put EVERY shape in one call's script — never one call per shape. Starts a new sketch if the name is new. Read it first when changing existing work, and see_drawing after to check.",
+    "description": "Draw on a room sketch. Put EVERY shape in one call's script — never one call per shape. Starts a new sketch if the name is new. Read it first when changing existing work, and read_drawing after to check.",
     "inputSchema": {
       "properties": {
         "name": {

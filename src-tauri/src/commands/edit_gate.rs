@@ -76,17 +76,42 @@ pub(crate) fn decision_from_str(decision: &str) -> EditDecision {
 
 /// The frontend's answer to an `edit-approve-request` — "once", "turn", or
 /// anything else (declined). Registered in `lib.rs` next to `resolve_mcp_call`.
+///
+/// Answering an id that is NOT pending is an ERROR, not a no-op — the same rule
+/// `resolve_agent_ui` follows. The card outlives the tool call waiting on it:
+/// the call gives up on its own 180s budget and the model is told nobody
+/// approved, while the card sits on screen. Pressing "Apply once" afterwards
+/// used to return `Ok(())`, so the card vanished, nothing was written, and the
+/// user had every reason to believe the edit landed.
 #[tauri::command]
 pub fn resolve_edit_approval(
     state: State<'_, AppState>,
     id: String,
     decision: String,
 ) -> Result<(), String> {
-    let d = decision_from_str(&decision);
-    if let Some(tx) = state.edit_pending.lock().unwrap().remove(&id) {
-        let _ = tx.send(d);
-    }
-    Ok(())
+    deliver_edit_decision(&state.edit_pending, &id, decision_from_str(&decision))
+}
+
+/// The command's body, without the Tauri wrapper, so the expired case is testable.
+pub(crate) fn deliver_edit_decision(
+    pending: &Mutex<HashMap<String, tokio::sync::oneshot::Sender<EditDecision>>>,
+    id: &str,
+    d: EditDecision,
+) -> Result<(), String> {
+    let Some(tx) = pending.lock().unwrap().remove(id) else {
+        return Err(crate::commands::agent_ui::NO_LONGER_WAITING.into());
+    };
+    // The receiver can also be gone between the timeout arm and this line — the
+    // same fact, told the same way rather than swallowed.
+    tx.send(d).map_err(|_| crate::commands::agent_ui::NO_LONGER_WAITING.to_string())
+}
+
+/// How the diff card ended. Nobody answering is NOT the same fact as a person
+/// reading the diff and saying no, and the model is told which one happened.
+pub(crate) enum EditVerdict {
+    Approved,
+    Declined,
+    NoAnswer,
 }
 
 /// SEC-1b-shaped: emit the diff, await a decision, decline on timeout/closed
@@ -97,7 +122,7 @@ async fn edit_call_approved(
     window: &tauri::Window,
     effects: &mut ToolEffects,
     preview: &EditPreview,
-) -> bool {
+) -> EditVerdict {
     use tauri::Emitter;
     let id = Uuid::new_v4().to_string();
     let (tx, rx) = tokio::sync::oneshot::channel::<EditDecision>();
@@ -124,13 +149,13 @@ async fn edit_call_approved(
         Ok(Ok(d)) => d,
         _ => {
             state.edit_pending.lock().unwrap().remove(&id);
-            EditDecision { approved: false, rest_of_turn: false }
+            return EditVerdict::NoAnswer;
         }
     };
     if decision.approved && decision.rest_of_turn && effects.run_scoped {
         effects.edit_approved_this_turn = true;
     }
-    decision.approved
+    if decision.approved { EditVerdict::Approved } else { EditVerdict::Declined }
 }
 
 /// Emit the post-write events and set the anti-fabrication `wrote` flag.
@@ -248,12 +273,23 @@ pub(crate) async fn gated_write(
 
     // Phase 2 (unlocked): show the diff and await consent.
     let preview = build_preview(tool, &plans, allow_turn);
-    if !edit_call_approved(state, window, effects, &preview).await {
-        return GateOutcome::Declined(
-            "The user declined the proposed change after seeing the preview, so nothing was \
-             modified. Ask what they'd like instead."
-                .into(),
-        );
+    match edit_call_approved(state, window, effects, &preview).await {
+        EditVerdict::Approved => {}
+        EditVerdict::Declined => {
+            return GateOutcome::Declined(
+                "The user declined the proposed change after seeing the preview, so nothing was \
+                 modified. Ask what they'd like instead."
+                    .into(),
+            );
+        }
+        EditVerdict::NoAnswer => {
+            return GateOutcome::Declined(
+                "Nobody answered the preview of this change in time, so nothing was modified. \
+                 That is not a decision the user made — say the change is still waiting and \
+                 offer to propose it again."
+                    .into(),
+            );
+        }
     }
 
     // Phase 3 (locked, sync): staleness re-check, then apply the computed bytes.
@@ -347,6 +383,31 @@ mod tests {
         // Any unknown string is a decline, never a silent yes.
         assert!(!decision_from_str("").approved);
         assert!(!decision_from_str("garbage").approved);
+    }
+
+    #[test]
+    fn answering_a_diff_card_that_gave_up_reports_it() {
+        let pending: Mutex<HashMap<String, tokio::sync::oneshot::Sender<EditDecision>>> =
+            Mutex::new(HashMap::new());
+        // A live card is delivered and reported as delivered.
+        let (tx, mut rx) = tokio::sync::oneshot::channel::<EditDecision>();
+        pending.lock().unwrap().insert("live".into(), tx);
+        assert!(deliver_edit_decision(&pending, "live", decision_from_str("once")).is_ok());
+        assert!(rx.try_recv().unwrap().approved);
+
+        // The same id again — the 180s wait timed out and dropped the entry.
+        // Pressing "Apply once" now writes nothing, and says so.
+        let err = deliver_edit_decision(&pending, "live", decision_from_str("once")).unwrap_err();
+        assert_eq!(err, crate::commands::agent_ui::NO_LONGER_WAITING);
+
+        // Still pending, but the tool call is gone: the send fails, and that is
+        // the same fact, not a silent Ok.
+        let (tx, rx) = tokio::sync::oneshot::channel::<EditDecision>();
+        pending.lock().unwrap().insert("orphan".into(), tx);
+        drop(rx);
+        let err = deliver_edit_decision(&pending, "orphan", decision_from_str("turn")).unwrap_err();
+        assert_eq!(err, crate::commands::agent_ui::NO_LONGER_WAITING);
+        assert!(pending.lock().unwrap().is_empty(), "the entry is consumed either way");
     }
 
     #[test]

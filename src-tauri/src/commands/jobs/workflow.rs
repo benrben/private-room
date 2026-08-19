@@ -961,7 +961,20 @@ pub fn compile_workflow(
         def.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
     let mut steps: Vec<Step> = Vec::with_capacity(order.len());
     for (idx, nid) in order.iter().enumerate() {
-        let node = node_of[nid.as_str()];
+        let mut node = node_of[nid.as_str()].clone();
+        // The validator reads a route's labels TRIMMED, and edges are checked
+        // against that cleaned list — so a stored label with padding (or an
+        // empty one) validated fine and then routed at run time to a string no
+        // edge matched, silently skipping every branch. Clean it once, here, and
+        // the sidecar payload, the artifact's branch and the edge comparison are
+        // all the same strings the definition was validated as.
+        if let NodeKind::Route { labels, .. } = &mut node.kind {
+            for l in labels.iter_mut() {
+                let clean = l.trim().to_string();
+                *l = clean;
+            }
+            labels.retain(|l| !l.is_empty());
+        }
         let incoming: Vec<serde_json::Value> = def
             .edges
             .iter()
@@ -1520,7 +1533,10 @@ pub(crate) async fn execute_workflow_step<R: tauri::Runtime>(
             // cloud-quota failure into one actionable line here, so agent_run
             // (which passes its error through raw) reads the same as generate.
             let e = crate::sidecar::humanize_empty_generation(&e).unwrap_or(e);
-            emit_workflow_node(app, job_id, &plan.workflow_id, &node.id, "error", Some(&e));
+            // The park marker is private to the runner: the diagram shows the
+            // sentence, never the flag in front of it.
+            let shown = e.strip_prefix(NEEDS_APPROVAL).unwrap_or(&e).to_string();
+            emit_workflow_node(app, job_id, &plan.workflow_id, &node.id, "error", Some(&shown));
             Err(e)
         }
     }
@@ -1805,18 +1821,32 @@ async fn run_workflow_node<R: tauri::Runtime>(
             })
         }
         NodeKind::ScriptRun { file, mode } => {
-            // transform mode makes the script a pipe stage: {{input}} → stdin,
-            // stdout → the step artifact (so a downstream node reads the script's
-            // output, not the run report). import mode is the Wave-5 behavior.
-            let stdin = if mode == "transform" {
-                Some(inputs_joined.clone())
+            // Idempotency, the same rule save_file and file_pass keep: an
+            // artifact is stored only once the process has finished, so a
+            // stored, non-skipped one means this script already ran in THIS job.
+            // A wave that failed beside it is never checkpointed, so without
+            // this the Resume executes the script a second time — importing a
+            // second copy of everything it produced.
+            if let Some(a) = existing.as_ref().filter(|a| !a.skipped) {
+                Ok(WfArtifact {
+                    result: a.result.clone(),
+                    file_id: a.file_id.clone(),
+                    ..Default::default()
+                })
             } else {
-                None
-            };
-            run_script_node(
-                app, job_id, step.id, room_path, plan, file, mode, stdin, cancel, published,
-            )
-            .await
+                // transform mode makes the script a pipe stage: {{input}} → stdin,
+                // stdout → the step artifact (so a downstream node reads the script's
+                // output, not the run report). import mode is the Wave-5 behavior.
+                let stdin = if mode == "transform" {
+                    Some(inputs_joined.clone())
+                } else {
+                    None
+                };
+                run_script_node(
+                    app, job_id, step.id, room_path, plan, file, mode, stdin, cancel, published,
+                )
+                .await
+            }
         }
         NodeKind::Transform { op, find, value } => Ok(WfArtifact {
             result: apply_transform(op, find, value, &inputs_joined),
@@ -2138,6 +2168,14 @@ async fn run_file_pass_node<R: tauri::Runtime>(
     })
 }
 
+/// Marks the error of a `script_run` step that PARKED for the user's approval
+/// instead of failing. `park_outcome` strips it and lands the run as paused with
+/// the reason attached. It has exactly two readers, and both strip it before
+/// anything is shown: that one, and the node-status emit in
+/// `execute_workflow_step`.
+/// The `STOPPED` sentinel above is the same idea for a user-pressed Stop.
+const NEEDS_APPROVAL: &str = "NEEDS_APPROVAL: ";
+
 /// Wave 5 (Idea 13): the `script_run` node arm. Resolves the script file id, reads
 /// its consent hash from the IMMUTABLE plan snapshot (a mid-run script edit parks,
 /// never silently runs new code), runs it, records the report JSON as the step
@@ -2179,9 +2217,22 @@ async fn run_script_node<R: tauri::Runtime>(
         plan.script_consents.values().find(|s| **s == sha).cloned()
     });
     let consent = consent.unwrap_or_default();
-    let report =
-        run_script_process(app, job_id, step_id, room_path, &file_id, &consent, stdin, cancel)
-            .await?;
+    let report = match run_script_process(
+        app, job_id, step_id, room_path, &file_id, &consent, stdin, cancel,
+    )
+    .await
+    {
+        Ok(r) => r,
+        // A script this run holds no matching approval for did not FAIL — it
+        // parked for a person to approve it, and there is nothing about the
+        // workflow to fix. Marked (the process's own sentence kept as the
+        // cause) so the run lands as paused rather than as a broken step the
+        // model is then told to rewrite.
+        Err(e) if script_fingerprint(&bytes) != consent => {
+            return Err(format!("{NEEDS_APPROVAL}{e}"))
+        }
+        Err(e) => return Err(e),
+    };
     // Publish the first imported output so a MANUAL run can auto-open it.
     if let Some(first) = report.imported.first() {
         *published.lock().unwrap() = Some(first.clone());
@@ -2483,6 +2534,24 @@ pub(crate) async fn run_agent_headless(
     }
 }
 
+/// How a finished plan actually landed, plus the reason to show for a park.
+///
+/// Two different things arrive here as `Error`: a Stop mid-model-call surfaces
+/// as the call's own error, and a `script_run` step that parked for approval
+/// marks its error with `NEEDS_APPROVAL`. Neither is a failing step — both are
+/// pauses — but only the approval park has something to say about itself, so a
+/// Stop lands with no reason rather than borrowing the approval sentence.
+fn park_outcome(outcome: RunOutcome, stopped: bool) -> (RunOutcome, Option<String>) {
+    match outcome {
+        RunOutcome::Error(_) if stopped => (RunOutcome::Paused, None),
+        RunOutcome::Error(e) => match e.strip_prefix(NEEDS_APPROVAL) {
+            Some(why) => (RunOutcome::Paused, Some(why.to_string())),
+            None => (RunOutcome::Error(e), None),
+        },
+        o => (o, None),
+    }
+}
+
 /// Spawn the checkpointed runner for a workflow job (fresh or resumed). Mirrors
 /// `spawn_file_pass`: status → running, per-wave checkpoint persists the DONE-SET
 /// (a workflow's branched multi-lane plan needs the real set, not a cursor), the
@@ -2606,11 +2675,7 @@ pub(crate) fn spawn_workflow_job(
         )
         .await;
 
-        // A Stop mid-model-call surfaces as the call's error — normalize to Paused.
-        let outcome = match outcome {
-            RunOutcome::Error(_) if cancel.load(Ordering::SeqCst) => RunOutcome::Paused,
-            o => o,
-        };
+        let (outcome, park_reason) = park_outcome(outcome, cancel.load(Ordering::SeqCst));
 
         {
             let guard = state.room.lock().unwrap();
@@ -2621,6 +2686,16 @@ pub(crate) fn spawn_workflow_job(
                     RunOutcome::Error(e) => ("error", Some(e.as_str())),
                 };
                 let _ = db::set_job_status(&r.conn, &job_id, status, err);
+                // A park is not a failure, so its reason goes in the column that
+                // means "why it's paused" — the one the job card renders and
+                // `job_status` reads. Written to `error` it would have the
+                // assistant tell the user their workflow errored, which is the
+                // sentence this whole path exists to stop saying. Both writes
+                // are under this room lock, so no poller can read the status
+                // without the reason.
+                if let Some(why) = park_reason.as_deref() {
+                    let _ = db::set_parked_reason(&r.conn, &job_id, why);
+                }
                 // Close the workflow_runs row for a terminal outcome. A PAUSE
                 // is not terminal — the run can still be resumed — but it must
                 // stop reading as 'running', or the history line keeps a live
@@ -2651,7 +2726,13 @@ pub(crate) fn spawn_workflow_job(
                 "fileId": if manual { published.lock().unwrap().take().map(|m| m.id) } else { None },
             }),
             RunOutcome::Paused => serde_json::json!({
-                "jobId": job_id, "label": "Paused", "done": done_now, "total": total,
+                "jobId": job_id,
+                // Whatever parked it, in its own words. A fixed "a script step
+                // needs your approval" here would be a second copy of a fact
+                // the reason already states — and wrong for the park that says
+                // the script CHANGED since it was approved.
+                "label": park_reason.as_deref().unwrap_or("Paused"),
+                "done": done_now, "total": total,
                 "paused": true,
             }),
             RunOutcome::Error(e) => serde_json::json!({
@@ -2708,6 +2789,28 @@ fn previous_run_at(conn: &Connection, workflow_id: &str) -> Option<String> {
     .ok()
 }
 
+/// Why a trigger did not start a run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refused {
+    /// A run of this workflow is already running or queued.
+    Inflight,
+    /// The shared background-job queue is full.
+    QueueFull,
+}
+
+/// A refusal, said the way each trigger needs it: a scheduled or agent tick
+/// skips silently (the tick still advances `next_run_at`), a manual press is
+/// told why.
+fn refused(why: Refused, trigger: &str) -> Result<String, String> {
+    if trigger != "manual" {
+        return Ok(String::new());
+    }
+    Err(match why {
+        Refused::Inflight => "This workflow is already running or queued.".to_string(),
+        Refused::QueueFull => queue::QUEUE_FULL.to_string(),
+    })
+}
+
 /// Compile a workflow and enqueue a run. Shared by the command, the agent tool,
 /// and the scheduler. Returns the new job id. `trigger` = manual|schedule|
 /// catchup|agent; `input_file_id` is the header-run's current file (validated by
@@ -2748,9 +2851,9 @@ pub(crate) async fn start_workflow_run(
     // Engine-review #1: never pile up runs of the SAME workflow. Without this a
     // scheduled workflow whose runtime exceeds its interval accumulates duplicate
     // queued runs (each re-firing save_file → a growing pile of output files).
-    // A scheduled trigger skips silently (the tick still advances next_run_at); a
-    // manual trigger tells the user why. Also honor the shared queue cap, which
-    // the scheduler path previously bypassed.
+    // Also honor the shared queue cap, which the scheduler path previously
+    // bypassed. This is the cheap early-out — the decision that counts is taken
+    // again under the lock that mints the row, below.
     let (has_inflight, full) = state.with_room(|room| {
         Ok((
             has_inflight_run(&room.conn, workflow_id),
@@ -2758,25 +2861,10 @@ pub(crate) async fn start_workflow_run(
         ))
     })?;
     if has_inflight {
-        return if trigger == "manual" {
-            Err("This workflow is already running or queued.".into())
-        } else {
-            Ok(String::new())
-        };
+        return refused(Refused::Inflight, trigger);
     }
-    // Nothing is in flight, so any job still sitting parked for this workflow is
-    // a stale attempt this run replaces. Clearing it here is what stops Activity
-    // filling up with indistinguishable paused copies of the same workflow.
-    state.with_room(|room| {
-        retire_parked_jobs(&room.conn, workflow_id);
-        Ok(())
-    })?;
     if full {
-        return if trigger == "manual" {
-            Err(queue::QUEUE_FULL.into())
-        } else {
-            Ok(String::new())
-        };
+        return refused(Refused::QueueFull, trigger);
     }
     // Wave 5: stamp the consent snapshot for any script_run nodes (approvals
     // file on this Mac ∪ this invocation's grants). Read under the room lock.
@@ -2809,9 +2897,24 @@ pub(crate) async fn start_workflow_run(
     let total = steps.len() as i64;
     let title = format!("Workflow — {}", wf.name);
     // Create the job row + open the run row, verifying the room didn't swap.
-    let job_id = state.with_room(|room| {
+    //
+    // The refusals are re-read HERE, under the same lock that mints the row, and
+    // not only in the cheap check above: everything between the two is awaited
+    // (the model probe), so two Run-now presses one keystroke apart both passed
+    // that check and both queued the same workflow — two of every output file
+    // for one gesture. And the parked-job sweep sits inside the same lock, so a
+    // resumable run is only ever dropped once its replacement exists: it used to
+    // be deleted before the queue cap was even consulted, taking the user's
+    // Resume card with it and putting nothing in its place.
+    let minted = state.with_room(|room| {
         if room.path != room_path {
             return Err("The room changed while starting this workflow.".into());
+        }
+        if has_inflight_run(&room.conn, workflow_id) {
+            return Ok(Err(Refused::Inflight));
+        }
+        if queue::at_capacity(&room.conn) {
+            return Ok(Err(Refused::QueueFull));
         }
         let id = db::create_job(&room.conn, "workflow", &title, &plan_json, total)?;
         db::create_workflow_run(
@@ -2821,8 +2924,16 @@ pub(crate) async fn start_workflow_run(
             trigger,
             input_file_id.as_deref(),
         )?;
-        Ok(id)
+        // AFTER both inserts, never before: an insert that fails must leave the
+        // user's Resume card where it was. The row just minted is 'queued', which
+        // the sweep skips, so it cannot retire itself.
+        retire_parked_jobs(&room.conn, workflow_id);
+        Ok(Ok(id))
     })?;
+    let job_id = match minted {
+        Ok(id) => id,
+        Err(why) => return refused(why, trigger),
+    };
     super::queue::submit(window, state, job_id.clone()).await?;
     Ok(job_id)
 }
@@ -3912,13 +4023,21 @@ pub(crate) async fn agent_test_workflow(
     // Poll the job to a terminal status, bounded. On timeout, cancel the run.
     const TEST_TIMEOUT_SECS: u64 = 240;
     let start = std::time::Instant::now();
+    // A parked run explains itself in `parked_reason`, a failed one in `error` —
+    // reading the wrong column is how "PAUSED" once had to invent its reason.
+    let why_of = |j: &db::Job| {
+        if j.status == "paused" {
+            j.parked_reason.clone()
+        } else {
+            j.error.clone()
+        }
+    };
     let (status, err): (String, Option<String>) = loop {
         let job = state.with_room(|room| db::get_job(&room.conn, &job_id));
         if let Ok(j) = job {
             match j.status.as_str() {
                 "done" => break ("done".into(), None),
-                "error" => break ("error".into(), j.error.clone()),
-                "paused" => break ("paused".into(), j.error.clone()),
+                "error" | "paused" => break (j.status.clone(), why_of(&j)),
                 _ => {}
             }
         }
@@ -3935,7 +4054,7 @@ pub(crate) async fn agent_test_workflow(
             let settled = state
                 .with_room(|room| db::get_job(&room.conn, &job_id))
                 .ok()
-                .map(|j| (j.status.clone(), j.error.clone()));
+                .map(|j| (j.status.clone(), why_of(&j)));
             break match settled {
                 Some((s, e)) if s == "done" || s == "error" || s == "paused" => (s, e),
                 _ => ("timeout".into(), None),
@@ -3987,11 +4106,17 @@ pub(crate) async fn agent_test_workflow(
             wf.name,
             err.as_deref().unwrap_or("a step errored (see steps below)")
         ),
-        "paused" => format!(
-            "Test of \"{}\": PAUSED — {}. A script step needs the user's approval on the Scripts page (the agent can't approve code).",
-            wf.name,
-            err.as_deref().unwrap_or("stopped before finishing")
-        ),
+        // The reason is whatever parked the run — an unapproved script says so
+        // itself (`park_outcome` carries its sentence onto the job row). A run
+        // with no reason was STOPPED, and saying a script needs approving there
+        // was a claim about work nobody had looked at.
+        "paused" => match err.as_deref() {
+            Some(why) => format!("Test of \"{}\": PAUSED — {why}", wf.name),
+            None => format!(
+                "Test of \"{}\": PAUSED — it was stopped before finishing. Nothing failed.",
+                wf.name
+            ),
+        },
         _ => format!(
             "Test of \"{}\": still running after {TEST_TIMEOUT_SECS}s — stopped waiting (it may be a heavy model step). The partial results so far:",
             wf.name
@@ -4012,7 +4137,10 @@ pub(crate) async fn agent_test_workflow(
 fn test_run_trailer(status: &str) -> &'static str {
     match status {
         "done" => "VALIDATED: yes — every step ran to completion. You may now tell the user this works and the draft is ready to review & activate.",
-        "paused" => "VALIDATED: no — a script step parked for the user's approval, so this run did NOT validate the workflow. Do NOT say it's fixed or works. Tell the user to review and run/approve it on the Scripts page; a script can only be confirmed by an approved run.",
+        // Why it parked is on the PAUSED line above — an unapproved script, or a
+        // Stop. Either way nothing was validated, and neither reason is a step
+        // to go and rewrite.
+        "paused" => "VALIDATED: no — the run parked before finishing (the PAUSED line above says why), so it did NOT validate the workflow. Do NOT say it's fixed or works, and do NOT start editing steps. If a script needs approving, tell the user to review and run it on the Scripts page; a script can only be confirmed by an approved run.",
         // A timeout is UNKNOWN, not failed: nothing errored, we simply stopped
         // waiting. Telling the model to "fix the failing step" made it report a
         // failure to the user for a run that went on to finish green.
@@ -4319,6 +4447,67 @@ mod tests {
         assert!(test_run_trailer("done").starts_with("VALIDATED: yes"));
         assert!(test_run_trailer("error").starts_with("VALIDATED: no"));
         assert!(test_run_trailer("paused").starts_with("VALIDATED: no"));
+    }
+
+    #[test]
+    fn a_script_waiting_for_approval_parks_the_run_instead_of_failing_it() {
+        // An unapproved `script_run` step returned an ordinary error, so the run
+        // landed as 'error': the user was shown a failed workflow and the model
+        // was told to "fix the failing step" — of a script nobody had approved
+        // yet. It is a PAUSE, and it is the only pause with a reason to give.
+        let park = format!(
+            "{NEEDS_APPROVAL}This workflow runs a script that isn't approved on this Mac yet."
+        );
+        let (outcome, why) = park_outcome(RunOutcome::Error(park), false);
+        assert_eq!(outcome, RunOutcome::Paused);
+        assert_eq!(
+            why.as_deref(),
+            Some("This workflow runs a script that isn't approved on this Mac yet."),
+            "the reason reaches the job row without the marker",
+        );
+
+        // A user-pressed Stop is also a pause — with NOTHING to say about
+        // approvals, which is what the report used to assert of every pause.
+        let (outcome, why) = park_outcome(RunOutcome::Error("read timed out".into()), true);
+        assert_eq!(outcome, RunOutcome::Paused);
+        assert_eq!(why, None);
+
+        // A genuinely failing step is still a failure, and still says why.
+        let (outcome, why) = park_outcome(RunOutcome::Error("the model returned nothing".into()), false);
+        assert_eq!(outcome, RunOutcome::Error("the model returned nothing".into()));
+        assert_eq!(why, None);
+        assert_eq!(park_outcome(RunOutcome::Done, false), (RunOutcome::Done, None));
+    }
+
+    #[test]
+    fn route_labels_are_cleaned_where_the_edges_were_validated() {
+        // The validator trims a route's labels and checks the edges against the
+        // trimmed list; the runtime sent the raw list, so a padded label routed
+        // to a branch string no edge matched and every handler was skipped.
+        let def = parse(serde_json::json!({
+            "nodes": [
+                { "id": "r", "kind": "route", "prompt": "which?",
+                  "labels": [" urgent ", "normal", "  "] },
+                { "id": "hot", "kind": "transform", "op": "append", "value": "!" }
+            ],
+            "edges": [ { "from": "r", "to": "hot", "branch": "urgent" } ]
+        }));
+        let steps = compile_workflow(&def, &None, &[]).expect("this def must compile");
+        let labels = steps[0].params["node"]["labels"]
+            .as_array()
+            .expect("a route step carries its labels")
+            .iter()
+            .map(|l| l.as_str().unwrap_or_default().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(labels, vec!["urgent".to_string(), "normal".to_string()]);
+        // An edge branch is matched against the artifact's branch verbatim
+        // (`edge_is_live`), so what the node is asked to choose between has to
+        // be exactly what the edges name.
+        let art = WfArtifact {
+            branch: Some(labels[0].clone()),
+            ..Default::default()
+        };
+        assert!(edge_is_live(Some(&art), &Some("urgent".to_string())));
     }
 
     #[test]
@@ -5461,6 +5650,52 @@ mod tests {
         let job = wf_job_row(&handle, &job_id);
         assert_eq!(job.cursor, 7);
         assert_eq!(job.state, serde_json::json!({ "done": [0, 1, 2, 3, 4, 5, 6] }));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_resume_does_not_run_a_finished_script_step_twice() {
+        use tauri::Manager;
+        // A wave whose OTHER step failed is never checkpointed, so a Resume
+        // re-dispatches every step of it — and `script_run` was the one arm with
+        // no idempotency check, so the script executed a second time and
+        // imported another copy of everything it produced. save_file and
+        // file_pass have short-circuited on their stored artifact all along.
+        let room_path = "mem://wf-script-once";
+        let app = wf_app(room_path);
+        let handle = app.handle().clone();
+        let plan = wf_plan(parse(serde_json::json!({
+            "nodes": [
+                { "id": "s", "kind": "script_run", "file": "ghost.py", "mode": "import" },
+                { "id": "out", "kind": "transform", "op": "append", "value": "!" }
+            ],
+            "edges": [ { "from": "s", "to": "out" } ]
+        })));
+        let job_id = create_wf_job(&handle, &plan);
+        // What the first leg left behind: the script finished and recorded its
+        // report. There is no such script file in the room, so a second run
+        // cannot be mistaken for a re-import — it errors outright.
+        {
+            let state = handle.state::<AppState>();
+            let guard = state.room.lock().unwrap();
+            store_wf_artifact(
+                &guard.as_ref().unwrap().conn,
+                &job_id,
+                0,
+                &WfArtifact {
+                    result: "rows: 3".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        }
+
+        let (outcome, ran) =
+            drive_workflow(&handle, &job_id, room_path, &plan, HashSet::new(), None).await;
+        assert_eq!(outcome, RunOutcome::Done, "the recorded run stands");
+        assert_eq!(ran, vec![0, 1]);
+        assert_eq!(wf_step_artifact(&handle, &job_id, 0).result, "rows: 3");
+        // …and the downstream step reads the same output it read the first time.
+        assert_eq!(wf_step_artifact(&handle, &job_id, 1).result, "rows: 3!");
     }
 
     #[tokio::test(flavor = "multi_thread")]

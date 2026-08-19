@@ -269,6 +269,110 @@ pub fn dedupe_parked_jobs(conn: &Connection) -> Result<usize, String> {
     Ok(removed)
 }
 
+/// How many FINISHED runs of one unit of work the room keeps.
+const JOB_HISTORY_KEEP: usize = 50;
+
+/// How many closed `workflow_runs` rows the room keeps per workflow. The same
+/// number `list_workflow_runs` already caps its read at, so nothing this sweep
+/// removes could still have been DRAWN.
+const RUN_HISTORY_KEEP: usize = 50;
+
+/// Roll the finished job history off the back, oldest first. Run on every room
+/// open, the way `prune_web_cache` runs on every web-cache write.
+///
+/// Nothing ever removed a finished job, its artifacts or a closed run row, so a
+/// workflow on a 30-minute schedule grew the encrypted room file forever — and
+/// `list_jobs` deserialized every one of those rows' plans (for a workflow, the
+/// whole definition plus its compiled step list) on every Activity refresh.
+///
+/// Only 'done', top-level rows are eligible, and only past the newest
+/// [`JOB_HISTORY_KEEP`] of their own `work_identity`:
+///  * an 'error' or 'paused' row is the Retry/Resume the user has not answered
+///    yet, and `dedupe_parked_jobs` already keeps those to one per identity;
+///  * a row still named by a surviving `workflow_runs` row is that run's
+///    evidence — deleting it would take the run's artifacts out from under a
+///    history line that stays on screen.
+///
+/// Deletion goes through `delete_job_tree`, so a swept parent takes its children
+/// and every one of their artifacts with it. Returns how many TOP-LEVEL job rows
+/// were removed — not the row count, which is larger wherever a parent owned
+/// children.
+pub fn prune_job_history(conn: &Connection) -> Result<usize, String> {
+    prune_workflow_runs(conn)?;
+
+    let rows: Vec<(String, String, String, String)> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, kind, title, plan FROM jobs \
+                 WHERE parent_job_id IS NULL AND status = 'done' \
+                   AND id NOT IN (SELECT job_id FROM workflow_runs WHERE job_id IS NOT NULL) \
+                 ORDER BY created_at DESC, rowid DESC",
+            )
+            .map_err(|e| e.to_string())?;
+        let out = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        out
+    };
+
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut removed = 0usize;
+    for (id, kind, title, plan) in rows {
+        // An unreadable plan is not evidence of sameness — same rule as
+        // `parked_identities`. Such a row is left alone rather than counted
+        // against some other identity's allowance.
+        let Ok(plan) = serde_json::from_str::<serde_json::Value>(&plan) else {
+            continue;
+        };
+        let identity = work_identity(&kind, &title, &plan);
+        let n = seen.entry(identity).or_insert(0);
+        *n += 1;
+        if *n > JOB_HISTORY_KEEP {
+            delete_job_tree(conn, &id)?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+/// The `workflow_runs` half of [`prune_job_history`]: closed runs past the
+/// newest [`RUN_HISTORY_KEEP`] of their workflow. An OPEN run (no `finished_at`)
+/// is never touched — it is either live or the phantom the callers close.
+fn prune_workflow_runs(conn: &Connection) -> Result<(), String> {
+    let rows: Vec<(String, String)> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, workflow_id FROM workflow_runs WHERE finished_at IS NOT NULL \
+                 ORDER BY started_at DESC, rowid DESC",
+            )
+            .map_err(|e| e.to_string())?;
+        let out = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        out
+    };
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (id, workflow_id) in rows {
+        let n = seen.entry(workflow_id).or_insert(0);
+        *n += 1;
+        if *n > RUN_HISTORY_KEEP {
+            execute_one(conn, "DELETE FROM workflow_runs WHERE id = ?1", [&id])?;
+        }
+    }
+    Ok(())
+}
+
 /// Checkpoint after a step: advance the cursor and overwrite the state blob.
 /// One small write, so a crash between steps loses at most the in-flight step.
 pub fn checkpoint_job(
@@ -421,13 +525,19 @@ pub fn list_jobs(conn: &Connection) -> Result<Vec<Job>, String> {
 /// any 'running' row is really stale (the process that ran it is gone), so the
 /// caller marks those 'paused' and offers Resume. Wave 4a: children are excluded
 /// — they must never be pumped/resumed/quiesced independently of their parent.
+///
+/// `created_at` has one-second resolution, so a scheduled run colliding with a
+/// manual one leaves the FIFO order to whatever the sorter happens to do; the
+/// `rowid` tiebreak states it instead, the same way `parked_identities` does.
+/// Deliberately untested: SQLite already returns rowid order for a small tied
+/// set, so any test of it would pass without the tiebreak too.
 pub fn unfinished_jobs(conn: &Connection) -> Result<Vec<Job>, String> {
     query_rows(
         conn,
         &format!(
             "SELECT {COLS} FROM jobs \
              WHERE status IN ('running','queued','paused') AND parent_job_id IS NULL \
-             ORDER BY created_at ASC"
+             ORDER BY created_at ASC, rowid ASC"
         ),
         [],
         row_to_job,
@@ -435,6 +545,13 @@ pub fn unfinished_jobs(conn: &Connection) -> Result<Vec<Job>, String> {
 }
 
 pub fn delete_job(conn: &Connection, id: &str) -> Result<(), String> {
+    // A workflow job also drives a `workflow_runs` row, and nothing but the
+    // runner's own epilogue ever closed one. Deleting the job left that row
+    // open forever: the library card kept its green "Running" badge and Run
+    // history printed a live run with no `finished_at` for work whose job no
+    // longer exists. Closing it as 'paused' is what the card already reads as
+    // "Stopped". A no-op for every other job kind — they have no run row.
+    let _ = crate::db::finish_workflow_run_by_job(conn, id, "paused", None);
     execute_one(conn, "DELETE FROM job_artifacts WHERE job_id = ?1", [id])?;
     execute_one(conn, "DELETE FROM jobs WHERE id = ?1", [id])
 }
@@ -494,6 +611,13 @@ mod tests {
                content TEXT NOT NULL,
                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
                PRIMARY KEY (job_id, step_id)
+             );
+             CREATE TABLE workflow_runs (
+               id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL, job_id TEXT,
+               trigger TEXT NOT NULL DEFAULT 'manual',
+               status TEXT NOT NULL DEFAULT 'running', error TEXT, input_file_id TEXT,
+               started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+               finished_at TEXT
              );",
         )
         .unwrap();
@@ -934,6 +1058,109 @@ mod tests {
         // run of the same workflow retires it rather than stacking beside it.
         let fresh = create_job(&conn, "workflow", "Workflow — Digest", &plan, 3).unwrap();
         assert_eq!(ids(&conn), vec![fresh]);
+    }
+
+    #[test]
+    fn deleting_a_workflow_job_closes_its_run_row() {
+        // Only the runner's epilogue ever closed a run row, so Remove on a
+        // workflow left a run reading 'running' with a NULL finished_at
+        // forever — a permanent green badge for work that is gone.
+        let conn = mem();
+        let plan = serde_json::json!({ "workflow_id": "wf-1" });
+        let id = create_job(&conn, "workflow", "Workflow — Digest", &plan, 2).unwrap();
+        conn.execute(
+            "INSERT INTO workflow_runs(id, workflow_id, job_id, status) VALUES ('r1','wf-1',?1,'running')",
+            [&id],
+        )
+        .unwrap();
+        delete_job(&conn, &id).unwrap();
+        let (status, finished): (String, Option<String>) = conn
+            .query_row("SELECT status, finished_at FROM workflow_runs WHERE id = 'r1'", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(status, "paused");
+        assert!(finished.is_some(), "the run row must be closed, not left open");
+    }
+
+    #[test]
+    fn finished_history_rolls_off_but_live_and_evidenced_rows_stay() {
+        let conn = mem();
+        let plan = serde_json::json!({ "file_id": "f1" });
+        // One identity, more finished runs than the room keeps.
+        let mut done = Vec::new();
+        for _ in 0..(JOB_HISTORY_KEEP + 3) {
+            let id = create_job(&conn, "file_pass", "big.pdf", &plan, 1).unwrap();
+            put_job_artifact(&conn, &id, 0, "notes").unwrap();
+            set_job_status(&conn, &id, "done", None).unwrap();
+            done.push(id);
+        }
+        // A stopped row of the same identity — the Retry the user hasn't answered.
+        let parked = create_job(&conn, "file_pass", "big.pdf", &plan, 1).unwrap();
+        set_job_status(&conn, &parked, "error", Some("OLLAMA_DOWN")).unwrap();
+        // A finished workflow job whose run row still names it.
+        let wf_plan = serde_json::json!({ "workflow_id": "wf-1" });
+        let wf = create_job(&conn, "workflow", "Workflow — Digest", &wf_plan, 1).unwrap();
+        set_job_status(&conn, &wf, "done", None).unwrap();
+        conn.execute(
+            "INSERT INTO workflow_runs(id, workflow_id, job_id, status, finished_at) \
+             VALUES ('r1','wf-1',?1,'done','2026-08-18T09:00:00Z')",
+            [&wf],
+        )
+        .unwrap();
+
+        assert_eq!(prune_job_history(&conn).unwrap(), 3);
+        let left: std::collections::HashSet<String> =
+            list_jobs(&conn).unwrap().into_iter().map(|j| j.id).collect();
+        // The three oldest 'done' rows went, with their artifacts.
+        for id in &done[..3] {
+            assert!(!left.contains(id), "an over-the-limit finished row survived");
+            assert!(get_job_artifact(&conn, id, 0).is_none());
+        }
+        assert!(left.contains(&done[3]));
+        assert!(left.contains(&parked), "a stopped row is a pending Retry, not history");
+        assert!(left.contains(&wf), "a row a run history still names must stay");
+        // Idempotent: a second sweep over the result removes nothing.
+        assert_eq!(prune_job_history(&conn).unwrap(), 0);
+    }
+
+    #[test]
+    fn closed_run_rows_roll_off_per_workflow_and_open_ones_never_do() {
+        let conn = mem();
+        for i in 0..(RUN_HISTORY_KEEP + 2) {
+            conn.execute(
+                "INSERT INTO workflow_runs(id, workflow_id, status, started_at, finished_at) \
+                 VALUES (?1,'wf-1','done',?2,?2)",
+                params![format!("r{i}"), format!("2026-08-{:02}T09:00:00Z", i % 28 + 1)],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO workflow_runs(id, workflow_id, status, started_at) \
+             VALUES ('live','wf-1','running','2026-01-01T09:00:00Z')",
+            [],
+        )
+        .unwrap();
+        // A second workflow with one run keeps it — the limit is per workflow.
+        conn.execute(
+            "INSERT INTO workflow_runs(id, workflow_id, status, started_at, finished_at) \
+             VALUES ('other','wf-2','done','2026-01-01T09:00:00Z','2026-01-01T09:00:00Z')",
+            [],
+        )
+        .unwrap();
+        prune_job_history(&conn).unwrap();
+        let kept: i64 = conn
+            .query_row("SELECT count(*) FROM workflow_runs WHERE workflow_id = 'wf-1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kept as usize, RUN_HISTORY_KEEP + 1, "the open run is never swept");
+        let live: i64 = conn
+            .query_row("SELECT count(*) FROM workflow_runs WHERE id = 'live'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(live, 1);
+        let other: i64 = conn
+            .query_row("SELECT count(*) FROM workflow_runs WHERE id = 'other'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(other, 1);
     }
 
     #[test]

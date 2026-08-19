@@ -29,6 +29,20 @@ function joined(v: string | string[] | undefined): string {
   return "";
 }
 
+/** The fence a code cell has to be wrapped in: one backtick longer than the
+ * longest run of backticks the source itself contains (three at minimum).
+ *
+ * A cell whose source holds a line of ``` — a docstring carrying Markdown, a
+ * cell that writes README text, a prompt string — closed the block early with
+ * a plain three-backtick fence, and the rest of the cell was then rendered as
+ * prose: headings became `<h1>`s, pipe tables became real tables, `*args`
+ * became italics. CommonMark closes a fence only on a run at least as long as
+ * the one that opened it, so a longer opener puts the whole cell back inside. */
+function codeFence(source: string): string {
+  const longest = Math.max(0, ...Array.from(source.matchAll(/`+/g), (m) => m[0].length));
+  return "`".repeat(Math.max(3, longest + 1));
+}
+
 /** A rendered output: an image, a table, or text. */
 function Output({ out }: { out: RawOutput }) {
   if (out.output_type === "error" || out.ename) {
@@ -128,12 +142,14 @@ export default function NotebookView({ text }: { text: string }) {
               {cell.execution_count == null ? "[ ]" : `[${cell.execution_count}]`}
             </div>
             <div className="nb-body">
-              {source && (
-                // Reuse the markdown renderer's highlighter by handing it a
-                // fenced block — one code style across the whole app, and no
-                // second syntax-highlighting dependency.
-                <MarkdownView text={"```python\n" + source + "\n```"} />
-              )}
+              {source &&
+                (() => {
+                  // Reuse the markdown renderer's highlighter by handing it a
+                  // fenced block — one code style across the whole app, and no
+                  // second syntax-highlighting dependency.
+                  const fence = codeFence(source);
+                  return <MarkdownView text={`${fence}python\n${source}\n${fence}`} />;
+                })()}
               {(cell.outputs ?? []).map((out, j) => (
                 <Output key={j} out={out} />
               ))}

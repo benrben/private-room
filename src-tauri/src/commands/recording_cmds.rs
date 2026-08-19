@@ -163,6 +163,16 @@ pub fn rec_start(
     let mut session = rec.session.lock().unwrap();
     clear_finished(&mut session);
     if let Some(live) = session.as_ref() {
+        // A stopped recording keeps its slot until the engine has written it
+        // (see `rec_stop`), so this arm now covers a session that is saving —
+        // where "Stop it first" would be an instruction nobody can follow.
+        if live.handle.shared.status.lock().unwrap().as_str() == "saving" {
+            return Err(format!(
+                "The last recording (file {}) is still being saved. It finishes on its own — \
+                 start the next one in a moment.",
+                live.file_id
+            ));
+        }
         return Err(format!(
             "A recording is already running (file {}). Stop it first.",
             live.file_id
@@ -179,6 +189,16 @@ pub fn rec_start(
     let (file_id, name, meta, base_samples) = match file_id {
         // Resume an existing recording file where it left off.
         Some(id) => {
+            // A session whose final write failed leaves its audio in
+            // rec_chunks. Splice those checkpoints in BEFORE reading the
+            // stored WAV: this session's first flush calls
+            // `finalize_rec_audio`, which drops the chunk rows, so resuming
+            // without the rescue records over that stretch of the meeting —
+            // and a crash instead would splice the old tail in afterwards,
+            // offsetting every timestamp in the new transcript. Refusing is
+            // the only safe answer when the rescue itself cannot run.
+            db::recover_rec_chunks(&room.conn)
+                .map_err(|e| format!("This recording can't be continued yet. {e}"))?;
             let (name, _mime, bytes, _text) = db::get_file_full(&room.conn, &id)?;
             let meta = parse_meta(db::get_rec_meta(&room.conn, &id))?;
             let base = match bytes {
@@ -239,6 +259,12 @@ pub fn rec_start(
     }
     let awake = std::process::Command::new("/usr/bin/caffeinate")
         .arg("-i") // prevent idle SYSTEM sleep; the display may still sleep
+        // Tied to OUR pid, so the OS ends it on every exit path this app has.
+        // Quitting mid-recording never runs `Drop for LiveSession`, and the
+        // orphan kept holding its assertion: the Mac stopped idle-sleeping
+        // until the user found and killed the stray process by hand.
+        .arg("-w")
+        .arg(std::process::id().to_string())
         .spawn()
         .ok();
     *session = Some(LiveSession { file_id: file_id.clone(), handle, awake });
@@ -490,6 +516,34 @@ async fn rec_retranscribe_inner(
     Ok(meta)
 }
 
+/// How long a stop waits for a verdict it can no longer be handed directly.
+/// Matches the bound `drain_inflight` puts on the same drain, which is the
+/// stop that took our reply channel in the first place.
+const STOP_VERDICT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The engine's verdict when it can no longer answer THIS caller.
+///
+/// `Engine::begin_stop` adopts the newest reply channel and drops the previous
+/// one, so a room lock or a quit arriving during this drain (both send their own
+/// Stop) closes ours while the save is still running. Reading `outcome` once at
+/// that instant answers "the engine stopped before it could save" for a
+/// recording that is saving perfectly — the exact lie the fallback exists to
+/// prevent. The verdict is therefore waited for, briefly, and only then given
+/// up on.
+fn stop_verdict(shared: &recording::RecShared) -> Result<RecMeta, String> {
+    let deadline = std::time::Instant::now() + STOP_VERDICT_WAIT;
+    loop {
+        let verdict = shared.outcome.lock().unwrap().clone();
+        if let Some(verdict) = verdict {
+            return verdict;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("The recording engine stopped before it could save.".to_string());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
 /// Stop and save. Waits for the tail phrases to finish transcribing and for
 /// the whole-recording speaker pass (the engine drains its decoder before
 /// flushing), so the returned meta is final.
@@ -506,27 +560,48 @@ pub async fn rec_stop(
     state: State<'_, AppState>,
     rec: State<'_, RecState>,
 ) -> Result<RecMeta, String> {
+    // The session entry STAYS for the whole drain. Removing it here told
+    // `rec_live_status` that nothing was recording while the engine was still
+    // finalising — minutes, on a long meeting — so a window that reloaded in
+    // that gap came back with no REC chip and no save card, and its Record
+    // button would happily point a second engine at the file the first one was
+    // still writing. The status the engine has already set ("saving") is what
+    // a reloaded window reads; `clear_finished` retires the entry on
+    // "saved"/"failed", and the retirement below covers the paths that never
+    // reach a terminal status.
     let (done_rx, shared, file_id) = {
-        let mut guard = rec.session.lock().unwrap();
-        let live = guard.take().ok_or("No live recording.")?;
+        let guard = rec.session.lock().unwrap();
+        let live = guard.as_ref().ok_or("No live recording.")?;
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let _ = live.handle.tx.send(EngineMsg::Stop { done: done_tx });
         (done_rx, live.handle.shared.clone(), live.file_id.clone())
     };
-    let meta = tauri::async_runtime::spawn_blocking(move || {
+    let engine = shared.clone();
+    let saved = tauri::async_runtime::spawn_blocking(move || {
         match done_rx.recv() {
             Ok(result) => result,
-            // The engine is gone without answering: it stopped itself first
-            // (the 3-hour ceiling, or the room closing under it) and left its
-            // verdict behind. Reporting a timeout for a recording that saved
+            // The engine is not answering US: it stopped itself first (the
+            // 3-hour ceiling, or the room closing under it) and left its
+            // verdict behind, or another Stop took over the reply channel while
+            // this drain ran. Reporting a timeout for a recording that saved
             // fine is exactly what that used to look like.
-            Err(_) => shared.outcome.lock().unwrap().clone().unwrap_or_else(|| {
-                Err("The recording engine stopped before it could save.".to_string())
-            }),
+            Err(_) => stop_verdict(&engine),
         }
     })
     .await
-    .map_err(|e| e.to_string())??;
+    .map_err(|e| e.to_string());
+    {
+        // Only if it is still THIS session: `clear_finished` may have retired
+        // it already, and a recording started since then owns the slot.
+        let mut guard = rec.session.lock().unwrap();
+        if guard
+            .as_ref()
+            .is_some_and(|l| Arc::ptr_eq(&l.handle.shared, &shared))
+        {
+            *guard = None;
+        }
+    }
+    let meta = saved??;
     // The meeting is over and the transcript is durable: read it. Best-effort
     // and deliberately after the save — a stop must never fail because the
     // room could not start reading (no model installed, the queue full, a
@@ -569,6 +644,40 @@ pub fn rec_get(state: State<'_, AppState>, id: String) -> Result<RecFile, String
     })
 }
 
+/// How long a live edit waits for the engine before giving up on it.
+const EDIT_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// What a live edit says when it could not be handed over. It tells the user to
+/// retry, so the edit it names must be certain NOT to land — see the claim in
+/// [`edit_rec_meta`].
+const REC_EDIT_BUSY: &str = "The recording is busy — try again in a moment.";
+
+/// The engine's answer for an edit the caller gave up on. It goes nowhere (the
+/// reply channel is dropped by then); what matters is that nothing is applied
+/// and no flush follows.
+const EDIT_ABANDONED: &str = "That edit was abandoned before this recording reached it.";
+
+/// What a live edit says once the engine has DEMONSTRABLY taken it (the claim
+/// was gone) and still has not answered. The edit is applied, so this may not
+/// be [`REC_EDIT_BUSY`]: that sentence asks for the retry that writes it twice.
+const REC_EDIT_LANDED: &str =
+    "That change was taken by the recording and will be saved with it — it may take a \
+     moment to appear. Making it again would put it in twice.";
+
+/// The single claim on one live edit. It answers `true` to the FIRST caller and
+/// to nobody after: either the engine takes it and applies the closure, or the
+/// timed-out command takes it and abandons the closure. Never both — which is
+/// the whole point, since "try again in a moment" is a duplicate whenever the
+/// edit it named goes on to land anyway.
+fn take_edit_claim(claim: &Mutex<bool>) -> bool {
+    let mut taken = claim.lock().unwrap();
+    if *taken {
+        return false;
+    }
+    *taken = true;
+    true
+}
+
 /// THE one way to change a recording's metadata. Everything that edits a
 /// transcript's overlay — a speaker's name, a note, a mark, a chapter — goes
 /// through here, live recording or not.
@@ -594,21 +703,60 @@ pub(crate) fn edit_rec_meta(
     id: &str,
     apply: impl FnOnce(&mut RecMeta) -> Result<(), String> + Send + 'static,
 ) -> Result<RecMeta, String> {
-    let live_tx = {
+    let live = {
         let mut session = rec.session.lock().unwrap();
         clear_finished(&mut session);
-        session.as_ref().filter(|l| l.file_id == id).map(|l| l.handle.tx.clone())
+        session
+            .as_ref()
+            .filter(|l| l.file_id == id)
+            .map(|l| (l.handle.tx.clone(), l.handle.shared.clone()))
     };
-    if let Some(tx) = live_tx {
+    if let Some((tx, shared)) = live {
+        // The engine's own meta only learns how long the recording is when it
+        // CHECKPOINTS (`Engine::flush` is the one place that stamps it), so
+        // mid-recording it describes a timeline minutes shorter than the one on
+        // screen — and `at_time` then refused a mark plainly inside the
+        // recording. The live head is on the shared handle, stored on every
+        // batch of audio, so the edit is shown that instead. Never backwards:
+        // the horizon a mark is measured against may only grow.
+        let live_cs = shared.duration_cs.load(Ordering::Relaxed);
+        // Whoever takes this first owns the edit: the engine, which then
+        // applies it, or the wait below, which gives up on it. Giving up did
+        // NOT use to cancel anything — the closure stayed queued and landed
+        // whenever the engine got to it, which on a long meeting is after the
+        // speaker-split pass, minutes later. The user meanwhile obeyed "try
+        // again in a moment", so the note, mark, chapter or rename was written
+        // twice (fresh uuids, nothing to de-duplicate them by).
+        let claim = Arc::new(Mutex::new(false));
+        let engine_claim = claim.clone();
+        let apply = move |meta: &mut RecMeta| {
+            if !take_edit_claim(&engine_claim) {
+                return Err(EDIT_ABANDONED.to_string());
+            }
+            meta.duration_cs = meta.duration_cs.max(live_cs);
+            apply(meta)
+        };
         let (done, wait) = std::sync::mpsc::channel();
         tx.send(recording::EngineMsg::EditMeta { apply: Box::new(apply), done })
             .map_err(|_| "That recording just stopped — try again.".to_string())?;
         // Bounded: the engine answers between phrases, and a caller blocked
         // forever on a wedged engine is a hung window. The stop/pause split
         // pass is the longest thing that can be in front of us.
+        if let Ok(result) = wait.recv_timeout(EDIT_WAIT) {
+            return result;
+        }
+        if take_edit_claim(&claim) {
+            // The engine had not reached it, and now it never will.
+            return Err(REC_EDIT_BUSY.into());
+        }
+        // The engine had already begun applying it, so the edit is committed
+        // and "try again" would be the sentence that causes the duplicate.
+        // Its answer is moments away — the apply is in memory and the flush is
+        // a local write — but if even that does not arrive, what the user is
+        // told still has to match what the recording did.
         return wait
-            .recv_timeout(std::time::Duration::from_secs(20))
-            .map_err(|_| "The recording is busy — try again in a moment.".to_string())?;
+            .recv_timeout(EDIT_WAIT)
+            .map_err(|_| REC_EDIT_LANDED.to_string())?;
     }
     state.with_room(|room| {
         let mut meta = parse_meta(db::get_rec_meta(&room.conn, id))?;
@@ -1546,6 +1694,56 @@ mod tests {
         RecState::default()
     }
 
+    /// A mid-recording edit that timed out had ALREADY been queued, and the
+    /// engine applied it whenever it got to it — after the speaker-split pass,
+    /// minutes later on a long meeting. The user meanwhile obeyed "try again in
+    /// a moment", so the note (or mark, chapter, rename) was written twice.
+    /// Both sides now take the same claim, and it can only be taken once — so
+    /// the message that invites a retry is only ever sent for an edit that was
+    /// cancelled, and an edit the engine has begun is answered with its result.
+    #[test]
+    fn only_one_side_can_own_a_live_edit() {
+        let claim = Mutex::new(false);
+        assert!(take_edit_claim(&claim), "the first caller owns the edit");
+        assert!(
+            !take_edit_claim(&claim),
+            "a second claim would mean the edit both landed and invited a retry"
+        );
+        assert!(!take_edit_claim(&claim), "and it stays taken");
+    }
+
+    /// The session entry now survives the whole save drain, which puts a second
+    /// Stop within reach: locking the room (or quitting) while a long meeting
+    /// finalises sends its own, and `Engine::begin_stop` adopts the newer reply
+    /// channel — closing this one. Reading the outcome at that instant reported
+    /// "stopped before it could save" for a recording that saved seconds later.
+    #[test]
+    fn a_stop_whose_reply_channel_was_taken_waits_for_the_verdict() {
+        let shared = Arc::new(recording::RecShared {
+            status: Mutex::new("saving".into()),
+            duration_cs: std::sync::atomic::AtomicI64::new(0),
+            sources: Mutex::new([("off".into(), String::new()), ("off".into(), String::new())]),
+            outcome: Mutex::new(None),
+        });
+        let engine = shared.clone();
+        let finishing = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            *engine.outcome.lock().unwrap() =
+                Some(Ok(RecMeta { duration_cs: 4242, ..Default::default() }));
+            *engine.status.lock().unwrap() = "saved".into();
+        });
+        let verdict = stop_verdict(&shared).expect("the recording saved — the stop must say so");
+        assert_eq!(verdict.duration_cs, 4242);
+        finishing.join().unwrap();
+
+        // A verdict already left behind (the 3-hour ceiling answered a dummy
+        // channel) is still returned without waiting for anything.
+        *shared.outcome.lock().unwrap() = Some(Err("no room to write to".into()));
+        let started = std::time::Instant::now();
+        assert!(stop_verdict(&shared).is_err());
+        assert!(started.elapsed() < STOP_VERDICT_WAIT, "it waited for a verdict it already had");
+    }
+
     /// GH #5. The rebuild moved "Dana" from Speaker 2 onto Speaker 1 (that is
     /// where her voice ended up). Merging the stored map back in wholesale put
     /// the old pair back beside the new one, so ONE person showed up as two
@@ -1764,6 +1962,73 @@ mod tests {
         // than storing an entry that shadows itself.
         let cleared = set_speaker_name(&state, &idle(), &id, "Speaker 1", "Speaker 1").unwrap();
         assert!(cleared.speaker_names.is_empty());
+    }
+
+    /// A stand-in for the engine thread, holding the meta the way `Engine`
+    /// does: `checkpoint_cs` is what its last flush stamped, `live_cs` is how
+    /// much audio has actually arrived since. The gap between the two is the
+    /// whole point — it is where a mark made mid-meeting lands.
+    fn live_engine(
+        file_id: &str,
+        checkpoint_cs: i64,
+        live_cs: i64,
+    ) -> (RecState, std::thread::JoinHandle<RecMeta>) {
+        let (tx, rx) = std::sync::mpsc::channel::<EngineMsg>();
+        let engine = std::thread::spawn(move || {
+            let mut meta = RecMeta { duration_cs: checkpoint_cs, ..Default::default() };
+            while let Ok(msg) = rx.recv() {
+                if let EngineMsg::EditMeta { apply, done } = msg {
+                    let applied = apply(&mut meta);
+                    let _ = done.send(applied.map(|()| meta.clone()));
+                }
+            }
+            meta
+        });
+        let rec = RecState::default();
+        *rec.session.lock().unwrap() = Some(LiveSession {
+            file_id: file_id.to_string(),
+            handle: recording::EngineHandle {
+                tx,
+                shared: Arc::new(recording::RecShared {
+                    status: Mutex::new("recording".into()),
+                    duration_cs: std::sync::atomic::AtomicI64::new(live_cs),
+                    sources: Mutex::new([
+                        ("on".into(), String::new()),
+                        ("off".into(), String::new()),
+                    ]),
+                    outcome: Mutex::new(None),
+                }),
+            },
+            awake: None,
+        });
+        (rec, engine)
+    }
+
+    /// "Mark this moment", 20s after the last checkpoint. The engine's copy of
+    /// the meta still says the recording is 60s long, so the moment the user
+    /// is watching was refused as "outside this recording".
+    #[test]
+    fn a_mark_mid_recording_is_measured_against_the_live_timeline() {
+        let state = AppState::default();
+        let (rec, engine) = live_engine("rec-live", 6000, 8000);
+
+        // The button marks 6s back from the live head — past the checkpoint.
+        let meta = rec_highlight_add_inner(&state, &rec, "rec-live", 7400, 7400)
+            .expect("a moment inside the running recording was refused");
+        assert_eq!(meta.highlights.len(), 1);
+        assert_eq!(meta.highlights[0].t0, 7400);
+
+        // Fresher, not gone: past the live head is still not a moment that
+        // exists, and neither is a negative one.
+        for t0 in [8600, -100] {
+            let err = rec_highlight_add_inner(&state, &rec, "rec-live", t0, t0)
+                .expect_err("a moment outside the recording was stored");
+            assert!(err.contains("outside this recording"), "{err}");
+        }
+
+        drop(rec);
+        let stored = engine.join().unwrap();
+        assert_eq!(stored.highlights.len(), 1, "the engine's own copy never got the mark");
     }
 
     /// The edited copy's transcript: cut words gone, everything after a cut

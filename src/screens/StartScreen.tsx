@@ -11,15 +11,14 @@ import { relativeTime } from "../rooms/helpers";
  * and a badge that is wrong is worse on this screen than no badge at all.
  *
  * The hue only reinforces the word it rides with. iCloud is marked pending
- * because a synced room is the one case where "never leaves this computer"
- * deserves a second look; the other is informational.
+ * because a synced room is the one case where a copy of the file exists
+ * somewhere else; the other is informational.
  *
  * There is deliberately NO fallback badge. This returned "On this Mac" for
  * anything it could not classify, which meant a room in ~/Dropbox or
- * ~/Google Drive was affirmatively labelled local — on the very screen whose
- * lead copy promises the file never leaves this computer. Saying nothing is
- * the only honest answer for a path we cannot read, and it keeps the badge
- * meaning what it says: it appears when we know something, not always. */
+ * ~/Google Drive was affirmatively labelled local. Saying nothing is the only
+ * honest answer for a path we cannot read, and it keeps the badge meaning what
+ * it says: it appears when we know something, not always. */
 function roomPlace(path: string): { label: string; sem: string } | null {
   if (path.includes("/Library/Mobile Documents/")) {
     return { label: "iCloud Drive", sem: "nb-sem-pending" };
@@ -51,17 +50,25 @@ export function StartScreen({
 }: StartScreenProps) {
   return (
     <>
+      {/* "…that never leaves this computer" was a claim about a file path,
+          made before any path is known — and `roomPlace` below deliberately
+          refuses to make it, saying nothing about a room in ~/Dropbox rather
+          than affirming it is local. The sentence now claims only what is
+          true of every room: one file, encrypted, on your Mac. */}
       <p className="gate-sub">
         Your files, links, chats and AI — sealed inside one encrypted
-        file that never leaves this computer.
+        file on your Mac.
       </p>
       <ul className="gate-assurances">
         {/* The check is a drawn glyph rather than a "✓" character: it is
             decoration reinforcing a sentence that already says the thing, so
             it stays out of the accessibility tree. */}
+        {/* Not "Offline by default": this screen is on display while
+            `checkForUpdatesQuietly` (updater.ts) is asking GitHub whether a
+            newer build exists. Settings → Updates & version switches it off. */}
         <li>
           <span className="nb-ico nb-ico-check" aria-hidden="true" />
-          Offline by default
+          Offline except a launch update check
         </li>
         <li>
           <span className="nb-ico nb-ico-check" aria-hidden="true" />
@@ -88,7 +95,7 @@ export function StartScreen({
           Open Room…
         </button>
         <button className="subtle gate-demo" onClick={onDemo}>
-          Try a demo room
+          Create a demo room
         </button>
       </div>
       {recent.length > 0 && (
@@ -105,13 +112,13 @@ export function StartScreen({
                   <button
                     className="recent-open"
                     onClick={() => onOpenRecent(room.path)}
-                    /* A room whose file is gone still OPENS: the open path is
-                       what knows how to ask you where it moved to. Saying so
-                       here just stops you typing a password for a file that
-                       isn't there. */
+                    /* A room whose file is gone still OPENS — but through the
+                       file picker, which is what can be told where it moved
+                       to, rather than through a password form for a file that
+                       isn't there. App.tsx routes it. */
                     title={
                       room.missing
-                        ? "This room's file is not at that location any more"
+                        ? "This room's file is not at that location any more — opens the file picker"
                         : undefined
                     }
                   >

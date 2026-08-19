@@ -1,27 +1,14 @@
 import { ReactNode, useId, useState } from "react";
 import { api, FrontPage as FrontPageData, fileKindLabel, RoomInfo } from "../api";
-import {
-  BookOpenIcon,
-  ChatBubbleIcon,
-  ClockIcon,
-  FileTypeIcon,
-  GlobeIcon,
-  GraphIcon,
-  LinkIcon,
-  MemoryIcon,
-  MicIcon,
-  ScriptIcon,
-  SparkIcon,
-  WorkflowsIcon,
-} from "../icons";
+import { ChatBubbleIcon, ClockIcon, FileTypeIcon } from "../icons";
 import { displayName, formatWhen } from "./composer";
 import { isCloudRoute } from "./markup";
 import { visibleWorkflows } from "./workflows/selectors";
 import { groupActivity, runningJobCount } from "../shell/activity";
+import { NAV_AREAS, type NavArea } from "../shell/navPrefs";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
 import type { LayoutApi } from "../shell/useLayout";
-import { useAdaptiveText } from "./adaptiveText";
 
 type BriefTone = "danger" | "warn" | "info";
 interface BriefItem {
@@ -179,7 +166,10 @@ function RoomStamp({ page, s }: { page: FrontPageData; s: WSState }) {
       : rec && rec.status === "paused"
         ? { word: "Recording paused", mark: "nb-sem-pending" }
         : busy > 0
-          ? { word: `${busy} running`, mark: "nb-sem-linked" }
+          ? // `runningJobCount` counts queued jobs alongside running ones, so
+            // "running" was a claim the number could not make — the status bar
+            // and Activity both say so in the same words.
+            { word: `${busy} running or waiting`, mark: "nb-sem-linked" }
           : // The privacy scanner is real work with no job row, so
             // `runningJobCount` cannot see it and Home said "All quiet" while
             // the fans were up. Deliberately NOT folded into `runningJobCount`:
@@ -298,35 +288,6 @@ function timeline(
   return [...running, ...past];
 }
 
-/** A major action: a wide notebook card, drawn as a frame on the sheet. These
- * are the four things Home actively invites you to START. */
-function ActionCard({
-  area,
-  title,
-  copy,
-  icon,
-  onClick,
-}: {
-  area: string;
-  title: string;
-  copy: string;
-  icon: ReactNode;
-  onClick: () => void;
-}) {
-  return (
-    <button className="rh-card nb-card nb-lift" onClick={onClick}>
-      <span className="rh-card-ico" aria-hidden="true">
-        {icon}
-      </span>
-      <span className="rh-card-title">{title}</span>
-      {/* Sans, never the hand: this is an instruction about what the area
-          does, and handwriting is reserved for asides, dates and counts. */}
-      <span className="rh-card-copy">{copy}</span>
-      <span className="rh-card-area">{area}</span>
-    </button>
-  );
-}
-
 /** A destination that already has a permanent home in the rail. It keeps its
  * link and its full description (as the hover title), and gives up the row of
  * page it did not need — Home was a second copy of the primary navigation. */
@@ -396,7 +357,6 @@ export default function FrontPage({
   s,
   a,
   layout,
-  info,
 }: {
   page: FrontPageData;
   s: WSState;
@@ -405,41 +365,35 @@ export default function FrontPage({
   info: RoomInfo;
 }) {
   const [suggestionsOpen, setSuggestionsOpen] = useState(false);
-  const goArea = (area: "recordings" | "memory" | "skills" | "connectors" | "browser") => {
+  const goArea = (
+    area: "recordings" | "memory" | "skills" | "connectors" | "sketch" | "create",
+  ) => {
     s.setShowMap(false);
     s.setShowWorkflows(false);
     s.setShowScripts(false);
     s.setOpenFile(null);
     s.setArea(area);
   };
+  /** How Home reaches every destination the rail knows. Keyed by the catalog,
+   * so an area added to `NAV_AREAS` with no way in from here stops the build —
+   * this list has silently fallen two and three destinations behind twice. */
+  const openArea: Record<NavArea, (() => void) | null> = {
+    home: null,
+    recordings: () => goArea("recordings"),
+    browser: () => a.revealBrowser(),
+    sketch: () => goArea("sketch"),
+    create: () => goArea("create"),
+    map: () => {
+      s.setOpenFile(null);
+      s.setShowMap(true);
+    },
+    workflows: () => a.openWorkflows(),
+    scripts: () => a.openScripts(),
+    skills: () => goArea("skills"),
+    connectors: () => goArea("connectors"),
+    memory: () => goArea("memory"),
+  };
   const recent = timeline(page, s, a, layout);
-  // A1 "living dek": the rh-subtitle below always renders first (RULE 1/3/8)
-  // — this only replaces it once there's a genuine fact to ground a sentence
-  // in. Facts are exactly what `RoomStamp` beside it and the timeline below it
-  // already show (file/chat counts, running-job count, the newest timeline
-  // entry) — nothing fetched fresh for this (RULE 4/10). Gated on the
-  // timeline having at least one entry: a brand-new empty room has nothing
-  // true to say beyond the static line.
-  const busy = runningJobCount(s);
-  const homeDekFacts =
-    recent.length > 0
-      ? {
-          fileCount: page.fileCount,
-          chatCount: page.chatCount,
-          runningCount: busy,
-          mostRecent: { title: recent[0].title, kind: recent[0].kind },
-        }
-      : null;
-  const homeDek = useAdaptiveText({
-    roomId: info.path,
-    kind: "dek",
-    prompt: homeDekFacts
-      ? `Write one plain sentence, max 20 words, describing what's in this room and what's happening right now. Use ONLY these facts: ${JSON.stringify(homeDekFacts)}. Match this voice: plain, direct, no hype (existing example: "Recent work, current background activity, and everything this room can do."). No preamble, just the sentence.`
-      : "",
-    facts: homeDekFacts,
-    maxWords: 20,
-    enabled: homeDekFacts !== null,
-  });
   return (
     <div className="rh-view">
       <div className="rh-inner">
@@ -447,12 +401,8 @@ export default function FrontPage({
           <div className="rh-masthead-main">
             <h1 className="rh-title">Continue where you left off</h1>
             <p className="rh-subtitle nb-subtitle">
-              {homeDek ?? (
-                <>
-                  Recent work, current background activity, and everything this room
-                  can do — nothing here leaves this Mac on its own.
-                </>
-              )}
+              Recent work, current background activity, and everything this room
+              can do — nothing here leaves this Mac on its own.
             </p>
           </div>
           <RoomStamp page={page} s={s} />
@@ -502,104 +452,40 @@ export default function FrontPage({
         <section className="rh-section">
           <div className="rh-section-head">
             <h2>Work in this room</h2>
-            {/* This list is a shortcut into the areas, not an inventory —
-                it said "All capabilities" while omitting three of them. */}
             <span className="rh-section-note">Go to an area</span>
           </div>
 
-          {/* Marginalia: deterministic, inert, and hidden by the stylesheet
-              the moment the column stops having a margin to draw in. */}
-          <aside className="rh-margin" aria-hidden="true">
-            <span className="rh-margin-note">start here</span>
-            <span className="nb-arrow-curve nb-arrow-curve--se rh-margin-arrow" />
-          </aside>
-
-          <div className="rh-cards nb-frame-set">
-            <ActionCard
-              area="Recordings"
-              title="Record and transcribe"
-              copy="Microphone, Mac audio, live translation, editing, export"
-              icon={<MicIcon size={16} />}
-              onClick={() => goArea("recordings")}
-            />
-            <ActionCard
-              area="Workflows"
-              title="Automate repeated work"
-              copy="Visual pipelines, schedules, file actions, run history"
-              icon={<WorkflowsIcon size={16} />}
-              onClick={() => a.openWorkflows()}
-            />
-            <ActionCard
-              area="Studio"
-              title="Transform your sources"
-              copy="Flashcards, mind maps, podcast scripts, room summary"
-              icon={<SparkIcon size={16} />}
-              onClick={() => {
-                s.setAiTab("studio");
-                layout.showPane("ai");
-              }}
-            />
-            <ActionCard
-              area="Browser"
-              title="Read the web privately"
-              copy="A browser that keeps no history, with search and downloads straight into the room"
-              icon={<GlobeIcon size={16} />}
-              onClick={() => a.revealBrowser()}
-            />
-          </div>
-
-          {/* A dashed pencil rule is the system's mark for a provisional
-              boundary — below it is the fold, not a second class of feature.
-              Every one of these still has a permanent home in the rail. */}
-          <hr className="nb-rule-dash rh-more-rule" />
-
           <div className="rh-more">
-            <AreaChip
-              label="Scripts"
-              hint="Run a room script — Python or JavaScript with explicit inputs, outputs, and consent"
-              icon={<ScriptIcon size={14} />}
-              onClick={() => a.openScripts()}
-            />
-            <AreaChip
-              label="Room Map"
-              hint="See how files connect — the Room Map of files, notes, and their relationships"
-              icon={<GraphIcon size={14} />}
-              unavailable={
-                s.files.length === 0
-                  ? "Add a file first — the map draws the connections between them"
-                  : undefined
-              }
-              onClick={() => {
-                s.setOpenFile(null);
-                s.setShowMap(true);
-              }}
-            />
-            <AreaChip
-              label="Memory"
-              hint="Manage memory and scratch notes — durable facts and preferences, always visible and editable"
-              icon={<MemoryIcon size={14} />}
-              onClick={() => goArea("memory")}
-            >
-              {/* A count is the handwriting's natural home, and the ring keeps
-                  it from reading as part of the label. */}
-              {page.memories.length > 0 && (
-                <span className="nb-circled rh-chip-count">
-                  {page.memories.length}
-                </span>
-              )}
-            </AreaChip>
-            <AreaChip
-              label="Skills"
-              hint="Teach the AI a skill — reusable instructions and resources, stored encrypted in this room"
-              icon={<BookOpenIcon size={14} />}
-              onClick={() => goArea("skills")}
-            />
-            <AreaChip
-              label="Connectors"
-              hint="Connect outside tools — MCP connectors, every call asks first"
-              icon={<LinkIcon size={14} />}
-              onClick={() => goArea("connectors")}
-            />
+            {NAV_AREAS.map((def) => {
+              const go = openArea[def.key];
+              if (!go) return null;
+              return (
+                <AreaChip
+                  key={def.key}
+                  label={def.label}
+                  hint={def.blurb}
+                  icon={def.icon(14)}
+                  unavailable={
+                    // Not "fewer than two files": RoomMap counts NODES, and one
+                    // file with linked memories is a real constellation it
+                    // draws (see RoomMap.tsx's `showEmpty`). An empty room is
+                    // the only state it can say nothing about.
+                    def.key === "map" && s.files.length === 0
+                      ? "Add a file first — the map draws the connections between them"
+                      : undefined
+                  }
+                  onClick={go}
+                >
+                  {/* A count is the handwriting's natural home, and the ring
+                      keeps it from reading as part of the label. */}
+                  {def.key === "memory" && page.memories.length > 0 && (
+                    <span className="nb-circled rh-chip-count">
+                      {page.memories.length}
+                    </span>
+                  )}
+                </AreaChip>
+              );
+            })}
           </div>
         </section>
 

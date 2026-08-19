@@ -182,6 +182,39 @@
     return el.disabled === true || el.getAttribute("aria-disabled") === "true";
   }
 
+  /** What a field is CALLED, for the two credential judgements below: its
+   *  autocomplete token, its form name and its id, lowercased. */
+  function fieldHint(el) {
+    return (
+      (el.getAttribute("autocomplete") || "") +
+      " " +
+      (el.getAttribute("name") || "") +
+      " " +
+      (el.id || "")
+    ).toLowerCase();
+  }
+
+  /** A credential by its NAME, whatever `type` currently says.
+   *
+   * Matched as a SUBSTRING rather than as a whole token: the site's own "show
+   * password" toggle sets `type="text"`, and from that moment the only signal
+   * left is the name — which real sign-in forms spell `password`, `passwd`,
+   * `login-password`, `user_password`, none of which the old tokenised pattern
+   * (`current-password`/`new-password` only) matched. The field then got a ref
+   * and its plaintext value went into the snapshot.
+   */
+  var SECRET_NAME = /passwo?rd|passwd|one-time-code|\botp\b/;
+
+  /** The input types a credential can be TYPED into (no `type` means text).
+   *
+   * The name test above is a substring one, so the reveal toggle that motivated
+   * it — `<input type="checkbox" id="showPassword">` — carries the word as
+   * plainly as the field it reveals. Fencing the checkbox counted it in the
+   * "N password field(s) present — fenced, the user must type those" line,
+   * which is a count of fields to fill that included one nobody fills.
+   */
+  var TYPED_INPUT = /^(text|password|email|tel|number|search|url)?$/;
+
   /** PRIVACY: a password input is never actionable by the agent. It is fenced
    *  at the walker — it never receives a ref, so there is no number the model
    *  could pass to `act`. The snapshot still SAYS one exists (silently hiding
@@ -190,14 +223,23 @@
     if (el.tagName !== "INPUT") return false;
     var t = (el.getAttribute("type") || "").toLowerCase();
     if (t === "password") return true;
-    var hint = (
-      (el.getAttribute("autocomplete") || "") +
-      " " +
-      (el.getAttribute("name") || "") +
-      " " +
-      (el.id || "")
-    ).toLowerCase();
-    return /(^|\W)(current-password|new-password|otp|one-time-code)(\W|$)/.test(hint);
+    return TYPED_INPUT.test(t) && SECRET_NAME.test(fieldHint(el));
+  }
+
+  /** Values that are the user's to type and nobody's to repeat: credentials,
+   *  card numbers, national ids.
+   *
+   *  Independent of [`isSecret`], and deliberately wider. `isSecret` decides
+   *  what the agent may ACT on; this decides what may be WRITTEN DOWN in a
+   *  snapshot the model reads. A card number in a plainly-named field is not a
+   *  password — the agent can legitimately be asked to fill one — but echoing
+   *  the digits back into the transcript is a copy of them nobody asked for.
+   */
+  var PRIVATE_VALUE =
+    /passwo?rd|passwd|one-time-code|\botp\b|\bcc-|card-?number|\bcvv\b|\bcvc\b|security-code|\bssn\b|social-security|national-id/;
+
+  function valueIsPrivate(el) {
+    return PRIVATE_VALUE.test(fieldHint(el));
   }
 
   function roleFor(el) {
@@ -253,7 +295,9 @@
     }
     var name = clean(el.getAttribute("name"));
     if (name) return truncate(name, LABEL_MAX);
-    if (el.value) return truncate(clean(el.value), LABEL_MAX);
+    // The last resort names a field by what is IN it, which for a credential
+    // field is the same disclosure `stateFor` refuses — through the other door.
+    if (el.value && !valueIsPrivate(el)) return truncate(clean(el.value), LABEL_MAX);
     return "(unlabeled)";
   }
 
@@ -283,8 +327,12 @@
     if (el.checked === true) bits.push("checked");
     if (el.tagName === "INPUT" || el.tagName === "TEXTAREA") {
       var v = clean(el.value);
-      if (v) bits.push('has "' + truncate(v, 40) + '"');
-      else bits.push("empty");
+      if (!v) bits.push("empty");
+      // Whether it is filled is what the model needs to know; WHAT it is
+      // filled with is the user's. Saying "filled" answers the question
+      // without copying a credential into the transcript.
+      else if (valueIsPrivate(el)) bits.push("filled");
+      else bits.push('has "' + truncate(v, 40) + '"');
     }
     if (el.tagName === "SELECT" && el.selectedOptions && el.selectedOptions[0]) {
       bits.push('"' + truncate(clean(el.selectedOptions[0].textContent), 40) + '"');
@@ -858,6 +906,18 @@
     return out;
   }
 
+  /** Is ANY number this page handed out still attached to the element it was
+   *  handed out for? Refs the model holds are live exactly while this is true. */
+  function anyMarkAlive() {
+    var alive = false;
+    registry.forEach(function (weak, n) {
+      if (alive) return;
+      var el = weak ? weak.deref() : null;
+      if (el && el.isConnected && el.getAttribute("data-arcelle-mark") === String(n)) alive = true;
+    });
+    return alive;
+  }
+
   function find(args) {
     var needle = clean((args && args.text) || "").toLowerCase();
     if (!needle) return { ok: false, error: "find needs text to look for." };
@@ -868,9 +928,20 @@
     // next click came back "e7 is gone" on a page nothing had changed on.
     var elements = currentElements();
     var gen = generation;
-    if (elements.length === 0) {
-      // Nothing numbered yet (or the page moved on): now a snapshot is the
-      // only way to answer, and there are no live refs left to invalidate.
+    if (!anyMarkAlive()) {
+      // Nothing numbered yet, or every number has come off the page with the
+      // document it was written on: a snapshot is the only way to answer, and
+      // there are no live refs left to invalidate.
+      //
+      // Gated on the marks being ATTACHED, not on the filtered list.
+      // `currentElements` also drops marks that have merely scrolled out of
+      // its visibility band, so a user scrolling to the bottom of a long page
+      // with the trackpad emptied it while every mark was still out there —
+      // and the re-snapshot then silently renumbered the page while returning
+      // only the matches, so the model's earlier refs pointed at different
+      // controls and the next click acted on the wrong one and reported
+      // success. With marks in place we answer with no matches instead, which
+      // the Rust side already words as "take a fresh browse_snapshot".
       var snap = snapshot({ badges: false });
       elements = snap.elements;
       gen = snap.generation;
@@ -1188,6 +1259,28 @@
   function waitFor(spec, budgetMs) {
     var budget = budgetMs || 8000;
     var started = Date.now();
+    // "Gone" means it WENT away, so the number has to be one this page issued.
+    // Without this a typo or a number from an older numbering resolved to
+    // nothing on the first 100ms tick and reported a wait that never happened
+    // — "wait until the spinner disappears" succeeding instantly against a
+    // page still spinning.
+    //
+    // Asked of the REGISTRY, not of `resolve_`: a ref this numbering issued
+    // whose element has since been detached IS gone, and the commonest batch
+    // there is — click the banner's close button, then wait for the banner to
+    // go — hands exactly that. Refusing it would call a batch that did what it
+    // was asked a failure, word it "was not on the page to begin with" about
+    // something that plainly was, and bill for a screenshot of it.
+    if (spec.gone && !issued_(spec.gone)) {
+      return Promise.resolve({
+        found: false,
+        waitedMs: 0,
+        error:
+          String(spec.gone) +
+          " is not one of this page's refs, so there was nothing to wait for" +
+          " — take a fresh browse_snapshot.",
+      });
+    }
     return new Promise(function (resolve) {
       var timer = setInterval(function () {
         var hit = false;
@@ -1214,6 +1307,11 @@
       var el = w ? w.deref() : null;
       return el && el.isConnected ? el : null;
     }
+    /** Did the numbering the model is holding ever hand out this number? */
+    function issued_(ref) {
+      var n = Number(String(ref).replace(/^e/i, ""));
+      return isFinite(n) && registry.has(n);
+    }
   }
 
   async function act(args) {
@@ -1224,14 +1322,27 @@
     var beforeUrl = location.href;
     var results = [];
     var stopped = null;
+    var cutShort = false;
     for (var i = 0; i < actions.length; i++) {
       var a = actions[i];
       var r;
       if (a && a.wait_for) {
-        r = { ok: true, did: "waited" };
         var w = await waitFor(a.wait_for, a.wait_for.timeout_ms);
-        r.did = w.found ? "waited until it appeared" : "waited, but it never appeared";
-        r.ok = w.found;
+        if (w.error) {
+          r = { ok: false, error: w.error };
+        } else if (a.wait_for.gone) {
+          // Worded per what was ASKED: reporting "waited until it appeared"
+          // for a wait on something disappearing says the opposite.
+          r = {
+            ok: w.found,
+            did: w.found ? "waited until it disappeared" : "waited, but it was still there",
+          };
+        } else {
+          r = {
+            ok: w.found,
+            did: w.found ? "waited until it appeared" : "waited, but it never appeared",
+          };
+        }
       } else {
         try {
           r = doOne(a);
@@ -1251,6 +1362,7 @@
       // of the batch was planned against the old page, so stop and re-report.
       if (location.href !== beforeUrl && i < actions.length - 1) {
         stopped = i;
+        cutShort = true;
         results.push({ ok: true, did: "page changed — remaining actions skipped" });
         break;
       }
@@ -1259,6 +1371,13 @@
     var snap = snapshot({ badges: false });
     return {
       ok: stopped === null,
+      // Same flag the cross-document path answers with (browser::call_async),
+      // so ONE reading covers both: the batch was cut short by a navigation,
+      // not by a failure. Without it every action had succeeded, `ok` was
+      // false because the batch stopped, and the model was told "an action
+      // failed" and billed for a screenshot of a page nothing had gone wrong
+      // on.
+      navigated: cutShort,
       results: results,
       stoppedAt: stopped,
       urlChanged: location.href !== beforeUrl,
@@ -1375,7 +1494,6 @@
             url: location.href,
             title: document.title || "",
             ready: document.readyState,
-            canGoBack: history.length > 1,
             mediaAreas: mediaAreas(),
             // Read-and-clear: the poll that sees this is the one that acts on
             // it, so a single double-Escape can never hand the keyboard back

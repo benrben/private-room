@@ -418,3 +418,45 @@ async def test_a_long_prompt_is_sent_whole_not_refused(monkeypatch) -> None:
         provider=config(),
     )
     assert seen["body"]["prompt"] == prompt
+
+
+@pytest.mark.asyncio
+async def test_an_oversized_reference_is_refused_before_the_upload(monkeypatch) -> None:
+    """The same picture the Video tab refuses instantly, naming the limit.
+
+    From this tab it used to be base64'd whole, POSTed, and answered only by
+    whatever the provider chose to say about it — after the wait.
+    """
+    posted: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        posted.append(str(request.url))
+        return reply()
+
+    mock_client(monkeypatch, handler)
+    huge = base64.b64encode(b"\0" * (imagegen.MAX_REFERENCE_BYTES + 1)).decode("ascii")
+    with pytest.raises(imagegen.ImageGenError) as caught:
+        await imagegen.generate(
+            prompt="the same hero, on a cliff",
+            model="openrouter::vendor/painter",
+            provider=config(),
+            reference_b64=[huge],
+            references_ack=True,
+        )
+    limit_mb = imagegen.MAX_REFERENCE_BYTES // (1024 * 1024)
+    assert f"{limit_mb} MB limit" in str(caught.value)
+    assert not posted, "the oversized picture was uploaded anyway"
+
+
+def test_a_reference_right_on_the_limit_still_goes() -> None:
+    """The ceiling is a ceiling, not a wall one byte lower."""
+    at_limit = base64.b64encode(b"\0" * imagegen.MAX_REFERENCE_BYTES).decode("ascii")
+    url = imagegen._reference_url(at_limit, "image/png")
+    assert url.startswith("data:image/png;base64,")
+
+
+def test_a_reference_that_is_not_base64_is_named_as_ours() -> None:
+    """Better than an opaque 400 from three services away."""
+    with pytest.raises(imagegen.ImageGenError) as caught:
+        imagegen._reference_url("not base64 at all!!", "image/png")
+    assert "could not be read" in str(caught.value)

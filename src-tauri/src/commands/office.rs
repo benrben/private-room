@@ -17,12 +17,21 @@ use super::*;
 
 // ------------------------------------------------------------- slide images
 
-/// Rendered slides, keyed by `<file id>:<index>`. A Quick Look render costs
-/// hundreds of milliseconds, and paging back and forth through a deck must not
-/// pay it twice. Cleared with the room, like every other decrypted derivative.
+/// Rendered slides, keyed by `<file id>:<index>:<digest of the bytes>`. A Quick
+/// Look render costs hundreds of milliseconds, and paging back and forth
+/// through a deck must not pay it twice. Cleared with the room, like every
+/// other decrypted derivative.
+///
+/// The DIGEST is in the key because a file id outlives the file's contents:
+/// restoring a version rewrites the bytes under the same id, and a cache keyed
+/// on the id alone kept answering with the previous deck's slides while the
+/// page count came from the new bytes.
 #[derive(Default)]
 pub struct SlideCache {
-    pub map: Mutex<HashMap<String, String>>,
+    /// Each PNG with the counter it was inserted at, which is what orders
+    /// eviction at the ceiling.
+    pub map: Mutex<HashMap<String, (u64, String)>>,
+    pub inserted: std::sync::atomic::AtomicU64,
 }
 
 /// Slides held at once. A deck's worth of PNGs is a few MB; past this the
@@ -104,15 +113,30 @@ fn find_tag_body(xml: &str, tag: &str) -> Option<(usize, usize)> {
 }
 
 /// Every `<tag …/>` (or `<tag …></tag>`) element in a fragment, as slices.
+///
+/// The long spelling is a WHOLE element: PowerPoint writes
+/// `<p:sldId id="256" r:id="rId1"><p:extLst>…</p:extLst></p:sldId>`, and
+/// carrying only its opening tag through left the rewritten `<p:sldIdLst>`
+/// unbalanced — Quick Look then refuses the staged file and every slide but
+/// the first came back undrawable.
 fn split_self_closing<'a>(fragment: &'a str, tag: &str) -> Vec<&'a str> {
     let open = format!("<{tag}");
+    let close = format!("</{tag}>");
     let mut out = Vec::new();
     let mut from = 0usize;
     while let Some(rel) = fragment[from..].find(&open) {
         let start = from + rel;
         let Some(gt) = fragment[start..].find('>').map(|i| start + i + 1) else { break };
-        out.push(&fragment[start..gt]);
-        from = gt;
+        let end = if fragment[start..gt].ends_with("/>") {
+            gt
+        } else {
+            // An element whose closing tag is missing is not one we can move,
+            // so the scan stops rather than emitting half of it.
+            let Some(rel) = fragment[gt..].find(&close) else { break };
+            gt + rel + close.len()
+        };
+        out.push(&fragment[start..end]);
+        from = end;
     }
     out
 }
@@ -140,7 +164,6 @@ pub async fn slide_preview(
     index: usize,
 ) -> Result<Option<SlideImage>, String> {
     use tauri::Manager;
-    let key = format!("{id}:{index}");
     let (name, bytes) = {
         let state = app.state::<AppState>();
         let guard = state.room.lock().unwrap();
@@ -161,9 +184,10 @@ pub async fn slide_preview(
     if index >= slides {
         return Ok(None);
     }
+    let key = format!("{id}:{index}:{}", deck_digest(&bytes));
     {
         let cache = app.state::<SlideCache>();
-        let hit = cache.map.lock().unwrap().get(&key).cloned();
+        let hit = cache.map.lock().unwrap().get(&key).map(|(_, png)| png.clone());
         if let Some(png_b64) = hit {
             return Ok(Some(SlideImage { png_b64, slides }));
         }
@@ -184,12 +208,35 @@ pub async fn slide_preview(
     let Some(png) = png else { return Ok(None) };
     let png_b64 = base64::engine::general_purpose::STANDARD.encode(png);
     let cache = app.state::<SlideCache>();
+    let seq = cache.inserted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut map = cache.map.lock().unwrap();
-    if map.len() >= MAX_CACHED_SLIDES {
-        map.clear();
-    }
-    map.insert(key, png_b64.clone());
+    evict_to_fit(&mut map, MAX_CACHED_SLIDES);
+    map.insert(key, (seq, png_b64.clone()));
     Ok(Some(SlideImage { png_b64, slides }))
+}
+
+/// Which deck these bytes are, so a rewritten file cannot be answered with the
+/// previous one's slides.
+fn deck_digest(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    h.update(bytes);
+    format!("{:x}", h.finalize())
+}
+
+/// Make room for one more entry by dropping the OLDEST, one at a time.
+///
+/// Emptying the map at the ceiling — which is what this used to do — meant a
+/// deck longer than the ceiling paid a fresh Quick Look render for every slide
+/// from then on, including the one the reader had just come from.
+fn evict_to_fit(map: &mut HashMap<String, (u64, String)>, ceiling: usize) {
+    while map.len() >= ceiling {
+        let Some(oldest) = map.iter().min_by_key(|(_, (seq, _))| *seq).map(|(k, _)| k.clone())
+        else {
+            break;
+        };
+        map.remove(&oldest);
+    }
 }
 
 // -------------------------------------------------------------- Word as HTML
@@ -313,6 +360,47 @@ mod tests {
         )
         .unwrap();
         assert_eq!(media, b"\x89PNG\r\n\x1a\nPRETEND");
+    }
+
+    #[test]
+    fn a_slide_entry_written_the_long_way_keeps_its_closing_tag_and_its_children() {
+        // PowerPoint writes `<p:sldId …><p:extLst>…</p:extLst></p:sldId>` as
+        // readily as the self-closing spelling. Carrying only the opening tag
+        // through left `<p:sldIdLst>` unbalanced, Quick Look refused the staged
+        // file, and every slide but the first came back undrawable.
+        let deck = crate::extraction::fake_office_zip(
+            "ppt/presentation.xml",
+            r#"<p:presentation><p:sldIdLst><p:sldId id="256" r:id="rId1"><p:extLst><p:ext uri="{ABC}"/></p:extLst></p:sldId><p:sldId id="257" r:id="rId2"></p:sldId></p:sldIdLst></p:presentation>"#,
+        );
+        assert_eq!(slide_count_of(&deck), 2);
+        let moved = deck_with_slide_first(&deck, 1).expect("reorder failed");
+        assert_eq!(id_order(&moved), ["rId2", "rId1"]);
+        let out = crate::extraction::read_zip_entry(&moved, "ppt/presentation.xml").unwrap();
+        assert_eq!(
+            out.matches("<p:sldId ").count(),
+            out.matches("</p:sldId>").count(),
+            "the rewritten slide list is unbalanced: {out}"
+        );
+        assert!(out.contains("<p:ext uri="), "the element's children were dropped: {out}");
+    }
+
+    #[test]
+    fn the_slide_cache_drops_its_oldest_entry_rather_than_emptying_itself() {
+        // At the ceiling the whole map used to go, so a deck longer than the
+        // ceiling re-rendered every slide from then on — including the one the
+        // reader had just paged back from.
+        let mut map: HashMap<String, (u64, String)> = HashMap::new();
+        for i in 0..4u64 {
+            map.insert(format!("deck:{i}:d"), (i, "png".into()));
+        }
+        evict_to_fit(&mut map, 4);
+        assert_eq!(map.len(), 3);
+        assert!(!map.contains_key("deck:0:d"), "the oldest should be the one that goes");
+        assert!(map.contains_key("deck:3:d"), "the newest was kept");
+        // A ceiling of zero empties the map and then stops — with nothing left
+        // to evict the loop ends rather than spinning.
+        evict_to_fit(&mut map, 0);
+        assert!(map.is_empty());
     }
 
     #[test]

@@ -63,6 +63,7 @@
    edge of a box. */
 .chat-head {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: var(--sp-1);
   padding: var(--sp-2) var(--sp-3);
@@ -87,8 +88,13 @@
    renamed chat can be in any script — Kalam ships latin + latin-ext only.
    Scoped to `.chat-head` because Settings → Spoken voice wears `.chat-select`
    too, and a settings control stays in the interface face either way. */
+/* The basis, not the min-width, is what decides where the row breaks: at a
+   pane narrow enough that the title would be squeezed under ~12 characters,
+   the buttons wrap to a second line instead of eating the name of the
+   conversation you are in. `min-width: 0` stays, so at any width below that
+   the select still shrinks rather than overflowing the pane. */
 .chat-head .chat-select {
-  flex: 1;
+  flex: 1 1 12ch;
   min-width: 0;
   padding: 3px 6px;
   font-family: var(--sans);

@@ -26,25 +26,53 @@ export default function SvgView({ text }: { text: string }) {
   return (
     <div className="svg-view">
       <div className="svg-bar">
-        <button type="button" className="subtle" onClick={() => setShowSource((s) => !s)}>
-          {showSource ? "Picture" : "Source"}
-        </button>
-        {!showSource && (
+        {/* Picture and Source are two readings of one document, so they are
+            drawn as the same `.rdr-modes` strip a saved article and a Word
+            file already use — not a link labelled by where it takes you. */}
+        <span className="rdr-modes" role="group" aria-label="How to read this file">
           <button
             type="button"
-            className="subtle"
-            title="Most diagrams are drawn in black on nothing — flip the backdrop to see them"
-            onClick={() => setDark((d) => !d)}
+            className="rdr-mode"
+            aria-pressed={!showSource}
+            onClick={() => setShowSource(false)}
           >
-            {dark ? "Light backdrop" : "Dark backdrop"}
+            Picture
           </button>
+          <button
+            type="button"
+            className="rdr-mode"
+            aria-pressed={showSource}
+            onClick={() => setShowSource(true)}
+          >
+            Source
+          </button>
+        </span>
+        {/* A viewing condition rather than a reading, so it sits at the far
+            end with the other actions and keeps its label-by-destination. */}
+        {!showSource && (
+          <span className="rdr-bar-end">
+            <button
+              type="button"
+              className="subtle"
+              title="Most diagrams are drawn in black on nothing — flip the backdrop to see them"
+              onClick={() => setDark((d) => !d)}
+            >
+              {dark ? "Light backdrop" : "Dark backdrop"}
+            </button>
+          </span>
         )}
       </div>
       {showSource ? (
         <pre className="svg-source">{text}</pre>
       ) : (
         <div className={`svg-stage${dark ? " dark" : ""}`}>
-          <img src={src} alt="" />
+          {/* Not `alt=""`: that says "this image carries no information",
+              asserted about the file that IS the document — a screen reader
+              landed in an empty main region with only a Source button to
+              prove anything was there. The viewer is handed the markup and
+              nothing else, so this names the kind of thing and claims
+              nothing about the drawing. */}
+          <img src={src} alt="SVG drawing" />
         </div>
       )}
     </div>

@@ -290,6 +290,20 @@ export default function Composer({ s, a }: { s: WSState; a: WSActions }) {
           // an empty menu would leave the user to guess which it meant.
           const note = a.autocompleteNote();
           if (items.length === 0 && !note) return null;
+          // `autocompleteItems` CAPS what it returns — ten skills, and ten rows
+          // for files & folders — so `items.length` is the length of this list,
+          // never how many the room holds. "10 enabled skills" said to someone
+          // who enabled twenty-five states our cap as a fact about their room.
+          // The same filters the list itself uses, run without the cap.
+          const q = s.ac.query;
+          const matched =
+            s.ac.kind === "skill"
+              ? s.skills.filter((skill) => skill.enabled && skill.name.startsWith(q)).length
+              : s.ac.kind === "ref"
+                ? s.folders.filter((f) => f.name.toLowerCase().includes(q)).length +
+                  s.files.filter((f) => f.name.toLowerCase().includes(q)).length
+                : items.length;
+          const count = matched > items.length ? `${items.length} of ${matched}` : `${items.length}`;
           return (
             <div className="ac-popover">
               {/* The count says how much is below the fold; the key hints make
@@ -299,12 +313,12 @@ export default function Composer({ s, a }: { s: WSState; a: WSActions }) {
                   {s.ac.kind === "cmd"
                     ? `${items.length} commands`
                     : s.ac.kind === "skill"
-                      ? `${items.length} enabled skills`
+                      ? `${count} enabled skills`
                       : s.ac.kind === "agent"
                         ? items.length > 0
                           ? `${items.length} specialists`
                           : "Specialists"
-                        : `${items.length} files & folders`}
+                        : `${count} files & folders`}
                 </span>
                 {/* A menu with no rows has nothing to arrow onto — promising
                     keys that do nothing is the same small lie in miniature. */}

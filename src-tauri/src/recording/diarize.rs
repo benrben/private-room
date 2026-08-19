@@ -274,6 +274,12 @@ fn gates(v: &[f32]) -> &'static Gates {
 ///
 /// Public so `tests/diar_bench.rs::voice_id_threshold_sweep` sweeps the bar
 /// the app actually ships, rather than a copy of it free to drift away.
+///
+/// That sweep is `#[ignore]`d and needs `PR_VOICEID_MANIFEST` pointing at a
+/// manifest of the same people recorded on different days. No such corpus is
+/// committed and none has been run, so this bar is DERIVED from `raw_same`,
+/// not measured: the false-accept rate at it — the rate at which a real
+/// person's name lands on somebody else's words — is unknown.
 pub const KNOWN_SAME: f32 = 0.72;
 
 /// How far the best saved voice must beat the runner-up. Two saved voices

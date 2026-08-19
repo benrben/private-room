@@ -402,6 +402,19 @@ export default function ConnectorsView() {
                         )}
                       </div>
                     </div>
+                    {/* The one state that needs a next step was the only one
+                        with none offered. Both recoveries already exist:
+                        `mcp_set_server_enabled` rewrites the config and
+                        redials (start_mcp_connections carries LIVE
+                        connections over untouched, so this costs no other
+                        connector its session), and Advanced → Save & Connect
+                        does the same after an edit. Neither was stated. */}
+                    {s.status === "failed" && (
+                      <p className="mkt-note nb-sem-pending">
+                        <span className="nb-tape mkt-note-tag">Retry</span>
+                        {" — turn it off and on again to try connecting once more, or fix its entry under Advanced."}
+                      </p>
+                    )}
                     {enabled && (
                       <div className="conn-perms">
                         {/* Each permission: the choice, then the sentence
@@ -568,8 +581,10 @@ export default function ConnectorsView() {
             <p className="mkt-note mkt-note--flag nb-sem-pending">
               <AlertIcon size={14} /> Connected tools are separate programs and
               can reach the internet — what the AI sends them leaves this room.
-              Paste the same <code>mcpServers</code> config used by Claude
-              Desktop or Cursor.
+              This box also shows every key a connector holds, in clear text —
+              including a sign-in token you never typed, which is written into
+              this config for you. Paste the same <code>mcpServers</code> config used by
+              Claude Desktop or Cursor.
             </p>
             <textarea
               className="mcp-config"

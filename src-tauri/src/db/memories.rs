@@ -106,16 +106,25 @@ pub fn restore_memory(conn: &Connection, id: &str) -> Result<(), String> {
 }
 
 /// UX-5: overwrite a memory's text (and, Wave 1b, its category) in place.
+///
+/// Scoped to a memory that is still IN the room, and an error when it is not —
+/// the same invariant every by-id write to `files` carries. An edit typed into
+/// a card whose memory was trashed in the meantime (the agent's forget tool, or
+/// another window) landed on the trashed row, reported success, and vanished
+/// from the list: the text was gone from the screen, still in the database, and
+/// waiting to reappear the moment anyone restored it.
 pub fn update_memory(
     conn: &Connection,
     id: &str,
     content: &str,
     category: Option<&str>,
 ) -> Result<(), String> {
-    execute_one(
+    execute_existing(
         conn,
-        "UPDATE memories SET content = ?2, category = ?3 WHERE id = ?1",
+        "UPDATE memories SET content = ?2, category = ?3
+         WHERE id = ?1 AND trashed_at IS NULL",
         params![id, content, category],
+        "That memory is not in this room.",
     )
 }
 
@@ -232,4 +241,34 @@ mod tests {
         assert!(err.contains("not in the trash"), "got: {err}");
     }
 
+    /// Editing a memory that has been trashed since the card was opened is
+    /// REFUSED, not silently swallowed. The old UPDATE matched on id alone, so
+    /// the typed text landed on the trashed row: the save said nothing, the
+    /// refetched list no longer held it, and restoring the memory later brought
+    /// back the post-deletion text as if it had always been there.
+    #[test]
+    fn editing_a_trashed_memory_is_refused_and_changes_nothing() {
+        let conn = mem();
+        let m = add_memory(&conn, "call every Friday", None).unwrap();
+        delete_memory(&conn, &m.id, TrashActor::Agent("delete_memory")).unwrap();
+
+        let err = update_memory(&conn, &m.id, "call every Tuesday", None).unwrap_err();
+        assert!(err.contains("not in this room"), "got: {err}");
+
+        // The trashed row still says what it said when it was trashed.
+        let raw: String = conn
+            .query_row("SELECT content FROM memories WHERE id = ?1", [&m.id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(raw, "call every Friday");
+        // …and putting it back cannot resurrect an edit nobody could see.
+        restore_memory(&conn, &m.id).unwrap();
+        assert_eq!(list_memories(&conn).unwrap()[0].content, "call every Friday");
+    }
+
+    #[test]
+    fn editing_a_memory_that_was_never_here_is_refused() {
+        let conn = mem();
+        let err = update_memory(&conn, "no-such-id", "text", None).unwrap_err();
+        assert!(err.contains("not in this room"), "got: {err}");
+    }
 }

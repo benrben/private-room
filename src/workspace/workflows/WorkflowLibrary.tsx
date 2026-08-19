@@ -313,9 +313,20 @@ export function WorkflowLibrary({ s, a }: Props) {
               </div>
               {w.description && <div className="wf-card-desc">{w.description}</div>}
               <div className="wf-card-foot">
+                {/* The scheduler only picks up ACTIVE workflows, but saving one
+                    stores a real next_run_at — so a freshly-instantiated
+                    template read "Draft · every day at 08:00 · in 5h" for a run
+                    that was never going to happen. A stored schedule is worth
+                    saying; a countdown to it is not. */}
                 <CadenceNote
                   cadence={cad}
-                  countdown={sc?.enabled ? countdown(sc.nextRunAt, now) : ""}
+                  countdown={
+                    !sc?.enabled
+                      ? ""
+                      : w.status === "active"
+                        ? countdown(sc.nextRunAt, now)
+                        : "not until you activate it"
+                  }
                 />
                 <div className="wf-badges">
                   {w.status === "draft" && <span className="wf-badge draft">Draft</span>}

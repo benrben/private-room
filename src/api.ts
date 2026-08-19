@@ -874,8 +874,13 @@ export const api = {
   aiStatus: () => invoke<AiStatus>("ai_status"),
   /** ADD-22: tool/vision abilities per installed model, for Settings badges. */
   modelCapabilities: () => invoke<ModelCaps[]>("model_capabilities"),
-  /** The OPEN room's engine, as ONE declared capability record. Nothing in the
-   *  UI should decide behaviour from a model name — ask this instead. */
+  /** The OPEN room's engine, as ONE declared capability record.
+   *
+   *  It is NOT yet the single source it was written to be, and saying otherwise
+   *  here would be a claim this file cannot keep: the trust chip still answers
+   *  the locality half from `markup.ts`'s own `isExternalEngine` id list, so a
+   *  new provider has to be added in both places or the chip calls a remote
+   *  room local. Wiring the chip to this record is what would close that. */
   engineCapabilities: () => invoke<EngineCapabilities>("engine_capabilities"),
   /** PREFLIGHT: can the room's engine do this, asked BEFORE the run so the user
    *  gets one plain sentence instead of a stream that dies halfway. */
@@ -1393,6 +1398,8 @@ export const api = {
    *  never sees it — the event-loop handler that does is synchronous and
    *  cannot ask anything, which is why this is pushed rather than pulled. */
   setUnsavedEdits: (on: boolean) => invoke<void>("set_unsaved_edits", { on }),
+  /** Answered the quit question with "no": re-arm the door, buffer still dirty. */
+  quitGuardRearm: () => invoke<void>("quit_guard_rearm"),
   /** Rust held a ⌘Q so this window can ask about those edits. Whoever listens
    *  OWNS finishing the quit — Rust will not hold the next one. */
   onQuitRequested: (cb: () => void): Promise<UnlistenFn> =>

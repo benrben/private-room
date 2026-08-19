@@ -285,3 +285,28 @@ test("a model that takes no starting picture is not offered one", () => {
   assert.equal(takesFirstFrame({ ...VEO, limits: null }), true);
   assert.equal(takesFirstFrame(null), true);
 });
+
+/* ---------- what a running job may claim about itself ---------- */
+
+test("the running-job card states the job's label and no figure of its own", () => {
+  // `jobProgress.ts` owns the rule, and a pure-function test cannot catch a
+  // surface that never calls it — which is how this page came to draw a bar of
+  // its own. A create job's `done` moves only at a variation boundary, so the
+  // ordinary one-picture job reports 0% from its first event to its last: a
+  // determinate meter stuck at zero for three minutes, on a call the user paid
+  // for.
+  const page = read("src/workspace/create/CreatePage.tsx");
+  assert.doesNotMatch(
+    page,
+    /role="progressbar"|<progress\b/,
+    "a create job has no measured percentage to draw a bar from",
+  );
+  assert.doesNotMatch(
+    page,
+    /\blive\s*\??\.\s*(done|total)\b/,
+    "a percentage computed here is a number nothing measured",
+  );
+  // What it says instead: the provider's own words when there are any, and a
+  // state word when there are not.
+  assert.match(page, /live\s*\??\.\s*label/);
+});

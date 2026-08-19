@@ -60,6 +60,19 @@ interface PastGraph {
   timings: { current: Record<string, AgentTiming> };
 }
 
+/** `effects.edits` outcome tags that mean bytes actually landed: the edit
+ * methods `edit_file` records, plus `edit_files`'s own "applied". The same
+ * array also carries declines and failures ("failed", "not_found", "error",
+ * …), and counting those would be the room claiming a change it never made. */
+const LANDED_EDIT_OUTCOMES = new Set([
+  "applied",
+  "exact",
+  "exact_all",
+  "fuzzy",
+  "docx",
+  "html",
+]);
+
 /** A short message set in the hand, with its technical tokens PRINTED.
  *
  * A person writing a note still prints the things that have to be read
@@ -109,9 +122,10 @@ export default function ChatPane({
   const [editDraft, setEditDraft] = useState<{ id: string; text: string } | null>(
     null,
   );
-  const lastAssistantId = [...messages]
+  const lastAssistant = [...messages]
     .reverse()
-    .find((m) => m.role === "assistant")?.id;
+    .find((m) => m.role === "assistant");
+  const lastAssistantId = lastAssistant?.id;
 
   // The privacy receipt and the "worth remembering?" card describe the turn
   // that just finished IN THIS conversation. They belong to the window, so
@@ -257,6 +271,66 @@ export default function ChatPane({
     setEditDraft(null);
     void a.editAndResend(draft.id, draft.text);
   };
+
+  // `editAndResend` deletes everything after the edited question. That count
+  // belongs on the control that does it: the only warning was a title on the
+  // button that OPENS the editor, i.e. gone by the time anyone presses Send.
+  const editIdx = editDraft
+    ? messages.findIndex((m) => m.id === editDraft.id)
+    : -1;
+  const editTail = editIdx < 0 ? 0 : messages.length - editIdx - 1;
+
+  /* A turn was silent to a screen reader: the route line and the stream cursor
+   * are plain spans, and the cursor is deliberately aria-hidden. ONE polite
+   * region carrying one sentence per turn — announcing the stream itself,
+   * token by token, would be unusable. Only ever the turn belonging to the
+   * conversation on screen; walking away from a running chat also flips
+   * `s.asking`, and that is not an answer arriving. */
+  // A local model keeps its OWN reasoning on this Mac, but the room's internet
+  // switch and its connected tools still carry the question — or text derived
+  // from it — out. Named once so the line on screen and the line a reader hears
+  // cannot say different things, and so it never names a reach the room has not
+  // got.
+  const localReach = [
+    s.webOn ? "online search" : null,
+    s.mcpTools.length > 0 ? "connected tools" : null,
+  ]
+    .filter(Boolean)
+    .join(" and ");
+  const routeNote = isCloudRoute(model, s.ai)
+    ? "Asking your cloud AI — content leaves this Mac."
+    : localReach
+      ? `Thinking on this Mac — ${localReach} can send parts of this out.`
+      : "Thinking locally.";
+  const [turnNote, setTurnNote] = useState("");
+  const turnRunning = useRef(false);
+  const turnChat = useRef<string | null>(null);
+  const turnStartId = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    if (s.asking) {
+      if (turnRunning.current && turnChat.current === s.activeChatId) return;
+      turnRunning.current = true;
+      turnChat.current = s.activeChatId;
+      turnStartId.current = lastAssistantId;
+      setTurnNote(routeNote);
+      return;
+    }
+    if (!turnRunning.current) return;
+    turnRunning.current = false;
+    if (turnChat.current !== s.activeChatId) {
+      setTurnNote("");
+      return;
+    }
+    // The stored answer lands before the run is de-registered, so by the time
+    // `asking` falls a new id means an answer really arrived.
+    if (lastAssistantId === turnStartId.current) {
+      setTurnNote("The turn ended with no answer.");
+      return;
+    }
+    const notice = lastAssistant ? lostReplyNotice(lastAssistant.content) : null;
+    setTurnNote(notice !== null ? lostReplyAdvice(notice) : "The answer is ready.");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [s.asking, s.activeChatId, lastAssistantId, routeNote]);
 
   return (
     <div className="chat" aria-label="Chat">
@@ -609,7 +683,21 @@ export default function ChatPane({
                   {m.effects.agents.map((p, i) => (
                     <span key={i} className="agent-pipe">
                       {i > 0 && <span className="agent-arrow" aria-hidden>→</span>}
-                      <span className="agent-chip past" title={p.instruction}>
+                      {/* The status was recorded, sent and stored; only this
+                          renderer dropped it, so a specialist that errored out
+                          read exactly like one that finished. Failure only:
+                          the persisted strip is deliberately quiet, and
+                          never state by colour alone — the glyph carries it
+                          too, as the diagram's nodes do. */}
+                      <span
+                        className={`agent-chip past${p.status === "failed" ? " failed" : ""}`}
+                        title={p.instruction}
+                      >
+                        {p.status === "failed" && (
+                          <span role="img" aria-label="failed">
+                            ⚠
+                          </span>
+                        )}
                         {p.label}
                       </span>
                     </span>
@@ -716,7 +804,11 @@ export default function ChatPane({
                   />
                   <span className="save-form">
                     <button className="subtle" onClick={submitEdit}>
-                      Send again
+                      {editTail === 0
+                        ? "Send again"
+                        : `Send again — deletes the ${editTail} message${
+                            editTail === 1 ? "" : "s"
+                          } below`}
                     </button>
                     <button
                       className="subtle"
@@ -809,6 +901,31 @@ export default function ChatPane({
                     ))}
                   </span>
                 )}
+                {/* "Ask before AI edits files" is off by owner decision, so
+                    the transcript is where a person discovers that an answer
+                    changed the room — and the only sign of it was the Undo
+                    button, which is session state and gone after a restart.
+                    A report rather than an action, so it is a span: the
+                    footer's fade rule is `> button` only, and this stays lit.
+                    Landed writes only, and counted as CHANGES not as distinct
+                    files: the records are content-free, so two edits to one
+                    file are indistinguishable from one edit to each of two. */}
+                {(() => {
+                  const landed = (m.effects?.edits ?? []).filter((e) =>
+                    LANDED_EDIT_OUTCOMES.has(e.outcome),
+                  );
+                  if (landed.length === 0) return null;
+                  const files = landed.reduce((n, e) => n + (e.files ?? 1), 0);
+                  return (
+                    <span
+                      className="msg-edits"
+                      title="Each change is in that file's History and can be undone there."
+                    >
+                      Made {files} file change{files === 1 ? "" : "s"} in this
+                      room
+                    </span>
+                  );
+                })()}
                 <button
                   className="subtle btn-ic"
                   title={
@@ -902,6 +1019,8 @@ export default function ChatPane({
           // hand, if it earns it, when the stored message replaces this row.
           <div
             className={`msg assistant is-streaming ${s.streamText ? "" : "thinking"}`}
+            // So a reader is not handed a half-written bubble as finished text.
+            aria-busy
           >
             <div className="msg-label">
               <span className="msg-avatar" aria-hidden>
@@ -929,21 +1048,41 @@ export default function ChatPane({
                 timings={liveTimings}
               />
             )}
-            {(s.lane || s.steps.length > 0) && (
-              <div className="step-chips">
-                {s.lane && <span className="lane-chip">{s.lane}</span>}
-                {s.steps.map((st, i) => (
-                  <span
-                    key={i}
-                    className={`step-chip${st.ok ? "" : " failed"}`}
-                    title={st.ok ? undefined : "This step didn't succeed"}
-                  >
-                    {st.ok ? "" : "⚠ "}
-                    {st.label}
-                  </span>
-                ))}
-              </div>
-            )}
+            {/* Capped at the last few so one long tool loop cannot push the
+                answer off the bottom of the pane. Kept on a delegating turn
+                too: only steps that arrive WITH a node are filed into the
+                diagram, every non-sidecar emitter sends none, and the hub's
+                inspector falls back to this list only when the hub itself ran
+                nothing — so hiding the row would take those steps out of the
+                UI entirely. */}
+            {(() => {
+              const shown = s.steps.slice(-6);
+              const earlier = s.steps.length - shown.length;
+              if (!s.lane && shown.length === 0) return null;
+              return (
+                <div className="step-chips">
+                  {s.lane && <span className="lane-chip">{s.lane}</span>}
+                  {earlier > 0 && (
+                    <span
+                      className="step-chip"
+                      title="Earlier steps in this turn"
+                    >
+                      +{earlier} earlier
+                    </span>
+                  )}
+                  {shown.map((st, i) => (
+                    <span
+                      key={earlier + i}
+                      className={`step-chip${st.ok ? "" : " failed"}`}
+                      title={st.ok ? undefined : "This step didn't succeed"}
+                    >
+                      {st.ok ? "" : "⚠ "}
+                      {st.label}
+                    </span>
+                  ))}
+                </div>
+              );
+            })()}
             <div className="msg-content" dir="auto">
               {s.streamText ? (
                 <>
@@ -964,7 +1103,16 @@ export default function ChatPane({
                   Asking your cloud AI — content leaves this Mac…
                 </span>
               ) : (
-                <span className="chat-route">Thinking locally…</span>
+                // Same reach the composer's badge names, and never quieter
+                // than the cloud line above.
+                localReach ? (
+                  <span className="chat-route chat-route-cloud">
+                    Thinking on this Mac — {localReach} can send parts of this
+                    out…
+                  </span>
+                ) : (
+                  <span className="chat-route">Thinking locally…</span>
+                )
               )}
             </div>
           </div>
@@ -1053,6 +1201,12 @@ export default function ChatPane({
             </div>
           </div>
         )}
+        {/* The whole turn's account for a screen reader, in the app's existing
+            visually-hidden live-region class. Always mounted so the first
+            sentence of a turn is announced rather than swallowed. */}
+        <p className="agraph-sr" role="status">
+          {turnNote}
+        </p>
       </div>
 
       <Composer s={s} a={a} />

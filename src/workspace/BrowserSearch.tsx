@@ -1,7 +1,8 @@
 import type React from "react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { api } from "../api";
 import type { BrowserSearchResult, FileMeta, ResultPreview, WebHit } from "../apiTypes";
+import { hostOf } from "./browserAnnounce";
 import { GlobeIcon, PlusIcon, CheckIcon, EyeIcon, LinkIcon, SparklesIcon } from "../icons";
 
 /* BROWSE-3: the results page.
@@ -41,6 +42,21 @@ const ENGINE_SLOTS = [
  *  for exactly what it will read keeps the two honest with each other. */
 const PREVIEW_COUNT = 8;
 
+/** The sidecar reports a failed engine by its FUNCTION name (`duckduckgo_ia`),
+ *  while every hit reports the same engine by its `source` — which is what the
+ *  dial, the footer and ENGINE_SLOTS above are written in. Left untranslated,
+ *  one page called one engine two things. Only the two that differ are listed;
+ *  every other failure name already IS a slot name. */
+const ENGINE_ALIASES: Record<string, string> = {
+  duckduckgo_ia: "ddg-ia",
+  google_news: "news",
+};
+
+/** The name for an engine in the page's own vocabulary. */
+function engineName(name: string): string {
+  return ENGINE_ALIASES[name] ?? name;
+}
+
 type AddState = "idle" | "adding" | "added" | "error";
 
 export interface BrowserSearchProps {
@@ -78,6 +94,10 @@ export function BrowserSearch({
   // monogram fallback below could never be reached.
   const [previewsSettled, setPreviewsSettled] = useState(false);
   const listRef = useRef<HTMLDivElement | null>(null);
+  // The container takes the keyboard on arrival, so it has to name itself. The
+  // query heading is already on screen: point at it rather than inventing a
+  // second copy of the words.
+  const headingId = useId();
 
   // --- the enrich pass -----------------------------------------------------
   // Runs AFTER the results are on screen, never before: the page is complete
@@ -155,11 +175,16 @@ export function BrowserSearch({
         return;
       }
       setPeeks((m) => ({ ...m, [hit.url]: null }));
+      // The read outlives the peek that started it: pressing 'p' again (or
+      // running another search) closes the preview, and a plain write here
+      // re-opened it when the page finally answered. Only fill a slot that is
+      // still open — the key's absence IS the cancellation.
+      const settle = (value: string) =>
+        setPeeks((m) => (hit.url in m ? { ...m, [hit.url]: value } : m));
       try {
-        const text = await api.browserPeek(hit.url);
-        setPeeks((m) => ({ ...m, [hit.url]: text }));
+        settle(await api.browserPeek(hit.url));
       } catch (e) {
-        setPeeks((m) => ({ ...m, [hit.url]: `Could not read that page — ${e}` }));
+        settle(`Could not read that page — ${e}`);
       }
     },
     [peeks],
@@ -182,7 +207,18 @@ export function BrowserSearch({
   // subject of every single-key action.
   const onKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
-      if (e.target instanceof HTMLInputElement) return;
+      // A control that is focused answers for itself. Enter on "Ask the
+      // assistant about this", on a card's Peek/Add button or on a citation
+      // chip used to be swallowed here — preventDefault() cancels the keydown
+      // that would have clicked the button — and navigated to the selected
+      // result instead. The cards are tabIndex=0 <article>s, so Enter on a
+      // focused CARD still opens it.
+      if (
+        e.target instanceof HTMLElement &&
+        e.target.closest("button, a, input, textarea, [contenteditable]")
+      ) {
+        return;
+      }
       const hit = hits[sel];
       const step = (delta: number) => {
         e.preventDefault();
@@ -208,10 +244,33 @@ export function BrowserSearch({
   // Hand the keyboard to the results the moment they arrive. Every single-key
   // action above is dead until this container holds focus, and a page that
   // ignores ArrowDown right after a search reads as broken rather than as
-  // "press Tab first". The search was started from the address bar, so nothing
-  // is being typed into when this runs.
+  // "press Tab first".
+  //
+  // But the search is not always the user's: the ASSISTANT searches too
+  // (browse_open → browser-searched), and that page mounts while the user is
+  // mid-sentence in the composer. Taking focus there turned the rest of the
+  // sentence into single-key actions — 'a' imports the selected result into
+  // the room.
+  //
+  // So: never reach OUT of this browser for the keyboard. Yielding to every
+  // editable instead would have broken the ordinary case it exists for — the
+  // address bar is an <input> and submitting it does not blur it, so the
+  // user's own search would have left the caret in the box with ArrowDown,
+  // 'p' and Enter all dead on the results they just asked for.
   useEffect(() => {
-    listRef.current?.focus({ preventScroll: true });
+    const list = listRef.current;
+    if (!list) return;
+    const active = document.activeElement;
+    const typing =
+      active instanceof HTMLInputElement ||
+      active instanceof HTMLTextAreaElement ||
+      (active instanceof HTMLElement && active.isContentEditable);
+    const area = list.closest(".browser-area");
+    // Unknown containment counts as outside: losing a shortcut is recoverable
+    // with one Tab, losing what someone is typing is not.
+    const inThisBrowser = active instanceof Node && !!area && area.contains(active);
+    if (typing && !inThisBrowser) return;
+    list.focus({ preventScroll: true });
   }, [hits]);
 
   useEffect(() => {
@@ -249,8 +308,17 @@ export function BrowserSearch({
     const failed = result.failed ?? [];
     const allFailed = failed.length >= ENGINE_SLOTS.length;
     return (
-      <div className="bsearch" onKeyDown={onKeyDown} tabIndex={-1}>
-        <SearchHeader result={result} />
+      // No ref and no tab stop on purpose: with nothing to move between, every
+      // single-key action is dead, and the caret belongs in the address bar
+      // where the query that found nothing still is.
+      <div
+        className="bsearch"
+        role="group"
+        aria-labelledby={headingId}
+        onKeyDown={onKeyDown}
+        tabIndex={-1}
+      >
+        <SearchHeader result={result} headingId={headingId} />
         <div className="bsearch-empty">
           <GlobeIcon size={30} />
           {allFailed ? (
@@ -269,7 +337,7 @@ export function BrowserSearch({
                 Nothing came back for “{query}”. Try fewer words, or open it as
                 an address if it was one.
                 {failed.length > 0 &&
-                  ` ${failed.length} of ${ENGINE_SLOTS.length} engines (${failed.join(", ")}) didn't answer, so this may be only part of the web.`}
+                  ` ${failed.length} of ${ENGINE_SLOTS.length} engines (${failed.map(engineName).join(", ")}) didn't answer, so this may be only part of the web.`}
               </p>
             </>
           )}
@@ -280,8 +348,15 @@ export function BrowserSearch({
 
   return (
     // eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex
-    <div className="bsearch" onKeyDown={onKeyDown} tabIndex={0} ref={listRef}>
-      <SearchHeader result={result} />
+    <div
+      className="bsearch"
+      role="group"
+      aria-labelledby={headingId}
+      onKeyDown={onKeyDown}
+      tabIndex={0}
+      ref={listRef}
+    >
+      <SearchHeader result={result} headingId={headingId} />
 
       {result.summaryAvailable && (
         <SummaryCard
@@ -368,7 +443,10 @@ export function BrowserSearchSkeleton({ query }: { query: string }) {
           <span className="sep">·</span>
           <span>{secs}s</span>
           <span className="sep">·</span>
-          <span className="privacy">only your query left this Mac</span>
+          {/* Nothing but the query has gone out YET — the enrich pass only
+              starts once results are on screen. Deliberately "so far": this is
+              the one state where the finished sentence is not known. */}
+          <span className="privacy">only your query has left this Mac so far</span>
         </p>
       </header>
       <div className="bsearch-skel feature" />
@@ -387,11 +465,60 @@ export function BrowserSearchSkeleton({ query }: { query: string }) {
 
 /* ---------------------------------------------------------------- header -- */
 
-function SearchHeader({ result }: { result: BrowserSearchResult }) {
+/** The one sentence this page is entitled to say about what left the Mac.
+ *
+ * It used to be three sentences that could contradict each other: a fixed
+ * "only your query left this Mac", a separate "previews fetched privately",
+ * and a cache hit's "no network touched" printed beside the first. Previews
+ * are ON by default and read the top result pages from their own origins — and
+ * they run on a cache hit too, because only the SEARCH is cached. So the claim
+ * has to be derived from all three facts, in one place, and nowhere else.
+ *
+ * Pure, so the wording can be tested: on this page the wording is the product.
+ */
+export function searchPrivacyLine(opts: {
+  cached: boolean;
+  previewsEnabled: boolean;
+  /** How many result pages the enrich pass will actually be asked about. */
+  previewCount: number;
+}): { text: string; title: string } {
+  const { cached, previewsEnabled, previewCount } = opts;
+  if (previewsEnabled && previewCount > 0) {
+    const pages = `${previewCount} result page${previewCount === 1 ? "" : "s"}`;
+    return {
+      text: cached
+        ? `no query left this Mac — the top ${pages} were asked for a preview`
+        : `your query, and a request to the top ${pages}, left this Mac`,
+      title:
+        "Result pages are read by the app itself for their preview image and description — no cookies, no scripts, no browser fingerprint. Turn off in Settings → Online features.",
+    };
+  }
+  return {
+    text: cached ? "nothing left this Mac" : "only your query left this Mac",
+    title: cached
+      ? "These results were already on this Mac and result previews are off, so no server was contacted."
+      : "Result previews are off, so no result page is contacted until you open, peek or add one.",
+  };
+}
+
+function SearchHeader({
+  result,
+  headingId,
+}: {
+  result: BrowserSearchResult;
+  headingId: string;
+}) {
   const present = new Set(result.hits.flatMap((h) => h.engines));
+  const privacy = searchPrivacyLine({
+    cached: result.cached,
+    previewsEnabled: result.previewsEnabled,
+    previewCount: Math.min(result.hits.length, PREVIEW_COUNT),
+  });
   return (
     <header className="bsearch-head">
-      <h1 dir="auto">{result.query}</h1>
+      <h1 id={headingId} dir="auto">
+        {result.query}
+      </h1>
       <div className="bsearch-fuse" aria-hidden>
         {ENGINE_SLOTS.map((e, i) => (
           <i
@@ -412,12 +539,17 @@ function SearchHeader({ result }: { result: BrowserSearchResult }) {
         )}
         <span className="sep">·</span>
         {result.cached ? (
-          <span>no network touched</span>
+          // A cache hit skips the ENGINES. It does not skip the enrich pass,
+          // so the blanket "no network touched" this used to say argued with
+          // the privacy clause three spans along.
+          <span>no engines asked</span>
         ) : (
           <span>{(result.tookMs / 1000).toFixed(1)}s</span>
         )}
         <span className="sep">·</span>
-        <span className="privacy">only your query left this Mac</span>
+        <span className="privacy" title={privacy.title}>
+          {privacy.text}
+        </span>
         {/* Naming the engines that fell out is the difference between "the web
             is thin on this" and "two of our scrapers are being rate limited
             right now" — indistinguishable from the result count alone. */}
@@ -425,28 +557,18 @@ function SearchHeader({ result }: { result: BrowserSearchResult }) {
           <>
             <span className="sep">·</span>
             <span className="bsearch-blocked" title="These engines were blocked, rate limited or too slow, so these results are only part of the web.">
-              {result.failed.join(", ")} unavailable
+              {result.failed.map(engineName).join(", ")} unavailable
             </span>
           </>
         )}
         {/* The keys are live as soon as the results are (the page takes focus
-            on arrival): say so, because a single-key shortcut nobody is told
-            about is not a feature. */}
+            on arrival, unless someone is typing outside this browser): say so,
+            because a single-key shortcut nobody is told about is not a
+            feature. */}
         {result.hits.length > 0 && (
           <>
             <span className="sep">·</span>
             <span>↑↓ or j/k move · ↩ open · p peek · a add to the chat</span>
-          </>
-        )}
-        {result.previewsEnabled && (
-          <>
-            <span className="sep">·</span>
-            <span
-              className="hint"
-              title="Result pages are read by the app itself to get their preview image and description — no cookies, no scripts, no browser fingerprint. Turn off in Settings → Online features."
-            >
-              previews fetched privately
-            </span>
           </>
         )}
       </p>
@@ -578,7 +700,9 @@ function SearchCard({
   onPeek: () => void;
   onAdd: () => void;
 }) {
-  const host = hostOf(hit.url);
+  // An address that will not parse shows the address, never a fragment of it:
+  // the crumb promises a hostname and the tile takes its first letter.
+  const host = hostOf(hit.url) ?? hit.url;
   // The page's own description beats the engine's blurb — it is first-party and
   // usually better written. Only once the enrich pass has actually read it.
   const blurb = preview?.description || hit.snippet || null;
@@ -750,14 +874,6 @@ function monoStyle(host: string): React.CSSProperties {
   let h = 0;
   for (let i = 0; i < host.length; i++) h = (h * 31 + host.charCodeAt(i)) % 360;
   return { "--mono-h": String(h) } as React.CSSProperties;
-}
-
-function hostOf(url: string): string {
-  try {
-    return new URL(url).host;
-  } catch {
-    return url.replace(/^https?:\/\//, "").split("/")[0];
-  }
 }
 
 function pathBits(url: string): string[] {

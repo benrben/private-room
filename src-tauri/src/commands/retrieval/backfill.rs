@@ -13,10 +13,6 @@ pub(crate) async fn embed_question(question: &str) -> Option<Vec<f32>> {
     }
 }
 
-/// ADD-13: kick off the lazy background embed pass for the currently open room.
-/// Bumps the embed generation (so any older pass exits) and spawns exactly one
-/// loop carrying the new stamp. Cheap to call on every unlock; no-op work once
-/// every chunk already has a vector.
 /// One-shot re-extraction pass for files that were imported before an
 /// extractor improvement and so carry no text (e.g. all-numeric .xlsx files
 /// stored when the extractor only read shared strings). Runs the current
@@ -142,6 +138,10 @@ pub(crate) fn spawn_legacy_text_repair(app: &tauri::AppHandle) {
     });
 }
 
+/// ADD-13: kick off the lazy background embed pass for the currently open room.
+/// Bumps the embed generation (so any older pass exits) and spawns exactly one
+/// loop carrying the new stamp. Cheap to call on every unlock; no-op work once
+/// every chunk already has a vector.
 pub(crate) fn spawn_embedding_backfill(app: &tauri::AppHandle) {
     use std::sync::atomic::Ordering;
     use tauri::Manager as _;
@@ -153,6 +153,24 @@ pub(crate) fn spawn_embedding_backfill(app: &tauri::AppHandle) {
     tauri::async_runtime::spawn(async move {
         backfill_embeddings(app, generation).await;
     });
+}
+
+/// May a pass that started as `carried_generation`, against `carried_path`,
+/// still write into the room now open at `room_path`?
+///
+/// Both halves matter and neither implies the other. A newer pass has taken
+/// the slot (the generation moved) means these vectors were computed against a
+/// corpus this pass no longer owns; a different room path means they belong to
+/// a different room entirely. Pulled out of the loop because the answer decides
+/// what retrieval can find, and inside an async loop it could not be exercised
+/// at all.
+fn pass_is_current(
+    carried_generation: u64,
+    current_generation: u64,
+    carried_path: &str,
+    room_path: &str,
+) -> bool {
+    carried_generation == current_generation && carried_path == room_path
 }
 
 /// ADD-13: background pass that fills `chunks.embedding` for the open room. It
@@ -205,12 +223,10 @@ pub(crate) async fn backfill_embeddings(app: tauri::AppHandle, generation: u64) 
 
         // Write the vectors back, only if this is still the same open room.
         let state = app.state::<AppState>();
-        if state.embed_generation.load(Ordering::SeqCst) != generation {
-            return;
-        }
+        let current_generation = state.embed_generation.load(Ordering::SeqCst);
         let guard = state.room.lock().unwrap();
         let Some(room) = guard.as_ref() else { return };
-        if room.path != path {
+        if !pass_is_current(generation, current_generation, &path, &room.path) {
             return;
         }
         for ((id, _, _), vec) in batch.iter().zip(vectors.iter()) {
@@ -220,5 +236,32 @@ pub(crate) async fn backfill_embeddings(app: tauri::AppHandle, generation: u64) 
             let blob = db::embedding_to_blob(vec);
             let _ = db::set_chunk_embedding(&room.conn, id, &blob);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pass_is_current;
+
+    const ROOM: &str = "/Users/x/Rooms/work.room";
+
+    #[test]
+    fn a_superseded_pass_does_not_write() {
+        // Another room was opened (or re-opened) while this batch was out at
+        // Ollama, so a newer pass now owns the slot. Writing here would land
+        // vectors computed from the previous corpus.
+        assert!(!pass_is_current(3, 4, ROOM, ROOM));
+    }
+
+    #[test]
+    fn a_pass_aimed_at_another_room_does_not_write() {
+        // Same generation, different file — the ids in this batch address a
+        // different room's chunks table.
+        assert!(!pass_is_current(3, 3, ROOM, "/Users/x/Rooms/personal.room"));
+    }
+
+    #[test]
+    fn the_current_pass_writes() {
+        assert!(pass_is_current(3, 3, ROOM, ROOM));
     }
 }

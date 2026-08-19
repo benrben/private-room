@@ -98,15 +98,21 @@ impl ToolScope {
     /// being the one engine that could not press a button, which is the gap
     /// live QA kept reporting as "Claude Code says it cannot see Arcelle".
     ///
-    /// This does NOT send the user's screen to a cloud provider, and the reason
-    /// is structural rather than a promise. All three tools hand their pixels to
-    /// `perceive_image`, which attaches a frame to the conversation only when
-    /// `effects.vision_chat` is set — and `chat_model_sees_images` leaves that
-    /// false for a `claude-cli`/`codex-cli`/API model. So a cloud engine's
-    /// screenshot is described by a LOCAL vision model and only that TEXT
-    /// crosses, through the redaction door like any other tool result. Exactly
-    /// the mechanism `include_media_perception` already relies on for a room
-    /// video's frames; this extends the same guarantee to the screen.
+    /// For a cloud CLI (`claude-cli`/`codex-cli`) this does not send the user's
+    /// screen anywhere, and the reason is structural rather than a promise: all
+    /// three tools hand their pixels to `perceive_image`, which attaches a frame
+    /// only when `effects.vision_chat` is set, and those engines have no image
+    /// channel at all — so the capture is described by a LOCAL vision model and
+    /// only that TEXT crosses, through the redaction door like any other tool
+    /// result. Same mechanism `include_media_perception` relies on for a room
+    /// video's frames.
+    ///
+    /// It is NOT a guarantee for every non-local model, and this comment used to
+    /// claim it was. `effects.vision_chat` is `pixels_reach_chat_model`, which is
+    /// true for an API-provider model that declares image input WHEN the room's
+    /// privacy door is off — so in that one configuration a screenshot of the app
+    /// window is attached to the outgoing turn. Whoever narrows that must change
+    /// the door-off warning with it, not this sentence alone.
     ///
     /// A merely CONSULTED advisor is still excluded: driving the app is an
     /// action, not advice — the same line `include_browse_tools` draws.
@@ -1602,13 +1608,11 @@ async fn tool_call(
                 Vec::new(),
             ));
         }
-        (
-            target.to_string(),
-            arguments
-                .get("arguments")
-                .cloned()
-                .unwrap_or_else(|| serde_json::json!({})),
-        )
+        let nested = match nested_run_arguments(&arguments, target) {
+            Ok(value) => value,
+            Err(complaint) => return Ok(tool_result(complaint, true, Vec::new())),
+        };
+        (target.to_string(), nested)
     } else {
         (name, arguments)
     };
@@ -1664,16 +1668,23 @@ async fn tool_call(
             // No effects sink here — CloudAdvisor AND ExternalAgent both ride
             // this branch deliberately: the job tools emit via the window, not
             // the sink, so an externally-started pass still shows the normal
-            // sidebar progress card. A cloud scope's captured pixels stay
-            // correctly discarded (a cloud client is never handed the user's
-            // screen).
+            // sidebar progress card. A consulted advisor's captured pixels stay
+            // discarded: `vision_chat` is left false below, so `perceive_image`
+            // has a LOCAL model describe them and only that text crosses.
             let mut effects = commands::ToolEffects::default();
-            // Wave 1a: the external tier's one perception tool is
-            // view_media_frame — a room video's pixels, content like
-            // open_file, never the screen. Mark the consumer vision-capable so
-            // the frame rides back as an MCP `image` block (parity with what
-            // the in-room agent sees) instead of a slower local vision-model
-            // description.
+            // Wave 1a: the external tier's perception tool is view_media_frame
+            // — a room video's pixels, content like open_file. Mark the
+            // consumer vision-capable so the frame rides back as an MCP `image`
+            // block (parity with what the in-room agent sees) instead of a
+            // slower local vision-model description.
+            //
+            // This tier also serves the SCREEN tools (`include_ui_tools`), and
+            // this line does not distinguish them: an opted-in external agent's
+            // `view_screenshot` rides back the same way whenever the room's
+            // privacy door is off. With the door ON the redaction step below
+            // drops the images while `perceive_image` has already answered "the
+            // image is attached" — an open defect, written down rather than
+            // claimed away.
             effects.vision_chat = matches!(scope, ToolScope::ExternalAgent);
             // CHG-33: seed the web-search brake from the BRIDGE, not from this
             // throwaway. Without it a failed search raised the flag, the
@@ -1722,6 +1733,45 @@ async fn tool_call(
         None => (text, images),
     };
     Ok(tool_result(text, is_error, images))
+}
+
+/// The `arguments` a `run_mcp_tool` call carries FOR the connector tool, or the
+/// complaint to hand back to the model.
+///
+/// The outer envelope's non-object arguments become `{}` (see `tool_call`),
+/// because something has to be indexable there. Doing the same to the NESTED
+/// ones is a different thing entirely: a model that emits them as a JSON
+/// *string* — `"arguments": "{\"title\":\"x\"}"` — had that string shown on the
+/// consent card and then handed the connector an empty object, so the tool ran
+/// with every default or failed for a reason nobody could see. Refusing names
+/// the problem and lets the model re-emit it. Absent or null stays `{}`: a tool
+/// with no inputs is ordinary.
+fn nested_run_arguments(
+    arguments: &serde_json::Value,
+    target: &str,
+) -> Result<serde_json::Value, String> {
+    match arguments.get("arguments") {
+        None | Some(serde_json::Value::Null) => Ok(serde_json::json!({})),
+        Some(value) if value.is_object() => Ok(value.clone()),
+        Some(value) => Err(format!(
+            "run_mcp_tool's `arguments` must be a JSON object matching {target}'s inputSchema, \
+             not {}. Call it again with the arguments as an object.",
+            json_kind(value)
+        )),
+    }
+}
+
+/// Name a JSON value's shape for a message aimed at the model, so "that is not
+/// an object" says what it actually got.
+fn json_kind(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a true/false value",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
 }
 
 /// Build the JSON-RPC `tools/call` result envelope. The tool's own result rides
@@ -1873,6 +1923,39 @@ mod tests {
         assert_eq!(run["annotations"]["readOnlyHint"], false);
         assert_eq!(run["annotations"]["idempotentHint"], false);
         assert_eq!(run["annotations"]["openWorldHint"], true);
+    }
+
+    /// A model that emits the connector's arguments as a JSON STRING used to
+    /// have that string shown on the consent card and the connector called with
+    /// `{}` — the tool ran with every default, or failed for a reason nobody
+    /// could see. It is told instead.
+    #[test]
+    fn run_mcp_tool_refuses_arguments_that_are_not_an_object() {
+        let call = |args: serde_json::Value| {
+            nested_run_arguments(
+                &serde_json::json!({"tool": "github_create_issue", "arguments": args}),
+                "github_create_issue",
+            )
+        };
+        let err = call(serde_json::json!("{\"title\":\"x\"}")).unwrap_err();
+        assert!(err.contains("a string"), "{err}");
+        assert!(err.contains("github_create_issue"), "{err}");
+        assert!(call(serde_json::json!([{"title": "x"}])).unwrap_err().contains("an array"));
+        assert!(call(serde_json::json!(7)).unwrap_err().contains("a number"));
+
+        // A real object rides through untouched…
+        assert_eq!(
+            call(serde_json::json!({"title": "x"})).unwrap(),
+            serde_json::json!({"title": "x"})
+        );
+        // …and a tool with no inputs is ordinary, however the model spells it.
+        for empty in [serde_json::json!({}), serde_json::json!(null)] {
+            assert_eq!(call(empty).unwrap(), serde_json::json!({}));
+        }
+        assert_eq!(
+            nested_run_arguments(&serde_json::json!({"tool": "fetch_fetch"}), "fetch_fetch").unwrap(),
+            serde_json::json!({})
+        );
     }
 
     #[test]
@@ -2787,10 +2870,12 @@ mod tests {
         // 2026-08-03 the LAST gap closed too: the screen tools. The owner's rule
         // is that every provider gets full control, the interface included, and
         // the privacy reason for the old carve-out does not survive contact with
-        // how the tools actually work — `view_screenshot`/`ui_snapshot` hand
-        // their pixels to `perceive_image`, which withholds the frame from a
-        // non-vision cloud model and has a LOCAL model describe it instead. The
-        // screen never left the Mac before this change and still does not.
+        // how the tools actually work for a CLI engine — `view_screenshot`/
+        // `ui_snapshot` hand their pixels to `perceive_image`, which withholds
+        // the frame from an engine with no image channel and has a LOCAL model
+        // describe it instead. (An API-provider vision model in a door-off room
+        // is the exception `include_ui_tools` now names; this parity assertion
+        // is about the CATALOG, not about where pixels go.)
         let engine = scoped_specs(false, ToolScope::CloudEngine);
         let local = scoped_specs(false, ToolScope::LocalEngine);
         // The room's own engine always sees its connected connectors.
@@ -2837,9 +2922,9 @@ mod tests {
                 "{name} missing from the cloud-engine tier"
             );
         }
-        // The screen tools are the room engine's too now, and the screen still
-        // never leaves the machine — `perceive_image` withholds the frame from a
-        // non-vision cloud model and a LOCAL model describes it instead.
+        // The screen tools are the room engine's too now; for the CLI engines
+        // this tier serves, `perceive_image` withholds the frame (no image
+        // channel) and a LOCAL model describes it instead.
         for name in ["ui_act", "ui_snapshot", "view_screenshot"] {
             assert!(
                 engine.iter().any(|t| t["name"] == name),

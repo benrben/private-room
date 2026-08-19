@@ -140,21 +140,28 @@ pub fn list_files(conn: &Connection) -> Result<Vec<FileMeta>, String> {
     )
 }
 
-/// How many files are in this room — the ONE definition every count surface
-/// uses (the status bar, the Library badge, `room_counts`, the front page).
+/// How many files are in this room — the ONE definition of THAT question
+/// (`room_counts`/RoomInfo, the front page's file count).
 ///
+/// It is not what the Library badge counts, and the two are allowed to differ.
 /// "In this room" means exactly what [`list_files`] lists, which is why this
-/// carries the same `NOT_TRASHED` clause and nothing else. A count is a claim
-/// about the same population the list shows, so the two must be derived from
-/// one predicate or they drift: before this existed, the counts were a bare
-/// `count(*) FROM files` and trash landed with the listings filtered but the
-/// counts not, so a room whose files had all been deleted still reported them
-/// as present.
+/// carries the same `NOT_TRASHED` clause and nothing else. The Library is a
+/// narrower question — which files Home LISTS — answered in exactly one place,
+/// `isLibraryVisible` in src/workspace/fileVisibility.ts, which also drops the
+/// `sectionOnly` rows a sketch or a browser page can be. A room with nine
+/// linked files and three section-only sketches is twelve files and a badge of
+/// nine, and both numbers are true of what they name.
+///
+/// A count is a claim about the same population the list shows, so the two must
+/// be derived from one predicate or they drift: before this existed, the counts
+/// were a bare `count(*) FROM files` and trash landed with the listings
+/// filtered but the counts not, so a room whose files had all been deleted
+/// still reported them as present.
 ///
 /// Nothing is excluded by KIND. A saved browser page, a download, a recording
 /// and a generated artifact are all things the user put in (or made in) this
 /// room, and a count that quietly skipped them would be answering a different
-/// question than the one the badge is asking (owner's ruling, 2026-08-03).
+/// question than the one this is asking (owner's ruling, 2026-08-03).
 pub fn room_file_count(conn: &Connection) -> Result<i64, String> {
     query_one(
         conn,
@@ -1166,6 +1173,22 @@ mod tests {
             list_files(&conn).unwrap().len() as i64,
             "the count and the list are the same population"
         );
+    }
+
+    /// The Library badge asks a NARROWER question than this count, and a
+    /// section-only file is where the two part: an unlinked sketch is in the
+    /// room and is not on Home's list (`isLibraryVisible`, in
+    /// src/workspace/fileVisibility.ts). Pinned because the doc above now says
+    /// so — a count that quietly started hiding these would answer neither
+    /// question.
+    #[test]
+    fn a_section_only_file_is_in_the_room_though_the_library_does_not_list_it() {
+        let conn = crate::db::mem();
+        let id = add_file(&conn, "Sketch.excalidraw.json", "{}");
+        mark_section_only(&conn, &id, "sketch");
+        assert_eq!(get_file_meta(&conn, &id).unwrap().library_visibility, "sectionOnly");
+        assert_eq!(room_file_count(&conn).unwrap(), 1);
+        assert_eq!(list_files(&conn).unwrap().len(), 1);
     }
 
     #[test]

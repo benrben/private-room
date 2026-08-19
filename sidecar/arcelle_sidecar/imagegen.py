@@ -51,6 +51,11 @@ from typing import Any
 
 import httpx
 
+#: What one reference picture may weigh, imported rather than restated: the two
+#: Create tabs send the same room pictures to the same providers, and a second
+#: copy of this number is a second answer to one question.
+from .videogen import MAX_REFERENCE_BYTES
+
 #: How long one generation may take. Video models are minutes, not seconds,
 #: and the Rust side already runs this inside a cancellable background job —
 #: so the ceiling here only has to stop a wedged socket, not pace the user.
@@ -177,11 +182,29 @@ def _reference_url(b64: str, mime: str) -> str:
     announced as ``image/png`` whatever it actually was, which is a lie a
     provider is entitled to act on — a JPEG labelled PNG can be refused, or
     worse, decoded as garbage and quietly turned into a picture of nothing.
+
+    The weight is measured here for the same reason :func:`videogen._data_url`
+    measures it: the same room picture that the Video tab refuses instantly,
+    naming the limit, was uploaded whole from this tab and came back as
+    whatever opaque error the provider chose, after the wait.
     """
+    payload = (b64 or "").strip()
+    if not payload:
+        raise ImageGenError("a reference picture was empty")
+    try:
+        raw = base64.b64decode(payload, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ImageGenError("a reference picture could not be read") from exc
+    if len(raw) > MAX_REFERENCE_BYTES:
+        raise ImageGenError(
+            f"a reference picture is {len(raw) // (1024 * 1024)} MB, over this "
+            f"room's {MAX_REFERENCE_BYTES // (1024 * 1024)} MB limit for one "
+            "picture sent to a model"
+        )
     kind = (mime or "").strip().lower() or "image/png"
     if not kind.startswith("image/"):
         raise ImageGenError(f"{kind} is not a picture, so it cannot guide a drawing")
-    return f"data:{kind};base64,{b64.strip()}"
+    return f"data:{kind};base64,{payload}"
 
 
 def guard_prompt(

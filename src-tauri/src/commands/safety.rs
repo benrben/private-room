@@ -271,8 +271,18 @@ pub(crate) fn unique_export_name(name: &str, is_taken: impl Fn(&str) -> bool) ->
 
 /// ADD-1: export every file into `dest_dir`, never overwriting. Returns the
 /// number written.
+///
+/// Async + `block_in_place` for `create_room_checkpoint`'s reason: reading every
+/// file out of the room and writing it to disk is minutes of blocking work on a
+/// big room, and on the main thread that is a window that stops redrawing and a
+/// macOS "not responding" — a freeze the user cannot tell from a hang.
 #[tauri::command]
-pub fn export_all(state: State<'_, AppState>, dest_dir: String) -> Result<u32, String> {
+pub async fn export_all(state: State<'_, AppState>, dest_dir: String) -> Result<u32, String> {
+    let state = state.inner();
+    tokio::task::block_in_place(|| export_all_core(state, &dest_dir))
+}
+
+fn export_all_core(state: &AppState, dest_dir: &str) -> Result<u32, String> {
     state.with_room(|room| {
         let dir = std::path::Path::new(&dest_dir);
         if !dir.is_dir() {
@@ -306,8 +316,14 @@ pub fn export_all(state: State<'_, AppState>, dest_dir: String) -> Result<u32, S
 /// sidecar it is re-wrapped around the NEW password and the FRESH code is
 /// returned (to show once) — the old code decrypts to a password that no
 /// longer opens the room. Returns `None` when the room had no recovery.
+///
+/// Async + `block_in_place` (`create_room_checkpoint`'s pattern): the live rekey
+/// rewrites every page of the room and each checkpoint gets a full rekey_copy of
+/// its own, which on a multi-GB room is minutes. Run on the main thread that is
+/// a beachball with no redraw and no input — and the one command where the user
+/// most needs to see that something is still happening.
 #[tauri::command]
-pub fn change_password(
+pub async fn change_password(
     state: State<'_, AppState>,
     current: String,
     new_password: String,
@@ -320,6 +336,15 @@ pub fn change_password(
     if state.rolling_back() {
         return Err(ROLLBACK_BUSY.into());
     }
+    let state = state.inner();
+    tokio::task::block_in_place(|| change_password_core(state, &current, &new_password))
+}
+
+fn change_password_core(
+    state: &AppState,
+    current: &str,
+    new_password: &str,
+) -> Result<Option<String>, String> {
     // Rekey the live room under the lock (fast: one SQLCipher rekey plus the
     // biometrics/recovery re-wrap). Capture the path and the OLD password —
     // `current` is already verified — so the per-checkpoint rekey below runs
@@ -329,9 +354,9 @@ pub fn change_password(
     let room_path = {
         let mut guard = state.room.lock().unwrap();
         let room = guard.as_mut().ok_or("No room is open.")?;
-        db::verify_password(&room.path, &current)?;
-        db::rekey(&room.conn, &new_password)?;
-        room.password = new_password.clone();
+        db::verify_password(&room.path, current)?;
+        db::rekey(&room.conn, new_password)?;
+        room.password = new_password.to_string();
         // ADD-11: keep Touch ID working after a password change. Chosen
         // behavior: UPDATE the Keychain entry with the new password (re-store
         // overwrites it). Storing creates a fresh biometric item and needs no
@@ -357,7 +382,7 @@ pub fn change_password(
     // "Regenerate token" action (`regenerate_leash_token`), which also severs
     // live connections.
     let new_code = if db::has_recovery(&room_path) {
-        match db::write_recovery(&room_path, &new_password) {
+        match db::write_recovery(&room_path, new_password) {
             Ok(code) => Some(code),
             Err(_) => {
                 let _ = db::remove_recovery(&room_path);
@@ -379,7 +404,7 @@ pub fn change_password(
     // room's own file name, which is the user's, and it never goes to a log.
     let mut stranded = 0u32;
     for ck in checkpoint_ck_paths(&room_path) {
-        if db::rekey_copy(&ck, &current, &new_password).is_err() {
+        if db::rekey_copy(&ck, current, new_password).is_err() {
             stranded += 1;
         }
     }
@@ -391,8 +416,12 @@ pub fn change_password(
 
 /// ADD-4: a full copy of the open room as it is now, optionally with its own
 /// new password. The original is never touched.
+///
+/// Async + `block_in_place`: `VACUUM INTO` writes the whole room out page by
+/// page (and the optional rekey rewrites it again), which is minutes on a
+/// multi-GB room — main-thread work the window cannot redraw through.
 #[tauri::command]
-pub fn duplicate_room(
+pub async fn duplicate_room(
     state: State<'_, AppState>,
     dest_path: String,
     new_password: Option<String>,
@@ -405,11 +434,20 @@ pub fn duplicate_room(
     if std::path::Path::new(&dest_path).exists() {
         return Err("A file already exists at that location.".into());
     }
+    let state = state.inner();
+    tokio::task::block_in_place(|| duplicate_room_core(state, &dest_path, new_password))
+}
+
+fn duplicate_room_core(
+    state: &AppState,
+    dest_path: &str,
+    new_password: Option<String>,
+) -> Result<(), String> {
     state.with_room(|room| {
-        db::vacuum_into(&room.conn, &dest_path)?;
+        db::vacuum_into(&room.conn, dest_path)?;
         if let Some(pw) = new_password {
-            if let Err(e) = db::rekey_copy(&dest_path, &room.password, &pw) {
-                let _ = std::fs::remove_file(&dest_path);
+            if let Err(e) = db::rekey_copy(dest_path, &room.password, &pw) {
+                let _ = std::fs::remove_file(dest_path);
                 return Err(e);
             }
         }
@@ -418,8 +456,15 @@ pub fn duplicate_room(
 }
 
 /// SEC-7: compact the open room on demand, reporting how much was reclaimed.
+///
+/// Async + `block_in_place`: a VACUUM rebuilds the entire database file.
 #[tauri::command]
-pub fn compact_room(state: State<'_, AppState>) -> Result<String, String> {
+pub async fn compact_room(state: State<'_, AppState>) -> Result<String, String> {
+    let state = state.inner();
+    tokio::task::block_in_place(|| compact_room_core(state))
+}
+
+fn compact_room_core(state: &AppState) -> Result<String, String> {
     state.with_room(|room| {
         let reclaimable = db::reclaimable_bytes(&room.conn)?;
         let mb = reclaimable as f64 / (1024.0 * 1024.0);
@@ -559,6 +604,37 @@ mod tests {
         assert_eq!(db::list_file_versions(&conn, &fid).unwrap().len(), 1);
         assert_eq!(restore_version_into(&conn, &vid).unwrap(), fid);
         assert_eq!(db::get_file_extracted_text(&conn, &fid).as_deref(), Some("we offer 90 days"));
+    }
+
+    /// The room-sized commands in this file hand their thread back to the
+    /// scheduler, the way `create_room_checkpoint` does. A synchronous
+    /// `#[tauri::command]` runs its whole body on the thread that dispatched
+    /// it, so a rekey or a VACUUM of a multi-GB room stops the window
+    /// redrawing for its full duration — macOS then shows "not responding",
+    /// which the user cannot tell from a crash.
+    ///
+    /// Nothing else can catch this: it compiles, it passes, and it is only
+    /// visible on a room big enough to take minutes. Needles are split so this
+    /// test cannot read its own source as the evidence.
+    #[test]
+    fn the_room_sized_commands_do_not_run_on_the_dispatch_thread() {
+        let src = include_str!("safety.rs");
+        for needle in [
+            concat!("fn change_pass", "word("),
+            concat!("fn duplicate_", "room("),
+            concat!("fn compact_", "room("),
+            concat!("fn export_", "all("),
+        ] {
+            let line = src
+                .lines()
+                .find(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} moved — find it and re-pin this"));
+            assert!(
+                line.trim().starts_with("pub async fn"),
+                "{needle} must not block the dispatch thread, got: {}",
+                line.trim()
+            );
+        }
     }
 
     // ------------------------------------------------ Idea 9: password rekey

@@ -92,6 +92,19 @@ export default function ActivityRail({
   // the sidebar never loses you.
   const current = nav.more.includes(area as NavArea) ? (area as NavArea) : null;
   const moreRows = layout.moreToolsOpen ? nav.more : current ? [current] : [];
+  // What the disclosure actually changes. The current place is drawn either
+  // way, so counting it made the button offer to show a row already on
+  // screen — and, open, to hide one that would stay. When the only unpinned
+  // tool IS where you are, the toggle changes nothing and must not offer a
+  // number at all.
+  const hiddenCount = nav.more.length - (current ? 1 : 0);
+  const tool = `tool${hiddenCount === 1 ? "" : "s"}`;
+  const moreLabel =
+    hiddenCount === 0
+      ? "More tools"
+      : layout.moreToolsOpen
+        ? `Hide the other ${hiddenCount} ${tool}`
+        : `Show ${hiddenCount} more ${tool}`;
 
   return (
     <nav
@@ -126,8 +139,10 @@ export default function ActivityRail({
         </button>
       )}
 
+      {/* "Pinned", the word the editor of this split uses — it was "Core"
+          here and "Pinned" there for the same set of rows. */}
       <div className="rail-group-label" aria-hidden>
-        Core
+        Pinned
       </div>
       <div className="rail-divider" aria-hidden />
       {nav.pinned.map((key) => (
@@ -141,20 +156,16 @@ export default function ActivityRail({
 
       {nav.more.length > 0 && (
         <>
-          <div className="rail-group-label" aria-hidden>
-            On demand
-          </div>
+          {/* No heading: the button below carries this group's name in words,
+              and a second name for it ("On demand") made two groups read as
+              four. The rule stays as the tier break. */}
           <div className="rail-divider" aria-hidden />
           <button
             className="rail-button rail-more"
             type="button"
             data-testid="more-tools"
             aria-expanded={layout.moreToolsOpen}
-            aria-label={
-              layout.moreToolsOpen
-                ? `Hide the other ${nav.more.length} tools`
-                : `Show ${nav.more.length} more tools`
-            }
+            aria-label={moreLabel}
             title={wide ? undefined : "More tools"}
             onClick={layout.toggleMoreTools}
           >

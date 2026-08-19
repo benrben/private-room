@@ -21,7 +21,7 @@
    base.css; nothing here restyles an element selector, so a feature
    stylesheet composes what it wants and inherits nothing it didn't ask for.
 
-   Three custom properties form the whole configuration surface:
+   Two custom properties form the whole configuration surface:
 
      --mk      a RAW marker hue (--mk-green, --sem-done-fill, …). Every
                primitive applies its OWN alpha to it, so the same value can
@@ -29,7 +29,6 @@
                pass a pre-mixed translucent colour — it would be mixed twice.
      --mk-ink  the contrast-safe INK of that same hue, for anything that has
                to carry a word or act as a 3:1 boundary.
-     --nb-val  a PERCENTAGE for the data primitives (bars, progress, dials).
 
    Set both marker properties at once with a semantic class
    (.nb-sem-done, .nb-sem-urgent, …) rather than by hand — then "green means
@@ -227,39 +226,6 @@ body {
 .nb-card:hover {
   border-color: var(--sketch);
 }
-/* Dense lists: pencil weight, tighter padding. Decorative boundary only —
-   see the .nb-frame-soft note before putting it on a control. */
-.nb-card-soft {
-  background: transparent;
-  border: 1px solid var(--line);
-  border-radius: var(--radius-sm);
-  padding: var(--sp-3);
-  position: relative;
-}
-
-/* ----- tilt -----
-   The brief caps a functional card at about one degree, and these sit under
-   it. Fixed angles, never generated: a card that re-rotates on every render
-   is a card the eye cannot trust.
-
-   WARNING: a transform makes the element a containing block for fixed-
-   position descendants, so a popover portalled inside a tilted card will
-   anchor to the card instead of the viewport. Tilt leaf notes, not
-   containers that host menus. */
-.nb-tilt {
-  transform: rotate(-0.6deg);
-}
-.nb-tilt-b {
-  transform: rotate(0.5deg);
-}
-/* Alternates the two angles down a list of pinned notes. */
-.nb-tilt-set > *:nth-child(odd) {
-  transform: rotate(-0.5deg);
-}
-.nb-tilt-set > *:nth-child(even) {
-  transform: rotate(0.6deg);
-}
-
 /* ----- taped note -----
    A note stuck to the page with a strip of matte tape across the top-left.
    The strip is a wash of --ink, which is the one recipe that reads correctly
@@ -408,27 +374,6 @@ body {
   box-decoration-break: clone;
 }
 
-/* ----- marker swash -----
-   The block-level cousin of .nb-mark: a highlighter dragged across the lower
-   two-thirds of a heading rather than around a phrase. Sits on the element's
-   own background, so text stays on top of it with no stacking games — the
-   negative-z-index pseudo-element trick is the one that vanished in WebKit,
-   and this avoids the question entirely. */
-.nb-swash {
-  background-image: linear-gradient(
-    101deg,
-    transparent 0.5%,
-    color-mix(in srgb, var(--mk, var(--mk-yellow)) 54%, transparent) 2%,
-    color-mix(in srgb, var(--mk, var(--mk-yellow)) 40%, transparent) 48%,
-    color-mix(in srgb, var(--mk, var(--mk-yellow)) 52%, transparent) 80%,
-    color-mix(in srgb, var(--mk, var(--mk-yellow)) 26%, transparent) 97%,
-    transparent 100%
-  );
-  background-repeat: no-repeat;
-  background-position: 0 92%;
-  background-size: 100% 46%;
-}
-
 /* ----- marker underline -----
    THE universal active signal: rail items, tabs, chips, pane headers and
    settings nav all use this one idiom instead of the mix of left spines,
@@ -455,11 +400,6 @@ body {
   transform-origin: left center;
   pointer-events: none;
 }
-/* Draws itself in when the item becomes active. */
-.nb-underline-draw::after {
-  animation: nb-draw var(--dur) var(--ease-pen);
-}
-
 /* ----- category edge -----
    A marker stroke down one edge, for rows that belong to a category or
    carry a state. A fill this thin cannot clear 3:1 in light mode, so it is
@@ -503,18 +443,6 @@ body {
   color: var(--mk-ink, var(--accent));
   border: 1.5px solid var(--mk-ink, var(--accent));
   border-radius: 60% 55% 58% 62% / 58% 62% 55% 60%;
-}
-
-/* ----- circled value -----
-   The analyst's ring around a number that matters — a chart datum, a total,
-   the one figure in a table worth arguing about. Unlike .nb-circled this
-   takes arbitrary content and does not force the hand. */
-.nb-ringed {
-  display: inline-block;
-  padding: 1px 7px;
-  color: var(--mk-ink, var(--accent));
-  border: 1.5px solid var(--mk-ink, var(--accent));
-  border-radius: 48% 52% 50% 50% / 56% 44% 54% 46%;
 }
 
 /* ==========================================================================
@@ -621,10 +549,7 @@ body {
 :root {
   --nb-glyph-check: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'><path d='M4.3 12.6 7.1 15.7 9.9 18.6 14.2 12.1 20 5.4'/></svg>");
   --nb-glyph-bookmark: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M6.3 3.7 17.6 3.2 17.9 20.6 12.1 15.6 6 20.8Z'/></svg>");
-  --nb-glyph-star: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M12 3.4 14.5 9.2 20.6 9.7 15.9 13.9 17.3 20.1 12 16.8 6.6 20.3 8.1 13.9 3.4 9.6 9.7 9.2Z'/></svg>");
   --nb-glyph-pin: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M9.4 3.4 16.3 3.6 14.6 9.4 18.6 13.3 5.6 13.5 9.7 9.3Z'/><path d='M12 13.5 11.6 20.8'/></svg>");
-  --nb-glyph-mic: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M8.8 6.8a3.2 3.2 0 0 1 6.4 0v4.4a3.2 3.2 0 0 1-6.4 0Z'/><path d='M5.6 10.7c.3 3.5 3.1 6.1 6.4 6.1s6.2-2.6 6.4-6.1'/><path d='M12 17.1 11.9 20.7'/></svg>");
-  --nb-glyph-file: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M6.4 3.5 14 3.2 18 7.5 17.8 20.6 6.2 20.8Z'/><path d='M13.8 3.4 14 7.6 18 7.5'/></svg>");
   --nb-glyph-arrow: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2.1' stroke-linecap='round' stroke-linejoin='round'><path d='M3.6 12.2C8 11.6 14 11.8 19.9 12.1'/><path d='M14.8 7.2 20.2 12.1 14.9 17.3'/></svg>");
   --nb-glyph-clip: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M16.6 8.4 9.3 15.9c-1.6 1.7-4 1.6-5.3.2s-1.1-3.7.5-5.3L13 2.9c1.1-1.1 2.7-1 3.6 0s.9 2.6-.2 3.7L8 15.2c-.5.5-1.1.4-1.5 0s-.4-1 .1-1.5L14 6.5'/></svg>");
   /* The margin arrow: one curve that sweeps down-left into a two-barb head.
@@ -645,10 +570,8 @@ body {
    disappears on an older Mac. */
 .nb-ico,
 .nb-bookmark,
-.nb-lead-ico::before,
 .nb-arrow-curve,
 .nb-annot::after,
-.nb-annot-l::before,
 .nb-btn-go::after,
 .nb-clip::before {
   background-color: currentColor;
@@ -675,44 +598,11 @@ body {
 .nb-ico-check {
   --nb-glyph: var(--nb-glyph-check);
 }
-.nb-ico-bookmark {
-  --nb-glyph: var(--nb-glyph-bookmark);
-}
-.nb-ico-star {
-  --nb-glyph: var(--nb-glyph-star);
-}
 .nb-ico-pin {
   --nb-glyph: var(--nb-glyph-pin);
 }
-.nb-ico-mic {
-  --nb-glyph: var(--nb-glyph-mic);
-}
-.nb-ico-file {
-  --nb-glyph: var(--nb-glyph-file);
-}
 .nb-ico-arrow {
   --nb-glyph: var(--nb-glyph-arrow);
-}
-.nb-ico-clip {
-  --nb-glyph: var(--nb-glyph-clip);
-}
-
-/* ----- leading icon -----
-   The hand-drawn mark in front of a card title or list row, drawn as a
-   pseudo-element so the row needs no extra span. The consumer sets --nb-glyph
-   (any --nb-glyph-* above) and, optionally, --mk-ink to colour it. */
-.nb-lead-ico {
-  display: inline-flex;
-  align-items: baseline;
-  gap: 7px;
-}
-.nb-lead-ico::before {
-  content: "";
-  flex: none;
-  width: var(--nb-ico-size, 1em);
-  height: var(--nb-ico-size, 1em);
-  color: var(--mk-ink, var(--ink-2));
-  transform: translateY(0.12em);
 }
 
 /* ==========================================================================
@@ -750,9 +640,8 @@ body {
 
    The arrow is an inline-flow pseudo-element, NOT an absolutely positioned
    one: it takes part in layout, so it can never end up clipped by an
-   ancestor's overflow or land on top of a control. .nb-annot puts it after
-   the words pointing down-right; .nb-annot-l puts it before them pointing
-   down-left. */
+   ancestor's overflow or land on top of a control. It follows the words,
+   pointing down-right. */
 .nb-annot {
   display: inline-flex;
   align-items: flex-end;
@@ -762,40 +651,28 @@ body {
   line-height: var(--lh-hand);
   color: var(--ink-2);
 }
-.nb-annot::after,
-.nb-annot-l::before {
+.nb-annot::after {
   content: "";
   flex: none;
   width: 42px;
   height: 34px;
   color: var(--ink-muted);
   --nb-glyph: var(--nb-glyph-curve);
-}
-.nb-annot::after {
   transform: scaleX(-1);
-}
-/* The left variant moves the mark to the other side rather than adding one. */
-.nb-annot-l::after {
-  content: none;
 }
 
 /* ----- connector thread -----
    The pencil line that ties a run of stacked items together: agent steps,
    a workflow's nodes, a threaded reply. Spans the element's own box, so
-   nothing has to be measured. Give the element padding-left (or padding-top
-   for the horizontal variant) to make room for it, and --nb-connect-at to
-   move the thread off the edge. */
-.nb-connect,
-.nb-connect-h {
+   nothing has to be measured. Give the element padding-left to make room for
+   it, and --nb-connect-at to move the thread off the edge. */
+.nb-connect {
   position: relative;
 }
-.nb-connect::before,
-.nb-connect-h::before {
+.nb-connect::before {
   content: "";
   position: absolute;
   pointer-events: none;
-}
-.nb-connect::before {
   left: var(--nb-connect-at, 0);
   top: 0;
   bottom: 0;
@@ -806,18 +683,6 @@ body {
     transparent 5px 9px
   );
 }
-.nb-connect-h::before {
-  top: var(--nb-connect-at, 0);
-  left: 0;
-  right: 0;
-  height: 1px;
-  background-image: repeating-linear-gradient(
-    to right,
-    var(--rule) 0 5px,
-    transparent 5px 9px
-  );
-}
-
 /* ==========================================================================
    6. CONTROLS
    Element defaults for bare button/input live in base.css. These are the
@@ -1087,19 +952,6 @@ body {
     transparent 100%
   );
 }
-/* The same stroke stood on end, for splitting a row into columns. */
-.nb-rule-v {
-  width: 1px;
-  border: 0;
-  align-self: stretch;
-  background: linear-gradient(
-    180deg,
-    transparent 0%,
-    var(--rule) 8%,
-    var(--rule) 90%,
-    transparent 100%
-  );
-}
 /* A dashed pencil rule, for a boundary that is provisional: a drop target,
    a section not yet filled in, the fold in a truncated list. */
 .nb-rule-dash {
@@ -1131,12 +983,6 @@ body {
   background-size: 100% 1px;
   background-position: left top;
 }
-/* Groups get real air between them — the spec asks for spacing to do the
-   grouping work that a heavier line would otherwise have to. */
-.nb-list-groups > * + * {
-  margin-top: var(--sp-6);
-}
-
 /* ----- bookmark flag -----
    The saved marker on a list row or card. Pink is "saved" across the whole
    product, and the glyph carries the meaning so the colour never has to. */
@@ -1176,114 +1022,11 @@ body {
 }
 
 /* ==========================================================================
-   8. DATA, CHARTS, PROGRESS
-   The values are never distorted. Every primitive here maps --nb-val
-   linearly to a length or an angle: the drawing is hand-made, the geometry
-   is not. Pass --nb-val as a PERCENTAGE (e.g. --nb-val: 62%).
+   8. TOOLTIP
+   Structured and clean, per the spec — no hand-drawn wobble on the thing
+   that has to be read fast. It floats, so it is opaque (section 9's rule).
    ========================================================================== */
 
-/* Pencil axes: the L a plot is drawn against. */
-.nb-axes {
-  border-left: 1px solid var(--rule);
-  border-bottom: 1px solid var(--rule);
-}
-/* Faint horizontal grid, one line every --nb-step (default quarters). Drawn
-   from the bottom up so the baseline lands on the axis. */
-.nb-gridlines {
-  background-image: repeating-linear-gradient(
-    to top,
-    color-mix(in srgb, var(--rule) 62%, transparent) 0 1px,
-    transparent 1px var(--nb-step, 25%)
-  );
-}
-
-/* ----- chart bar -----
-   A marker stroke inside a pen outline. The outline is not decoration: a
-   marker fill measures ~1.7:1 against light paper, and a bar is meaningful
-   non-text that owes 3:1 — the --mk-ink stroke is what pays it.
-
-   .nb-bar-v takes its height from --nb-val (put it in a fixed-height track);
-   .nb-bar-h takes its width. */
-.nb-bar {
-  background-image: linear-gradient(
-    100deg,
-    color-mix(in srgb, var(--mk, var(--mk-blue)) 62%, transparent) 0%,
-    color-mix(in srgb, var(--mk, var(--mk-blue)) 48%, transparent) 55%,
-    color-mix(in srgb, var(--mk, var(--mk-blue)) 60%, transparent) 100%
-  );
-  box-shadow: inset 0 0 0 1px var(--mk-ink, var(--blue));
-  border-radius: 3px 4px 2px 3px / 3px 2px 4px 3px;
-}
-.nb-bar-v {
-  height: var(--nb-val, 0%);
-  width: 100%;
-  align-self: flex-end;
-}
-.nb-bar-h {
-  width: var(--nb-val, 0%);
-  height: 100%;
-}
-/* The track a bar sits in: a pencil outline that shows the full extent, so
-   a short bar still reads as "out of this much". */
-.nb-bar-track {
-  position: relative;
-  background: transparent;
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--rule) 70%, transparent);
-  border-radius: 3px 4px 2px 3px / 3px 2px 4px 3px;
-  overflow: hidden;
-}
-
-/* ----- progress -----
-   A marker stroke wiped across the page, not a generic bar: the fill uses
-   the same uneven alpha ramp as the highlighter, and the ends are rounded
-   the way a chisel tip leaves them. The percentage must also be written out
-   next to it — progress is never colour and length alone. */
-.nb-progress {
-  height: 8px;
-  border-radius: 999px 999px 999px 999px / 8px 6px 8px 6px;
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--rule) 70%, transparent);
-  overflow: hidden;
-}
-.nb-progress-fill {
-  width: var(--nb-val, 0%);
-  height: 100%;
-  background-image: linear-gradient(
-    99deg,
-    color-mix(in srgb, var(--mk, var(--accent-fill)) 72%, transparent) 0%,
-    color-mix(in srgb, var(--mk, var(--accent-fill)) 52%, transparent) 46%,
-    color-mix(in srgb, var(--mk, var(--accent-fill)) 68%, transparent) 88%,
-    color-mix(in srgb, var(--mk, var(--accent-fill)) 46%, transparent) 100%
-  );
-  box-shadow: inset 0 0 0 1px var(--mk-ink, var(--accent));
-  border-radius: inherit;
-  transition: width var(--dur-slow) var(--ease-pen);
-}
-
-/* ----- dial -----
-   A partially filled circle, for the places a bar would be the wrong shape:
-   a quota, a confidence, a step count. The conic sweep starts at twelve
-   o'clock and is exactly --nb-val of the circle — no easing, no padding, no
-   minimum visible sliver that would overstate a small value. Size it with
-   --nb-dial-size. */
-.nb-dial {
-  display: inline-block;
-  width: var(--nb-dial-size, 20px);
-  height: var(--nb-dial-size, 20px);
-  border: 1.5px solid var(--mk-ink, var(--accent));
-  border-radius: 50%;
-  /* The second stop is 0deg, which the gradient clamps up to the first —
-     that is what produces a hard edge instead of a soft sweep. A bare `0`
-     is a length, not an angle, and is not valid here. */
-  background-image: conic-gradient(
-    color-mix(in srgb, var(--mk, var(--accent-fill)) 68%, transparent)
-      var(--nb-val, 0%),
-    transparent 0deg
-  );
-}
-
-/* ----- tooltip -----
-   Structured and clean, per the spec — no hand-drawn wobble on the thing
-   that has to be read fast. It floats, so it is opaque (section 9's rule). */
 .nb-tip {
   background: var(--raised);
   color: var(--text);
@@ -1321,22 +1064,17 @@ body {
   transform: translateY(-2px);
   box-shadow: 0 6px 18px var(--shadow-lift);
 }
-/* Pressed against the paper. */
-.nb-press {
-  transition: transform var(--dur-fast) var(--ease-pen);
-}
-.nb-press:active {
-  transform: translateY(1px);
-}
 
 /* ==========================================================================
    10. MOTION
    160-260ms, --ease-pen, and each animation is a pen doing one thing once.
-   No bounce, no glow, no loop, no parallax. Every one of them has an escape
-   in the reduced-motion block at the end of the file.
+   No bounce, no glow, no loop, no parallax. Motion here marks a state change;
+   nothing in this library animates for decoration.
    ========================================================================== */
 
-/* The underline swipes in from where the pen touched down. */
+/* The underline swipes in from where the pen touched down. Kept as a keyframe
+   only: shell.css, viewer.css and markdowneditor.css animate their own ::after
+   with it, and each carries its own reduced-motion escape. */
 @keyframes nb-draw {
   from {
     transform: scaleX(0);
@@ -1344,79 +1082,6 @@ body {
   to {
     transform: scaleX(1);
   }
-}
-
-/* A highlighter is dragged left to right across the phrase. Only `from` is
-   declared, so the mark's own background-size is the resting state and
-   switching the animation off leaves it fully drawn. */
-@keyframes nb-mark-in {
-  from {
-    background-size: 0% 100%;
-  }
-}
-.nb-mark-draw {
-  animation: nb-mark-in var(--dur) var(--ease-pen);
-}
-
-@keyframes nb-swash-in {
-  from {
-    background-size: 0% 46%;
-  }
-}
-.nb-swash-draw {
-  animation: nb-swash-in var(--dur-slow) var(--ease-pen);
-}
-
-/* The border traces itself in, one side at a time, like a pen going round
-   the box. Done with border-color rather than a clip-path overlay so it
-   needs no pseudo-element and cannot collide with .nb-redraw's ::after.
-
-   Requires the element to already have a border. There is no 100% keyframe
-   on purpose — the last quarter interpolates to the element's OWN border
-   colour, so the animation can never end on a colour the box does not
-   actually have. Set --nb-trace-col to the same colour when the border is
-   not the pen. */
-@keyframes nb-trace {
-  0% {
-    border-color: transparent;
-  }
-  25% {
-    border-top-color: var(--nb-trace-col, var(--sketch));
-    border-right-color: transparent;
-    border-bottom-color: transparent;
-    border-left-color: transparent;
-  }
-  50% {
-    border-top-color: var(--nb-trace-col, var(--sketch));
-    border-right-color: var(--nb-trace-col, var(--sketch));
-    border-bottom-color: transparent;
-    border-left-color: transparent;
-  }
-  75% {
-    border-top-color: var(--nb-trace-col, var(--sketch));
-    border-right-color: var(--nb-trace-col, var(--sketch));
-    border-bottom-color: var(--nb-trace-col, var(--sketch));
-    border-left-color: transparent;
-  }
-}
-.nb-trace-in {
-  animation: nb-trace var(--dur-slow) var(--ease-pen);
-}
-
-/* A checkmark drawn like a pen stroke. It is a left-to-right REVEAL of the
-   glyph, not a path animation — a mask cannot be dashed the way an inline
-   <svg> stroke can, and for a tick the two read identically because the
-   stroke happens to run left to right. */
-@keyframes nb-check {
-  from {
-    clip-path: inset(0 100% 0 0);
-  }
-  to {
-    clip-path: inset(0 0 0 0);
-  }
-}
-.nb-check-draw {
-  animation: nb-check var(--dur) var(--ease-pen);
 }
 
 /* A floating surface arriving: a short rise and fade, no scale, no bounce. */
@@ -1437,28 +1102,20 @@ body {
    switching the animations off lands on the finished frame rather than on a
    half-drawn one. */
 @media (prefers-reduced-motion: reduce) {
-  .nb-underline-draw::after,
-  .nb-mark-draw,
-  .nb-swash-draw,
-  .nb-trace-in,
-  .nb-check-draw,
   .nb-float-draw {
     animation: none;
   }
   .nb-lift,
-  .nb-press,
   .nb-card,
   .nb-btn,
   .nb-btn-go::after,
   .nb-chip-btn,
-  .nb-field,
-  .nb-progress-fill {
+  .nb-field {
     transition: none;
   }
   .nb-lift:hover {
     transform: none;
   }
-  .nb-press:active,
   .nb-btn:active:not(:disabled),
   .nb-chip-btn:active {
     transform: none;

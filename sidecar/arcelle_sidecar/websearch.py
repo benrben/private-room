@@ -343,6 +343,7 @@ def _ddg_attempt(query: str, k: int, read: float = 20.0) -> list[Hit]:
     )
 
 
+@_fails_soft
 def duckduckgo(query: str, k: int = 10, tries: int = 3, budget: float = FANOUT_BUDGET) -> list[Hit]:
     """Real DuckDuckGo web results by scraping the no-JS HTML endpoint.
     Page 1 needs NO token — just a POST with b='' and proper browser headers.
@@ -351,7 +352,10 @@ def duckduckgo(query: str, k: int = 10, tries: int = 3, budget: float = FANOUT_B
 
     All the attempts together get `budget` seconds, which is the whole fan-out's
     budget: three 20s attempts plus their pauses is 64s of a 22s search, so past
-    the budget a retry can only produce results that arrive too late to be used."""
+    the budget a retry can only produce results that arrive too late to be used.
+
+    Fail-soft like every other engine — the inner `except requests.RequestException`
+    is a different thing, the do-not-retry short-circuit for an unreachable host."""
     deadline = time.monotonic() + budget
     for attempt in range(tries):
         # A retry's pause comes out of the same budget the attempt does, and is not
@@ -645,7 +649,21 @@ def _fuse(
         try:
             for future in as_completed(list(futures), timeout=budget):
                 index = futures[future]
-                results[index], broke[index] = future.result()
+                try:
+                    results[index], broke[index] = future.result()
+                except Exception as exc:
+                    # Every engine is wrapped in _fails_soft, so reaching here
+                    # means one was added without it (duckduckgo was, for a
+                    # year). Letting that escape discards the six engines that
+                    # DID answer and turns the whole search into a 502 — the
+                    # engine name and the exception TYPE, never the query
+                    # (SPEC §6), say which one to go and fix.
+                    _log.warning(
+                        "engine %s raised past its guard: %s",
+                        engines[index].__name__,
+                        type(exc).__name__,
+                    )
+                    broke[index] = True
         except FuturesTimeout:
             # A running engine is not waited for: a straggler blocked on a dead
             # host would put the whole budget back. It ends on its own read

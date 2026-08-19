@@ -2,6 +2,12 @@ import { useEffect, useState } from "react";
 import { api, hasRecoveryKey } from "../api";
 import { MIN_PASSWORD, ROOM_FILTER } from "../rooms/constants";
 import { duplicateFileName } from "../rooms/helpers";
+import {
+  newPasswordProblem,
+  revokedRecoveryWarning,
+  strandedCheckpointWarning,
+  touchIdLostWarning,
+} from "../rooms/passwordChange";
 
 /** Privacy section (Wave 2): auto-lock, change password, Touch ID unlock,
  * duplicate room, and compact. */
@@ -63,18 +69,14 @@ export function usePrivacy() {
   // SEC-4: verify + rekey via the existing command.
   async function changePassword() {
     setPwError("");
-    if (pwNew !== pwRepeat) {
-      setPwError("The new passwords do not match.");
-      return;
-    }
-    if (pwNew.length < MIN_PASSWORD) {
-      setPwError(`New password must be at least ${MIN_PASSWORD} characters.`);
+    const problem = newPasswordProblem(pwNew, pwRepeat, MIN_PASSWORD);
+    if (problem) {
+      setPwError(problem);
       return;
     }
     try {
-      // change_password returns null both when the room never had a recovery
-      // sidecar AND when re-wrapping failed (sidecar deleted) — check up
-      // front so a silent revocation gets surfaced.
+      // Asked BEFORE the change, because afterwards a room that never had a
+      // recovery key and one whose key was just lost look identical.
       const hadRecovery = roomPath
         ? await hasRecoveryKey(roomPath).catch(() => false)
         : false;
@@ -85,36 +87,31 @@ export function usePrivacy() {
       setPwSaved(true);
       setPwRecoveryCopied(false);
       setPwRecoveryCode(freshCode);
-      if (hadRecovery && freshCode === null) {
-        setPwError(
-          "Your recovery key could not be re-issued and has been revoked — create a new one in Settings → Recovery key.",
-        );
+      // Two independent things can fail AFTER the password itself changed, and
+      // they used to share one string slot — the checkpoint warning below was
+      // written over this one, so the credential that is now permanently gone
+      // went unmentioned. Accumulate: whichever happened gets said, and when
+      // both happened both get said.
+      const warnings: string[] = [];
+      const revoked = revokedRecoveryWarning(hadRecovery, freshCode);
+      if (revoked) {
+        warnings.push(revoked);
+        // Painted before the stranded-checkpoint query, which is a round trip.
+        setPwError(warnings.join(" "));
       }
-      // Same doctrine, one boundary further out: a checkpoint whose re-key
-      // failed leaves the password change reporting a clean success while that
-      // restore point quietly stops working. Name them NOW, while the old
-      // password is still fresh in the user's mind — the alternative is finding
-      // out weeks later from a rollback that says the current password is wrong.
-      const stranded = await api.listStrandedCheckpoints().catch(() => []);
-      if (stranded.length > 0) {
-        setPwError(
-          `${stranded.length} restore point${stranded.length === 1 ? "" : "s"} could not be re-locked with the new password (${stranded.join(", ")}). ` +
-            "Only your PREVIOUS password opens them — keep it somewhere safe, or delete them under Settings → Restore points.",
-        );
+      const strandedWarning = strandedCheckpointWarning(
+        await api.listStrandedCheckpoints().catch(() => []),
+      );
+      if (strandedWarning) {
+        warnings.push(strandedWarning);
+        setPwError(warnings.join(" "));
       }
-      // The Keychain entry holds the OLD password, so `change_password`
-      // re-saves it behind Touch ID — and when that re-save fails it safely
-      // DELETES the entry instead (safety.rs). Settings kept showing the switch
-      // as on until it was reopened, so the room read as biometric-unlockable
-      // when only typing worked. Ask the Keychain rather than assume either way.
+      // Ask the Keychain rather than assume either way.
       if (roomPath) {
         const still = await api.touchIdHas(roomPath).catch(() => touchIdOn);
         setTouchIdOn(still);
-        if (touchIdOn && !still) {
-          setTouchIdErr(
-            "Touch ID unlock was turned off: the new password could not be stored behind it. Turn it back on to re-enable it.",
-          );
-        }
+        const lost = touchIdLostWarning(touchIdOn, still);
+        if (lost) setTouchIdErr(lost);
       }
       window.setTimeout(() => setPwSaved(false), 2400);
     } catch (e) {
@@ -159,12 +156,9 @@ export function usePrivacy() {
     }
     let newPassword: string | null = null;
     if (dupPassword) {
-      if (dupPassword !== dupRepeat) {
-        setDupError("The new passwords do not match.");
-        return;
-      }
-      if (dupPassword.length < MIN_PASSWORD) {
-        setDupError(`New password must be at least ${MIN_PASSWORD} characters.`);
+      const problem = newPasswordProblem(dupPassword, dupRepeat, MIN_PASSWORD);
+      if (problem) {
+        setDupError(problem);
         return;
       }
       newPassword = dupPassword;

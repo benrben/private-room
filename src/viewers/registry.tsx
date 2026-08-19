@@ -113,6 +113,13 @@ export interface FormatEntry {
   render: (ctx: ViewerContext) => ReactNode;
 }
 
+/** The tail `clip_preview` (files.rs) leaves on an extracted-text payload it cut
+ * at 1 MB. Nothing else in the app writes this sentence. */
+const CLIPPED_TAIL = "… (truncated preview)";
+
+/** Was this text cut short before it reached the viewer? */
+const isClippedPreview = (text: string) => text.trimEnd().endsWith(CLIPPED_TAIL);
+
 /** Kinds whose text round-trips: Rust already decided per FILE (it also checks
  * the bytes are valid UTF-8), so the row only has to honour that answer. */
 const editableText = (c: FileContent): EditMode | null => (c.editable ? "editor" : null);
@@ -120,11 +127,26 @@ const editableText = (c: FileContent): EditMode | null => (c.editable ? "editor"
 const copyIfText = (c: FileContent): EditMode | null => (c.text ? "copy" : null);
 const notEditable = (): EditMode | null => null;
 
-/** A legacy `.xls`. The grid can READ one (calamine and SheetJS both do), but
- * `set_cell` writes an `.xlsx` workbook — which would silently change the
- * file's format while its name still said `.xls`. So it is read-only, and the
- * viewer says so rather than just omitting the button. */
-const isLegacyXls = (name: string) => /\.xls$/i.test(name);
+/** Why this workbook can be READ by the grid but not written through it, or
+ * `undefined` when it can.
+ *
+ * The `sheet` kind covers .xlsx, .xls and .ods, and Rust's `set_cell_in_bytes`
+ * writes exactly one of them: an .xlsx workbook. A legacy `.xls` is refused
+ * because writing it back would silently change the file's format under a name
+ * that still said `.xls`; an `.ods` is refused outright by the writer. Both
+ * answers come from here, so the Edit button and the grid's read-only line can
+ * never disagree — .ods used to get a live editable grid that painted every
+ * change, raised "1 cell changed", and had every write refused by the backend
+ * with a toast the grid contradicted. */
+const readOnlySheetReason = (name: string): string | undefined => {
+  if (/\.xls$/i.test(name)) {
+    return "This is a legacy Excel 97–2003 file, which Arcelle can read but not write. Export it, save it as .xlsx, and add it back to edit it here.";
+  }
+  if (/\.ods$/i.test(name)) {
+    return "This is an OpenDocument spreadsheet, which Arcelle can read but not write. Save it as .xlsx from your spreadsheet app and add it back to edit it here.";
+  }
+  return undefined;
+};
 
 export const FORMATS: Record<ViewerKind, FormatEntry> = {
   // ---- rich formats: the viewer parses the streamed bytes ----------------
@@ -158,8 +180,14 @@ export const FORMATS: Record<ViewerKind, FormatEntry> = {
   },
   docx: {
     label: "Word document",
-    // The ONE kind whose Edit is a real in-place rewrite rather than a copy.
-    edit: (c) => (c.text ? "docx" : null),
+    // The ONE kind whose Edit is a real in-place rewrite rather than a copy —
+    // but only when the editor is holding the WHOLE document. The rewrite pairs
+    // the edited text with the file's paragraphs one for one, so a payload the
+    // 1 MB clip cut short could only ever be refused with "the document has N
+    // paragraphs and the edited text has M — undo the added or deleted line",
+    // accusing the user of a cut this app made. A book-length manuscript edits
+    // as a copy instead, which is honest about what its Save can do.
+    edit: (c) => (c.text ? (isClippedPreview(c.text) ? "copy" : "docx") : null),
     render: ({ content: c, target: t, lazy }) => (
       <lazy.DocxView
         mediaToken={c.mediaToken}
@@ -180,26 +208,32 @@ export const FORMATS: Record<ViewerKind, FormatEntry> = {
   },
   sheet: {
     label: "spreadsheet",
-    // Legacy .xls can be READ by the grid but not written back through it —
-    // set_cell writes an .xlsx workbook, which would silently change the file's
-    // format under a name that still says .xls.
-    edit: (c) => (isLegacyXls(c.name) ? null : "grid"),
+    // Only the formats the cell writer can actually write get the grid; see
+    // readOnlySheetReason for the rest, which say why instead.
+    edit: (c) => (readOnlySheetReason(c.name) ? null : "grid"),
     render: ({ content: c, target: t, lazy }) => (
       <lazy.SheetView
         mediaToken={c.mediaToken}
         dataB64={c.dataB64}
         target={{ sheet: t?.sheet, range: t?.range ?? t?.cell }}
-        readOnlyReason={
-          isLegacyXls(c.name)
-            ? "This is a legacy Excel 97–2003 file, which Arcelle can read but not write. Export it, save it as .xlsx, and add it back to edit it here."
-            : undefined
-        }
+        readOnlyReason={readOnlySheetReason(c.name)}
       />
     ),
   },
   csv: {
     label: "table",
-    edit: () => "grid",
+    // Honour Rust's per-FILE answer like every other raw-text row. A .csv whose
+    // bytes came back with replacement characters is not the file, and the cell
+    // writer refuses it — so the grid offered an Edit button whose every commit
+    // came back as an error toast over a grid that had already painted the
+    // change.
+    edit: (c) => (c.editable ? "grid" : null),
+    // No `readOnlyReason` here, unlike the workbook rows above: the ONLY thing
+    // that turns a csv read-only is a lossy decode, and the encoding alert
+    // ViewerRouter already draws over this same column says so — naming the
+    // encoding, and ending "Editing stays off until the text reads correctly."
+    // A second sentence beneath it would be the same fact told twice, in
+    // vaguer words, which reads as two different problems.
     render: ({ content: c, target: t, lazy }) => (
       <lazy.SheetView
         text={c.text}
@@ -320,14 +354,16 @@ export const FORMATS: Record<ViewerKind, FormatEntry> = {
     label: "document",
     edit: copyIfText,
     // The catch-all: pptx text we couldn't lay out, RTF, legacy .doc/.ppt, an
-    // oversized raw-text file. The words we DID read lead, and macOS draws the
-    // page underneath — so a .doc shows both its text and what it looks like,
-    // where before it showed a bare `<pre>` at best and nothing at worst.
-    render: ({ fileId, content: c, target: t }) => (
-      <QuickLookView fileId={fileId}>
-        {c.text ? <TextView text={c.text} quote={t?.quote ?? t?.find} /> : null}
-      </QuickLookView>
-    ),
+    // oversized raw-text file. Either the words we read, or — when there were
+    // none — macOS's picture of page one. Never both: Quick Look's caption says
+    // the text here can't be selected or searched, which was a flat
+    // contradiction of the selectable text it was printed underneath.
+    render: ({ fileId, content: c, target: t }) =>
+      c.text ? (
+        <TextView text={c.text} quote={t?.quote ?? t?.find} />
+      ) : (
+        <QuickLookView fileId={fileId} />
+      ),
   },
 
   // ---- media --------------------------------------------------------------

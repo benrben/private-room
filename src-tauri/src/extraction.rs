@@ -288,6 +288,18 @@ pub fn extract_text(name: &str, bytes: &[u8]) -> Option<String> {
     if TEXT_EXTENSIONS.contains(&ext.as_str()) {
         return Some(decode_text_bytes(bytes));
     }
+    // A file with NO extension is decided on its BYTES, because there is no
+    // name left to decide on. Every reader below is chosen by extension, so
+    // README, LICENSE, Makefile, Dockerfile, .gitignore and .env imported with
+    // no extracted text at all: no chunks written, absent from keyword search
+    // and from RAG, invisible to the assistant. (A leading dot is a file STEM,
+    // which is also why the table's "gitignore", "env" and "dockerfile" rows
+    // only ever matched the dotted spellings — `web.dockerfile`.)
+    if ext.is_empty() {
+        if let Some(text) = sniff_text_bytes(bytes) {
+            return Some(text);
+        }
+    }
     // Every reader below parses UNTRUSTED bytes with a third-party crate
     // (pdf-extract, umya-spreadsheet, zip). Import runs these on
     // `spawn_blocking` with the room mutex HELD, so a panic on one malformed
@@ -356,6 +368,31 @@ pub fn extract_text(name: &str, bytes: &[u8]) -> Option<String> {
     })
     .map(|t| normalize_whitespace(&t))
     .filter(|t| !t.trim().is_empty())
+}
+
+/// Text from bytes alone, or None — the last resort for a name that says
+/// nothing about its contents.
+///
+/// Only a FACT about the bytes is accepted: a byte-order mark, or valid UTF-8.
+/// `decode_text_detail`'s third step GUESSES, and a single-byte encoding
+/// decodes any byte sequence at all without complaint — so letting it answer
+/// here would put a page of mojibake from every extension-less binary in the
+/// room into the search index and into the model's context. A NUL rules out
+/// UTF-8 bytes for the same reason: documents do not carry one, and the formats
+/// that do are read by their own parsers above.
+fn sniff_text_bytes(bytes: &[u8]) -> Option<String> {
+    let decoded = decode_text_detail(bytes);
+    match decoded.source {
+        // A BOM names the encoding outright — including the UTF-16 pair, whose
+        // bytes are full of NULs by construction.
+        EncodingSource::Bom => {}
+        EncodingSource::Utf8 if !bytes.contains(&0) => {}
+        _ => return None,
+    }
+    if decoded.lossy || decoded.text.trim().is_empty() {
+        return None;
+    }
+    Some(decoded.text)
 }
 
 /// Run one document reader, turning a panic inside it into "no text".
@@ -1135,6 +1172,43 @@ mod tests {
                     <li><a href=\"/b\">Beta</a></li></ul></body></html>";
         let text = extract_text("links.htm", list.as_bytes()).expect("still has text");
         assert!(text.contains("Alpha") && text.contains("Beta"), "{text}");
+    }
+
+    #[test]
+    fn a_file_with_no_extension_still_gives_up_its_text() {
+        // Every one of these reaches `extension_of` as "", so no reader was
+        // ever chosen for them and the row landed with no extracted text at
+        // all: out of keyword search, out of RAG, invisible to the assistant.
+        // (Dockerfile/.gitignore/.env are in TEXT_EXTENSIONS, but only the
+        // DOTTED spellings — `web.dockerfile` — could ever reach that table.)
+        let readme = "# Arcelle\n\nEverything in this room stays in this room.\n";
+        for name in ["README", "LICENSE", "Makefile", "Dockerfile", ".gitignore", ".env"] {
+            assert_eq!(
+                extract_text(name, readme.as_bytes()).as_deref(),
+                Some(readme),
+                "{name} has readable text in it"
+            );
+        }
+    }
+
+    #[test]
+    fn bytes_that_are_not_text_are_still_refused_without_an_extension() {
+        // The decoder's third step GUESSES, and a single-byte encoding decodes
+        // any bytes at all — so an extension-less binary must be refused on the
+        // bytes rather than indexed as a page of mojibake.
+        let mach_o = [0xCFu8, 0xFA, 0xED, 0xFE, 0x0C, 0x00, 0x00, 0x01, 0x00, 0x00];
+        assert_eq!(extract_text("someprogram", &mach_o), None);
+        // Valid UTF-8 on either side of a NUL is still not a document.
+        let mut with_nul = b"header".to_vec();
+        with_nul.push(0);
+        with_nul.extend_from_slice(b"payload");
+        assert_eq!(extract_text("blob", &with_nul), None);
+        // Legacy bytes with no name to go on: a guess, and a guess is not a
+        // fact about the file.
+        assert_eq!(extract_text("data", &[0xE7u8, 0xE8, 0xE9, 0xEA]), None);
+        // Nothing in it is nothing to index.
+        assert_eq!(extract_text("EMPTY", b""), None);
+        assert_eq!(extract_text("BLANK", b"   \n\t "), None);
     }
 
     #[test]

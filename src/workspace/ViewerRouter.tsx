@@ -25,7 +25,7 @@ let lazyViewers: LazyViewers = makeLazyViewers();
  * otherwise throw through Suspense to the root and unmount the entire app.
  * Catch it here instead and offer a retry. */
 class ViewerChunkBoundary extends Component<
-  { children: ReactNode },
+  { children: ReactNode; resetKey: string },
   { failed: boolean }
 > {
   state = { failed: false };
@@ -36,6 +36,13 @@ class ViewerChunkBoundary extends Component<
     lazyViewers = makeLazyViewers();
     this.setState({ failed: false });
   };
+  // A caught chunk failure otherwise LATCHES: the boundary never unmounts, so
+  // the next document the reader opened — a plain note whose chunk is already
+  // in memory — drew the failure card instead of itself until Retry was
+  // pressed. Opening something else IS the retry.
+  componentDidUpdate(prev: { resetKey: string }) {
+    if (this.state.failed && prev.resetKey !== this.props.resetKey) this.retry();
+  }
   render() {
     if (this.state.failed) {
       return (
@@ -95,7 +102,7 @@ interface ViewerRouterProps {
  */
 export default function ViewerRouter(props: ViewerRouterProps) {
   return (
-    <ViewerChunkBoundary>
+    <ViewerChunkBoundary resetKey={`${props.openFile.id}-${props.openFile.content.kind}`}>
       <Suspense fallback={<div className="empty-hint">Loading viewer…</div>}>
         <ViewerBody {...props} />
       </Suspense>
@@ -177,7 +184,15 @@ function ViewerBody({
   if (editMode && mode === "grid") {
     return (
       <SheetView
-        key={`${openFile.id}-grid-${viewerRev}`}
+        // NOT keyed by `viewerRev` here, unlike every other branch. A grid edit
+        // writes the file, and that write raises the `file-updated` the
+        // workspace answers by bumping `viewerRev` — so the grid remounted on
+        // its OWN commit, throwing away the change marks and the ⌘Z history
+        // that are the only way back out of a cell edit, once per cell. The
+        // component is built for this: it overlays committed values on the
+        // workbook it parsed at open (see `editedAt`) and re-reads the bytes
+        // itself when the streaming token changes.
+        key={`${openFile.id}-grid`}
         mediaToken={c.mediaToken}
         dataB64={c.dataB64}
         text={c.kind === "csv" ? c.text : undefined}

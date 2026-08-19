@@ -12,14 +12,41 @@ function fmtWhen(ts: string | null | undefined): string {
   return Number.isNaN(d.getTime()) ? "" : d.toLocaleString();
 }
 
-/** The human cause line from a script's error text — the executor prefixes
- * "The script failed (exit N):" then the stderr tail; show the most telling
- * line rather than the whole dump. */
-function causeLine(err: string): string {
-  const lines = err.split("\n").map((l) => l.trim()).filter(Boolean);
-  // Prefer the last non-empty stderr line (usually the actual exception);
-  // fall back to the first line.
-  return lines[lines.length - 1] || lines[0] || err;
+/** The opening words of the two paragraphs `script_run.rs` appends after the
+ * stderr tail — the only text in a script failure that is ADVICE rather than
+ * the failure itself. Recognised by their wording rather than by the blank
+ * line in front of them: a blank line is not the runner's signature. CPython
+ * puts one either side of "During handling of the above exception…" on every
+ * re-raise, and treating that as the boundary read a swallowed inner exception
+ * as the cause and printed the rest of the traceback as a suggestion. */
+const GUIDANCE_OPENERS = [
+  "Couldn't auto-install '",
+  "This script imports a package that isn't installed.",
+];
+
+/** A script failure, split into the two different things the runner writes.
+ *
+ * `script_run.rs` stores "The script failed (exit N):" + the stderr tail and
+ * then, for the two commonest failures (a package it could not auto-install, a
+ * module nothing declared), appends a blank line and a paragraph of GUIDANCE.
+ * Taking the last line of the whole text put that guidance under the title
+ * "same error", so the cause of a failing run read "Or ask the assistant to
+ * declare the script's dependencies." and the exception was only in a tooltip.
+ * Wording the runner does not recognise as its own is all stderr, and the
+ * card offers no advice nobody wrote.
+ */
+function splitError(err: string): { cause: string; advice: string } {
+  const paragraphs = err.split("\n\n");
+  const tail = paragraphs.length > 1 ? paragraphs[paragraphs.length - 1].trim() : "";
+  const advice = GUIDANCE_OPENERS.some((o) => tail.startsWith(o)) ? tail : "";
+  const stderr = advice ? paragraphs.slice(0, -1).join("\n\n") : err;
+  const lines = stderr.split("\n").map((l) => l.trim()).filter(Boolean);
+  // Within the stderr the LAST line is the exception; the first is the
+  // executor's own header, which is the only thing an empty tail leaves.
+  return {
+    cause: lines[lines.length - 1] || lines[0] || err.trim(),
+    advice: advice.replace(/\s+/g, " "),
+  };
 }
 
 /** One script's row on the Scripts page: identity + deps/inputs/outputs chips,
@@ -33,6 +60,7 @@ export function ScriptRow({ sc, s, a }: { sc: ScriptInfo; s: WSState; a: WSActio
   const jobId = sc.lastRun?.jobId ?? undefined;
   const live = jobId ? s.jobProgress[jobId] : undefined;
   const lastStatus = sc.lastRun?.status ?? null;
+  const incident = sc.lastError ? splitError(sc.lastError) : null;
 
   async function toggleHistory() {
     if (histOpen) {
@@ -100,8 +128,12 @@ export function ScriptRow({ sc, s, a }: { sc: ScriptInfo; s: WSState; a: WSActio
               {sc.consecutiveFailures === 1 ? " time" : " times in a row — same error"}
             </div>
             <div className="script-incident-cause" title={sc.lastError}>
-              {causeLine(sc.lastError)}
+              {incident?.cause}
             </div>
+            {/* What to do about it, when the runner had something to say —
+                kept OUT of the cause line above, which is stderr and nothing
+                else. */}
+            {incident?.advice && <div className="caption">{incident.advice}</div>}
           </div>
           <div className="script-incident-actions">
             <button

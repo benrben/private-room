@@ -1,7 +1,8 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api } from "../api";
 import TextView from "../workspace/TextView";
 import QuickLookView from "./QuickLookView";
+import { applyQuoteHighlight, clearQuoteHighlight } from "./highlight";
 import "./officedoc.css";
 
 /**
@@ -38,7 +39,25 @@ export default function OfficeDocView({
   // The formatted document renders in an opaque frame, so a selection made in
   // it never reaches the app. This second reading is the same one the page and
   // book readers offer, and the only way this document's words can be quoted.
-  const [mode, setMode] = useState<"page" | "text">("page");
+  const [mode, setMode] = useState<"page" | "text">(quote ? "text" : "page");
+  const textRef = useRef<HTMLPreElement>(null);
+
+  // A citation lands on the Text side because it can land nowhere else: the
+  // formatted page is an opaque frame that cannot be annotated or scrolled
+  // from here. Opening on Page with the passage unmarked left the reader to
+  // find the quote by eye — the one thing clicking a citation is for.
+  useEffect(() => {
+    if (quote) setMode("text");
+  }, [quote]);
+
+  useEffect(() => {
+    if (!quote || mode !== "text" || !textRef.current) return;
+    applyQuoteHighlight(textRef.current, quote);
+    return clearQuoteHighlight;
+    // `state` is a dependency because the pane only exists once the import has
+    // finished: a citation clicked while the document was still opening would
+    // otherwise never be painted.
+  }, [quote, mode, text, state]);
 
   useEffect(() => {
     let alive = true;
@@ -108,7 +127,7 @@ export default function OfficeDocView({
         {mode === "text" && (
           <div className="odoc-text">
             {text?.trim() ? (
-              <pre className="html-doc" dir="auto">
+              <pre className="html-doc" dir="auto" ref={textRef}>
                 {text}
               </pre>
             ) : (

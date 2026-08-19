@@ -556,12 +556,23 @@ async def _gather_window(client: ModelClient, model: str) -> int:
     prompt and the instruction — so the summary came back rambling or empty
     with no error.
 
-    A non-local engine owns its own window on the remote side and is never
-    sized here, so it keeps the ceiling (unchanged behaviour).
+    A provider room states its window in its own catalog entry
+    (:attr:`config.Provider.context_window`), and every call it makes is cut to
+    that window by :meth:`provider_api.OpenAICompatibleChatModel._fit_one_shot`
+    — silently. Budgeting an 8k cloud model's reads off this Mac's RAM instead
+    spent hundreds of KB the provider then threw away, so the one-liner was
+    written from a truncated read nothing had reported as truncated. The
+    ceiling still caps it: the gathered text is held in THIS process first.
+
+    A cloud CLI states no window, and neither does a provider whose catalog
+    entry carries none, so both keep the ceiling (unchanged behaviour).
     """
     from .external_llm import is_external_model
 
     ceiling = max_num_ctx()
+    provider_window = getattr(getattr(client, "provider", None), "context_window", None)
+    if provider_window:
+        return min(ceiling, provider_window)
     base_url = getattr(client, "base_url", "")
     if not base_url or getattr(client, "provider", None) is not None:
         return ceiling

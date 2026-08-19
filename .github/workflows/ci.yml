@@ -82,9 +82,14 @@ jobs:
           touch src-tauri/resources/models/ggml-large-v3-turbo-q5_0.bin
           mkdir -p src-tauri/resources/sidecar/arcelle-sidecar
       - run: cargo test --manifest-path src-tauri/Cargo.toml
-      # Report-only on purpose: the tree has never been through clippy, so a
-      # failing gate here would just be switched off. Read the output, fix
-      # what it finds, and turn this into a gate once it is quiet.
+      # Report-only on purpose: a gate that fails on day one just gets switched
+      # off. Deferred, not forgotten — measured 2026-08-18 with
+      # `npm run lint:rust`: 53 distinct findings (118 lines, the lib being
+      # linted again through its test targets), no bugs among them. The biggest
+      # groups are `map_or`, needless borrows, `vec!` in tests, and eight
+      # `assertions_on_constants` — those last are the deliberate
+      # constant-invariant tests, so they want an `#[allow]` with a reason
+      # rather than a rewrite. Clear the 53, then delete `continue-on-error`.
       - name: clippy (report only)
         continue-on-error: true
         run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets

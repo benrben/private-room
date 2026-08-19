@@ -98,6 +98,9 @@ pub fn spawn_workflow_scheduler(app: &tauri::AppHandle) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         catch_up_pass(&app, generation).await;
+        // Everything already overdue has just been settled, so the loop's watch
+        // starts here: a slot older than this one was not skipped by us.
+        let mut watching_since = utc_now_string();
         loop {
             {
                 let state = app.state::<AppState>();
@@ -108,14 +111,39 @@ pub fn spawn_workflow_scheduler(app: &tauri::AppHandle) {
                     return;
                 }
             }
-            tick(&app, generation).await;
+            let looked_at = utc_now_string();
+            tick(&app, generation, &watching_since).await;
+            watching_since = looked_at;
             tokio::time::sleep(std::time::Duration::from_secs(TICK_SECS)).await;
         }
     });
 }
 
+/// Was this schedule's slot passed while the loop was already watching and did
+/// NOT fire it? Then nothing was ever going to: at that moment the workflow was
+/// a draft or the schedule was off, which is the same missed run "Catch up at
+/// unlock" governs.
+///
+/// `watching_since` is the START of the PREVIOUS tick, deliberately — not a
+/// grace period measured from now. A slot that fell after it (the machine was
+/// asleep, the clock jumped, a tick was slow) was never looked at, so it is
+/// merely LATE, and a late run still runs. A lateness threshold cannot tell
+/// those apart and would silently drop a run the user was owed.
+///
+/// Both timestamps are the stored UTC strings; an unreadable one is not
+/// evidence of a miss.
+fn is_missed(next_run_at: Option<&str>, watching_since: &str) -> bool {
+    let Some(due) = next_run_at.and_then(|s| DateTime::parse_from_rfc3339(s).ok()) else {
+        return false;
+    };
+    let Ok(since) = DateTime::parse_from_rfc3339(watching_since) else {
+        return false;
+    };
+    due < since
+}
+
 /// Read the currently-due schedules (under the lock, then drop it) and fire each.
-async fn tick(app: &tauri::AppHandle, generation: u64) {
+async fn tick(app: &tauri::AppHandle, generation: u64, watching_since: &str) {
     use tauri::Manager;
     let now = utc_now_string();
     let due: Vec<(db::Schedule, db::Workflow)> = {
@@ -131,8 +159,25 @@ async fn tick(app: &tauri::AppHandle, generation: u64) {
                 return;
             }
         }
+        // A slot missed while the workflow was a draft is governed by "Catch up
+        // at unlock" exactly as one missed while the app was closed is —
+        // otherwise activating a workflow starts a full pass within 30 s.
+        if !sched.catch_up && is_missed(sched.next_run_at.as_deref(), watching_since) {
+            skip_missed_run(app, &sched);
+            continue;
+        }
         fire(app, &sched, &wf, "schedule").await;
     }
+}
+
+/// Skip a missed run: advance `next_run_at` past now without firing, so the
+/// schedule resumes at its next slot instead of running late.
+fn skip_missed_run(app: &tauri::AppHandle, sched: &db::Schedule) {
+    use tauri::Manager;
+    let next = next_run_from_now(&sched.kind, &sched.param);
+    let state = app.state::<AppState>();
+    let _ = state
+        .with_room(|room| db::set_schedule_next_run(&room.conn, &sched.id, next.as_deref()));
 }
 
 /// The one-shot catch-up at unlock: for every enabled schedule of an active
@@ -157,12 +202,7 @@ async fn catch_up_pass(app: &tauri::AppHandle, generation: u64) {
         if sched.catch_up {
             fire(app, &sched, &wf, "catchup").await;
         } else {
-            // Skip the missed run, just advance so it doesn't fire immediately.
-            let next = next_run_from_now(&sched.kind, &sched.param);
-            let state = app.state::<AppState>();
-            let _ = state.with_room(|room| {
-                db::set_schedule_next_run(&room.conn, &sched.id, next.as_deref())
-            });
+            skip_missed_run(app, &sched);
         }
     }
 }
@@ -255,6 +295,35 @@ mod tests {
         let next = next_run_after("daily", "02:30", after);
         assert!(next.is_some(), "a valid daily schedule must always resolve");
         assert!(next.unwrap() > after);
+    }
+
+    #[test]
+    fn a_slot_missed_while_the_workflow_was_a_draft_counts_as_missed() {
+        // The repro: daily 08:00, left in draft across it, activated at 10:00.
+        // The loop was watching at 09:59:30 and did not fire it, so nothing was
+        // ever going to.
+        assert!(is_missed(Some("2026-08-18T08:00:00Z"), "2026-08-18T09:59:30Z"));
+        // One second before the previous look is still on the missed side.
+        assert!(is_missed(Some("2026-08-18T09:59:29Z"), "2026-08-18T09:59:30Z"));
+    }
+
+    #[test]
+    fn a_slot_the_loop_never_looked_at_is_late_not_missed() {
+        // The machine slept from 07:30 to 11:00 with the room unlocked: the
+        // 08:00 slot fell while nothing was watching, so it is owed a late run.
+        // A lateness threshold would have called it missed and dropped it.
+        assert!(!is_missed(Some("2026-08-18T08:00:00Z"), "2026-08-18T07:30:00Z"));
+        // The boundary: due exactly at the previous look — that tick would have
+        // fired it, so err towards running.
+        assert!(!is_missed(Some("2026-08-18T09:59:30Z"), "2026-08-18T09:59:30Z"));
+        // An ordinary live schedule, half a tick behind.
+        assert!(!is_missed(Some("2026-08-18T09:59:45Z"), "2026-08-18T09:59:30Z"));
+        // A future slot is never a miss (due_schedules wouldn't return it).
+        assert!(!is_missed(Some("2026-08-18T11:00:00Z"), "2026-08-18T09:59:30Z"));
+        // Nothing to judge, or an unreadable stamp: not evidence of a miss.
+        assert!(!is_missed(None, "2026-08-18T09:59:30Z"));
+        assert!(!is_missed(Some("whenever"), "2026-08-18T09:59:30Z"));
+        assert!(!is_missed(Some("2026-08-18T08:00:00Z"), "whenever"));
     }
 
     #[test]

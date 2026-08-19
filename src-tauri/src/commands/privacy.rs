@@ -29,6 +29,10 @@ const KEY_CONCEPTS: &str = "cloud_privacy_concepts"; // JSON array of strings
 /// Bump when the scanner's behavior changes enough that old scans are stale.
 const SCANNER_VERSION: &str = "v1";
 
+/// How many private topics one room may hold. Every one of them is sent to the
+/// live guard on each cloud turn, so the list is a prompt as well as a setting.
+const MAX_PRIVACY_CONCEPTS: usize = 20;
+
 // ---------------------------------------------------------------------------
 // Mechanics
 // ---------------------------------------------------------------------------
@@ -259,6 +263,10 @@ impl PolicyState {
             })).collect::<Vec<_>>(),
             "concepts": self.concepts,
             "guard_model": guard_model,
+            // Only this side can see where the Ollama transport points, and the
+            // model name cannot: the Closet aims an ordinary `qwen3.5:4b` at
+            // another computer. Told, never guessed.
+            "relayed": !super::capabilities::ollama_runs_here(),
         })
     }
 }
@@ -336,6 +344,42 @@ pub(crate) fn remote_seam_redactor() -> Option<Arc<PolicyState>> {
 /// it is made visible, so both switches can be believed.
 pub(crate) fn connector_args_masked(unmask_outbound: bool) -> bool {
     remote_seam_redactor().is_some() && super::masks_outbound_args(true, unmask_outbound)
+}
+
+/// The panel's version of the question, asked once per REMOTE connector this
+/// room has connected.
+///
+/// The unmasking flag became per-connector on 2026-08-03 and this note did not
+/// follow it: reading the Mac-wide switch alone, the panel printed "a remote
+/// connector is still sent placeholders" while a connector whose own override
+/// says otherwise received the real names — and printed the leak warning for
+/// seams that were masked. `exec_tool` decides per connector
+/// ([`super::outbound_unmask_for`]), so the honest summary is the weakest
+/// answer among them: the note may only claim masking when EVERY remote
+/// connector is masked. A DISABLED connector cannot be called at all, so its
+/// override says nothing about what leaves this room; with no remote connector
+/// in the list there is no seam to describe and the Mac-wide switch is the
+/// room-wide answer, as before.
+fn every_connector_masked(state: &AppState) -> bool {
+    let remote: Vec<String> = state
+        .mcp
+        .lock()
+        .unwrap()
+        .statuses()
+        .into_iter()
+        .filter(|s| s.remote && s.status != mcp::Status::Disabled)
+        .map(|s| s.name)
+        .collect();
+    if remote.is_empty() {
+        return connector_args_masked(
+            state
+                .mcp_outbound_unmask
+                .load(std::sync::atomic::Ordering::SeqCst),
+        );
+    }
+    remote
+        .iter()
+        .all(|name| connector_args_masked(outbound_unmask_for(state, name)))
 }
 
 /// PRIV-4 — the WEB seam. Mask the room's protected entities out of a string
@@ -506,28 +550,71 @@ fn set_global_default(app: &tauri::AppHandle, on: bool) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-/// Recompute the cached policy from the open room + the global default. Call
-/// after room open, any privacy-settings change, and any entity-map change.
-pub(crate) fn refresh_policy(app: &tauri::AppHandle, state: &AppState) {
-    let computed = compute_policy(app, state);
-    *policy_cell().lock().unwrap() = computed.map(Arc::new);
+/// What a recomputation could establish about the room's policy.
+enum Computed {
+    /// No room is open — the teardown invariant: no policy outlives a room.
+    NoRoom,
+    Policy(PolicyState),
+    /// The room is open but its ENTITY MAP could not be read. Everything else
+    /// (the switch, the topic rules, the guard model) is known; only the
+    /// mechanical rules are missing.
+    Partial(PolicyState),
 }
 
-fn compute_policy(app: &tauri::AppHandle, state: &AppState) -> Option<PolicyState> {
+/// Recompute the cached policy from the open room + the global default. Call
+/// after room open, any privacy-settings change, and any entity-map change.
+///
+/// A failed entity-map read used to land here as `None`, which cleared the cell
+/// — and a cleared cell is the door wide open: no policy on the sidecar request
+/// (so nothing redacted and images no longer stripped), no outbound masking of
+/// remote-connector arguments, no masking of web queries, and the scanner
+/// silently declining to run. All of that from one transient read, with the
+/// panel still reading "On for this room". So a read failure keeps the rules
+/// already in force and applies THIS room's switch and topics to them: the
+/// switch is what decides whether the model seams engage, so it may never come
+/// from a stale reading, while rules only ever hide more.
+pub(crate) fn refresh_policy(app: &tauri::AppHandle, state: &AppState) {
+    install_policy(compute_policy(app, state));
+}
+
+/// Put a recomputation into the cell — the one place the cell is written in a
+/// real run, and the whole of the fail-closed rule above.
+fn install_policy(computed: Computed) {
+    match computed {
+        Computed::NoRoom => *policy_cell().lock().unwrap() = None,
+        Computed::Policy(p) => *policy_cell().lock().unwrap() = Some(Arc::new(p)),
+        Computed::Partial(mut p) => {
+            let mut cell = policy_cell().lock().unwrap();
+            if let Some(previous) = cell.as_ref() {
+                p.rules = previous.rules.clone();
+                p.redactor = Redactor::new(p.rules.clone());
+            }
+            *cell = Some(Arc::new(p));
+        }
+    }
+}
+
+fn compute_policy(app: &tauri::AppHandle, state: &AppState) -> Computed {
     let guard = state.room.lock().unwrap();
-    let room = guard.as_ref()?;
+    let Some(room) = guard.as_ref() else {
+        return Computed::NoRoom;
+    };
     let switch = db::get_setting(&room.conn, KEY_SWITCH);
     let active = match switch.as_deref() {
         Some("off") => false,
         Some("on") => true,
         _ => global_default_on(app),
     };
-    let entities = db::list_privacy_entities(&room.conn).ok()?;
+    let entities = db::list_privacy_entities(&room.conn);
     let rules: Vec<(String, String)> = entities
-        .iter()
-        .filter(|e| e.source != "dismissed")
-        .map(|e| (e.real_text.clone(), e.placeholder.clone()))
-        .collect();
+        .as_ref()
+        .map(|list| {
+            list.iter()
+                .filter(|e| e.source != "dismissed")
+                .map(|e| (e.real_text.clone(), e.placeholder.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
     let concepts = parse_concepts(db::get_setting(&room.conn, KEY_CONCEPTS));
     // The live guard + scanner need a model that runs ON THIS MAC. The room's
     // chosen model qualifies only when local; otherwise the tuned default.
@@ -543,13 +630,17 @@ fn compute_policy(app: &tauri::AppHandle, state: &AppState) -> Option<PolicyStat
     } else {
         DEFAULT_MODEL.to_string()
     };
-    Some(PolicyState {
+    let policy = PolicyState {
         active,
         redactor: Redactor::new(rules.clone()),
         rules,
         concepts,
         guard_model,
-    })
+    };
+    match entities {
+        Ok(_) => Computed::Policy(policy),
+        Err(_) => Computed::Partial(policy),
+    }
 }
 
 /// Attach the room policy to a sidecar request body when its `model` is
@@ -629,17 +720,7 @@ pub async fn privacy_status(
     state: State<'_, AppState>,
 ) -> Result<PrivacyStatus, String> {
     let global_on = global_default_on(&app);
-    // The Mac-wide switch, not `outbound_unmask_for`, because this is a
-    // room-wide statement with no one connector in view — and because
-    // `effective_power` currently returns the global switch for every
-    // connector anyway, so the two agree. If per-connector overrides are ever
-    // made to bite, this becomes a per-connector question and the panel's two
-    // notes have to be able to appear together (some masked, some not).
-    let connector_masked = connector_args_masked(
-        state
-            .mcp_outbound_unmask
-            .load(std::sync::atomic::Ordering::SeqCst),
-    );
+    let connector_masked = every_connector_masked(&state);
     state.with_room(|room| {
         let switch = db::get_setting(&room.conn, KEY_SWITCH);
         let effective = match switch.as_deref() {
@@ -676,17 +757,18 @@ pub async fn set_privacy_room(
 ) -> Result<(), String> {
     state.with_room(|room| match mode.as_str() {
         "on" | "off" => db::set_setting(&room.conn, KEY_SWITCH, &mode),
-        "default" => {
-            let _ = room
-                .conn
-                .execute("DELETE FROM settings WHERE key = ?1", [KEY_SWITCH]);
-            Ok(())
-        }
+        // "Follow the app default instead" is a write like any other: a DELETE
+        // that failed used to return Ok, so the panel reloaded with the
+        // override still in place and nothing said why.
+        "default" => room
+            .conn
+            .execute("DELETE FROM settings WHERE key = ?1", [KEY_SWITCH])
+            .map(|_| ())
+            .map_err(|e| e.to_string()),
         other => Err(format!("unknown privacy mode: {other}")),
     })?;
     refresh_policy(&app, &state);
-    if active_policy().is_some() || policy_cell().lock().unwrap().as_ref().map_or(false, |p| p.active)
-    {
+    if active_policy().is_some() {
         schedule_privacy_scan(app);
     }
     Ok(())
@@ -762,6 +844,31 @@ pub async fn remove_privacy_entity(
     Ok(())
 }
 
+/// Trim the topic list, drop the blank lines, and REFUSE one over the cap.
+///
+/// It used to `take(20)`: the extra topics were dropped, the panel's reload
+/// rewrote the box from the twenty that were stored, and the rest of what the
+/// user had typed vanished with nothing said — while they had every reason to
+/// believe those topics were protected. Same doctrine as `add_privacy_block`'s
+/// two-character floor: the door states its limits at its own entrance, and
+/// stores all of what it accepts. Pure — unit-tested.
+fn clean_concepts(concepts: Vec<String>) -> Result<Vec<String>, String> {
+    let cleaned: Vec<String> = concepts
+        .into_iter()
+        .map(|c| c.trim().to_string())
+        .filter(|c| !c.is_empty())
+        .collect();
+    if cleaned.len() > MAX_PRIVACY_CONCEPTS {
+        return Err(format!(
+            "That is {} private topics — this room holds at most {MAX_PRIVACY_CONCEPTS}. \
+             Nothing was saved: shorten the list and save again, or add the rest as \
+             protected items below.",
+            cleaned.len()
+        ));
+    }
+    Ok(cleaned)
+}
+
 /// Replace the concept list ("my health", "my kids"). Changes the scan rules,
 /// so stale files re-scan in the background.
 #[tauri::command]
@@ -770,12 +877,7 @@ pub async fn set_privacy_concepts(
     state: State<'_, AppState>,
     concepts: Vec<String>,
 ) -> Result<(), String> {
-    let cleaned: Vec<String> = concepts
-        .into_iter()
-        .map(|c| c.trim().to_string())
-        .filter(|c| !c.is_empty())
-        .take(20)
-        .collect();
+    let cleaned = clean_concepts(concepts)?;
     state.with_room(|room| {
         db::set_setting(
             &room.conn,
@@ -929,13 +1031,21 @@ pub(crate) fn schedule_privacy_scan(app: tauri::AppHandle) {
     // A new attempt supersedes whatever the last one had to say.
     *last_scan_error().lock().unwrap() = None;
     tauri::async_runtime::spawn(async move {
-        let error = run_privacy_scan(app.clone()).await;
+        let ScanEnd { error, room_changed } = run_privacy_scan(app.clone()).await;
         scan_flag().store(false, Ordering::SeqCst);
         *last_scan_error().lock().unwrap() = error.clone();
         use tauri::Manager;
         let state = app.state::<AppState>();
         refresh_policy(&app, &state);
         emit_scan_done(&app, error);
+        // The room this run belonged to was replaced. Whatever room is open now
+        // asked for its own scan while this one still held the flag and was
+        // turned away by the idempotence check above, so it is started here —
+        // once, and only after the flag is clear. A run that ends normally
+        // never lands here, so this cannot loop.
+        if room_changed {
+            schedule_privacy_scan(app);
+        }
     });
 }
 
@@ -949,10 +1059,45 @@ fn emit_scan_done(app: &tauri::AppHandle, error: Option<String>) {
     );
 }
 
-/// Returns the user-facing error when the scan could not run (the caller
-/// emits exactly ONE terminal event, so an error is never overwritten).
-async fn run_privacy_scan(app: tauri::AppHandle) -> Option<String> {
+/// How a scan run ended.
+struct ScanEnd {
+    /// The user-facing error when the scan could not run (the caller emits
+    /// exactly ONE terminal event, so an error is never overwritten).
+    error: Option<String>,
+    /// The run was ABANDONED because the room it was scanning was replaced.
+    room_changed: bool,
+}
+
+impl ScanEnd {
+    fn finished(error: Option<String>) -> Self {
+        ScanEnd { error, room_changed: false }
+    }
+
+    /// The room moved under the run. Not an error the user should read: the
+    /// room they were in is closed, and its findings are simply not this room's
+    /// business.
+    fn abandoned() -> Self {
+        ScanEnd { error: None, room_changed: true }
+    }
+}
+
+async fn run_privacy_scan(app: tauri::AppHandle) -> ScanEnd {
     use tauri::{Emitter, Manager};
+
+    // The room these findings belong to. Every write below re-checks it: the
+    // scan is a long loop around a sidecar call, so locking this room and
+    // opening another mid-chunk used to file the names, addresses and phone
+    // numbers read out of THIS room's documents into the next room's
+    // `privacy_entities` table, where they showed up as its protected items.
+    // Same room-path + epoch pin `AppState::room_epoch` documents.
+    let (room_path, epoch) = {
+        let state = app.state::<AppState>();
+        let guard = state.room.lock().unwrap();
+        let Some(room) = guard.as_ref() else {
+            return ScanEnd::finished(None);
+        };
+        (room.path.clone(), state.room_epoch())
+    };
 
     // Show life immediately — waking the daemon below can take seconds, and a
     // button that does nothing for that long reads as broken.
@@ -967,7 +1112,7 @@ async fn run_privacy_scan(app: tauri::AppHandle) -> Option<String> {
     let _daemon = match crate::ollama::wake_daemon().await {
         Ok(g) => g,
         Err(e) => {
-            return Some(format!("The local AI engine isn't available: {e}"));
+            return ScanEnd::finished(Some(format!("The local AI engine isn't available: {e}")));
         }
     };
 
@@ -991,12 +1136,20 @@ async fn run_privacy_scan(app: tauri::AppHandle) -> Option<String> {
         let state = app.state::<AppState>();
         let snapshot = {
             let guard = state.room.lock().unwrap();
-            let Some(room) = guard.as_ref() else { return None };
+            let Some(room) = guard.as_ref() else {
+                return ScanEnd::finished(None);
+            };
+            // A different room (or the same path reopened) is not this run's to
+            // read or write. Checked before the work list as well as before the
+            // findings, so nothing from room A is even looked up in room B.
+            if room.path != room_path || state.room_epoch() != epoch {
+                return ScanEnd::abandoned();
+            }
             let concepts = parse_concepts(db::get_setting(&room.conn, KEY_CONCEPTS));
             let sha = rules_sha(&concepts);
             let work = match db::files_needing_privacy_scan(&room.conn, &sha) {
                 Ok(w) => w,
-                Err(e) => return Some(e),
+                Err(e) => return ScanEnd::finished(Some(e)),
             };
             let known: Vec<String> = db::list_privacy_entities(&room.conn)
                 .unwrap_or_default()
@@ -1013,7 +1166,7 @@ async fn run_privacy_scan(app: tauri::AppHandle) -> Option<String> {
         };
         let (concepts, sha, work, mut known, guard_model) = snapshot;
         if work.is_empty() {
-            return None;
+            return ScanEnd::finished(None);
         }
         // Anything that already failed this run is not retried in it.
         let work: Vec<_> = work.into_iter().filter(|(id, _, _)| !failed.contains(id)).collect();
@@ -1021,13 +1174,13 @@ async fn run_privacy_scan(app: tauri::AppHandle) -> Option<String> {
             // Everything left is something we just failed on. Say so — counts
             // only, never a file name (a name is room content) — and stop, so
             // the next import or "Scan now" is what retries.
-            return Some(format!(
+            return ScanEnd::finished(Some(format!(
                 "{} file{} couldn't be scanned all the way through this time — \
                  anything found so far is protected, the rest is not yet. They'll \
                  be retried on the next import, or when you press Scan now.",
                 failed.len(),
                 if failed.len() == 1 { "" } else { "s" }
-            ));
+            )));
         }
         let total = work.len();
         for (i, (file_id, name, text)) in work.into_iter().enumerate() {
@@ -1078,7 +1231,16 @@ async fn run_privacy_scan(app: tauri::AppHandle) -> Option<String> {
                         .unwrap_or_default();
                     let state = app.state::<AppState>();
                     let guard = state.room.lock().unwrap();
-                    let Some(room) = guard.as_ref() else { return None };
+                    let Some(room) = guard.as_ref() else {
+                        return ScanEnd::finished(None);
+                    };
+                    // These findings came out of the PINNED room's document. If
+                    // the room was locked and another opened while the sidecar
+                    // was working, they are dropped rather than filed in
+                    // whichever room happens to be open now.
+                    if room.path != room_path || state.room_epoch() != epoch {
+                        return ScanEnd::abandoned();
+                    }
                     for f in findings {
                         let real = f.get("text").and_then(|t| t.as_str()).unwrap_or("");
                         let cat = f.get("category").and_then(|c| c.as_str()).unwrap_or("concept");
@@ -1132,7 +1294,7 @@ async fn run_privacy_scan(app: tauri::AppHandle) -> Option<String> {
                          retry on the next import or when you press Scan now."
                             .to_string()
                     };
-                    return Some(msg);
+                    return ScanEnd::finished(Some(msg));
                 }
                 Err(_) => {
                     // Transient failure on this file: leave it stale (no scan
@@ -1362,12 +1524,190 @@ mod tests {
     }
 
     #[test]
+    fn topics_past_the_cap_are_refused_rather_than_dropped() {
+        // The box took 25 lines, the backend kept 20, and the panel's reload
+        // rewrote the box from what was stored — so five topics the user
+        // believed were protected disappeared with no error and no mention of a
+        // cap anywhere in the copy.
+        let lines = |n: usize| (0..n).map(|i| format!("topic {i}")).collect::<Vec<_>>();
+        assert_eq!(clean_concepts(vec![]).unwrap().len(), 0);
+        assert_eq!(clean_concepts(lines(1)).unwrap().len(), 1);
+        assert_eq!(
+            clean_concepts(lines(MAX_PRIVACY_CONCEPTS)).unwrap().len(),
+            MAX_PRIVACY_CONCEPTS,
+            "the cap itself must still save"
+        );
+        let err = clean_concepts(lines(MAX_PRIVACY_CONCEPTS + 1))
+            .expect_err("one past the cap was silently truncated");
+        assert!(err.contains(&MAX_PRIVACY_CONCEPTS.to_string()), "{err}");
+        assert!(err.contains("Nothing was saved"), "{err}");
+        // Blank and whitespace-only lines are not topics, so a list that only
+        // exceeds the cap by way of them is still saved whole.
+        let mut padded = lines(MAX_PRIVACY_CONCEPTS);
+        padded.extend(["".to_string(), "   ".to_string()]);
+        assert_eq!(
+            clean_concepts(padded).unwrap().len(),
+            MAX_PRIVACY_CONCEPTS,
+            "empty lines must not spend the room's allowance"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_entity_map_never_opens_the_door() {
+        // The reported failure: `list_privacy_entities` returning Err made
+        // `compute_policy` answer None, which CLEARED the cell — and a cleared
+        // cell is every seam open at once (no policy on the request, no image
+        // stripping, no outbound masking, no scan) while Settings kept saying
+        // "On for this room".
+        let _guard = policy_test_lock();
+        clear_policy();
+        let partial = || PolicyState {
+            active: true,
+            rules: vec![],
+            concepts: vec!["my health".into()],
+            guard_model: DEFAULT_MODEL.to_string(),
+            redactor: Redactor::new(vec![]),
+        };
+        // Nothing cached yet: the room's switch and topics are still known, so
+        // the door stays armed with no rules rather than vanishing.
+        install_policy(Computed::Partial(partial()));
+        let policy = active_policy().expect("a read failure must not disarm the door");
+        assert_eq!(policy.concepts, vec!["my health".to_string()]);
+
+        // With rules already in force, they stay in force — they are the only
+        // copy of the entity map this Mac has until a read succeeds.
+        install_policy(Computed::Policy(PolicyState {
+            active: true,
+            rules: vec![("Ben Reich".into(), "[Person A]".into())],
+            concepts: vec![],
+            guard_model: DEFAULT_MODEL.to_string(),
+            redactor: Redactor::new(vec![("Ben Reich".into(), "[Person A]".into())]),
+        }));
+        install_policy(Computed::Partial(partial()));
+        let kept = active_policy().expect("still armed");
+        assert_eq!(kept.rules.len(), 1, "the known entities must survive a failed read");
+        let mut report = PrivacyReport::default();
+        assert_eq!(kept.redactor.redact("from Ben Reich", &mut report), "from [Person A]");
+
+        // A closed room is the one case that empties the cell (teardown).
+        install_policy(Computed::NoRoom);
+        assert!(policy_cell().lock().unwrap().is_none());
+        clear_policy();
+    }
+
+    /// A connector row as the manager holds one — only its name and whether it
+    /// is remote matter to the seam under test.
+    fn connector(name: &str, remote: bool) -> crate::mcp::Server {
+        crate::mcp::Server {
+            name: name.to_string(),
+            status: crate::mcp::Status::Connected,
+            error: None,
+            tools: Vec::new(),
+            remote,
+            client: None,
+            config_key: String::new(),
+        }
+    }
+
+    fn unmask_override(state: &AppState, server: &str, value: Option<bool>) {
+        let mut powers = state.mcp_connector_powers.lock().unwrap();
+        powers.clear();
+        if let Some(v) = value {
+            powers.insert(
+                server.to_string(),
+                super::super::ConnectorOverride {
+                    auto_approve: None,
+                    outbound_unmask: Some(v),
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn the_masking_note_follows_the_connectors_not_the_mac_wide_switch() {
+        // Unmasking became per-connector on 2026-08-03 and this note did not:
+        // reading only the Mac-wide switch, Cloud privacy printed "a remote
+        // connector is still sent placeholders" while a connector whose own
+        // override says otherwise received the real names — and printed the
+        // leak warning for a seam that was masked.
+        use std::sync::atomic::Ordering::SeqCst;
+        let _guard = policy_test_lock();
+        clear_policy();
+        set_policy_for_test(false); // the seam is switch-blind; the map is what counts
+        let state = AppState::default();
+        {
+            let mut mgr = state.mcp.lock().unwrap();
+            mgr.servers = vec![connector("fetch", true), connector("files", false)];
+        }
+        assert!(
+            every_connector_masked(&state),
+            "both follow the Mac-wide switch, which is off: everything is masked"
+        );
+
+        unmask_override(&state, "fetch", Some(true));
+        assert!(
+            !every_connector_masked(&state),
+            "one remote connector is sent real values — the note may not claim otherwise"
+        );
+
+        // The mirror case: the switch says real values, one connector says no.
+        state.mcp_outbound_unmask.store(true, SeqCst);
+        unmask_override(&state, "fetch", None);
+        assert!(!every_connector_masked(&state));
+        unmask_override(&state, "fetch", Some(false));
+        assert!(
+            every_connector_masked(&state),
+            "the only remote connector is masked, so the leak warning would be wrong"
+        );
+
+        // A LOCAL connector's override is about a seam that does not leave the
+        // Mac, so it may not decide this note either way.
+        state.mcp_outbound_unmask.store(false, SeqCst);
+        unmask_override(&state, "files", Some(true));
+        assert!(every_connector_masked(&state));
+
+        // Nor may a connector that is switched off: nothing can be sent to it.
+        {
+            let mut mgr = state.mcp.lock().unwrap();
+            mgr.servers[0].status = crate::mcp::Status::Disabled;
+        }
+        unmask_override(&state, "fetch", Some(true));
+        assert!(
+            every_connector_masked(&state),
+            "a disabled connector receives nothing, so it cannot be the exception"
+        );
+        clear_policy();
+    }
+
+    #[test]
     fn rules_sha_changes_with_concepts_only() {
         let a = rules_sha(&["my health".into()]);
         let b = rules_sha(&["my health".into(), "my kids".into()]);
         let c = rules_sha(&["my kids".into(), "my health".into()]);
         assert_ne!(a, b);
         assert_eq!(b, c); // order-independent
+    }
+
+    /// The sidecar cannot see where the Ollama transport points, so the answer
+    /// travels with the policy. Without it the Closet — a local-NAMED model
+    /// aimed at another computer — reached the door reading "local" and nothing
+    /// was redacted.
+    #[test]
+    fn the_payload_tells_the_sidecar_whether_the_transport_is_relayed() {
+        let _guard = policy_test_lock();
+        let state = PolicyState {
+            active: true,
+            rules: vec![],
+            concepts: vec![],
+            guard_model: "qwen3.5:4b".into(),
+            redactor: Redactor::new(vec![]),
+        };
+        let sent = state.payload();
+        assert_eq!(
+            sent.get("relayed").and_then(|v| v.as_bool()),
+            Some(!super::super::capabilities::ollama_runs_here()),
+            "the wire must carry the transport verdict, not leave it to the name"
+        );
     }
 
     #[test]

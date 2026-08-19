@@ -13,9 +13,30 @@ pub(crate) fn is_embedding_model(model: &str) -> bool {
     m.starts_with(ollama::EMBED_MODEL) || m.contains("embed") || m.contains("bge-")
 }
 
+/// The installed tag that IS the default, if one of them is.
+///
+/// Recognised by prefix, because `qwen3.5:4b-mlx` and `qwen3.5:4b-q4_K_M` are
+/// builds of the default and picking them is the whole point — but the tag
+/// RETURNED has to be the one Ollama was listed as holding. Returning the bare
+/// constant instead meant a Mac with only the MLX build asked for a model that
+/// does not exist there, and every caller falling back to the default got
+/// `model 'qwen3.5:4b' not found` with nothing to say why.
+///
+/// Exact first: with several builds installed, the plain tag is the one the
+/// app's own defaults were tuned against.
+fn installed_default(models: &[String]) -> Option<&String> {
+    models
+        .iter()
+        .find(|m| *m == DEFAULT_MODEL)
+        .or_else(|| models.iter().find(|m| m.starts_with(DEFAULT_MODEL)))
+}
+
 pub(crate) fn best_default(models: &[String]) -> String {
-    if models.is_empty() || models.iter().any(|m| m.starts_with(DEFAULT_MODEL)) {
+    if models.is_empty() {
         return DEFAULT_MODEL.to_string();
+    }
+    if let Some(installed) = installed_default(models) {
+        return installed.clone();
     }
     // Fall back to the first *chat-capable* model — never an embedding model.
     models
@@ -32,8 +53,11 @@ pub(crate) fn best_default(models: &[String]) -> String {
 /// Prefers the tuned default; falls back to the first eligible installed model,
 /// then to the default name (so an Ollama error names the missing model).
 pub(crate) fn best_local_default(models: &[String]) -> String {
-    if models.iter().any(|m| m.starts_with(DEFAULT_MODEL)) {
-        return DEFAULT_MODEL.to_string();
+    // The tag that is actually installed, never the canonical name — see
+    // [`installed_default`]. This picker feeds the privacy scan, so a name
+    // Ollama refuses is a scan that fails on every file with nothing to show.
+    if let Some(installed) = installed_default(models) {
+        return installed.clone();
     }
     models
         .iter()
@@ -200,12 +224,24 @@ pub async fn ai_status(state: State<'_, AppState>) -> Result<AiStatus, String> {
         let guard = state.room.lock().unwrap();
         guard.as_ref().and_then(|room| model_setting(&room.conn))
     };
-    let external = tauri::async_runtime::spawn_blocking(detect_external_blocking)
-        .await
-        .unwrap_or_default();
-    // Advisors are CLI subprocesses today. Keep this cache CLI-only while the
-    // user-facing engine list below also includes connected API providers.
-    *state.external_cache.lock().unwrap() = Some(external.clone());
+    // Probe ONCE per session. Detecting the cloud CLIs forks an interactive
+    // login shell that sources the whole `.zshrc`, and `ai_status` runs on every
+    // image open and every status refresh — re-probing each time paid that cost
+    // repeatedly for an answer that cannot change without a reinstall. Advisors
+    // are CLI subprocesses today, so this cache stays CLI-only while the
+    // user-facing list below also folds in connected API providers.
+    // The lock is taken, cloned and released around the await, never across it.
+    let cached = state.external_cache.lock().unwrap().clone();
+    let external = match cached {
+        Some(hit) => hit,
+        None => {
+            let probed = tauri::async_runtime::spawn_blocking(detect_external_blocking)
+                .await
+                .unwrap_or_default();
+            *state.external_cache.lock().unwrap() = Some(probed.clone());
+            probed
+        }
+    };
     let mut external = external;
     if provider_connected("openrouter") {
         external.push("openrouter".into());
@@ -341,6 +377,25 @@ pub(crate) fn pull_cancel_key(name: &str) -> String {
     format!("pull:{name}")
 }
 
+/// What Ollama will actually be asked for, from what the user typed.
+///
+/// Ollama files a pulled model under the exact string it was given, and only
+/// its own library is case-insensitive about finding one. A name with a host or
+/// a namespace in it (`hf.co/Owner/Repo`, `someone/Model`) is that host's to
+/// spell, and lowercasing it would break the pull outright; a bare `name:tag`
+/// belongs to ollama.com, which is lowercase throughout.
+///
+/// See `a_typed_model_name_is_normalised_to_the_registry_that_will_serve_it`
+/// for what a stray capital did to a hosted model.
+fn registry_name(typed: &str) -> String {
+    let typed = typed.trim();
+    if typed.contains('/') {
+        typed.to_string()
+    } else {
+        typed.to_lowercase()
+    }
+}
+
 /// Download a model, reporting progress on `pull-progress`.
 ///
 /// Cancellable FROM HERE DOWN: the flag is registered in the SAME registry
@@ -363,6 +418,9 @@ pub async fn pull_model(
 ) -> Result<(), String> {
     use tauri::Emitter;
     let cancel = Arc::new(AtomicBool::new(false));
+    // Keyed on what the CALLER typed, not on the normalised name: the frontend
+    // stops a download with `cancelAsk('pull:' + <the name it asked for>)`, and
+    // a key it cannot reproduce is a Stop button that does nothing.
     let key = pull_cancel_key(&name);
     state
         .cancels
@@ -381,7 +439,7 @@ pub async fn pull_model(
     // progress, or the final 100%.
     let mut last_status = String::new();
     let mut last_percent: Option<f64> = None;
-    ollama::pull_cancellable(&name, &cancel, |status, percent| {
+    ollama::pull_cancellable(&registry_name(&name), &cancel, |status, percent| {
         let phase_changed = status != last_status;
         let moved = match (percent, last_percent) {
             (Some(now), Some(before)) => (now - before).abs() >= PULL_PROGRESS_STEP || now >= 100.0,
@@ -413,6 +471,35 @@ pub async fn delete_model(name: String) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// A CAPITAL LETTER IN THE DOWNLOAD FIELD USED TO BREAK THE MODEL FOREVER.
+    ///
+    /// Reproduced against the live daemon (2026-08-19): Ollama's registry is
+    /// lowercase, but `/api/pull` accepts any casing and then FILES the model
+    /// under the literal string it was handed. For a local model that is only
+    /// cosmetic. For a hosted one it is fatal — `/api/chat` strips the `-cloud`
+    /// suffix and proxies the rest of the name to ollama.com verbatim, so
+    ///
+    ///     POST /api/chat {"model":"Gpt-oss:120b-cloud"}
+    ///       → {"error": "model 'Gpt-oss:120b' not found"}
+    ///
+    /// on every request, for a model the Settings list shows as installed.
+    /// Live QA lost a whole privacy check to it.
+    #[test]
+    fn a_typed_model_name_is_normalised_to_the_registry_that_will_serve_it() {
+        assert_eq!(registry_name("  Gpt-oss:120b-cloud "), "gpt-oss:120b-cloud");
+        assert_eq!(registry_name("Qwen3.5:4B"), "qwen3.5:4b");
+        assert_eq!(registry_name("qwen3.5:4b"), "qwen3.5:4b");
+        // NOT lowercased: everything with a host or a namespace in it belongs
+        // to somebody else's case-SENSITIVE registry. Hugging Face serves
+        // `hf.co/bartowski/Llama-3.2-1B-Instruct-GGUF` and 404s on the
+        // lowercase spelling, which is the same bug pointed the other way.
+        assert_eq!(
+            registry_name("hf.co/bartowski/Llama-3.2-1B-Instruct-GGUF"),
+            "hf.co/bartowski/Llama-3.2-1B-Instruct-GGUF"
+        );
+        assert_eq!(registry_name("  library/Gemma3  "), "library/Gemma3");
+    }
+
     #[test]
     fn vision_keep_alive_by_ram_and_model() {
         let gb = 1024 * 1024 * 1024;
@@ -423,6 +510,38 @@ mod tests {
         // 32 GB Mac keeps a distinct vision model warm too.
         assert_eq!(vision_keep_alive(32 * gb, "qwen2.5vl", "qwen3.5:4b"), "30m");
         assert_eq!(vision_keep_alive(64 * gb, "qwen2.5vl", "qwen3.5:4b"), "30m");
+    }
+
+    /// Detecting the cloud CLIs forks an INTERACTIVE login shell, which sources
+    /// the user's whole `.zshrc` — that is why the result is cached in
+    /// `external_cache`. `ai_status` runs on every image open and every status
+    /// refresh, and it used to re-probe every time and then overwrite the cache
+    /// with its own answer, so the cache saved nothing here.
+    ///
+    /// The sentinel proves the cached answer is USED: a fresh probe on this Mac
+    /// can only return engine ids this app knows about.
+    #[tokio::test]
+    async fn ai_status_answers_from_the_cached_engine_probe() {
+        use tauri::Manager;
+        let app = tauri::test::mock_builder()
+            .manage(AppState::default())
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let state = app.state::<AppState>();
+        *state.external_cache.lock().unwrap() = Some(vec!["sentinel-cli".to_string()]);
+
+        let status = ai_status(state.clone()).await.unwrap();
+
+        assert!(
+            status.external.contains(&"sentinel-cli".to_string()),
+            "the cached probe should be the answer, got {:?}",
+            status.external
+        );
+        // …and the cache is left as it was, rather than replaced by a re-probe.
+        assert_eq!(
+            *state.external_cache.lock().unwrap(),
+            Some(vec!["sentinel-cli".to_string()])
+        );
     }
 
     #[test]
@@ -523,6 +642,44 @@ mod tests {
             "nomic-embed-text:latest".to_string(),
         ];
         assert_eq!(best_local_default(&no_local), DEFAULT_MODEL);
+    }
+
+    /// THE DEFAULT MUST BE A TAG OLLAMA WILL ANSWER TO.
+    ///
+    /// Both pickers recognised the default by PREFIX — so an MLX or quantised
+    /// build counts, which is right — and then returned the bare constant,
+    /// which Ollama has never heard of. On a Mac holding `qwen3.5:4b-mlx` and
+    /// nothing else local, every caller that falls back to the local default
+    /// asked for `qwen3.5:4b`:
+    ///
+    ///     {"error":"model 'qwen3.5:4b' not found"}
+    ///
+    /// Live QA saw it as the privacy scan failing on all 20 files, every time,
+    /// with no reason given — the scan's own model is exactly that fallback.
+    #[test]
+    fn the_default_model_picked_is_the_variant_actually_installed() {
+        let mlx = vec![
+            "qwen3.5:4b-mlx".to_string(),
+            "nomic-embed-text:latest".to_string(),
+        ];
+        assert_eq!(best_default(&mlx), "qwen3.5:4b-mlx");
+        assert_eq!(best_local_default(&mlx), "qwen3.5:4b-mlx");
+        // An exact match wins over a variant, whatever order Ollama lists them.
+        let both = vec![
+            "qwen3.5:4b-mlx".to_string(),
+            DEFAULT_MODEL.to_string(),
+            "qwen3.5:4b-q4_K_M".to_string(),
+        ];
+        assert_eq!(best_default(&both), DEFAULT_MODEL);
+        assert_eq!(best_local_default(&both), DEFAULT_MODEL);
+        // Nothing installed at all still names the default, so the error the
+        // user reads is "install this", not "install something".
+        assert_eq!(best_default(&[]), DEFAULT_MODEL);
+        assert_eq!(best_local_default(&[]), DEFAULT_MODEL);
+        // The local picker still refuses a variant it must not drive the app
+        // with: a relayed tag is not a model running on this Mac.
+        let embed_only = vec!["nomic-embed-text:latest".to_string()];
+        assert_eq!(best_local_default(&embed_only), DEFAULT_MODEL);
     }
 
     #[test]

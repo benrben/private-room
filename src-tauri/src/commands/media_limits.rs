@@ -22,6 +22,7 @@
 //! silently does nothing on those two.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
@@ -31,6 +32,14 @@ use super::providers::OPENROUTER_BASE_URL;
 /// allowed. Model line-ups change on the order of weeks, and a room open for a
 /// fortnight should notice a new model without a restart.
 const REFRESH_AFTER: Duration = Duration::from_secs(60 * 60);
+
+/// How long a HALF table is trusted. When one of the two endpoints answered and
+/// the other did not, an hour is far too long to sit on the gap — but retrying
+/// on every Create-page open would make each one wait out the failing
+/// endpoint's 30-second timeout, so the missing half is not chased that hard
+/// either. Nothing is excluded while a table is missing (see
+/// [`media_table_loaded`]), so the only cost of the wait is the seconds picker.
+const RETRY_HALF_AFTER: Duration = Duration::from_secs(5 * 60);
 
 /// What one media model accepts.
 ///
@@ -85,6 +94,12 @@ fn fetched_at() -> &'static std::sync::Mutex<Option<Instant>> {
     AT.get_or_init(|| std::sync::Mutex::new(None))
 }
 
+/// Which of the two catalogues has ever arrived, tracked separately because
+/// they fail separately. Set only when that endpoint answered and parsed; never
+/// cleared, since the table it filled stays in the cache.
+static VIDEOS_LOADED: AtomicBool = AtomicBool::new(false);
+static IMAGES_LOADED: AtomicBool = AtomicBool::new(false);
+
 /// Everything known about one model, by bare slug (no engine prefix).
 pub fn limits_for(slug: &str) -> Option<MediaLimits> {
     cache().read().ok()?.get(slug).cloned()
@@ -99,8 +114,13 @@ pub fn limits_for(slug: &str) -> Option<MediaLimits> {
 /// from a table that never arrived is nothing at all, and excluding models on
 /// the strength of it would empty the Create page every time the network
 /// hiccuped.
+///
+/// BOTH tables, not either: the caller judges every model against one shared
+/// map, so a lone video table made every image model look unserved and the
+/// page said, as fact, that the provider's picture endpoint refuses them. Half
+/// a table answers nothing about the other half's models.
 pub fn media_table_loaded() -> bool {
-    cache().read().map(|c| !c.is_empty()).unwrap_or(false)
+    VIDEOS_LOADED.load(Ordering::Relaxed) && IMAGES_LOADED.load(Ordering::Relaxed)
 }
 
 /// Load both limit tables if they are missing or stale.
@@ -109,40 +129,74 @@ pub fn media_table_loaded() -> bool {
 /// offers no seconds picker and the provider applies its own defaults, which
 /// is a smaller loss than refusing to show the page.
 pub async fn ensure_media_limits(key: &str) {
-    {
-        let stale = fetched_at()
-            .lock()
-            .ok()
-            .and_then(|at| *at)
-            .is_none_or(|at| at.elapsed() > REFRESH_AFTER);
-        if !stale {
-            return;
-        }
+    if !limits_are_stale() {
+        return;
     }
-    // Stamped BEFORE the calls, not after: two Create-page opens in quick
-    // succession would otherwise both see "stale" and fetch twice.
-    if let Ok(mut at) = fetched_at().lock() {
-        *at = Some(Instant::now());
+    // A second Create-page open inside the (up to 60 s) fetch window used to
+    // return here with the table still empty, and that page then rendered every
+    // model with no legal durations, no sizes and no frame-slot knowledge until
+    // it was navigated away from. A concurrent caller with nothing to serve
+    // waits for the fetch in flight instead — the shape
+    // `ensure_provider_catalog` uses.
+    static FETCHING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _fetch_lock = match FETCHING.try_lock() {
+        Ok(lock) => lock,
+        // Someone else is already fetching. Wait for them only when there is
+        // nothing to serve meanwhile: with a table in hand this call is a
+        // refresh, and making the page sit through someone else's refresh is
+        // the same stall the wait exists to prevent.
+        Err(_) if media_table_loaded() => return,
+        Err(_) => FETCHING.lock().await,
+    };
+    // The winner of the race may have just filled it.
+    if !limits_are_stale() {
+        return;
     }
 
     let mut found: HashMap<String, MediaLimits> = HashMap::new();
+    // A catalogue counts as arrived only when it NAMED models. A 200 carrying
+    // no `data` array — an outage page, a renamed field — parses to nothing,
+    // and calling that "loaded" would tell `drop_unserved` the endpoint serves
+    // no model at all, which empties the Create page and blames the provider
+    // for it. That is the same defect the per-endpoint flags exist to prevent,
+    // one step further in.
+    let mut videos = false;
+    let mut images = false;
     if let Some(value) = get_json(key, "/videos/models").await {
-        parse_video_models(&value, &mut found);
+        videos = parse_video_models(&value, &mut found) > 0;
     }
     if let Some(value) = get_json(key, "/images/models").await {
-        parse_image_models(&value, &mut found);
+        images = parse_image_models(&value, &mut found) > 0;
     }
-    if found.is_empty() {
-        // Nothing arrived — let the next caller try again rather than sitting
-        // on an empty table for an hour.
-        if let Ok(mut at) = fetched_at().lock() {
-            *at = None;
+    if !found.is_empty() {
+        if let Ok(mut cache) = cache().write() {
+            cache.extend(found);
         }
-        return;
     }
-    if let Ok(mut cache) = cache().write() {
-        cache.extend(found);
+    if videos {
+        VIDEOS_LOADED.store(true, Ordering::Relaxed);
     }
+    if images {
+        IMAGES_LOADED.store(true, Ordering::Relaxed);
+    }
+    if let Ok(mut at) = fetched_at().lock() {
+        // Nothing arrived — let the next caller try again rather than sitting
+        // on an empty table. A half table IS stamped, but only counts as fresh
+        // for `RETRY_HALF_AFTER`.
+        *at = (videos || images).then(Instant::now);
+    }
+}
+
+/// A full table stands for an hour; half a one for five minutes. Half used to
+/// stand for the full hour, which is how a single failed fetch decided what the
+/// Create page believed about the other endpoint's models until a restart.
+fn limits_are_stale() -> bool {
+    let good_for = if media_table_loaded() { REFRESH_AFTER } else { RETRY_HALF_AFTER };
+    fetched_at()
+        .lock()
+        .ok()
+        .and_then(|at| *at)
+        .is_none_or(|at| at.elapsed() > good_for)
 }
 
 async fn get_json(key: &str, path: &str) -> Option<serde_json::Value> {
@@ -174,9 +228,14 @@ fn strings(value: &serde_json::Value) -> Vec<String> {
         .collect()
 }
 
-fn parse_video_models(value: &serde_json::Value, into: &mut HashMap<String, MediaLimits>) {
+/// Returns how many models were read, which is what tells the caller whether a
+/// catalogue actually arrived: zero is a body in a shape this does not
+/// recognise, not a provider that serves nothing.
+fn parse_video_models(value: &serde_json::Value, into: &mut HashMap<String, MediaLimits>) -> usize {
+    let mut seen = 0;
     for model in value["data"].as_array().into_iter().flatten() {
         let Some(id) = model["id"].as_str() else { continue };
+        seen += 1;
         into.insert(
             id.to_string(),
             MediaLimits {
@@ -196,28 +255,44 @@ fn parse_video_models(value: &serde_json::Value, into: &mut HashMap<String, Medi
             },
         );
     }
+    seen
 }
 
 /// The images endpoint publishes a *shape*, not flat lists: each parameter is
 /// an object that is either an enum of values or a numeric range.
-fn parse_image_models(value: &serde_json::Value, into: &mut HashMap<String, MediaLimits>) {
+///
+/// Runs SECOND, into the same map the video parse filled, so a slug published
+/// by both endpoints is merged rather than overwritten. An overwrite blanked
+/// that model's durations (no seconds picker) and — worse — its frame slots,
+/// and an empty frame list is a PUBLISHED "takes no starting picture": the
+/// generate path would have refused a legal starting frame on the strength of
+/// a field the images endpoint never speaks about.
+///
+/// Returns how many models were read — see [`parse_video_models`].
+fn parse_image_models(value: &serde_json::Value, into: &mut HashMap<String, MediaLimits>) -> usize {
+    let mut seen = 0;
     for model in value["data"].as_array().into_iter().flatten() {
         let Some(id) = model["id"].as_str() else { continue };
+        seen += 1;
         let params = &model["supported_parameters"];
-        into.insert(
-            id.to_string(),
-            MediaLimits {
-                durations: Vec::new(),
-                resolutions: strings(&params["resolution"]["values"]),
-                aspect_ratios: strings(&params["aspect_ratio"]["values"]),
-                frame_images: Vec::new(),
-                max_references: params["input_references"]["max"]
-                    .as_u64()
-                    .map(|n| n as u32),
-                generate_audio: false,
-            },
-        );
+        let resolutions = strings(&params["resolution"]["values"]);
+        let aspect_ratios = strings(&params["aspect_ratio"]["values"]);
+        let max_references = params["input_references"]["max"].as_u64().map(|n| n as u32);
+        let entry = into.entry(id.to_string()).or_default();
+        // Fill what is not already there rather than replace it: on a slug the
+        // video endpoint also published, its sizes are the ones the clip has to
+        // honour, and the images endpoint's silence corrects nothing.
+        if entry.resolutions.is_empty() {
+            entry.resolutions = resolutions;
+        }
+        if entry.aspect_ratios.is_empty() {
+            entry.aspect_ratios = aspect_ratios;
+        }
+        if entry.max_references.is_none() {
+            entry.max_references = max_references;
+        }
     }
+    seen
 }
 
 #[cfg(test)]
@@ -284,6 +359,86 @@ mod tests {
         // The number the cast strip needs: four heroes in one picture, not five.
         assert_eq!(qwen.max_references, Some(4));
         assert!(qwen.durations.is_empty(), "a still has no length");
+    }
+
+    #[test]
+    fn a_slug_on_both_endpoints_keeps_its_lengths_and_frame_slots() {
+        // The image parse runs second into the SAME map. Overwriting the video
+        // entry blanked `durations` (no seconds picker) and `frame_images` —
+        // and an empty frame list is a PUBLISHED "takes no starting picture",
+        // so `check_media_shape` refused a legal first frame on the strength of
+        // a field `/images/models` never speaks about.
+        let videos = serde_json::json!({"data": [{
+            "id": "vendor/model-x",
+            "supported_durations": [4, 6, 8],
+            "supported_resolutions": ["720p"],
+            "supported_frame_images": ["first_frame"],
+            "generate_audio": true
+        }]});
+        let images = serde_json::json!({"data": [{
+            "id": "vendor/model-x",
+            "supported_parameters": {
+                "aspect_ratio": {"type": "enum", "values": ["1:1"]},
+                "input_references": {"type": "range", "min": 0, "max": 3}
+            }
+        }]});
+        let mut found = HashMap::new();
+        parse_video_models(&videos, &mut found);
+        parse_image_models(&images, &mut found);
+        let both = found.get("vendor/model-x").expect("parsed");
+        assert_eq!(both.durations, vec![4, 6, 8], "the video lengths survive");
+        assert!(both.takes_first_frame(), "the frame slot survives");
+        assert!(both.generate_audio);
+        assert_eq!(both.resolutions, vec!["720p"], "the clip's own sizes stand");
+        // What the images endpoint alone knows is still picked up.
+        assert_eq!(both.aspect_ratios, vec!["1:1"]);
+        assert_eq!(both.max_references, Some(3));
+    }
+
+    #[test]
+    fn one_catalogue_alone_is_not_a_loaded_table() {
+        // The P1: `/videos/models` answered and `/images/models` did not, so the
+        // cache held video slugs only — and a non-empty cache used to count as
+        // "the media tables loaded". The Create page then dropped all 42 image
+        // models behind a row saying the provider's picture endpoint refuses
+        // them, a fact nothing had established.
+        const VIDEO_ONLY: &str = "vendor/video-only-fixture";
+        cache()
+            .write()
+            .expect("cache")
+            .insert(VIDEO_ONLY.to_string(), MediaLimits::default());
+        VIDEOS_LOADED.store(true, Ordering::Relaxed);
+        IMAGES_LOADED.store(false, Ordering::Relaxed);
+        assert!(
+            !media_table_loaded(),
+            "a video table alone settles nothing about image models"
+        );
+        IMAGES_LOADED.store(true, Ordering::Relaxed);
+        assert!(media_table_loaded(), "both halves in, the rule applies");
+
+        cache().write().expect("cache").remove(VIDEO_ONLY);
+        VIDEOS_LOADED.store(false, Ordering::Relaxed);
+        IMAGES_LOADED.store(false, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn a_body_that_names_no_models_is_not_a_catalogue() {
+        // `ensure_media_limits` sets that endpoint's loaded flag from this
+        // count, and the flag is what lets `drop_unserved` remove models. A 200
+        // whose body is not the shape read here parses to nothing — and calling
+        // THAT "the catalogue loaded" says the endpoint serves no model at all,
+        // which takes every model off the Create page behind a row blaming the
+        // provider for it.
+        let mut found = HashMap::new();
+        let empty = serde_json::json!({"data": []});
+        assert_eq!(parse_video_models(&empty, &mut found), 0);
+        let foreign = serde_json::json!({"error": {"message": "no endpoint"}});
+        assert_eq!(parse_image_models(&foreign, &mut found), 0);
+        assert!(found.is_empty());
+        // And one real entry counts, so the guard cannot be satisfied by a
+        // parser that always answers zero.
+        let one = serde_json::json!({"data": [{"id": "vendor/one"}]});
+        assert_eq!(parse_video_models(&one, &mut found), 1);
     }
 
     #[test]

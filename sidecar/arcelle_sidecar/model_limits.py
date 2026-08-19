@@ -87,8 +87,19 @@ _CAL_ALPHA: float = 0.3
 #: rather than per-model on purpose: measured spread across CONTENT (2.48 to
 #: 5.89) dwarfs the spread across tokenizers, a room chats with one model at a
 #: time, and the clamp plus `_CAL_SAFETY` absorb a model switch inside a few
-#: rounds. Only local calls consult it — a non-local model owns its own window
-#: and is never budgeted here.
+#: rounds.
+#:
+#: Only local rounds FEED it — chat.py guards the observation with
+#: ``is_nonlocal_model``. Every window budget READS it, though, including the
+#: cloud ones: :func:`.budget.window_budget_bytes` is on the path of
+#: :func:`.compaction.fit_budget_bytes`, which an OpenRouter/Claude room calls
+#: with the PROVIDER's context window. So the point at which a cloud
+#: conversation starts compacting moves with whatever a local model in this
+#: process last generated — up to the 2x between the cold-start floor and
+#: :data:`_CAL_CEILING`. Keying it by lane means giving every caller of
+#: ``window_budget_bytes`` a way to say which lane it is budgeting for; until
+#: that happens this is "the local tokenizer's ratio, applied everywhere", and
+#: this comment must not say otherwise.
 _calibration: float | None = None
 
 _max_ctx_cache: int | None = None

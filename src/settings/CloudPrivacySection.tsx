@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../api";
+import { CircleCheckIcon } from "../icons";
 import type { PrivacyScanProgress, PrivacyStatus } from "../apiTypes";
 
 /** PRIV-1 — the cloud-privacy gatekeeper's controls.
@@ -17,7 +18,16 @@ export default function CloudPrivacySection() {
   const [newCat, setNewCat] = useState("person");
   const [conceptDraft, setConceptDraft] = useState("");
   const [err, setErr] = useState<string | null>(null);
+  // The topics box saves on blur, with nothing to press. Both halves of that
+  // write are reported where it happened rather than at the foot of the
+  // section: on a privacy surface, a write you cannot see land is a question
+  // about what the room is protecting, not a convenience.
+  const [conceptsSaved, setConceptsSaved] = useState(false);
+  const [conceptsErr, setConceptsErr] = useState<string | null>(null);
   const conceptsDirty = useRef(false);
+  // Counts keystrokes so a save that lands AFTER the user has typed again
+  // knows its text is no longer what the box holds, and leaves the flag up.
+  const conceptEdits = useRef(0);
 
   const reload = useCallback(() => {
     api
@@ -102,17 +112,38 @@ export default function CloudPrivacySection() {
   };
 
   const saveConcepts = async () => {
-    conceptsDirty.current = false;
     const concepts = conceptDraft
       .split("\n")
       .map((c) => c.trim())
       .filter(Boolean);
+    const editsAtSave = conceptEdits.current;
+    // Blur fires on every pass through the box, so only a blur that follows
+    // typing is allowed to claim anything was written.
+    const wasEdited = conceptsDirty.current;
     try {
       await api.setPrivacyConcepts(concepts);
+      // Cleared only once the store HAS the typing. Cleared before the await,
+      // a rejected save (room locked, DB write failure) showed its error and
+      // left the box unprotected: the next background scan's terminal event
+      // ran `reload`, which then overwrote the topics with the stored list —
+      // losing what the user typed without them touching anything. And only
+      // when the box still holds what was sent: blur saves, so a click back
+      // into the box and a keystroke can both land while this call is in
+      // flight, and clearing then would hand the newer typing to the same
+      // `reload`.
+      const stillCurrent = conceptEdits.current === editsAtSave;
+      if (stillCurrent) conceptsDirty.current = false;
       setErr(null);
+      setConceptsErr(null);
+      // "Saved" sits under the box, so it is a claim about what the box holds
+      // NOW: typing that landed while this call was in flight is not saved yet.
+      if (wasEdited && stillCurrent) {
+        setConceptsSaved(true);
+        window.setTimeout(() => setConceptsSaved(false), 1600);
+      }
       reload();
     } catch (e) {
-      setErr(String(e));
+      setConceptsErr(String(e));
     }
   };
 
@@ -285,6 +316,7 @@ export default function CloudPrivacySection() {
         value={conceptDraft}
         onChange={(e) => {
           conceptsDirty.current = true;
+          conceptEdits.current += 1;
           setConceptDraft(e.target.value);
         }}
         onKeyDown={(e) => {
@@ -296,6 +328,18 @@ export default function CloudPrivacySection() {
         onBlur={saveConcepts}
         placeholder={"my health\nmy family"}
       />
+      {conceptsErr && (
+        <div className="gate-error" role="alert">
+          These topics were not saved: {conceptsErr}
+        </div>
+      )}
+      {conceptsSaved && (
+        <div className="settings-actions">
+          <span className="settings-confirm btn-ic" role="status">
+            <CircleCheckIcon size={14} /> Saved
+          </span>
+        </div>
+      )}
 
       <label className="settings-label">Document scan</label>
       <p className="settings-hint">

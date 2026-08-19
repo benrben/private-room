@@ -95,6 +95,46 @@ test("the strength bar hides the weakest links and keeps the rest", () => {
   assert.equal(filterEdges(all, { hidden: [], minWeight: 0.9 })[0].weight, 0.9);
 });
 
+test("the strength bar never takes a proven relation off the map", () => {
+  // The backend gives each recorded kind a CONSTANT weight — same_site 0.45, a
+  // memory's match 0.6 — while an inferred link is scored against the room's
+  // own range and can sit near 1. One comparison across every kind therefore
+  // hid the facts first and kept the guesses drawn.
+  const all = [
+    edge("a", "b", "same_site", 0.45),
+    edge("mem:1", "c", "mentions", 0.6),
+    edge("c", "d", "similar", 0.95),
+    edge("d", "e", "similar", 0.2),
+  ];
+  const shown = filterEdges(all, { hidden: [], minWeight: 0.9 });
+  assert.deepEqual(
+    shown.map((e) => e.kind),
+    ["same_site", "mentions", "similar"],
+    "the facts stayed and only the weak guess went",
+  );
+  // Switching a kind off still removes it, strength bar or not.
+  assert.equal(filterEdges(all, { hidden: ["same_site"], minWeight: 0.9 }).length, 2);
+});
+
+test("a memory's link does not claim the memory named the file", () => {
+  // graph.rs matches a memory's two RAREST WORDS against a file's text and
+  // files the edge under `mentions`, the kind whose lead describes a
+  // file-to-file match on the file's own NAME. Borrowing that sentence told
+  // the reader the memory names the file, with "zermatt" offered as proof.
+  const memory = edgeLines({
+    ...edge("mem:7", "trip.md", "mentions", 0.6),
+    shared: ["zermatt", "february"],
+  });
+  assert.ok(!/names the other/.test(memory[0]), memory[0]);
+  assert.equal(memory[0], "This memory's distinctive words appear in this file");
+  assert.deepEqual(memory.slice(1), ["zermatt", "february"]);
+  // A file naming a file really is a name match, and keeps saying so.
+  assert.equal(
+    edgeLines(edge("notes.md", "lease.pdf", "mentions", 0.8))[0],
+    "This one names the other by name",
+  );
+});
+
 test("the legend counts what EXISTS, not what is currently shown", () => {
   // A toggle whose count moved to 0 the moment you switched it off would give
   // the reader no way back that reads as sensible.

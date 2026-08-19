@@ -12,6 +12,32 @@
  * would read as something the page said. */
 const TEXT_SKIP = new Set(["script", "style", "noscript", "template"]);
 
+/**
+ * Text that is in the markup but nowhere on the page.
+ *
+ * The third caller is a check on a CLAIM: a sandboxed frame reports what it
+ * says the reader selected, and the app looks for that passage in the document
+ * before letting it be quoted. A reader can only select what is rendered, so
+ * hidden markup must not answer for them — otherwise a saved page can announce
+ * a sentence buried in a `display:none` block and have the room quote it, with
+ * the file's name attached, on a selection that never happened.
+ *
+ * WHAT THIS CANNOT SEE: the document is inert — no browsing context, no layout,
+ * no style resolution — so only what is written on the element itself is
+ * readable. A rule in a `<style>` block, an off-screen position or white ink on
+ * white paper are all invisible to this, and the gesture check that would close
+ * those lives on the message path, not here.
+ */
+export function isHiddenMarkup(el: Element): boolean {
+  if (el.hasAttribute("hidden")) return true;
+  const style = (el.getAttribute("style") ?? "").toLowerCase().replace(/\s+/g, "");
+  return (
+    style.includes("display:none") ||
+    style.includes("visibility:hidden") ||
+    style.includes("visibility:collapse")
+  );
+}
+
 /** Elements that start their own line. Without these the whole page arrives
  * as one paragraph with words fused across every tag boundary. */
 const TEXT_BLOCK = new Set([
@@ -29,7 +55,9 @@ const TEXT_BLOCK = new Set([
  * are text nodes.
  *
  * Nothing is summarised, filtered by "importance", or reordered: what comes
- * out is the document's own text in the document's own order. Runs of
+ * out is the document's own text in the document's own order — minus what the
+ * document itself hid, which is not text a reader could ever see or select.
+ * Runs of
  * whitespace collapse the way a browser collapses them when it lays the page
  * out — EXCEPT inside `<pre>`, where the author's spacing IS the content and
  * is passed through untouched.
@@ -66,6 +94,7 @@ export function textOf(html: string): string {
     if (node.nodeType !== Node.ELEMENT_NODE) return;
     const tag = (node as Element).tagName.toLowerCase();
     if (TEXT_SKIP.has(tag)) return;
+    if (isHiddenMarkup(node as Element)) return;
     if (tag === "br") {
       out.push("\n");
       return;

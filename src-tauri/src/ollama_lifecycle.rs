@@ -79,13 +79,26 @@ fn should_sleep(we_started: bool, idle: Duration, inflight: usize) -> bool {
 }
 
 /// RAII marker for one in-flight real call: keeps the daemon awake for the
-/// duration and bumps the idle clock on the way out, so the idle window is
-/// measured from the END of the last call.
+/// duration and bumps the idle clock at BOTH ends, so the window is measured
+/// from the last call to touch the daemon rather than the last one to finish.
 pub struct Busy;
 
 impl Busy {
     fn new() -> Self {
+        // Both writes under the `our_pid` lock, which the idle watcher holds
+        // across its ENTIRE check-and-kill. Without that shared lock the watcher
+        // sampled `inflight`, then spawned `kill` — milliseconds in which a call
+        // could be admitted onto a daemon already being terminated, so the first
+        // thing a returning user did came back as a transport error.
+        //
+        // The clock is wound forward at the START of a call as well as at its
+        // end: a call beginning one tick before the deadline was invisible to
+        // the idle reading, which was taken from the last call to FINISH.
+        let _own = lc().our_pid.lock();
         lc().inflight.fetch_add(1, Ordering::SeqCst);
+        if let Ok(mut t) = lc().last_used.lock() {
+            *t = Instant::now();
+        }
         Busy
     }
 }
@@ -190,6 +203,13 @@ fn ollama_bin() -> Option<String> {
 pub async fn ensure_up(base: &str) -> Result<Busy, String> {
     let guard = Busy::new();
     if reachable(base).await {
+        if base_is_local(base) {
+            // A daemon answering on this Mac may be one WE started and were
+            // force-quit away from — take it back before deciding it is a
+            // stranger's. Only ever a local base: nothing on another machine
+            // can be a process this app spawned.
+            adopt_orphan();
+        }
         return Ok(guard);
     }
     if !base_is_local(base) {
@@ -238,6 +258,7 @@ pub async fn ensure_up(base: &str) -> Result<Busy, String> {
     if let Ok(mut slot) = lc().our_pid.lock() {
         *slot = Some(pid);
     }
+    write_pid_file(&pid_file_path(), pid);
     // Reap on exit rather than leaking the handle: `ollama serve` is stopped and
     // restarted every time the idle watcher sleeps it, and an unwaited child
     // leaves a `<defunct>` entry under the app's name each time.
@@ -260,6 +281,7 @@ pub async fn ensure_up(base: &str) -> Result<Busy, String> {
             *slot = None;
         }
     }
+    let _ = std::fs::remove_file(pid_file_path());
     let _ = Command::new("kill").arg(pid.to_string()).status();
     eprintln!(
         "[ollama] `{bin} serve` never answered within {}s — see {}",
@@ -274,6 +296,96 @@ pub fn daemon_log_path() -> std::path::PathBuf {
     std::env::temp_dir().join("arcelle-ollama.log")
 }
 
+/// Where the PID of a daemon WE spawned is recorded, so an abnormal exit cannot
+/// orphan it forever.
+///
+/// Beside the daemon's stderr mirror rather than in the app's data folder:
+/// nothing on this path has an `AppHandle` (the gateway calls it off any
+/// command), and the two files describe the same process. If the temp directory
+/// is swept between runs the only cost is a daemon we no longer recognise —
+/// which is exactly today's behaviour — never a process stopped by mistake.
+fn pid_file_path() -> std::path::PathBuf {
+    std::env::temp_dir().join("arcelle-ollama.pid")
+}
+
+fn write_pid_file(path: &std::path::Path, pid: u32) {
+    if let Err(e) = std::fs::write(path, pid.to_string()) {
+        eprintln!(
+            "[ollama] could not record the daemon's pid at {}: {e} — a crash would orphan it",
+            path.display()
+        );
+    }
+}
+
+fn read_pid_file(path: &std::path::Path) -> Option<u32> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+/// Is this `ps` command line the exact invocation [`ensure_up`] spawns —
+/// `<path ending in /ollama> serve`, nothing after it?
+///
+/// Whole invocation, not two words found somewhere in it: "contains ollama"
+/// also matches `node /Users/me/ollama-tools/cli.js serve`, and what this
+/// answer buys is the right to SIGTERM the process.
+fn is_our_serve_command(cmd: &str) -> bool {
+    let cmd = cmd.trim().to_ascii_lowercase();
+    let Some(bin) = cmd.strip_suffix(" serve") else {
+        return false;
+    };
+    std::path::Path::new(bin)
+        .file_name()
+        .map_or(false, |f| f == "ollama")
+}
+
+/// Is `pid` a live `ollama serve` right now?
+///
+/// The recorded number alone does not earn the right to SIGTERM anything: PIDs
+/// are recycled, and by the next launch that one may belong to the user's
+/// editor. The command line has to still be the daemon we wrote down.
+fn is_ollama_serve(pid: u32) -> bool {
+    Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "command="])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| is_our_serve_command(&String::from_utf8_lossy(&o.stdout)))
+        .unwrap_or(false)
+}
+
+/// Take back a daemon this app spawned before an abnormal exit.
+///
+/// [`stop_if_ours`] runs on a clean quit; a force-quit, a crash or a `kill -9`
+/// never reaches it and the `ollama serve` it started keeps running. The next
+/// launch found that daemon answering, recorded no PID, and by the safety rule
+/// at the top of this file could then neither sleep it nor stop it — ever. The
+/// PID file is what carries ownership across that gap; the `ps` check is what
+/// keeps the rule intact, so a stranger's daemon is still never touched.
+fn adopt_orphan() {
+    if lc().our_pid.lock().map(|s| s.is_some()).unwrap_or(true) {
+        return; // already ours this run — nothing to adopt
+    }
+    let path = pid_file_path();
+    let Some(pid) = read_pid_file(&path) else {
+        return;
+    };
+    if !is_ollama_serve(pid) {
+        // Dead, or the number now belongs to something else. Forget it rather
+        // than re-asking `ps` before every model call for the rest of the run.
+        let _ = std::fs::remove_file(&path);
+        return;
+    }
+    if let Ok(mut slot) = lc().our_pid.lock() {
+        if slot.is_some() {
+            return; // another caller adopted it while we were asking `ps`
+        }
+        *slot = Some(pid);
+    } else {
+        return;
+    }
+    eprintln!("[ollama] adopted the `ollama serve` (pid {pid}) left behind by an earlier run");
+    start_watcher();
+}
+
 /// Spawn the idle watcher exactly once. It periodically checks the pure
 /// [`should_sleep`] condition and, when met, SIGTERMs the daemon we started and
 /// forgets its PID — so the next [`ensure_up`] starts a fresh one.
@@ -285,16 +397,25 @@ fn start_watcher() {
     tauri::async_runtime::spawn(async move {
         loop {
             tokio::time::sleep(WATCH_INTERVAL).await;
-            let pid = *lc().our_pid.lock().unwrap();
-            let idle = lc().last_used.lock().unwrap().elapsed();
+            // The whole decision under the `our_pid` lock that `Busy::new` also
+            // takes. Sampling the condition and THEN spawning `kill` left a
+            // window in which a call could take its guard, find the daemon
+            // reachable, and be answered by a process already terminating.
+            let Ok(mut slot) = lc().our_pid.lock() else {
+                continue;
+            };
+            let Some(pid) = *slot else { continue };
+            let Ok(idle) = lc().last_used.lock().map(|t| t.elapsed()) else {
+                continue;
+            };
             let inflight = lc().inflight.load(Ordering::SeqCst);
-            if should_sleep(pid.is_some(), idle, inflight) {
-                if let Some(pid) = pid {
-                    // SIGTERM lets Ollama unload models and exit cleanly.
-                    let _ = Command::new("kill").arg(pid.to_string()).status();
-                    *lc().our_pid.lock().unwrap() = None;
-                }
+            if !should_sleep(true, idle, inflight) {
+                continue;
             }
+            // SIGTERM lets Ollama unload models and exit cleanly.
+            let _ = Command::new("kill").arg(pid.to_string()).status();
+            *slot = None;
+            let _ = std::fs::remove_file(pid_file_path());
         }
     });
 }
@@ -333,6 +454,11 @@ pub fn stop_if_ours() {
     if let Ok(mut slot) = lc().our_pid.lock() {
         if let Some(pid) = slot.take() {
             let _ = Command::new("kill").arg(pid.to_string()).status();
+            // Only once something was actually stopped: a PID recorded by a run
+            // that crashed before this one is the ONLY way that daemon can ever
+            // be adopted, and a quit that never made a model call must not
+            // throw it away.
+            let _ = std::fs::remove_file(pid_file_path());
         }
     }
     let _ = std::fs::remove_file(daemon_log_path());
@@ -341,6 +467,15 @@ pub fn stop_if_ours() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`lc`] is one process-wide singleton, so the tests that READ it cannot
+    /// run beside the tests that WRITE it — `Busy::new` winding the idle clock
+    /// forward is the whole point of one of them and would silently rescue
+    /// another. Held for the body of every test that touches the singleton.
+    fn globals() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     #[test]
     fn only_sleeps_a_daemon_we_own_when_idle_and_quiet() {
@@ -361,6 +496,7 @@ mod tests {
     /// Still only ever a daemon we own, and still never one with work in flight.
     #[test]
     fn locking_the_room_lets_the_idle_watcher_sleep_our_daemon() {
+        let _g = globals();
         note_room_closed();
         let idle = lc().last_used.lock().unwrap().elapsed();
         assert!(
@@ -419,11 +555,90 @@ mod tests {
 
     #[test]
     fn busy_guard_tracks_inflight() {
+        let _g = globals();
         let before = lc().inflight.load(Ordering::SeqCst);
         {
             let _g = Busy::new();
             assert_eq!(lc().inflight.load(Ordering::SeqCst), before + 1);
         }
         assert_eq!(lc().inflight.load(Ordering::SeqCst), before);
+    }
+
+    /// The watcher samples the idle clock and `inflight` and then spends
+    /// milliseconds spawning `kill`. A call that starts inside that window used
+    /// to be invisible to both readings — the clock only moved when a call
+    /// FINISHED — so the daemon could be terminated under a request that had
+    /// already been admitted, and the user's first message after a pause came
+    /// back as a transport error.
+    #[test]
+    fn a_call_that_starts_now_stops_the_next_tick_from_sleeping_the_daemon() {
+        let _g = globals();
+        note_room_closed(); // the watcher would sleep it on the next tick
+        let busy = Busy::new();
+        let idle = lc().last_used.lock().unwrap().elapsed();
+        assert!(
+            idle < IDLE_SLEEP,
+            "the idle clock was not wound forward when the call STARTED: read {idle:?} \
+             against a {IDLE_SLEEP:?} window, so a tick between its start and its end \
+             sleeps the daemon it is using"
+        );
+        assert!(!should_sleep(true, idle, 0));
+        drop(busy);
+        // …and once it is over the idle window starts again from the end of it.
+        let after = lc().last_used.lock().unwrap().elapsed();
+        assert!(after < IDLE_SLEEP, "the clock did not restart at the call's end");
+    }
+
+    #[test]
+    fn a_recorded_pid_round_trips_and_junk_is_ignored() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("arcelle-ollama-test-{}.pid", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(read_pid_file(&path), None, "a missing record is not a pid");
+        write_pid_file(&path, 4242);
+        assert_eq!(read_pid_file(&path), Some(4242));
+        std::fs::write(&path, "not a pid\n").unwrap();
+        assert_eq!(read_pid_file(&path), None, "a corrupt record is not a pid");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Adoption may only ever hand us back an `ollama serve`. A PID is recycled
+    /// the moment the daemon dies, so believing the recorded number on its own
+    /// would eventually SIGTERM whatever inherited it.
+    #[test]
+    fn only_a_live_ollama_daemon_can_be_adopted() {
+        assert!(
+            !is_ollama_serve(std::process::id()),
+            "the test runner is not an ollama daemon"
+        );
+        assert!(!is_ollama_serve(1), "launchd is not an ollama daemon");
+        // A PID that cannot exist: `ps` finds nothing and must not claim it.
+        assert!(!is_ollama_serve(u32::MAX));
+    }
+
+    /// The command line that earns a SIGTERM is the one we spawn, whole. A
+    /// looser reading ("ends in serve, mentions ollama somewhere") hands the
+    /// same right to any process that happens to have the word on its argument
+    /// list — a wrapper script, a checkout, a log path.
+    #[test]
+    fn only_the_invocation_we_spawn_reads_as_our_daemon() {
+        for cmd in [
+            "/Applications/Ollama.app/Contents/Resources/ollama serve",
+            "/opt/homebrew/bin/ollama serve\n",
+            "/OPT/Homebrew/bin/Ollama Serve",
+        ] {
+            assert!(is_our_serve_command(cmd), "should be ours: {cmd:?}");
+        }
+        for cmd in [
+            "node /Users/me/ollama-tools/cli.js serve",
+            "/opt/homebrew/bin/ollama serve --port 11500",
+            "/opt/homebrew/bin/ollama run llama3",
+            "/usr/local/bin/my-ollama-proxy serve",
+            " serve",
+            "serve",
+            "",
+        ] {
+            assert!(!is_our_serve_command(cmd), "should not be ours: {cmd:?}");
+        }
     }
 }

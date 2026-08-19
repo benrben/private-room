@@ -25,6 +25,13 @@ import type { BrowserProtection } from "../apiTypes";
  * and files you deliberately saved — kept, encrypted, in this room). Every
  * string below draws that line rather than choosing a side of it.
  *
+ * Which is why no claim here is ever the bare "Nothing is written to disk".
+ * `browser_clear_journal` erases the room's web cache alongside the journal,
+ * and the Clear confirmation counts it out loud — "42 cached items (searches,
+ * page text and previews)". The unqualified promise and that confirmation are
+ * two surfaces of one feature stating opposite facts, and the one making the
+ * promise was the security string. The WEB SESSION is what writes nothing.
+ *
  * And the claim this browser must never make at all: private browsing is not
  * anonymity. Safari and Firefox both say so in their own words; a browser that
  * lets an assistant drive it and can send a page to a cloud model owes the user
@@ -64,8 +71,9 @@ export interface PrivacyClaim {
  *  the two surfaces cannot drift apart again. */
 export const EPHEMERAL_VS_ROOM =
   "Page history, cookies and cache clear when the last private page closes. " +
-  "The assistant's actions and the files you choose to save stay in this " +
-  "encrypted room.";
+  "The assistant's actions, the searches and page text the room kept, and the " +
+  "files you choose to save stay in this encrypted room — the Journal's Clear " +
+  "erases that record.";
 
 /** The claim this browser must not let the user assume it is making.
  *
@@ -102,7 +110,7 @@ export function protectionAlert(
     return `Tracker blocking is OFF: the block list failed to load (${protection.reason}). Pages will load their trackers until this succeeds.`;
   }
   if (protection.state === "unavailable") {
-    return `Tracker blocking is unavailable on this system (${protection.reason}). Everything else about this browser is unchanged: nothing is written to disk.`;
+    return `Tracker blocking is unavailable on this system (${protection.reason}). Everything else about this browser is unchanged: the web session still writes nothing to disk.`;
   }
   return null;
 }
@@ -158,7 +166,7 @@ export function privacyClaim(
     return {
       tone: "degraded",
       chip: "Partly private",
-      detail: `Nothing is written to disk — but tracker blocking is not running. ${EPHEMERAL_VS_ROOM} ${NOT_ANONYMOUS}`,
+      detail: `The web session writes nothing to disk — but tracker blocking is not running. ${EPHEMERAL_VS_ROOM} ${NOT_ANONYMOUS}`,
       alert,
     };
   }
@@ -166,7 +174,7 @@ export function privacyClaim(
   return {
     tone: "verified",
     chip: "Private",
-    detail: `Nothing is written to disk, and the tracker block list is loaded. ${EPHEMERAL_VS_ROOM} ${NOT_ANONYMOUS}`,
+    detail: `The web session writes nothing to disk, and the tracker block list is loaded. ${EPHEMERAL_VS_ROOM} ${NOT_ANONYMOUS}`,
     alert: null,
   };
 }

@@ -52,18 +52,18 @@ pub fn add_privacy_entity(
     source: &str,
 ) -> Result<PrivacyEntity, String> {
     let real = real_text.trim();
-    if real.len() < 2 {
-        return Err("A protected detail needs at least 2 characters.".into());
+    // The redactor's own floor, counted the way the message states it and the
+    // way the redactor applies it: in CHARACTERS. `real.len()` is bytes, so a
+    // single Hebrew or accented letter passed a test its own error text said it
+    // failed, and was stored as an item the panel lists as protected and
+    // `Redactor::new` then discards.
+    if !crate::commands::is_protectable(real) {
+        return Err(format!(
+            "A protected detail needs at least {} characters.",
+            crate::commands::MIN_PROTECTED_CHARS
+        ));
     }
-    if let Some(existing) = conn
-        .query_row(
-            "SELECT id, real_text, placeholder, category, source FROM privacy_entities
-             WHERE lower(real_text) = lower(?1)",
-            [real],
-            entity_row,
-        )
-        .ok()
-    {
+    if let Some(existing) = find_entity_ignoring_case(conn, real)? {
         if source == "user" && existing.source != "user" {
             conn.execute(
                 "UPDATE privacy_entities SET source = 'user' WHERE id = ?1",
@@ -111,6 +111,31 @@ pub fn add_privacy_entity(
         category: category.to_string(),
         source: source.to_string(),
     })
+}
+
+/// The existing entity whose real text is the same string ignoring case, if any.
+///
+/// Done in Rust rather than in SQL because SQLite's `lower()` only folds ASCII:
+/// "JOSÉ MUÑOZ" did not match "José Muñoz", so one person became two rows with
+/// two placeholders — the panel listed them twice and only one of the two was
+/// ever emitted. The table is a hand-curated block list plus scan findings, so
+/// reading it whole costs less than the correctness did.
+fn find_entity_ignoring_case(
+    conn: &Connection,
+    real: &str,
+) -> Result<Option<PrivacyEntity>, String> {
+    let wanted = real.to_lowercase();
+    let mut stmt = conn
+        .prepare("SELECT id, real_text, placeholder, category, source FROM privacy_entities")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt.query_map([], entity_row).map_err(|e| e.to_string())?;
+    for row in rows {
+        let row = row.map_err(|e| e.to_string())?;
+        if row.real_text.to_lowercase() == wanted {
+            return Ok(Some(row));
+        }
+    }
+    Ok(None)
 }
 
 fn entity_row(row: &rusqlite::Row) -> rusqlite::Result<PrivacyEntity> {
@@ -339,5 +364,27 @@ mod tests {
     fn short_entities_rejected() {
         let conn = db::mem();
         assert!(add_privacy_entity(&conn, " a ", "person", "user").is_err());
+    }
+
+    #[test]
+    fn the_length_floor_counts_characters_not_bytes() {
+        // One Hebrew letter is two BYTES, so the old `real.len() < 2` accepted
+        // it while the error text promised a two-CHARACTER floor — and the
+        // redactor then discarded the item the panel called protected.
+        let conn = db::mem();
+        assert!(add_privacy_entity(&conn, "א", "person", "user").is_err());
+        assert!(add_privacy_entity(&conn, "אב", "person", "user").is_ok());
+    }
+
+    #[test]
+    fn duplicates_are_folded_past_ascii() {
+        // SQLite's lower() is ASCII-only, so this pair used to become two rows
+        // with two placeholders for one person.
+        let conn = db::mem();
+        let a = add_privacy_entity(&conn, "José Muñoz", "person", "user").unwrap();
+        let b = add_privacy_entity(&conn, "JOSÉ MUÑOZ", "person", "scan").unwrap();
+        assert_eq!(a.id, b.id);
+        assert_eq!(b.placeholder, "[Person A]");
+        assert_eq!(list_privacy_entities(&conn).unwrap().len(), 1);
     }
 }

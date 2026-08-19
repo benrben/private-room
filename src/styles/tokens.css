@@ -28,9 +28,9 @@
    2. CANONICAL APP TOKENS — --bg/--panel/--text/--accent/--line etc.,
       mapped onto the primitives above. This is what most CSS should use.
 
-   3. LEGACY ALIASES — --surface-1..4, --border, --text-dim, --ok/--warn/
-      --danger and friends, so every pre-notebook rule resolves onto the
-      same palette. New CSS should use canonical names only.
+   3. LEGACY ALIASES — --border, --text-dim, --ok/--warn/--danger and friends,
+      so every pre-notebook rule resolves onto the same palette. New CSS should
+      use canonical names only.
 
    Accent is the BERRY pen (active, selected, AI attribution). Danger is the
    RED ink (destructive, error, recording). The accent used to be pink, which
@@ -237,7 +237,7 @@
      ad-hoc sizes precisely because size was carrying all the hierarchy on its
      own. Space Grotesk's flat terminals and squared bowls read as a decision
      at 26px and up; below that it is merely idiosyncratic, which is why the
-     reserve stops at --fs-section and does not reach --fs-card.
+     reserve stops at --fs-section and does not reach --fs-lead.
 
      THE HAND'S RESERVE. Kalam is for words a PERSON wrote, and for the app
      speaking in its own voice at an empty moment. It is never for
@@ -266,7 +266,6 @@
   --fs-page: 44px; /* page title */
   --fs-section: 26px; /* section title */
   --fs-lead: 16px; /* intro + instruction copy: never set instructions small */
-  --fs-card: 16px; /* card title */
   --fs-body: 14px;
   --fs-meta: 13px; /* metadata floor — was 12, too small to be a floor */
   --fs-micro: 12px; /* the smallest size allowed anywhere */
@@ -321,20 +320,18 @@
   --dur-slow: 260ms;
   --ease-pen: cubic-bezier(0.32, 0.72, 0.3, 1);
 
-  /* ----- legacy aliases — old rules keep working, on the new palette ----- */
-  --surface-1: var(--bg);
+  /* ----- legacy aliases — old rules keep working, on the new palette -----
+     A migration debt with a finish line, not a second vocabulary: 107 rules in
+     src/ still read the palette names below, and the block goes when that
+     reaches zero. Seven more (--surface-1, --surface-4, --card-bg, --chip-bg,
+     --border-subtle, --text-faint, --slate) were kept warm for ZERO rules and
+     have been deleted — dead names here make the live ones look load-bearing. */
   --surface-2: var(--panel);
   --surface-3: var(--panel-2);
-  --surface-4: var(--hover);
-  --card-bg: var(--panel-2);
-  --chip-bg: var(--hover);
   --input-bg: var(--panel-2);
   --border: var(--line);
-  --border-subtle: var(--line-soft);
   --border-strong: var(--rule-strong);
   --text-dim: var(--muted);
-  --text-faint: var(--faint);
-  --slate: var(--muted);
   --ok: var(--green);
   --warn: var(--amber);
   --danger: var(--red);
@@ -346,6 +343,14 @@
   --on-accent: var(--accent-ink);
   --warn-bg: color-mix(in srgb, var(--mk-yellow) 26%, transparent);
   --danger-bg: color-mix(in srgb, var(--mk-red) 24%, transparent);
+
+  /* --fs-card was a second name for --fs-lead's rung: identical in BOTH
+     densities, so it could never differ, and moving one of them would either
+     have done nothing or silently split a tier that was never meant to split.
+     --fs-lead keeps the rung because its note carries the rule ("never set
+     instructions small"); its 42 existing readers keep working through here,
+     and new CSS uses --fs-lead. */
+  --fs-card: var(--fs-lead);
 
   font-family: var(--sans);
   color-scheme: dark;
@@ -455,7 +460,6 @@
   --fs-page: 36px;
   --fs-section: 22px;
   --fs-lead: 15px;
-  --fs-card: 15px;
   --fs-body: 13px;
   --fs-meta: 12px;
   /* --fs-micro deliberately unchanged: it is the floor. */

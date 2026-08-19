@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, roomGraph } from "../../api";
 import type { RoomGraph, GraphEdge, SimNode, SimEdge, View } from "./types";
-import { MAX_NODES, AREA_PER_NODE, COOL, GRAPH_MAX_FILES } from "./constants";
+import { AREA_PER_NODE, COOL, GRAPH_MAX_FILES } from "./constants";
 import { seedFrom, mulberry32, runTick, computeFit } from "./layout";
 import { rankEdges, filterEdges, countByKind, type EdgeFilter } from "./edges";
 
@@ -120,14 +120,22 @@ export function useRoomGraph({
         });
     };
     load();
-    const un = api.onRoomFilesChanged(() => {
+    const again = () => {
       window.clearTimeout(timer);
       timer = window.setTimeout(load, RELOAD_DEBOUNCE_MS);
-    });
+    };
+    const unFiles = api.onRoomFilesChanged(again);
+    // The map draws memories as stars and links them to the files they came
+    // from, so a memory the agent added or forgot changes the picture exactly
+    // as a file write does. Without this the star for a memory that no longer
+    // exists stayed on the map — still hoverable, still reporting its text —
+    // until an unrelated file write happened to re-fetch the graph.
+    const unMemories = api.onMemoriesChanged(again);
     return () => {
       alive = false;
       window.clearTimeout(timer);
-      un.then((fn) => fn());
+      unFiles.then((fn) => fn());
+      unMemories.then((fn) => fn());
     };
   }, [reloadNonce]);
 
@@ -174,18 +182,13 @@ export function useRoomGraph({
   // ---- (re)build the layout and run the settle animation on graph change ----
   useEffect(() => {
     if (!graph) return;
-    // Cap to the highest-degree nodes if a room is enormous.
-    let nodes = graph.nodes;
-    if (nodes.length > MAX_NODES) {
-      const deg = new Map<string, number>();
-      for (const e of cappedEdges) {
-        deg.set(e.a, (deg.get(e.a) ?? 0) + 1);
-        deg.set(e.b, (deg.get(e.b) ?? 0) + 1);
-      }
-      nodes = [...nodes]
-        .sort((x, y) => (deg.get(y.id) ?? 0) - (deg.get(x.id) ?? 0))
-        .slice(0, MAX_NODES);
-    }
+    // Every node the payload holds is laid out. There is no second cap here:
+    // the backend already maps only the newest GRAPH_MAX_FILES files and the
+    // same number of memories, so a "if a room is enormous" branch could never
+    // run — and if it had, it would have dropped nodes without dropping their
+    // edges, leaving the header, the degrees and the neighbour lists counting
+    // links to stars that are not on the map.
+    const nodes = graph.nodes;
     const count = nodes.length;
     if (count === 0) {
       layoutRef.current = null;

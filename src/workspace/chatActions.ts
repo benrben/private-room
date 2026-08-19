@@ -2,7 +2,10 @@ import {
   ClipboardEvent,
   KeyboardEvent as ReactKeyboardEvent,
 } from "react";
-import { api, FileTarget, memorySuggestion, Message } from "../api";
+import { api, FileContent, FileTarget, memorySuggestion, Message } from "../api";
+import { ocrBody } from "../viewers/util";
+import { textOf } from "../viewers/htmlText";
+import { parseCues } from "../viewers/subtitles";
 import type { BrowserPageSelection, BrowserPageText } from "../apiTypes";
 import {
   AutocompleteItem,
@@ -18,7 +21,7 @@ import {
 } from "./composer";
 import { runGuarded } from "./guard";
 import { prefersReducedMotion } from "../rooms/helpers";
-import { speakerName, splitMarkupBlocks } from "./markup";
+import { lostReplyNotice, speakerName, splitMarkupBlocks } from "./markup";
 import {
   BrowserScope,
   ChatScope,
@@ -36,6 +39,24 @@ import { WSState } from "./state";
  * updater is allowed to run more than once for one update (StrictMode, a
  * re-entrant render), so the decline it fires has to be idempotent. */
 const declinedApprovals = new Set<string>();
+
+/** Held from the moment an outgoing turn is accepted until it is over.
+ *
+ * `s.asking` cannot do this job: the run is only registered inside `runTurn`,
+ * and every path to it awaits something first — the live page read under a
+ * browser scope, the deletes an edit or a regenerate does. Two Enters inside
+ * that round trip both read `asking === false`, both started a turn in the same
+ * chat, and the first to finish deleted the chat's run slot — leaving the second
+ * answer streaming with no overlay and no Stop. Module state, like the scope
+ * above: `makeChatActions` is rebuilt on every render, so a closure variable
+ * would be a fresh `false` each time.
+ *
+ * Keyed BY CHAT, exactly as `s.asking` is (`isAsking(runs, chatId)`): a run
+ * belongs to its conversation, so a turn still streaming in one chat must not
+ * silently swallow the Enter pressed in another — the composer stays typable
+ * while an answer is running, and a Send that does nothing at all is the worse
+ * failure of the two. */
+const sendInFlight = new Set<string>();
 
 /**
  * WHAT THE NEXT TURN IS ANSWERED FROM.
@@ -82,6 +103,66 @@ export function subscribeTurnScope(notify: () => void): () => void {
 const PAGE_TEXT_MODE: Partial<Record<BrowserScope, "main" | "full">> = {
   page: "main",
 };
+
+/** Write to the clipboard, and say either that it worked or WHAT failed.
+ *
+ * The failure used to be reported as `String(e)`, which is right for the Rust
+ * commands — they throw written sentences — and wrong for this one: the
+ * browser rejects with a DOMException, so a refused write put
+ * "NotAllowedError: Write permission denied." on screen as the whole message,
+ * naming neither the act nor which of the Copy buttons it was. It is also the
+ * one error here whose cause is known at the call site. */
+function copyToClipboard(s: WSState, text: string, done: string): void {
+  navigator.clipboard.writeText(text).then(
+    () => s.pushToast("success", done),
+    () =>
+      s.pushToast(
+        "error",
+        "Couldn't copy — macOS refused clipboard access to Arcelle.",
+      ),
+  );
+}
+
+/** The provenance line `run_stt_job` puts in front of a transcript, for the
+ * same reason `OCR_PREFIX` exists: the model has to know the words are a
+ * machine reading. See `commands/stt_cmds.rs` — the two strings have to stay
+ * identical. */
+const TRANSCRIPT_PREFIX = "(transcribed from recording)";
+
+/** The words in a file, without what was stamped on them for the MODEL.
+ *
+ * Two kinds carry such a line — a picture's OCR prefix, a recording's
+ * transcript prefix. `ImageView` already keeps its one off the screen; the
+ * audio card still draws its own as the transcript's first line, so this is
+ * the one place the two agree, and it agrees with the reason the prefixes
+ * exist: they are an instruction to the model, not a caption to paste under
+ * someone's photograph. Two more formats simply store something other than
+ * what is on screen: an .html file's markup, and a subtitle file's cue numbers
+ * and `-->` timecodes.
+ *
+ * Never empty when the file has text: an extractor that finds nothing returns
+ * the stored text rather than silently handing back a blank clipboard. */
+function readableText(c: FileContent): string {
+  const text = c.text ?? "";
+  switch (c.kind) {
+    case "image":
+      return ocrBody(text) ?? "";
+    case "audio":
+    case "video":
+    case "recording":
+      return text.startsWith(TRANSCRIPT_PREFIX)
+        ? text.slice(TRANSCRIPT_PREFIX.length).trimStart()
+        : text;
+    case "html":
+      return textOf(text) || text;
+    case "subtitle": {
+      const cues = parseCues(text);
+      return cues.length > 0 ? cues.map((cue) => cue.text).join("\n\n") : text;
+    }
+    default:
+      return text;
+  }
+}
 
 /** Chat sessions + the AI-turn flow + the composer's #, @, / and * autocomplete. Cross-hook
  * deps threaded from the shell: files' viewFile (openSource), recording's
@@ -390,6 +471,52 @@ export function makeChatActions(
     return { ok: true, text: withPageContext(question, page) };
   }
 
+  /** The strip's promise, applied to ONE outgoing question — the single place
+   * every way of asking makes it true.
+   *
+   * A #command is exempt: it is not free text — it carries its own arguments and
+   * picks its own sources — so a page block prepended to it would ride along in
+   * something that never reads it.
+   *
+   * `ok: false` is a refusal to ask at all, never a downgrade: answering from
+   * the whole room while the strip still reads "This page" would be a different
+   * question, answered from different evidence, with nothing on screen saying
+   * so. */
+  async function applyScope(
+    outgoing: string,
+    isCommand: boolean,
+  ): Promise<
+    | { ok: true; text: string; fileIds: readonly string[] }
+    | { ok: false; why: string }
+  > {
+    if (isCommand) return { ok: true, text: outgoing, fileIds: [] };
+    const scope = currentTurnScope();
+    if (scope.sendsPageText) {
+      const scoped = await scopedQuestion(scope, outgoing);
+      if (!scoped.ok) return scoped;
+      return { ok: true, text: scoped.text, fileIds: scope.fileIds };
+    }
+    // A scope that already knows its evidence — the objects selected on the
+    // open drawing — carries it straight in. Nothing to fetch, so nothing that
+    // can fail; the empty preamble is the ordinary case and a no-op.
+    return {
+      ok: true,
+      text: withPreamble(outgoing, scope.preamble),
+      fileIds: scope.fileIds,
+    };
+  }
+
+  /** Hold the send latch for one whole outgoing turn attempt, whatever it lands
+   * on — a sent turn, a refusal, a thrown reload. */
+  async function holdingSendLatch(chatId: string, run: () => Promise<void>) {
+    sendInFlight.add(chatId);
+    try {
+      await run();
+    } finally {
+      sendInFlight.delete(chatId);
+    }
+  }
+
   /** `text` overrides the composer draft (hands-free dictation sends the
    * transcript directly — state updates would race a same-tick send). */
   async function send(text?: string) {
@@ -398,7 +525,17 @@ export function makeChatActions(
     // "must be first in the gesture" doctrine as acquireMic).
     voice.ensureUnlocked();
     const raw = (text ?? s.question).trim();
-    if (!raw || s.asking || !s.activeChatId) return;
+    // `handoffStarting` refuses a turn for the same reason `handoffContext`
+    // refuses to compact during one: the two race over the same chat, and the
+    // recap that becomes the model's whole memory of it would never have seen
+    // the question saved beside it.
+    const chatId = s.activeChatId;
+    if (!raw || s.asking || s.handoffStarting || !chatId || sendInFlight.has(chatId))
+      return;
+    await holdingSendLatch(chatId, () => sendAccepted(raw));
+  }
+
+  async function sendAccepted(raw: string) {
     if (/^#help(\s|$)/i.test(raw)) {
       s.setAc(null);
       s.setShowHelp(true);
@@ -462,27 +599,16 @@ export function makeChatActions(
       : parsed.specialist
         ? hoistTag(raw, parsed.specialist)
         : raw;
-    // The strip's promise, made good. A #command is exempt: it is not free text
-    // — it carries its own arguments and picks its own sources — so a page
-    // block prepended to it would ride along in something that never reads it.
-    const scope = currentTurnScope();
-    let sending = outgoing;
-    if (!parsed.command && scope.sendsPageText) {
-      const scoped = await scopedQuestion(scope, outgoing);
-      if (!scoped.ok) {
-        // Nothing was sent, so the question goes back in the box: losing what
-        // someone typed is a second failure on top of the one being reported.
-        s.pushToast("error", scoped.why);
-        s.setQuestion(raw);
-        return;
-      }
-      sending = scoped.text;
-    } else if (!parsed.command) {
-      // A scope that already knows its evidence — the objects selected on the
-      // open drawing — carries it straight in. Nothing to fetch, so nothing
-      // that can fail; the empty preamble is the ordinary case and a no-op.
-      sending = withPreamble(outgoing, scope.preamble);
+    // The strip's promise, made good.
+    const scoped = await applyScope(outgoing, !!parsed.command);
+    if (!scoped.ok) {
+      // Nothing was sent, so the question goes back in the box: losing what
+      // someone typed is a second failure on top of the one being reported.
+      s.pushToast("error", scoped.why);
+      s.setQuestion(raw);
+      return;
     }
+    const sending = scoped.text;
     const optimistic: Message = {
       id: `pending-${Date.now()}`,
       role: "user",
@@ -492,7 +618,7 @@ export function makeChatActions(
       effects: null,
     };
     s.setMessages((m) => [...m, optimistic]);
-    const chatId = s.activeChatId;
+    const chatId = s.activeChatId!;
     if (parsed.command) {
       s.setAttachments([]);
       await runTurn((askId) =>
@@ -507,7 +633,7 @@ export function makeChatActions(
         ...new Set([
           ...s.attachments.map((f) => f.id),
           ...parsed.refIds,
-          ...scope.fileIds,
+          ...scoped.fileIds,
         ]),
       ];
       s.setAttachments([]);
@@ -788,36 +914,104 @@ export function makeChatActions(
   }
 
   async function regenerate(assistantId: string) {
-    if (s.asking || !s.activeChatId) return;
     const chatId = s.activeChatId;
+    if (s.asking || s.handoffStarting || !chatId || sendInFlight.has(chatId)) return;
+    await holdingSendLatch(chatId, () => regenerateAccepted(assistantId));
+  }
+
+  async function regenerateAccepted(assistantId: string) {
+    const chatId = s.activeChatId!;
     const idx = s.messages.findIndex((m) => m.id === assistantId);
     if (idx < 0) return;
     let userText = "";
+    let userId = "";
     for (let i = idx - 1; i >= 0; i--) {
       if (s.messages[i].role === "user") {
         userText = s.messages[i].content;
+        userId = s.messages[i].id;
         break;
       }
     }
     if (!userText) return;
+    // The answer about to be deleted, held so the press is not a one-way door.
+    // Regenerate is pressed hardest on a local 4B, which is exactly where the
+    // second attempt can come back worse than the first — and the first is
+    // gone by then. Nothing can put it back in the room (a message can be
+    // deleted, never re-filed), so what is offered is what is true: a copy.
+    const previous = s.messages[idx].content;
     try {
+      // The question goes WITH the answer, because `ask`/`run_command` saves it
+      // again: leaving it behind put a second copy of it in the transcript, in
+      // the history the next turn is answered from, and in Copy chat — one more
+      // with every press. Newest first, so an interrupted delete never strands
+      // an answer above the question it came from (the editAndResend order).
       await api.deleteMessage(assistantId);
+      await api.deleteMessage(userId);
     } catch (e) {
       s.pushToast("error", String(e));
+      try {
+        s.setMessages(await api.getMessages(chatId));
+      } catch {
+        /* the failure above is already reported; a second toast about the
+           repaint would say nothing the user can act on */
+      }
       return;
     }
     s.setMessages(await api.getMessages(chatId));
+    // A lost-reply notice is not an answer, so there is nothing worth offering
+    // back for one. The offer waits to be dismissed rather than expiring: the
+    // moment a user knows they wanted the old answer is after the new one has
+    // finished arriving.
+    if (lostReplyNotice(previous) === null && splitMarkupBlocks(previous).text.trim()) {
+      s.pushToast("info", "Asking again — the previous answer was deleted.", {
+        label: "Copy the old one",
+        run: () =>
+          copyToClipboard(
+            s,
+            splitMarkupBlocks(previous).text,
+            "The previous answer was copied to the clipboard.",
+          ),
+      });
+    }
+    // The question is back on screen while the answer is written, exactly as
+    // `send` shows it — it was just deleted from the room, and a chat that goes
+    // blank until the reply lands reads like the press did nothing.
+    const optimistic: Message = {
+      id: `pending-${Date.now()}`,
+      role: "user",
+      content: userText,
+      sources: [],
+      createdAt: "",
+      effects: null,
+    };
+    s.setMessages((m) => [...m, optimistic]);
     // Re-run the original turn the SAME way it was first sent: a #command
     // re-executes as a command (not resent as literal text), and any @-mentioned
-    // files are re-attached (parsed back out of the text). Paperclip-only
-    // attachments aren't stored on the message, so those can't be recovered here.
+    // files are re-attached (parsed back out of the text). The message stores no
+    // record of the paperclip, so what rides along is what is on it NOW —
+    // which is the rule `askAgainWithRealDetails` already follows, and the
+    // reason it gives is the one that matters here too: a retry that carries
+    // less evidence than the question it is retrying answers a different
+    // question and says nothing about having done so.
+    // The scope's TEXT is not re-applied — the saved text already carries
+    // whatever the first send prepended, and a second copy of the page would
+    // stack on top — but the files it names are not in that text, so they are.
+    // A #command is exempt from all of it, exactly as on send: it carries its
+    // own arguments and picks its own sources.
     const parsed = parseComposer(userText, s.commands, s.skills, s.files, s.folders);
     if (parsed.command) {
       await runTurn((askId) =>
         api.runCommand(chatId, parsed.command!, parsed.args, parsed.refIds, userText, askId),
       );
     } else {
-      await askOnce(userText, parsed.refIds);
+      const attachmentIds = [
+        ...new Set([
+          ...s.attachments.map((f) => f.id),
+          ...parsed.refIds,
+          ...currentTurnScope().fileIds,
+        ]),
+      ];
+      await askOnce(userText, attachmentIds);
     }
   }
 
@@ -825,8 +1019,13 @@ export function makeChatActions(
    * straight line, so everything after the edited question goes with it —
    * those answers belong to a question that was never asked. */
   async function editAndResend(messageId: string, newText: string) {
-    if (s.asking || !s.activeChatId) return;
     const chatId = s.activeChatId;
+    if (s.asking || s.handoffStarting || !chatId || sendInFlight.has(chatId)) return;
+    await holdingSendLatch(chatId, () => editAndResendAccepted(messageId, newText));
+  }
+
+  async function editAndResendAccepted(messageId: string, newText: string) {
+    const chatId = s.activeChatId!;
     const text = newText.trim();
     if (!text) return;
     const idx = s.messages.findIndex((m) => m.id === messageId);
@@ -882,6 +1081,19 @@ export function makeChatActions(
       : parsed.specialist
         ? hoistTag(text, parsed.specialist)
         : text;
+    // A rewrite IS a send, so it is answered from what the strip promises —
+    // this used to go out as bare text, and a question edited under "This page"
+    // was answered from the room while the strip above it still said otherwise.
+    // Read BEFORE anything is deleted, for the same reason the validation above
+    // is: a page that cannot be read must not cost the user the tail of their
+    // conversation. Nothing has been removed yet, so a refusal leaves the chat
+    // exactly as it was.
+    const scoped = await applyScope(outgoing, !!parsed.command);
+    if (!scoped.ok) {
+      s.pushToast("error", scoped.why);
+      return;
+    }
+    const sending = scoped.text;
     let removed = true;
     try {
       // Newest first, so an interrupted run never leaves an answer stranded
@@ -907,7 +1119,7 @@ export function makeChatActions(
     const optimistic: Message = {
       id: `pending-${Date.now()}`,
       role: "user",
-      content: outgoing,
+      content: sending,
       sources: [],
       createdAt: "",
       effects: null,
@@ -918,16 +1130,16 @@ export function makeChatActions(
         api.runCommand(chatId, parsed.command!, parsed.args, parsed.refIds, outgoing, askId),
       );
     } else {
-      await askOnce(outgoing, parsed.refIds);
+      // The scope's own files ride alongside what the rewrite names, exactly as
+      // on send.
+      const attachmentIds = [...new Set([...parsed.refIds, ...scoped.fileIds])];
+      await askOnce(sending, attachmentIds);
     }
   }
 
   function copyMessage(m: Message) {
     const clean = splitMarkupBlocks(m.content).text;
-    navigator.clipboard.writeText(clean).then(
-      () => s.pushToast("success", "Copied to clipboard."),
-      (e) => s.pushToast("error", String(e)),
-    );
+    copyToClipboard(s, clean, "Copied to clipboard.");
   }
 
   /** The whole thread as plain markdown. Copying an answer at a time was the
@@ -952,19 +1164,24 @@ export function makeChatActions(
         return `**${who}**\n\n${text}`;
       })
       .join("\n\n---\n\n");
-    navigator.clipboard.writeText(`# ${title}\n\n${body}\n`).then(
-      () => s.pushToast("success", "The whole chat was copied to the clipboard."),
-      (e) => s.pushToast("error", String(e)),
+    copyToClipboard(
+      s,
+      `# ${title}\n\n${body}\n`,
+      "The whole chat was copied to the clipboard.",
     );
   }
 
   function copyAllText() {
-    const text = s.openFile?.content.text;
-    if (!text) return;
-    navigator.clipboard.writeText(text).then(
-      () => s.pushToast("success", "Copied all text to clipboard."),
-      (e) => s.pushToast("error", String(e)),
-    );
+    const content = s.openFile?.content;
+    if (!content) return;
+    const text = readableText(content);
+    if (!text) {
+      // Reachable: the menu offers this whenever `content.text` is non-empty,
+      // and a picture whose OCR found nothing but the prefix has exactly that.
+      s.pushToast("info", "There are no words in this file to copy.");
+      return;
+    }
+    copyToClipboard(s, text, "Copied the text to the clipboard.");
   }
 
   function openSource(name: string) {

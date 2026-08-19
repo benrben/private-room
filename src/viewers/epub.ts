@@ -39,6 +39,34 @@ function attr(el: Element, local: string): string | null {
   return null;
 }
 
+/** An href in an OPF, an NCX or a chapter is a URI reference, so a zip entry
+ * named `Text/Chapter 1.xhtml` is written `Text/Chapter%201.xhtml` — required
+ * for any space or non-ASCII character. The entry names are the decoded text,
+ * so a book whose publisher escaped its hrefs loses its whole spine unless the
+ * escapes come off here.
+ *
+ * The escapes come off LAST, once the reference has been resolved, because
+ * every separator `resolvePath` reads is a URI separator: a chapter named
+ * `Notes: one.xhtml` is written `Notes%3A%20one.xhtml`, and decoding that
+ * first hands `resolvePath` something starting `Notes:`, which it correctly
+ * reads as an absolute URL and returns unresolved — the book's folder is
+ * dropped and the chapter is lost. For the same reason an encoded `%2E%2E`
+ * stays one path segment instead of climbing out of the archive.
+ *
+ * The fragment goes first of all, so an encoded `%23` in a filename cannot
+ * turn into a fragment separator. A malformed escape is kept as written rather
+ * than throwing: a stray `%` in a filename is not a reason for the book to
+ * fail to open. */
+export function hrefToPath(base: string, href: string): string {
+  const path = resolvePath(base, withoutFragment(href));
+  try {
+    return decodeURIComponent(path);
+  } catch {
+    // Not a valid escape sequence — the literal text is the only name we have.
+    return path;
+  }
+}
+
 /** The OPF package path, from `META-INF/container.xml`. Falls back to any
  * `.opf` in the archive, which is what a slightly-malformed book has. */
 export function opfPath(files: Record<string, Uint8Array>): string | null {
@@ -65,7 +93,7 @@ function tocTitles(
     for (const a of toc ? descendants(toc, "a") : []) {
       const href = attr(a, "href");
       const label = (a.textContent ?? "").trim();
-      if (href && label) out.set(resolvePath(navPath, withoutFragment(href)), label);
+      if (href && label) out.set(hrefToPath(navPath, href), label);
     }
   }
   if (ncxPath) {
@@ -75,7 +103,7 @@ function tocTitles(
       const href = content ? attr(content, "src") : null;
       const label = descendants(point, "text")[0]?.textContent?.trim() ?? "";
       if (href && label) {
-        const path = resolvePath(ncxPath, withoutFragment(href));
+        const path = hrefToPath(ncxPath, href);
         if (!out.has(path)) out.set(path, label);
       }
     }
@@ -106,7 +134,7 @@ export function parseEpub(files: Record<string, Uint8Array>): Book | null {
     const href = attr(item, "href");
     if (!id || !href) continue;
     manifest.set(id, {
-      path: resolvePath(opf, withoutFragment(href)),
+      path: hrefToPath(opf, href),
       type: attr(item, "media-type") ?? "",
       props: attr(item, "properties") ?? "",
     });
@@ -181,12 +209,10 @@ export function chapterHtml(
     const srcAttr = img.localName === "image" ? "href" : "src";
     const raw = attr(img, srcAttr);
     if (!raw || raw.startsWith("data:")) continue;
-    const asset = findEntry(files, resolvePath(path, withoutFragment(raw)));
+    const assetPath = hrefToPath(path, raw);
+    const asset = findEntry(files, assetPath);
     if (asset) {
-      img.setAttribute(
-        srcAttr,
-        toDataUrl(asset, mimeForPath(resolvePath(path, withoutFragment(raw)))),
-      );
+      img.setAttribute(srcAttr, toDataUrl(asset, mimeForPath(assetPath)));
     } else {
       img.removeAttribute(srcAttr);
     }
@@ -198,7 +224,7 @@ export function chapterHtml(
     const rel = (attr(link, "rel") ?? "").toLowerCase();
     const href = attr(link, "href");
     if (!rel.includes("stylesheet") || !href) continue;
-    const cssPath = resolvePath(path, withoutFragment(href));
+    const cssPath = hrefToPath(path, href);
     const css = findEntry(files, cssPath);
     if (css) styles.push(inlineCssAssets(files, cssPath, bytesToText(css)));
     link.remove();
@@ -225,7 +251,7 @@ function inlineCssAssets(
 ): string {
   return css.replace(/url\(\s*(['"]?)([^'")]+)\1\s*\)/g, (all, _q, ref: string) => {
     if (/^(data:|https?:)/i.test(ref)) return all;
-    const assetPath = resolvePath(cssPath, withoutFragment(ref));
+    const assetPath = hrefToPath(cssPath, ref);
     const bytes = findEntry(files, assetPath);
     return bytes ? `url("${toDataUrl(bytes, mimeForPath(assetPath))}")` : "url()";
   });

@@ -348,13 +348,40 @@ async def test_the_gather_budget_follows_the_model_not_the_mac(monkeypatch: Any)
 
     monkeypatch.setattr(summarize, "native_context_length", _tiny)
     assert await summarize._gather_window(_LocalModelClient(), "m") == 8_192
-    # Nothing local to size — no base_url, a provider client, or a cloud CLI —
-    # keeps the ceiling, which is what those engines got before.
+    # Nothing to size against — no base_url, a provider that states no window,
+    # or a cloud CLI — keeps the ceiling, which is what those engines got before.
     assert await summarize._gather_window(FakeModelClient(), "m") == summarize.max_num_ctx()
     via_provider = _LocalModelClient()
     via_provider.provider = object()  # type: ignore[attr-defined]
     assert await summarize._gather_window(via_provider, "m") == summarize.max_num_ctx()
     assert await summarize._gather_window(_LocalModelClient(), "claude-cli") == summarize.max_num_ctx()
+
+
+async def test_the_gather_budget_follows_a_providers_stated_window() -> None:
+    """A cloud room's window is a published number, not a guess about this Mac.
+
+    Budgeting an 8k OpenRouter model's reads off the RAM ceiling spent ~380 KB
+    of file text on a window that holds a fraction of it; `_fit_one_shot` then
+    cut the reads back on the provider side with nothing saying so, so the
+    one-liner was written from a truncated read the app had called a full one.
+    """
+
+    class _Provider:
+        context_window = 8_192
+
+    small = FakeModelClient()
+    small.provider = _Provider()  # type: ignore[attr-defined]
+    assert await summarize._gather_window(small, "m") == 8_192
+
+    class _Huge:
+        context_window = 2_000_000
+
+    # The RAM ceiling still caps: the gathered text is held in THIS process
+    # before it is sent, so a provider window larger than the Mac's ceiling
+    # cannot license a bigger read than a local model would get.
+    huge = FakeModelClient()
+    huge.provider = _Huge()  # type: ignore[attr-defined]
+    assert await summarize._gather_window(huge, "m") == summarize.max_num_ctx()
 
 
 async def test_a_small_window_model_reads_less_of_a_long_file(monkeypatch: Any) -> None:

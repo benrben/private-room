@@ -12,10 +12,16 @@ import { displayName, uniqueFileName } from "./composer";
 import { sectionLabel } from "./fileVisibility";
 import { tryToast } from "./guard";
 import { WSState } from "./state";
+import type { Toast } from "./types";
 import {
   EditMode,
   editModeOf as registryEditModeOf,
 } from "../viewers/registry";
+
+/** The file id of the most recent open request, so a slower earlier open can
+ * tell it has been superseded. Module-level because `makeFileActions` is
+ * rebuilt on every render, and there is one workspace in the process. */
+let openIntent: string | null = null;
 
 /** File + folder + open-file state handlers (import/view/edit/versions/folders).
  * All state lives in `s`; this only owns the plumbing. Extracted verbatim. */
@@ -162,13 +168,53 @@ export function makeFileActions(s: WSState) {
     }
   }
 
+  /** Undo the file writes ONE answer made.
+   *
+   * The chip records file ids only, so WHICH saved version each file goes back
+   * to is worked out here, from the turn this answer belongs to: the writes of
+   * a turn are the version rows cut between the question and the answer that
+   * finished it. Restoring the newest row instead — whatever made it — got both
+   * halves wrong. A turn that wrote one file twice was only half undone (the
+   * first write stayed, and the chip was gone). And a file the user had SAVED
+   * THEMSELVES since was rolled back onto the AI's wording under a toast that
+   * said "Change undone" — their paragraph, discarded by an undo of something
+   * else. A file whose head has moved on since the answer is left alone and
+   * said so, the way `apply_with_staleness` refuses a stale edit. */
   async function undoEdits(msgId: string) {
     const fileIds = s.undoByMsg[msgId];
     if (!fileIds || fileIds.length === 0) return;
+    const at = s.messages.findIndex((m) => m.id === msgId);
+    // The answer's own row is written when the turn ends, and the message
+    // before it is the question that started it — the two ends of the window
+    // every write of this turn falls inside.
+    const answeredAt = at === -1 ? null : s.messages[at].createdAt;
+    const askedAt = at > 0 ? s.messages[at - 1].createdAt : null;
+    const undone: string[] = [];
+    const moved: string[] = [];
+    const nameOf = (id: string) => {
+      const f = s.files.find((x) => x.id === id);
+      return f ? `"${displayName(f.name)}"` : "That file";
+    };
     try {
       for (const fid of fileIds) {
+        // Newest first (list_file_versions orders by saved_at DESC).
         const versions = await api.listFileVersions(fid);
-        if (versions[0]) await api.restoreFileVersion(versions[0].id);
+        const head = versions[0];
+        if (!head) continue;
+        if (answeredAt && head.savedAt > answeredAt) {
+          moved.push(fid);
+          continue;
+        }
+        const inTurn =
+          askedAt && answeredAt
+            ? versions.filter((v) => v.savedAt >= askedAt && v.savedAt <= answeredAt)
+            : [];
+        // The state before the turn's FIRST write to this file. With no window
+        // to read (the answer is no longer in this chat's messages), the last
+        // write is all that can honestly be claimed — and the head check above
+        // has already ruled out rolling over a later save.
+        await api.restoreFileVersion((inTurn[inTurn.length - 1] ?? head).id);
+        undone.push(fid);
       }
       s.setUndoByMsg((u) => {
         const next = { ...u };
@@ -177,15 +223,28 @@ export function makeFileActions(s: WSState) {
       });
       s.setFiles(await api.listFiles());
       const current = s.openFileRef.current;
-      if (current && fileIds.includes(current.id)) {
+      if (current && undone.includes(current.id)) {
         const content = await api.getFileContent(current.id);
         s.setOpenFile({ ...current, content });
         s.setViewerRev((r) => r + 1);
       }
-      s.pushToast(
-        "success",
-        fileIds.length > 1 ? `Undid changes to ${fileIds.length} files.` : "Change undone.",
-      );
+      if (undone.length > 0) {
+        s.pushToast(
+          "success",
+          undone.length > 1 ? `Undid changes to ${undone.length} files.` : "Change undone.",
+        );
+      }
+      // Say what was NOT undone, and where the older text still is. Silence
+      // here would read as "all of it went back".
+      if (moved.length > 0) {
+        const which = moved.map(nameOf).join(", ");
+        s.pushToast(
+          "info",
+          moved.length > 1
+            ? `${which} have been saved again since that answer, so they were left alone — open a file's version history to go further back.`
+            : `${which} has been saved again since that answer, so it was left alone — open its version history to go further back.`,
+        );
+      }
     } catch (e) {
       s.pushToast("error", String(e));
     }
@@ -365,12 +424,16 @@ export function makeFileActions(s: WSState) {
     forgetFile(id);
     await tryToast(s, async () => s.setFiles(await api.listFiles()));
     await reloadTrash();
-    // Say where it went. "Deleted" with no undo in sight is what made this the
-    // audit's one high-severity gap; the toast is the first place the net is
-    // visible, so it names the trash rather than just reporting success.
+    // Say where it went, and offer the way back from the message itself. The
+    // toast machinery already models this: an `about` + an `action` is an
+    // OFFER and waits 12s rather than 5 (toastStack.toastLifeMs), which is the
+    // window someone needs to read it, decide it was wrong, and press Undo.
+    // Without the offer the only route back is Trash → find the row → Restore.
     s.pushToast(
       "success",
       name ? `Moved "${displayName(name)}" to the trash.` : "Moved to the trash.",
+      { label: "Undo", run: () => void restoreFile(id) },
+      `file:${id}`,
     );
   }
 
@@ -430,8 +493,18 @@ export function makeFileActions(s: WSState) {
    * length of the list we sent: a batch is best-effort, so "moved 7 files" over
    * a run where 2 failed is precisely the lie these commands return a value to
    * prevent. Failures are NAMED — "3 could not be moved" leaves the reader to
-   * diff two lists by eye to find out which three. */
-  function reportBulk(report: BulkReport, verbPast: string) {
+   * diff two lists by eye to find out which three.
+   *
+   * `undo` rides on the success receipt for the batches that have an inverse.
+   * It needs `about` too: a toast carrying an action but no `about` never
+   * expires (toastStack.toastLifeMs), and one `about` per KIND of batch means
+   * a second bulk removal replaces the first rather than leaving two Undos on
+   * screen that mean different things. */
+  function reportBulk(
+    report: BulkReport,
+    verbPast: string,
+    undo?: { action: Toast["action"]; about: string },
+  ) {
     const n = report.ok.length;
     if (n > 0) {
       s.pushToast(
@@ -439,6 +512,8 @@ export function makeFileActions(s: WSState) {
         n === 1
           ? `${verbPast[0].toUpperCase()}${verbPast.slice(1)} "${displayName(report.ok[0])}".`
           : `${n} files ${verbPast}.`,
+        undo?.action,
+        undo?.about,
       );
     }
     if (report.failed.length > 0) {
@@ -561,7 +636,19 @@ export function makeFileActions(s: WSState) {
     clearSelection();
     await tryToast(s, async () => s.setFiles(await api.listFiles()));
     await reloadTrash();
-    reportBulk(report, "moved to the trash");
+    // The Undo can only send the ids this call sent, so it is offered only when
+    // every one of them actually landed in the trash. `db::restore_file` refuses
+    // a file that was never trashed, so on a partial batch — some failed, or the
+    // tail was past the backend's per-batch ceiling — pressing Undo would answer
+    // a removal with a list of restore failures.
+    const wholeBatchLanded = report.failed.length === 0 && report.capped === 0;
+    reportBulk(
+      report,
+      "moved to the trash",
+      wholeBatchLanded
+        ? { action: { label: "Undo", run: () => void restoreFiles(ids) }, about: "file-bulk" }
+        : undefined,
+    );
   }
 
   async function restoreFiles(ids: string[]) {
@@ -636,10 +723,47 @@ export function makeFileActions(s: WSState) {
     });
   }
 
+  /** Open a file into the viewer — the funnel every open in the app goes
+   * through (Library click, ⌘K hit, agent open, job toast, recording chip).
+   *
+   * Replacing the open document unmounts Monaco with its buffer in it, which
+   * is the same loss closing the file causes, from a click that never mentions
+   * the file being left. So it asks first — except when the id ALREADY showing
+   * is the one being opened: that is a reload (the agent rewrote it, a
+   * recording finished writing it), and a dialog there would be a false alarm
+   * about work nothing is about to throw away. */
   async function viewFile(id: string, target?: FileTarget) {
+    const showing = s.openFileRef.current;
+    if (showing && showing.id !== id) {
+      // `guardLeave` runs `proceed` ON THE SPOT when there is nothing to lose —
+      // the ordinary path — so hold onto that promise: callers await this to
+      // know the file is on screen. "New page" turns edit mode on the moment it
+      // resolves, and an unawaited open lands `setEditMode(false)` behind them,
+      // opening the new note read-only. When the dialog DOES go up there is
+      // nothing here to wait for: the open happens whenever it is answered, and
+      // blocking until then would hang callers that must carry on regardless
+      // (a started recording attaches its microphone on the next line).
+      let opening: Promise<void> = Promise.resolve();
+      guardLeave("Opening another file", () => {
+        opening = openFile(id, target);
+      });
+      await opening;
+      return;
+    }
+    await openFile(id, target);
+  }
+
+  async function openFile(id: string, target?: FileTarget) {
     // One key for every message about opening THIS file. It makes the failure
     // replaceable rather than stackable, and retirable by the success below.
     const about = `open:${id}`;
+    // The LAST open asked for is the one that must land. Two can be in flight
+    // at once — a click while a big PDF is still fetching, the job-finished
+    // toast's auto-open, a recording's reload — and `get_file_content` calls
+    // are separate tasks whose order out of the room mutex is not the order
+    // they went in. Whoever resolved last used to win the screen, which is the
+    // click the user made FIRST.
+    openIntent = id;
     // Say it is opening BEFORE the wait, not after it. `get_file_content` is a
     // synchronous command behind the room mutex, so on a large file this await
     // is the whole delay — and nothing on screen changed for its duration.
@@ -649,8 +773,10 @@ export function makeFileActions(s: WSState) {
       content = await api.getFileContent(id);
     } catch (e) {
       // Opening is the most-used action in the app; failing it silently left
-      // the previous file on screen and read as a dead click.
-      s.setOpeningFileId(null);
+      // the previous file on screen and read as a dead click. The failure is
+      // reported either way — but the "Opening…" indicator belongs to whichever
+      // open is still running, so a superseded call must not clear it.
+      if (openIntent === id) s.setOpeningFileId(null);
       // NAME THE FILE. "Could not open that file" is unanswerable in a room of
       // two hundred: the click that failed is over, the Library selection may
       // have moved on, and the message outlives both.
@@ -664,6 +790,10 @@ export function makeFileActions(s: WSState) {
       );
       return;
     }
+    // A newer open was asked for while this one was fetching: that one owns the
+    // screen and the "Opening…" line. Painting this content now would put the
+    // file the user left back over the one they just chose.
+    if (openIntent !== id) return;
     // It opened. Whatever this file's last failure said about it is now false.
     s.forgetToastsAbout(about);
     s.setOpeningFileId(null);
@@ -674,8 +804,17 @@ export function makeFileActions(s: WSState) {
 
   /** "New page": a blank Markdown note via the ordinary generated-file path
    * (same command chat's "Save to room" uses), opened straight into editing.
-   * A dated name keeps repeat presses from colliding. */
-  async function createNewNote() {
+   * A dated name keeps repeat presses from colliding.
+   *
+   * The unsaved-edits question is asked BEFORE anything is written, not by the
+   * `viewFile` below: cancelling it must not leave a note nobody asked for in
+   * the library, and the `setEditMode` that follows the open belongs to the new
+   * note, never to the file the user is still editing. */
+  function createNewNote() {
+    guardLeave("Making a new note", () => void writeNewNote());
+  }
+
+  async function writeNewNote() {
     const now = new Date();
     const stamp = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")} ${String(now.getHours()).padStart(2, "0")}.${String(now.getMinutes()).padStart(2, "0")}.${String(now.getSeconds()).padStart(2, "0")}`;
     try {
@@ -765,8 +904,14 @@ export function makeFileActions(s: WSState) {
   }
 
   /** Create a starter `.py` script and open it in the editor (the Scripts page's
-   * "New script" action — a room .py/.js file IS a script). */
-  async function createNewScript() {
+   * "New script" action — a room .py/.js file IS a script). Asks about an
+   * unsaved edit before writing anything, for the same reason `createNewNote`
+   * does. */
+  function createNewScript() {
+    guardLeave("Making a new script", () => void writeNewScript());
+  }
+
+  async function writeNewScript() {
     const starter = `# /// script
 # dependencies = []
 # ///
@@ -780,12 +925,19 @@ import sys
 data = sys.stdin.read()
 print(data.upper())
 `;
+    // `save_generated_impl` does not de-duplicate, so a second press used to
+    // file a second row also called "New script.py" — indistinguishable in the
+    // Scripts list, the top-bar shortcut menu and the run-consent card.
+    const name = uniqueFileName("New script.py", s.files.map((f) => f.name));
     try {
-      const meta = await api.saveGeneratedFile("New script.py", starter);
+      const meta = await api.saveGeneratedFile(name, starter);
       s.setFiles(await api.listFiles());
       await viewFile(meta.id);
       s.setEditMode(true);
-      s.pushToast("info", "New script created — edit it, then run it from the Scripts page.");
+      s.pushToast(
+        "info",
+        `"${displayName(name)}" created — edit it, then run it from the Scripts page.`,
+      );
     } catch (e) {
       s.pushToast("error", String(e));
     }

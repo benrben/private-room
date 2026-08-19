@@ -420,3 +420,26 @@ async def test_the_route_returns_audio_with_its_timings(fake_voices: list) -> No
     assert base64.b64decode(body["audio_b64"])[:4] == b"RIFF"
     assert body["offsets_ms"] == [0, 500]
     assert body["duration_ms"] == 1000
+
+
+def test_a_turn_with_no_ascii_spaces_is_still_cut_to_the_limit() -> None:
+    # Chinese and Japanese write no spaces, so the last-resort splitter — which
+    # only knew ASCII whitespace — handed the whole turn back as ONE piece and
+    # the podcast path sent it to the service over the limit.
+    cjk = "这是一个很长的句子，没有任何空格。" * 40
+    pieces = tts.split_for_tts(cjk, limit=100)
+    assert pieces and all(len(p) <= 100 for p in pieces), (
+        f"longest piece was {max(len(p) for p in pieces)} of a 100 limit"
+    )
+    assert "".join(pieces).replace(" ", "") == cjk.replace(" ", "")
+
+    # One unbroken token with no break character anywhere: cut on the count.
+    run = "x" * 250
+    hard = tts.split_for_tts(run, limit=100)
+    assert [len(p) for p in hard] == [100, 100, 50]
+    assert "".join(hard) == run
+
+    # A single character over the boundary, and the empty case.
+    assert tts.split_for_tts("y" * 101, limit=100) == ["y" * 100, "y"]
+    assert tts.split_for_tts("y" * 100, limit=100) == ["y" * 100]
+    assert tts.split_for_tts("", limit=100) == []

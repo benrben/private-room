@@ -67,6 +67,53 @@ pub(crate) fn main_webview<R: tauri::Runtime>(
     tauri::Manager::webviews(app).get(MAIN_WINDOW).cloned()
 }
 
+/// How long the quit waits for a live recording's final write.
+///
+/// The engine drains its decoder and runs the whole-recording speaker pass
+/// before it writes, and that work grows with the meeting — `close_room` allows
+/// the same 30 s for the same stop (`commands::rooms::drain_inflight`). Bounded
+/// rather than open-ended because a wedged engine must still let the app quit;
+/// the wait running out is the one case where the tail is lost anyway, so it is
+/// logged rather than passed over.
+const REC_FLUSH_ON_QUIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Stop the live recording, if there is one, and wait for its final write.
+///
+/// THE BUG THIS EXISTS FOR: ⌘Q (and closing the window) raises no window CLOSE
+/// request, so nothing on the quit path had ever touched `RecState`. The engine
+/// checkpoints its audio only every 60 s and its transcript only every few
+/// phrases, so quitting mid-meeting discarded everything since the last
+/// checkpoint — up to a minute of audio and the words in it — in silence.
+/// `EngineMsg::Stop` is what makes `flush(true)`/`finish()` run, and the wait is
+/// what stops the process exiting out from under it.
+fn flush_live_recording<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    use tauri::Manager;
+    // Take the session out under the lock and release it before waiting: the
+    // engine thread needs the lock to finish its own write, so holding it
+    // across the wait would deadlock the very flush we are here for.
+    let done_rx = {
+        let rec = app.state::<commands::RecState>();
+        let mut session = rec.session.lock().unwrap();
+        session.take().map(|live| {
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let _ = live.handle.tx.send(recording::EngineMsg::Stop { done: done_tx });
+            done_rx
+        })
+    };
+    let Some(done_rx) = done_rx else { return };
+    // Blocking, not `spawn_blocking`: this runs inside `RunEvent::Exit`, where
+    // the async runtime is already on its way out and nothing would be left to
+    // poll the task. Bounded, so a wedged decoder still lets the app quit.
+    // Logged, not passed over: the wait running out is the one case where the
+    // tail really is lost, and it must leave a trace.
+    if done_rx.recv_timeout(REC_FLUSH_ON_QUIT).is_err() {
+        obs::warn(
+            "rec_flush_on_quit_timed_out",
+            &[("waited_s", obs::count(REC_FLUSH_ON_QUIT.as_secs() as usize))],
+        );
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // FIRST, before anything can make a decision worth recording: the host's own
@@ -491,6 +538,7 @@ pub fn run() {
             // Owner replacement #1: point the user at the log folder.
             obs::reveal_logs,
             commands::set_unsaved_edits,
+            commands::quit_guard_rearm,
             // The native View menu's ticks and its enabled state, pushed from
             // the window that owns the layout.
             menu::menu_sync,
@@ -557,7 +605,7 @@ pub fn run() {
                 if commands::hold_quit_for_unsaved(*code) {
                     api.prevent_exit();
                     if let Some(window) = main_window(_app) {
-                        let _ = window.emit("quit-requested", ());
+                        let _ = window.emit(commands::QUIT_REQUESTED, ());
                     }
                 }
             }
@@ -568,6 +616,13 @@ pub fn run() {
                 // never be able to fail a quit, and it must not depend on the
                 // window still existing by the time teardown gets here.
                 commands::save_geometry(_app);
+                // ADD-27: a live recording's un-checkpointed tail is only made
+                // durable by the engine's final flush, and ⌘Q is a quit no
+                // window event ever sees. BEFORE `stt::unload_ctx`: the engine
+                // drains its decoder through Whisper as it stops, and pulling
+                // the context out from under it would trade lost audio for a
+                // ggml assert.
+                flush_live_recording(_app);
                 // Metal wave: the warm Whisper context must drop BEFORE ggml's
                 // atexit teardown, or its resident GPU buffers turn Quit into
                 // a ggml_metal_device_free assert (a crash report).
@@ -603,4 +658,121 @@ pub fn run() {
                 }
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::recording::{self, EngineMsg, RecMeta, SAMPLE_RATE};
+    use tauri::Manager;
+
+    /// Quitting mid-meeting used to throw away everything since the last
+    /// checkpoint.
+    ///
+    /// The engine only writes audio into the room every 60 s (and the
+    /// transcript every few phrases), so a recording younger than that has
+    /// NOTHING durable behind it. ⌘Q raises no window close event, `RunEvent::
+    /// Exit` never touched `RecState`, and the engine thread died with the
+    /// process holding the only copy.
+    ///
+    /// Two seconds of audio is the whole point: it is under the checkpoint
+    /// interval, so before the fix the room's file is still the empty WAV
+    /// `rec_start` inserted. No Whisper — silence gives the VAD nothing to
+    /// close, so this measures the write path and nothing else.
+    #[test]
+    fn quitting_during_a_recording_makes_its_tail_durable() {
+        let room_path = std::env::temp_dir()
+            .join(format!("pr-quit-rec-{}.roomai", uuid::Uuid::new_v4()))
+            .to_string_lossy()
+            .into_owned();
+        let conn = db::create_room(&room_path, "qa-room-pw", "QA").unwrap();
+        let file = db::insert_file(
+            &conn,
+            "QA recording.wav",
+            "audio/wav",
+            &recording::encode_wav(&[]),
+            Some("(live recording)\n"),
+            "recording",
+        )
+        .unwrap();
+        db::set_rec_meta(&conn, &file.id, &serde_json::to_string(&RecMeta::default()).unwrap())
+            .unwrap();
+
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let state = AppState::default();
+        *state.room.lock().unwrap() = Some(commands::Room {
+            conn,
+            path: room_path.clone(),
+            name: "QA".into(),
+            password: "qa-room-pw".into(),
+        });
+        app.manage(state);
+        app.manage(commands::RecState::default());
+
+        let handle = recording::start_engine(
+            app.handle().clone(),
+            recording::EngineConfig {
+                file_id: file.id.clone(),
+                room_path: room_path.clone(),
+                model_path: std::path::PathBuf::from("/nonexistent-model"),
+                base_samples: Vec::new(),
+                meta: RecMeta::default(),
+                system_audio: false,
+                live_translate: None,
+                known_voices: Vec::new(),
+            },
+        );
+        handle
+            .tx
+            .send(EngineMsg::Audio {
+                source: recording::Source::Mic,
+                rate: SAMPLE_RATE as u32,
+                samples: vec![0.0; SAMPLE_RATE * 2],
+            })
+            .unwrap();
+        // The live session exactly as `rec_start` registers it.
+        let rec = app.state::<commands::RecState>();
+        *rec.session.lock().unwrap() = Some(commands::LiveSession {
+            file_id: file.id.clone(),
+            handle,
+            awake: None,
+        });
+
+        let recorded_samples = || {
+            let state = app.state::<AppState>();
+            let guard = state.room.lock().unwrap();
+            let bytes = db::get_file_bytes(&guard.as_ref().unwrap().conn, &file.id)
+                .unwrap()
+                .unwrap_or_default();
+            recording::decode_wav(&bytes).unwrap().len()
+        };
+        assert_eq!(recorded_samples(), 0, "the room already held audio — the setup checkpointed");
+
+        flush_live_recording(app.handle());
+
+        assert!(
+            recorded_samples() >= SAMPLE_RATE * 2,
+            "quitting discarded the recording's un-checkpointed tail"
+        );
+        assert!(
+            rec.session.lock().unwrap().is_none(),
+            "the live session outlived the quit that stopped it"
+        );
+        let _ = std::fs::remove_file(&room_path);
+    }
+
+    /// A quit with nothing recording must not block on an engine that isn't
+    /// there — the empty case of the same door.
+    #[test]
+    fn quitting_with_no_recording_is_a_no_op() {
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        app.manage(commands::RecState::default());
+        let began = std::time::Instant::now();
+        flush_live_recording(app.handle());
+        assert!(began.elapsed() < std::time::Duration::from_secs(1));
+    }
 }

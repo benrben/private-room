@@ -185,7 +185,14 @@ export default function Workspace({ info, onLock, onRenamed }: Props) {
         "This file has edits you haven't saved yet. Quitting Arcelle loses them.",
         { title: "Unsaved edits", kind: "warning", okLabel: "Quit and discard" },
       ).catch(() => true);
-      if (!go) return;
+      if (!go) {
+        // Staying. The buffer is still dirty, so the flag must NOT be cleared —
+        // but Rust latched this quit as "already asked", and left alone that
+        // latch lets the next ⌘Q quit with no dialog and discard the very
+        // buffer this one just saved.
+        await api.quitGuardRearm().catch(() => {});
+        return;
+      }
       s.editorDirtyRef.current = false;
       await api.setUnsavedEdits(false).catch(() => {});
       await exit(0).catch(() => {});
@@ -221,7 +228,12 @@ export default function Workspace({ info, onLock, onRenamed }: Props) {
     s.pushToast("error", message),
   );
 
-  const tabs = useTabs(info.name);
+  // Keyed on the PATH, not the display name. The name is editable from the top
+  // bar, and re-keying on it made a rename read as "a different room": the tab
+  // list was re-read and the area restore ran again, closing whatever
+  // section-only object was open. tabs.ts's "tabs belong to a room, not to the
+  // window" is about identity, and the path is what carries it.
+  const tabs = useTabs(info.path);
   // Which tab's state has already been put into effect. Declared up here
   // because closing a tab has to forget it: re-activating the SAME tab id
   // would otherwise skip the apply below and leave an empty pane.
@@ -489,8 +501,8 @@ export default function Workspace({ info, onLock, onRenamed }: Props) {
    * retired area has to degrade to the default rather than wedge the room. */
   const areaRestoredFor = useRef("");
   useEffect(() => {
-    if (!tabs.restored || areaRestoredFor.current === info.name) return;
-    areaRestoredFor.current = info.name;
+    if (!tabs.restored || areaRestoredFor.current === info.path) return;
+    areaRestoredFor.current = info.path;
     if (tabs.activeId) return;
     void api
       .getSetting(AREA_SETTING)
@@ -500,7 +512,7 @@ export default function Workspace({ info, onLock, onRenamed }: Props) {
       .catch(() => {
         /* opens at the default place, which is a fine outcome */
       });
-  }, [tabs.restored, tabs.activeId, info.name, showArea]);
+  }, [tabs.restored, tabs.activeId, info.path, showArea]);
 
   // Every existing `setOpenFile` call site — citations, agent opens, the
   // library, Quick Actions, 21 of them — earns a tab for free by being watched
@@ -621,8 +633,13 @@ export default function Workspace({ info, onLock, onRenamed }: Props) {
   // One-time housekeeping: a room saved before places stopped being tabs has
   // area tabs in `workspace_tabs`, and they arrive a tick after mount when the
   // setting is read back. Dropping them here rewrites the setting clean.
+  //
+  // `unlist`, not `prune`: housekeeping must never navigate. A room whose saved
+  // `activeId` WAS one of those area rows had it applied for one tick and was
+  // then handed to the last file tab in the strip — so a room opened on Memory
+  // landed on a document the reader might not have touched in weeks.
   useEffect(() => {
-    tabs.prune((t) => t.kind !== "area");
+    tabs.unlist((t) => t.kind !== "area");
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tabs.tabs.length]);
 
@@ -638,12 +655,22 @@ export default function Workspace({ info, onLock, onRenamed }: Props) {
   // silently replaced the drawing on the canvas. The object never went
   // anywhere; the strip simply stopped listing it, which is exactly what the
   // user asked for and all that may happen.
+  //
+  // The guard is "the list has arrived", not "the list has something in it".
+  // Trashing a room's only file leaves `s.files` empty, and an early return on
+  // that left the tab for the file that was just deleted: persisted, restored
+  // and re-activated on the next unlock, where it produced "Could not open that
+  // file" over an empty workspace and held off the saved-area restore. The room
+  // path is the key so a room swap does not prune against the previous room's
+  // list while the new one is still loading.
+  const filesLoadedFor = useRef("");
   useEffect(() => {
-    if (!s.files.length) return;
+    if (s.files.length) filesLoadedFor.current = info.path;
+    if (filesLoadedFor.current !== info.path) return;
     const shown = new Set(libraryFiles(s.files).map((f) => f.id));
     tabs.unlist((t) => t.kind !== "file" || shown.has(t.ref));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [s.files]);
+  }, [s.files, info.path]);
 
   // Tab keys. Every switch goes through the same unsaved-edits guard the strip
   // itself uses — a shortcut that quietly threw away typing was the one hole.
@@ -654,9 +681,14 @@ export default function Workspace({ info, onLock, onRenamed }: Props) {
       // toggles (useLayout, and the rail says so out loud) — both handlers
       // used to fire, so one press collapsed a pane AND jumped tabs. Read off
       // `code`, because Option rewrites `key` into ¡™£ on macOS.
+      // ...and only where the strip is on screen. The document tabs are Home's
+      // (`showsDocumentTabs`, the same predicate the strip itself renders on),
+      // so in Sketch, Skills, Memory, Create or Connectors these keys used to
+      // open a Home document that was nowhere in sight and drag the rail back
+      // to Home with it — the failure the redesign fixed for ⌘T.
       if (e.altKey) {
         const digit = /^Digit([1-9])$/.exec(e.code);
-        if (!digit) return;
+        if (!digit || !showsDocumentTabs(area)) return;
         e.preventDefault();
         guardLeave("Switching tabs", () => tabs.activateIndex(Number(digit[1]) - 1));
         return;
@@ -668,11 +700,13 @@ export default function Workspace({ info, onLock, onRenamed }: Props) {
       // With Shift held the bracket keys report as "}" / "{" — checking only
       // the unshifted characters meant these never fired at all.
       if (e.shiftKey && (e.key === "]" || e.key === "}")) {
+        if (!showsDocumentTabs(area)) return;
         e.preventDefault();
         guardLeave("Switching tabs", () => tabs.step(1));
         return;
       }
       if (e.shiftKey && (e.key === "[" || e.key === "{")) {
+        if (!showsDocumentTabs(area)) return;
         e.preventDefault();
         guardLeave("Switching tabs", () => tabs.step(-1));
         return;

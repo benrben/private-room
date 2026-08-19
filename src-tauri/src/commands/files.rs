@@ -65,6 +65,18 @@ fn import_files_blocking(app: &tauri::AppHandle, paths: Vec<String>) -> Result<I
         // with it on the way). A file that can't be stat'd (missing / no
         // permission) still surfaces its own clean error.
         match std::fs::metadata(&path) {
+            // A dropped FOLDER used to fall through to `std::fs::read` and come
+            // back as "Is a directory (os error 21)" — the OS's words for a
+            // gesture the user meant perfectly clearly. Folders are not added
+            // as a unit (nothing here walks one), so say that and what to do
+            // instead.
+            Ok(meta) if meta.is_dir() => {
+                errors.push(format!(
+                    "{file_name} is a folder — folders can't be added yet. \
+                     Open it and drop the files inside."
+                ));
+                continue;
+            }
             Ok(meta) if meta.len() > MAX_IMPORT_BYTES => {
                 errors.push(format!(
                     "{file_name} is {} MB — larger than the {} MB limit for a room file.",
@@ -127,7 +139,15 @@ fn import_files_blocking(app: &tauri::AppHandle, paths: Vec<String>) -> Result<I
                     .then(|| crate::media_probe::probe_path(std::path::Path::new(&path)))
                     .flatten()
                     .and_then(|m| serde_json::to_string(&m).ok());
-                match db::insert_file(&room.conn, &file_name, &mime, &bytes, text.as_deref(), "upload")
+                // Two different files called "report.pdf" made two identical
+                // Library rows with nothing to tell them apart. Every other
+                // write path in the room already steps the name the way Finder
+                // does; import was the one that did not. A read failure here is
+                // left to the insert immediately below, which fails with a real
+                // message rather than being reported twice.
+                let stored_name = db::available_name(&room.conn, &file_name)
+                    .unwrap_or_else(|_| file_name.clone());
+                match db::insert_file(&room.conn, &stored_name, &mime, &bytes, text.as_deref(), "upload")
                 {
                     Ok(meta) => {
                         if let Some(json) = &media_meta {
@@ -138,7 +158,7 @@ fn import_files_blocking(app: &tauri::AppHandle, paths: Vec<String>) -> Result<I
                             // bytes from the DB when it runs.
                             ocr_jobs.push(JobMeta {
                                 id: meta.id.clone(),
-                                name: file_name.clone(),
+                                name: stored_name.clone(),
                                 mime: mime.clone(),
                                 ext,
                                 room_path: room_path.clone(),
@@ -182,6 +202,15 @@ fn import_files_blocking(app: &tauri::AppHandle, paths: Vec<String>) -> Result<I
     // PRIV-2: newly imported text gets its privacy scan (no-op when the door
     // is off for this room).
     schedule_privacy_scan(app.clone());
+    // The caller refreshes the sidebar from the report it gets back, so THAT
+    // list was right — but Home's file count and timeline, the Scripts index
+    // and the unscanned-file privacy count all listen for this and kept
+    // showing the room as it was before the drop. `import_download` has always
+    // emitted it; the many-file path never did.
+    if !imported.is_empty() {
+        use tauri::Emitter;
+        let _ = app.emit("room-files-changed", ());
+    }
     Ok(ImportReport { imported, errors })
 }
 
@@ -816,6 +845,13 @@ pub fn decode_file_text(
 /// CURRENT bytes into version history (ADD-2) tagged with `cause`, then
 /// overwrites and rebuilds the search index. Every caller that mutates a file's
 /// content goes through here so nothing is ever irreversibly overwritten.
+///
+/// The snapshot and the overwrite are ONE write. Taken separately, a failed
+/// overwrite (a blob past SQLite's ceiling, a full disk) still cut a version:
+/// the file was unchanged, its history had gained a duplicate of the current
+/// bytes, and at the ten-unpinned-version window the oldest snapshot — the one
+/// furthest back, the one most worth keeping — had been evicted to make room
+/// for it, while the caller was told nothing had been saved.
 pub(crate) fn store_file_bytes(
     conn: &Connection,
     id: &str,
@@ -823,8 +859,10 @@ pub(crate) fn store_file_bytes(
     text: Option<&str>,
     cause: &str,
 ) -> Result<(), String> {
-    db::snapshot_file_version(conn, id, cause)?;
-    db::update_file_content(conn, id, bytes, text)
+    db::in_transaction(conn, || {
+        db::snapshot_file_version(conn, id, cause)?;
+        db::update_file_content(conn, id, bytes, text)
+    })
 }
 
 #[tauri::command]

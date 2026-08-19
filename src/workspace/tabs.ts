@@ -57,7 +57,9 @@ export interface TabsApi {
   move: (from: number, to: number) => void;
   /** Relative move through the strip, wrapping at both ends. */
   step: (delta: number) => void;
-  /** ⌘1–⌘8 pick by position; ⌘9 is last, as every browser does it. */
+  /** ⌥⌘1–⌥⌘8 pick by position; ⌥⌘9 is last, as every browser does it. Option
+   * is part of it because plain ⌘1/⌘2 belong to the native View menu's pane
+   * toggles (src-tauri/src/menu.rs). */
   activateIndex: (index: number) => void;
   /** Drop tabs whose target no longer EXISTS — a trashed file. What the reader
    * was looking at is gone, so the neighbour takes the empty pane. */

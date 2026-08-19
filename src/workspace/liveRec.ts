@@ -12,6 +12,10 @@ import { api } from "../api";
 let ctx: AudioContext | null = null;
 let stream: MediaStream | null = null;
 let teardown: (() => void) | null = null;
+/** The singleton is claimed here, from the first line of `attachMicTap` until
+ * its tap is built — `teardown` cannot do it, because it only exists several
+ * awaits later. */
+let attaching = false;
 /** Pending first-frame probe (see attachMicTap). Held in module state so it
  * can be cancelled: a probe left over from a finished recording would fire
  * against the NEXT one and tear down a perfectly healthy tap. */
@@ -126,8 +130,13 @@ function makeSink(
     const b64 = floatsToBase64(pending, pendingLen);
     pending = [];
     pendingLen = 0;
+    // Chained, not fired: `rec_push_audio` is an async command, so each
+    // invocation is its own task and the engine appends a batch where it
+    // ARRIVES. Two batches in flight at once means a starved task can write
+    // its 250 ms after the audio that followed it — the mixed WAV and the
+    // phrase boundaries both scrambled at that point, silently.
     // Failures swallowed: one dropped batch must never stall the tap.
-    inflight = push(rate, b64).catch(() => {});
+    inflight = inflight.then(() => push(rate, b64)).catch(() => {});
     return inflight;
   };
   return {
@@ -211,12 +220,28 @@ export async function acquireMic(): Promise<MediaStream> {
   }
 }
 
-/** Stream an already-open microphone into the live session. */
+/** Stream an already-open microphone into the live session.
+ *
+ * The singleton is claimed SYNCHRONOUSLY. `teardown` is only set several
+ * awaits later (the worklet module is fetched on the way), so two overlapping
+ * calls — Resume pressed twice — both used to pass the guard: the loser's
+ * stream and context were then dropped with nothing left holding them, its
+ * tracks never stopped (macOS keeps the mic indicator lit) and its tap still
+ * pushing audio into this session and the next. */
 export async function attachMicTap(mic: MediaStream): Promise<void> {
-  if (teardown) {
+  if (teardown || attaching) {
     mic.getTracks().forEach((t) => t.stop());
     return;
   }
+  attaching = true;
+  try {
+    await buildMicTap(mic);
+  } finally {
+    attaching = false;
+  }
+}
+
+async function buildMicTap(mic: MediaStream): Promise<void> {
   stream = mic;
   // A mic re-acquired mid-session (resume) respects the standing mute.
   mic.getAudioTracks().forEach((t) => {

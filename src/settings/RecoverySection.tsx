@@ -66,15 +66,31 @@ export default function RecoverySection({
                 </div>
               </div>
             ) : (
-              <div className="settings-actions">
-                <button
-                  className="primary"
-                  disabled={recoveryBusy}
-                  onClick={createRecoveryKey}
-                >
-                  {recoveryBusy ? "Creating…" : "Create a recovery key"}
-                </button>
-              </div>
+              <>
+                {/* `write_recovery_key` renames a fresh sidecar over the old
+                    one, and every room made through the create screen already
+                    got a code there — so this button is a REPLACEMENT far more
+                    often than a first issue, and the printed page in the
+                    drawer stops working the moment it is pressed. Same flag
+                    tape the password section uses for the same consequence. */}
+                <p className="set-note set-note--flag nb-sem-pending">
+                  <span className="nb-tape set-note-tag">
+                    A new key ends the old one
+                  </span>
+                  . Making one replaces any key this room already has —
+                  including the code it was given when it was created — so a
+                  code you printed earlier stops working.
+                </p>
+                <div className="settings-actions">
+                  <button
+                    className="primary"
+                    disabled={recoveryBusy}
+                    onClick={createRecoveryKey}
+                  >
+                    {recoveryBusy ? "Creating…" : "Make a new recovery key"}
+                  </button>
+                </div>
+              </>
             )}
             {recoveryErr && <div className="gate-error">{recoveryErr}</div>}
     </section>

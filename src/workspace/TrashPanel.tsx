@@ -66,18 +66,6 @@ export default function TrashPanel({
   // with no visible control to explain or clear it.
   const shown: TrashedFile[] = s.trashed;
 
-  if (s.trashed.length === 0) {
-    return (
-      <div className="library-scroll trash-list">
-        <p className="trash-empty">
-          Nothing deleted. Files you remove land here first — they leave the
-          library, the counts and the AI's search, but stay inside this
-          encrypted room until you delete them for good.
-        </p>
-      </div>
-    );
-  }
-
   // The trash gets the same multi-selection as the library, over its own rows.
   // Twenty files deleted by one agent errand is exactly the case where putting
   // them back one at a time is the difference between undo being real and undo
@@ -107,6 +95,22 @@ export default function TrashPanel({
       else shown.forEach((f) => next.add(f.id));
       return next;
     });
+
+  // Below every hook, never above one. Emptying the trash — restoring the last
+  // file, or deleting it for good — used to take this return while the select-all
+  // ref and its effect stayed behind it, so React rendered fewer hooks than the
+  // previous pass and threw the panel away mid-interaction.
+  if (shown.length === 0) {
+    return (
+      <div className="library-scroll trash-list">
+        <p className="trash-empty">
+          Nothing deleted. Files you remove land here first — they leave the
+          library, the counts and the AI's search, but stay inside this
+          encrypted room until you delete them for good.
+        </p>
+      </div>
+    );
+  }
 
   return (
     <div className="library-scroll trash-list">

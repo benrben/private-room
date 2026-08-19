@@ -34,6 +34,20 @@ struct NormText {
     spans: Vec<Range<usize>>,
 }
 
+impl NormText {
+    /// Two neighbouring entries carrying the SAME source span are the two halves
+    /// of one ligature (`FoldOut::Pair` is the only producer that pushes a span
+    /// twice). A match that begins on the second half or ends on the first
+    /// covers half a character, and splicing its byte range would delete the
+    /// other half — one letter more than the quote asked for, reported as a
+    /// clean single replacement.
+    fn splits_a_ligature(&self, first: usize, last: usize) -> bool {
+        let begins_mid = first > 0 && self.spans[first - 1] == self.spans[first];
+        let ends_mid = last + 1 < self.spans.len() && self.spans[last] == self.spans[last + 1];
+        begins_mid || ends_mid
+    }
+}
+
 /// Flush a pending whitespace run into the normalized stream: a run with 2+
 /// newlines becomes the unmatchable paragraph sentinel, otherwise one space.
 fn flush_ws(
@@ -142,7 +156,7 @@ pub(crate) fn fuzzy_find(content: &str, old_text: &str) -> FuzzyFind {
     let mut count = 0usize;
     let mut i = 0;
     while i + n <= h.len() {
-        if h[i..i + n] == needle[..] {
+        if h[i..i + n] == needle[..] && !hay.splits_a_ligature(i, i + n - 1) {
             count += 1;
             if first.is_none() {
                 first = Some(i);
@@ -308,22 +322,69 @@ pub(crate) fn hash_bytes(b: &[u8]) -> [u8; 32] {
 }
 
 /// Human-readable rendering of a file's bytes for the diff card — extracted text
-/// for binary office formats, raw UTF-8 for everything else.
+/// for binary office formats, the file's own text encoding for everything else.
+/// A lossy UTF-8 read turned every windows-1252/1255 byte into U+FFFD, so the
+/// card described a legacy-encoded file as boxes and `write_file_summary`
+/// counted its lines against that same corrupted string; `decode_text_bytes` is
+/// what the viewer and the search index already read it with.
 fn render_for_preview(real_name: &str, bytes: &[u8]) -> String {
     let ext = extraction::extension_of(real_name);
     match ext.as_str() {
         "docx" | "xlsx" | "xls" | "pdf" | "pptx" => {
             extraction::extract_text(real_name, bytes).unwrap_or_default()
         }
-        _ => String::from_utf8_lossy(bytes).into_owned(),
+        _ => extraction::decode_text_bytes(bytes),
     }
+}
+
+/// First byte position where two renderings differ, or the shorter length when
+/// one is a prefix of the other.
+fn first_difference(a: &str, b: &str) -> usize {
+    a.as_bytes()
+        .iter()
+        .zip(b.as_bytes())
+        .position(|(x, y)| x != y)
+        .unwrap_or_else(|| a.len().min(b.len()))
+}
+
+/// One pane clipped to `PREVIEW_CLIP` bytes from `start`. A window that doesn't
+/// begin at byte 0 is marked, because `dry_run_summary` quotes this same string
+/// as what the file "would start" with.
+fn preview_window(s: &str, start: usize) -> String {
+    let end = floor_boundary(s, start.saturating_add(PREVIEW_CLIP));
+    if start == 0 {
+        return s[..end].to_string();
+    }
+    format!("…{}", &s[start..end])
+}
+
+/// Both panes clipped to the SAME window, positioned so the first place they
+/// differ falls inside it. Clipping from byte 0 drew two identical heads for
+/// any change past `PREVIEW_CLIP`: the card showed no diff at all and still
+/// asked for approval, so a change in a 1 MB file's last chapter was approved
+/// unseen.
+fn clip_to_change(before: String, after: String) -> (String, String, bool) {
+    if before.len() <= PREVIEW_CLIP && after.len() <= PREVIEW_CLIP {
+        return (before, after, false);
+    }
+    let diff_at = first_difference(&before, &after);
+    // Renderings that really are identical (an office file whose extracted text
+    // is unchanged) have no changed region to centre on — keep the head.
+    let start = if diff_at == before.len() && diff_at == after.len() {
+        0
+    } else {
+        // A quarter of the budget of unchanged lead-in for context. Every byte
+        // before `diff_at` is shared, so a char boundary there is a boundary in
+        // both strings.
+        floor_boundary(&before, diff_at.saturating_sub(PREVIEW_CLIP / 4))
+    };
+    (preview_window(&before, start), preview_window(&after, start), true)
 }
 
 fn preview_pair(real_name: &str, before_bytes: &[u8], after_bytes: &[u8]) -> (String, String, bool) {
     let before = render_for_preview(real_name, before_bytes);
     let after = render_for_preview(real_name, after_bytes);
-    let clipped = before.len() > PREVIEW_CLIP || after.len() > PREVIEW_CLIP;
-    (clamp_bytes(before, PREVIEW_CLIP), clamp_bytes(after, PREVIEW_CLIP), clipped)
+    clip_to_change(before, after)
 }
 
 /// Commit already-computed plans in ONE transaction: any error rolls all of them
@@ -335,8 +396,12 @@ pub(crate) fn commit_plans(conn: &Connection, plans: &[PlannedWrite], cause: &st
     let applied: Result<(), String> = (|| {
         for p in plans {
             if let Some(bytes) = &p.new_bytes {
-                let name_for_text = p.rename_to.as_deref().unwrap_or(&p.real_name);
-                let text = extraction::extract_text(name_for_text, bytes)
+                // Derive the searchable text with the name whose format the
+                // BYTES are in — the current one — exactly as the preview does.
+                // Reading them through the NEW name meant a batch that edited a
+                // .docx and renamed it to .md stored the zip decoded as text, so
+                // search and every retrieved context carried binary mojibake.
+                let text = extraction::extract_text(&p.real_name, bytes)
                     .or_else(|| String::from_utf8(bytes.clone()).ok());
                 store_file_bytes(conn, &p.file_id, bytes, text.as_deref(), cause)?;
             }
@@ -562,19 +627,123 @@ fn find_markdown_section_range(content: &str, section: &str) -> Result<Range<usi
     }
 }
 
+/// The file is past `MAX_FUZZY_BYTES`, so only an exact quote is offered.
+fn too_large_for_fuzzy_error(real_name: &str) -> String {
+    format!(
+        "Could not find that exact text in \"{real_name}\". This file is too \
+         large for the forgiving match, so the quote has to be exact — copy \
+         it from the file, including spacing and punctuation."
+    )
+}
+
+/// A1: `all: true` reached the forgiving matcher, which cannot promise "every
+/// occurrence" of a quote it only matched approximately.
+fn all_needs_exact_error(old_text: &str, real_name: &str) -> String {
+    format!(
+        "\"{}\" doesn't appear in \"{real_name}\" byte-for-byte, so all: true \
+         can't be honored safely — it only matched approximately. Copy the text \
+         exactly as it appears (including spacing and punctuation), or drop \
+         all: true to change just the one closest match.",
+        clamp_bytes(old_text.to_string(), 80)
+    )
+}
+
+/// The "nothing matched" message for a refined edit, naming ONLY the
+/// refinements the caller actually passed. It used to name all three
+/// unconditionally, so a `section`-scoped edit was told to drop
+/// prefix_context/suffix_context/occurrence it had never sent — advice that
+/// changes nothing on the retry. Callers reach this only with a positional
+/// refinement in play (a `section`-only miss goes to `fuzzy_in_section`).
+fn refinement_not_found_error(real_name: &str, refine: &EditRefinements<'_>) -> String {
+    let section_note =
+        refine.section.map(|s| format!(" in the \"{s}\" section")).unwrap_or_default();
+    let mut named: Vec<&str> = Vec::new();
+    if refine.prefix_context.is_some() {
+        named.push("prefix_context");
+    }
+    if refine.suffix_context.is_some() {
+        named.push("suffix_context");
+    }
+    if refine.occurrence.is_some() {
+        named.push("occurrence");
+    }
+    let (verb, them) = if named.len() == 1 { ("needs", "it") } else { ("need", "them") };
+    format!(
+        "Could not find that exact text in \"{real_name}\"{section_note}. {} {verb} old_text to \
+         match EXACTLY — copy it exactly, including spacing and punctuation, or drop {them} and \
+         let the forgiving match try.",
+        named.join(" and ")
+    )
+}
+
+/// The plain text path's fuzzy fallback, scoped to one Markdown section.
+/// `section` narrows WHERE to look; it is not a claim that the quote is
+/// byte-perfect, so a quote that the forgiving matcher would have found in the
+/// whole file must still be found inside the section — otherwise scoping an
+/// edit to a heading silently turned the tolerant matcher off. The HTML branch
+/// already works this way. `fuzzy_find` reports positions relative to the
+/// section, so the hit is offset by the section's start before splicing.
+fn fuzzy_in_section(
+    real_name: &str,
+    content: &str,
+    range: &Range<usize>,
+    old_text: &str,
+    new_text: &str,
+    all: Option<bool>,
+    section: &str,
+) -> Result<(Vec<u8>, usize, EditMethod), EditError> {
+    if content.len() > MAX_FUZZY_BYTES {
+        return Err(EditError::new(too_large_for_fuzzy_error(real_name), "not_found"));
+    }
+    if all == Some(true) {
+        return Err(EditError::new(all_needs_exact_error(old_text, real_name), "all_needs_exact"));
+    }
+    let scope = &content[range.clone()];
+    match fuzzy_find(scope, old_text) {
+        FuzzyFind::Unique(hit) => {
+            let mut out = content.to_string();
+            out.replace_range(range.start + hit.start..range.start + hit.end, new_text);
+            Ok((out.into_bytes(), 1, EditMethod::Fuzzy))
+        }
+        FuzzyFind::Ambiguous(n) => Err(EditError::new(
+            format!(
+                "That text appears in {n} places in the \"{section}\" section of \"{real_name}\" \
+                 with slightly different spacing or punctuation. Include more surrounding text \
+                 so it matches exactly one place."
+            ),
+            "ambiguous",
+        )),
+        FuzzyFind::NotFound => {
+            let hint = closest_snippet(scope, old_text)
+                .map(|s| format!(" The closest text there is: \"{}\".", clamp_bytes(s, 200)))
+                .unwrap_or_default();
+            Err(EditError::new(
+                format!(
+                    "Could not find that text in the \"{section}\" section of \"{real_name}\". \
+                     Copy it from that section, or drop section to search the whole file.{hint}"
+                ),
+                "not_found",
+            ))
+        }
+    }
+}
+
 /// Resolve `old_text` against `content` using `prefix_context`/`suffix_context`/
 /// `occurrence` (E3/E4, 2026-08-04) instead of the ambiguity-or-unique guard
-/// the plain path uses. Requires an EXACT (non-fuzzy) quote — a refinement is
-/// meant to narrow candidates the model already found via search_room/
-/// open_file, not to also absorb typographic drift, and combining both would
-/// make a wrong-candidate pick unfalsifiable. Enumerates every candidate span
-/// up front (`match_indices`), which is why this needs its own function rather
-/// than reusing `fuzzy_find`'s Unique/Ambiguous/NotFound shape.
+/// the plain path uses. A POSITIONAL refinement requires an EXACT (non-fuzzy)
+/// quote — it is meant to narrow candidates the model already found via
+/// search_room/open_file, not to also absorb typographic drift, and combining
+/// both would make a wrong-candidate pick unfalsifiable. `section` carries no
+/// such claim: on its own it only says WHERE to look, so a miss there falls
+/// through to `fuzzy_in_section`. Enumerates every candidate span up front
+/// (`match_indices`), which is why this needs its own function rather than
+/// reusing `fuzzy_find`'s Unique/Ambiguous/NotFound shape.
 fn resolve_with_refinements(
     real_name: &str,
     content: &str,
     old_text: &str,
     new_text: &str,
+    all: Option<bool>,
     refine: &EditRefinements<'_>,
 ) -> Result<(Vec<u8>, usize, EditMethod), EditError> {
     // E6: the top-level guard in compute_edit_bytes already restricted
@@ -598,16 +767,17 @@ fn resolve_with_refinements(
         .filter(|&(s, e)| section_range.as_ref().map_or(true, |r| s >= r.start && e <= r.end))
         .collect();
     if candidates.is_empty() {
-        let section_note = refine.section.map(|s| format!(" in the \"{s}\" section")).unwrap_or_default();
-        return Err(EditError::new(
-            format!(
-                "Could not find that exact text in \"{real_name}\"{section_note}. prefix_context, \
-                 suffix_context and occurrence all need old_text to match EXACTLY — copy it \
-                 exactly, including spacing and punctuation, or drop them and let the forgiving \
-                 match try."
-            ),
-            "not_found",
-        ));
+        // A positional refinement keeps the exact-quote rule (see above): it
+        // narrows candidates the model already read, and absorbing typographic
+        // drift as well would make a wrong-candidate pick unfalsifiable. A
+        // `section` alone carries no such claim, so the forgiving matcher runs
+        // inside it.
+        if let (Some(range), Some(section), false) =
+            (&section_range, refine.section, refine.has_positional_refinement())
+        {
+            return fuzzy_in_section(real_name, content, range, old_text, new_text, all, section);
+        }
+        return Err(EditError::new(refinement_not_found_error(real_name, refine), "not_found"));
     }
     let filtered: Vec<(usize, usize)> = match (refine.prefix_context, refine.suffix_context) {
         (None, None) => candidates,
@@ -656,6 +826,17 @@ fn resolve_with_refinements(
         None => match filtered.len() {
             1 => filtered[0],
             n => {
+                if all == Some(true) {
+                    // The error below offers `all: true`; honouring it here is
+                    // what makes that advice true for a refined edit. Spliced
+                    // right-to-left so the spans still to come keep their
+                    // offsets in the string being rewritten.
+                    let mut out = content.to_string();
+                    for &(s, e) in filtered.iter().rev() {
+                        out.replace_range(s..e, new_text);
+                    }
+                    return Ok((out.into_bytes(), n, EditMethod::ExactAll));
+                }
                 // Only reached via edit_file (edit_files never has a non-empty
                 // refine), so `all_offered=true` is always the right wording.
                 return Err(EditError::new(
@@ -814,7 +995,7 @@ pub(crate) fn compute_edit_bytes(
                 .map_err(|_| EditError::new(non_utf8_error(real_name), "wrong_type"))?
                 .to_string();
             if !refine.is_empty() {
-                return resolve_with_refinements(real_name, &content, old_text, new_text, &refine);
+                return resolve_with_refinements(real_name, &content, old_text, new_text, all, &refine);
             }
             let exact = content.matches(old_text).count();
             if exact == 1 {
@@ -837,14 +1018,7 @@ pub(crate) fn compute_edit_bytes(
                 // `Vec<char>` plus a byte span per char — tens of times the
                 // file's size in memory, all of it built under the room lock.
                 // Past this size the exact match is the only one offered.
-                Err(EditError::new(
-                    format!(
-                        "Could not find that exact text in \"{real_name}\". This file is too \
-                         large for the forgiving match, so the quote has to be exact — copy \
-                         it from the file, including spacing and punctuation."
-                    ),
-                    "not_found",
-                ))
+                Err(EditError::new(too_large_for_fuzzy_error(real_name), "not_found"))
             } else if all == Some(true) {
                 // A1 (2026-08-04): reached only when NO byte-exact match exists
                 // anywhere in the file — `all: true` asks to replace every
@@ -857,16 +1031,7 @@ pub(crate) fn compute_edit_bytes(
                 // whether it got one or all of them. One clean rule now covers
                 // both the unique and ambiguous fuzzy cases: `all: true` always
                 // needs an exact quote, full stop.
-                Err(EditError::new(
-                    format!(
-                        "\"{}\" doesn't appear in \"{real_name}\" byte-for-byte, so all: true \
-                         can't be honored safely — it only matched approximately. Copy the text \
-                         exactly as it appears (including spacing and punctuation), or drop \
-                         all: true to change just the one closest match.",
-                        clamp_bytes(old_text.to_string(), 80)
-                    ),
-                    "all_needs_exact",
-                ))
+                Err(EditError::new(all_needs_exact_error(old_text, real_name), "all_needs_exact"))
             } else {
                 match fuzzy_find(&content, old_text) {
                     FuzzyFind::Unique(range) => {
@@ -1280,6 +1445,22 @@ mod tests {
     }
 
     #[test]
+    fn a_match_that_would_split_a_ligature_is_refused() {
+        // Both halves of U+FB01 map back to the SAME source char, so a match
+        // that starts on the `i` (or ends on the `f`) returned a span covering
+        // the whole ligature: splicing it deleted a letter the quote never
+        // named, reported as "Replaced 1 occurrence(s)".
+        let file = "the \u{FB01}nal draft";
+        assert!(matches!(fuzzy_find(file, "inal draft"), FuzzyFind::NotFound));
+        assert!(matches!(fuzzy_find(file, "the f"), FuzzyFind::NotFound));
+        // Covering the whole character still matches, spanning it exactly.
+        match fuzzy_find(file, "the final draft") {
+            FuzzyFind::Unique(range) => assert_eq!(&file[range], file),
+            _ => panic!("the whole-character match must still resolve"),
+        }
+    }
+
+    #[test]
     fn fuzzy_find_returns_exact_byte_span_on_multibyte_text() {
         // Hebrew + curly quotes: the returned range must slice the ORIGINAL cleanly.
         let content = "פתיח \u{201C}שלום עולם\u{201D} סוף";
@@ -1619,6 +1800,100 @@ mod tests {
     }
 
     #[test]
+    fn a_section_scoped_markdown_edit_still_gets_the_forgiving_match() {
+        // `section` says WHERE to look, not "this quote is byte-perfect". It
+        // used to route every refined edit through the exact-only resolver, so
+        // a quote that matched fine unscoped failed the moment the model
+        // scoped it to a heading — and the failure blamed prefix_context,
+        // suffix_context and occurrence, none of which had been passed.
+        let conn = db::open_in_memory_schema();
+        let id = seed_text_file(
+            &conn,
+            "report.md",
+            "## Q1\nnothing here\n\n## Q2\nFee is \u{201C}5%\u{201D} today\n",
+        );
+        let applied = run_edit_file_refined(
+            &conn,
+            "report.md",
+            "Fee is \"5%\" today",
+            "Fee is \"7%\" today",
+            EditRefinements { section: Some("Q2"), ..Default::default() },
+        )
+        .unwrap();
+        assert_eq!(applied.method, EditMethod::Fuzzy);
+        let text = String::from_utf8(current_bytes(&conn, &id)).unwrap();
+        assert_eq!(text, "## Q1\nnothing here\n\n## Q2\nFee is \"7%\" today\n");
+    }
+
+    #[test]
+    fn a_drifted_quote_outside_the_named_section_is_still_refused() {
+        // The scoping must survive the fallback: the forgiving matcher runs
+        // over the SECTION, not the file, or `section` would stop narrowing
+        // anything the moment the quote drifted.
+        let conn = db::open_in_memory_schema();
+        let id = seed_text_file(
+            &conn,
+            "report.md",
+            "## Q1\nFee is \u{201C}5%\u{201D} today\n\n## Q2\nnothing here\n",
+        );
+        let err = run_edit_file_refined(
+            &conn,
+            "report.md",
+            "Fee is \"5%\" today",
+            "Fee is \"7%\" today",
+            EditRefinements { section: Some("Q2"), ..Default::default() },
+        )
+        .unwrap_err();
+        assert_eq!(err.outcome, "not_found");
+        assert!(err.message.contains("\"Q2\" section"), "got: {}", err.message);
+        assert!(!err.message.contains("occurrence"), "names a field never passed: {}", err.message);
+        assert_eq!(
+            String::from_utf8(current_bytes(&conn, &id)).unwrap(),
+            "## Q1\nFee is \u{201C}5%\u{201D} today\n\n## Q2\nnothing here\n"
+        );
+    }
+
+    #[test]
+    fn a_refinement_miss_names_only_the_refinements_that_were_passed() {
+        let conn = db::open_in_memory_schema();
+        seed_text_file(&conn, "n.md", "Q1: cost is 5.");
+        let err = run_edit_file_refined(
+            &conn,
+            "n.md",
+            "cost is 9",
+            "cost is 7",
+            EditRefinements { prefix_context: Some("Q1: "), ..Default::default() },
+        )
+        .unwrap_err();
+        assert!(err.message.contains("prefix_context needs"), "got: {}", err.message);
+        assert!(!err.message.contains("occurrence"), "got: {}", err.message);
+        assert!(!err.message.contains("suffix_context"), "got: {}", err.message);
+    }
+
+    #[test]
+    fn section_scoped_all_replaces_every_match_in_that_section_only() {
+        // The ambiguity error offers `all: true`; the refined path dropped the
+        // flag, so passing it returned the identical error — the one option
+        // that path recommended was the one it could not honour.
+        let content = "# Q1\ncost is 5\ncost is 5\n\n# Q2\ncost is 5\n";
+        let (bytes, count, method) = compute_edit_bytes(
+            "report.md",
+            content.as_bytes(),
+            "cost is 5",
+            "cost is 7",
+            Some(true),
+            EditRefinements { section: Some("Q1"), ..Default::default() },
+        )
+        .unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(method, EditMethod::ExactAll);
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            "# Q1\ncost is 7\ncost is 7\n\n# Q2\ncost is 5\n"
+        );
+    }
+
+    #[test]
     fn section_is_refused_on_a_file_type_it_does_not_support() {
         let conn = db::open_in_memory_schema();
         seed_text_file(&conn, "notes.txt", "Q1: total is 5. Q2: total is 5.");
@@ -1953,6 +2228,94 @@ mod tests {
         assert!(plans[0].before.contains("hello world"), "before was blank: {:?}", plans[0].before);
         assert!(plans[0].after.contains("goodbye world"), "after was blank: {:?}", plans[0].after);
         assert_eq!(plans[0].rename_to.as_deref(), Some("notes.docx"));
+    }
+
+    #[test]
+    fn a_clipped_preview_shows_the_changed_region_not_the_first_page() {
+        // Both panes used to be clipped from byte 0, so a change past
+        // PREVIEW_CLIP produced two IDENTICAL heads: a card with no visible
+        // diff that still asked for approval.
+        let conn = db::open_in_memory_schema();
+        let mut body = "filler line of ordinary prose.\n".repeat(20_000); // ~600 KB
+        body.push_str("the closing sentence.\n");
+        assert!(body.len() > PREVIEW_CLIP * 2);
+        seed_text_file(&conn, "big.md", &body);
+        let plans = plan_single_edit(
+            &conn,
+            &PreviewEdit {
+                name: "big.md".into(),
+                old_text: "the closing sentence.".into(),
+                new_text: "the corrected sentence.".into(),
+                all: false,
+                prefix_context: None,
+                suffix_context: None,
+                occurrence: None,
+                section: None,
+            },
+        )
+        .unwrap();
+        assert!(plans[0].clipped, "a 600 KB file must still report a clipped preview");
+        assert!(plans[0].before.contains("the closing sentence."), "before pane missed the change");
+        assert!(plans[0].after.contains("the corrected sentence."), "after pane missed the change");
+        assert_ne!(plans[0].before, plans[0].after, "the card must show a diff");
+        // Still bounded (the window, plus the leading ellipsis marking it).
+        assert!(plans[0].after.len() <= PREVIEW_CLIP + 4);
+    }
+
+    #[test]
+    fn a_small_files_preview_is_the_whole_file_unclipped() {
+        let conn = db::open_in_memory_schema();
+        seed_text_file(&conn, "small.md", "hello world");
+        let plans = plan_write_file(&conn, "small.md", "goodbye world").unwrap();
+        assert!(!plans[0].clipped);
+        assert_eq!(plans[0].before, "hello world");
+        assert_eq!(plans[0].after, "goodbye world");
+    }
+
+    #[test]
+    fn a_legacy_encoded_file_previews_as_text_not_replacement_boxes() {
+        // windows-1252 bytes read lossily became U+FFFD everywhere, so the
+        // approval card showed boxes for every accented letter — and
+        // write_file_summary counted its lines against that same string.
+        let conn = db::open_in_memory_schema();
+        let latin1 = b"Le si\xE8ge social de la soci\xE9t\xE9 est \xE0 Paris, pr\xE8s de la gare.";
+        db::insert_file(&conn, "note.txt", "text/plain", latin1, None, "upload").unwrap();
+        let plans = plan_write_file(&conn, "note.txt", "Le siege social est a Lyon.").unwrap();
+        assert!(
+            !plans[0].before.contains('\u{FFFD}'),
+            "before pane is mojibake: {}",
+            plans[0].before
+        );
+        assert!(plans[0].before.contains("Paris"), "got: {}", plans[0].before);
+    }
+
+    #[test]
+    fn a_batch_rename_that_changes_the_type_indexes_the_bytes_as_they_are() {
+        // The searchable text used to be derived with the NEW name, so editing
+        // a .docx and renaming it to .md in one batch stored the zip decoded
+        // as text — search and every retrieved context got binary mojibake.
+        let conn = db::open_in_memory_schema();
+        let docx = crate::extraction::fake_office_zip(
+            "word/document.xml",
+            r#"<w:document><w:p><w:t>fee is 5%</w:t></w:p></w:document>"#,
+        );
+        db::insert_file(&conn, "contract.docx", "application/docx", &docx, Some("fee is 5%"), "upload")
+            .unwrap();
+        let ops = vec![
+            BatchOp::Edit {
+                name: "contract.docx".into(),
+                old_text: "5%".into(),
+                new_text: "7%".into(),
+            },
+            BatchOp::Rename { name: "contract.docx".into(), new_name: "contract.md".into() },
+        ];
+        let plans = plan_batch(&conn, &ops).unwrap();
+        commit_plans(&conn, &plans, "AI edit").unwrap();
+        let (_, name, text) = db::find_file_like_full(&conn, "contract").unwrap();
+        assert_eq!(name, "contract.md");
+        let text = text.expect("the file keeps searchable text");
+        assert!(text.contains("fee is 7%"), "got: {text}");
+        assert!(!text.contains("word/document.xml"), "indexed the raw zip: {text}");
     }
 
     #[test]

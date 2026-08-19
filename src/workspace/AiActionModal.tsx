@@ -1,5 +1,7 @@
 import { useEffect } from "react";
+import { CloudIcon } from "../icons";
 import { tokenAtCaret } from "./composer";
+import { isCloudRoute } from "./markup";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
 
@@ -37,6 +39,17 @@ export default function AiActionModal({ s, a }: { s: WSState; a: WSActions }) {
   // ADD-27: "translate" reuses the question field to carry the language.
   const questionMissing =
     (def.needsQuestion || def.needsLanguage) && !aiPrompt.question.trim();
+  // `aiPrompt.scope` is the OPEN FILE's id (AiPane passes `s.openFile?.id`, and
+  // the host reads it with `get_file_extracted_text`) — never a folder. The
+  // title has been calling it "this folder" for a while, which was merely wrong
+  // copy until a privacy sentence started repeating it.
+  const refCount = aiPrompt.refs?.length ?? 0;
+  const scopeLabel =
+    refCount > 1
+      ? `these ${refCount} files`
+      : refCount === 1 || aiPrompt.scope
+        ? "this file"
+        : "whole room";
   return (
     <div
       className={`studio-prompt-backdrop${running ? " running" : ""}`}
@@ -53,17 +66,33 @@ export default function AiActionModal({ s, a }: { s: WSState; a: WSActions }) {
         onClick={(e) => e.stopPropagation()}
       >
         <div className="studio-prompt-title">
-          {def.title} ·{" "}
-          {aiPrompt.refs && aiPrompt.refs.length
-            ? "this file"
-            : aiPrompt.scope
-              ? "this folder"
-              : "whole room"}
+          {def.title} · {scopeLabel}
         </div>
         <p className="studio-prompt-hint">
           {def.description} Edit the prompt the AI will follow, then run it.
           Type <strong>@</strong> to add a specific file or folder as context.
         </p>
+        {/* The same strip the composer draws, for the same reason — except the
+            composer waits for typing and this prompt arrives prefilled, so the
+            route alone is the condition. Every other place content is handed to
+            a model says where it goes; this is the widest-scoped send there is.
+            No "Use local" here: switching the room's model out from under an
+            open dialog is a different decision than the one being made.
+
+            It does NOT re-name the scope the title just named. The material is
+            not the scope: a room-wide run sends the first 12 KB the host can
+            gather (`gather_scope_text`), and an @-mention in the prompt adds a
+            file or folder the title never mentioned. "Everything it reads" is
+            the one phrasing that stays true through both. */}
+        {isCloudRoute(s.model, s.ai) && (
+          <div className="cloud-strip">
+            <span className="cloud-strip-label">
+              <CloudIcon size={14} />
+              This room uses a cloud model — the prompt and everything this
+              action reads leave your Mac.
+            </span>
+          </div>
+        )}
         {def.needsLanguage && (
           <>
             <input
@@ -140,7 +169,11 @@ export default function AiActionModal({ s, a }: { s: WSState; a: WSActions }) {
             ref={s.studioPromptRef}
             className="studio-prompt-input"
             value={aiPrompt.text}
-            autoFocus={!def.needsQuestion}
+            // `needsLanguage` reuses the question field, and the Run button is
+            // disabled until it is filled — so it, not the prompt, is what the
+            // caret has to land in. Two autoFocus in one mount and the later
+            // mount wins.
+            autoFocus={!def.needsQuestion && !def.needsLanguage}
             disabled={running}
             rows={4}
             dir="auto"

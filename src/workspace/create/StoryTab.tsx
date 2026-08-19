@@ -11,7 +11,7 @@ import {
   type StoryList,
   type StoryShot,
 } from "../../api";
-import { CheckIcon, CreateIcon, LockIcon } from "../../icons";
+import { CheckIcon, CreateIcon } from "../../icons";
 import { WSState } from "../state";
 import { WSActions } from "../actions";
 import { PicturePicker } from "./PicturePicker";
@@ -221,6 +221,35 @@ function CastStrip({
   // instant. Without this the button looks broken for the whole call.
   const [reading, setReading] = useState("");
 
+  // ONE fetch for the whole strip. Every portrait used to ask for the room's
+  // thumbnails itself, and `story_pictures` builds the WHOLE list each time —
+  // on a cold cache eight heroes meant eight concurrent decode-and-shrink
+  // passes over every picture in the room before the first face appeared.
+  // `null` means "not read yet", which is why the blank square below can tell
+  // "still loading" apart from "not in the list we got".
+  const [faces, setFaces] = useState<Record<string, string> | null>(null);
+  const faceKey = cast.map((m) => m.faceFileId ?? "").join(",");
+  useEffect(() => {
+    // Nobody has a face yet: no portrait will be drawn, so building the room's
+    // thumbnails would be work for a strip that shows none of it.
+    if (!faceKey.split(",").some(Boolean)) return;
+    let live = true;
+    api
+      .storyPictures()
+      .then((all) => {
+        if (!live) return;
+        const next: Record<string, string> = {};
+        for (const p of all) next[p.fileId] = p.thumbB64;
+        setFaces(next);
+      })
+      // A failed read is not evidence that a face is missing — stay at "not
+      // read yet" rather than accusing every portrait of being out of range.
+      .catch(() => undefined);
+    return () => {
+      live = false;
+    };
+  }, [faceKey]);
+
   return (
     <section className="nb-panel cr-cast">
       <div className="cr-sec-head">
@@ -299,7 +328,7 @@ function CastStrip({
               title={member.faceFileId ? "Change their picture" : "Give them a picture"}
             >
               {member.faceFileId ? (
-                <HeroFace fileId={member.faceFileId} />
+                <HeroFace fileId={member.faceFileId} thumbs={faces} />
               ) : (
                 <span className="cr-hero-noface">
                   <CreateIcon size={16} />
@@ -520,22 +549,34 @@ function CastFromFileReview({
  *
  * Reads the same pre-shrunk thumbnails the picker uses rather than streaming
  * the real file: this is a 64-pixel square, and the original is measured in
- * megabytes. */
-function HeroFace({ fileId }: { fileId: string }) {
-  const [thumb, setThumb] = useState<string | null>(null);
-  useEffect(() => {
-    let live = true;
-    api
-      .storyPictures()
-      .then((all) => {
-        if (live) setThumb(all.find((p) => p.fileId === fileId)?.thumbB64 ?? null);
-      })
-      .catch(() => live && setThumb(null));
-    return () => {
-      live = false;
-    };
-  }, [fileId]);
-  if (!thumb) return <span className="cr-hero-noface" aria-hidden />;
+ * megabytes. The strip fetches them once and hands the map in — `null` while
+ * that is still in flight.
+ *
+ * The picker's list is the newest 150 pictures, so a face pinned from an older
+ * import is simply not in it. That used to draw as an empty square forever,
+ * indistinguishable from loading; it says which now, because a face that is
+ * still in the room is fine — shots read it by id, never through this list. */
+function HeroFace({
+  fileId,
+  thumbs,
+}: {
+  fileId: string;
+  thumbs: Record<string, string> | null;
+}) {
+  if (!thumbs) return <span className="cr-hero-noface" aria-hidden />;
+  const thumb = thumbs[fileId];
+  if (!thumb) {
+    // Not a flat "it is still sent": a DELETED picture is missing from the
+    // newest 150 too, and this square cannot tell that from an old import.
+    return (
+      <span
+        className="cr-hero-noface"
+        title="Their picture isn’t among the newest 150 pictures in this room, so it can’t be shown here. If it is still in the room it is still the face sent with every shot they appear in."
+      >
+        <span>picture not shown</span>
+      </span>
+    );
+  }
   return <img src={`data:image/jpeg;base64,${thumb}`} alt="" />;
 }
 
@@ -668,6 +709,10 @@ function ScriptSplitter({
   const effective = lengths.length
     ? (lengths.includes(secondsEach) ? secondsEach : Math.max(...lengths))
     : secondsEach;
+  const missingModels = [
+    imageModel ? null : "picture model",
+    videoModel ? null : "clip model",
+  ].filter((m): m is string => m !== null);
 
   useEffect(() => {
     if (!script.trim()) {
@@ -886,6 +931,32 @@ function ScriptSplitter({
             ))}
           </ol>
 
+          {/* Both models are written onto every shot this makes, and a pass
+              refuses a shot whose model is empty ("no picture model chosen" /
+              "no clip model chosen") — after the shots are already in the
+              list. Said before the click, naming which pass would not run.
+              With ONE of the two chosen the shots are still worth adding: the
+              other pass is a per-shot select away, and the row editor lets a
+              shot sit with either half unset. Only "neither" is stopped. */}
+          {missingModels.length > 0 && (
+            <p className="cr-hint">
+              {missingModels.length === 2 ? (
+                <>
+                  Pick a picture model and a clip model above first — every shot
+                  this adds carries them, and one added with neither is a shot
+                  neither pass will make.
+                </>
+              ) : (
+                <>
+                  No {missingModels[0]} is chosen, so every shot this adds will
+                  be skipped by{" "}
+                  {imageModel ? "“Film them”" : "“Draw the frames”"} until one
+                  is set — here, or on the shots themselves.
+                </>
+              )}
+            </p>
+          )}
+
           <div className="cr-form-acts">
             <button type="button" className="nb-btn" onClick={() => setOpen(false)}>
               Cancel
@@ -893,7 +964,7 @@ function ScriptSplitter({
             <button
               type="button"
               className="nb-btn nb-btn-primary"
-              disabled={busy || plan.parts === 0}
+              disabled={busy || plan.parts === 0 || missingModels.length === 2}
               onClick={() => {
                 onApply(plan, imageModel, videoModel);
                 setOpen(false);
@@ -997,11 +1068,21 @@ function ShotList({
   // helps a clip aim its ending.
   // Receivers only: the first shot is never handed a frame, so its model's
   // first-frame support says nothing about whether this list can chain.
-  const canChain = board.shots.some(
-    (shot, i) =>
-      i > 0 &&
-      takesFirstFrame(videoModels.find((m) => m.model === shot.videoModel) ?? null),
-  );
+  const receivers = board.shots
+    .slice(1)
+    .map((shot) => videoModels.find((m) => m.model === shot.videoModel) ?? null);
+  const canChain = receivers.some(takesFirstFrame);
+  // The models actually looked at and found to refuse a starting picture. A
+  // one-shot list looks at none, and used to be told a capability fact about
+  // "the clip model chosen here" that nothing had evaluated — and which
+  // contradicts what most of them publish.
+  const noFirstFrame = [
+    ...new Set(
+      receivers
+        .filter((m): m is CreateModel => !!m && !takesFirstFrame(m))
+        .map((m) => m.slug),
+    ),
+  ];
 
   if (board.lists.length === 0) {
     return (
@@ -1009,9 +1090,14 @@ function ShotList({
         <div className="cr-empty">
           <CreateIcon size={26} />
           <h2>No shot list yet</h2>
+          {/* A script carried over from the bench is HELD here, not lost: the
+              splitter that opens with it in place only mounts once a list
+              exists. A first-time user is by definition in this state, so the
+              screen that greets their handoff has to say where it went. */}
           <p>
-            A shot list is the order things happen in — one line per shot. Each
-            line becomes a picture, and each picture can become a clip.
+            {handoff
+              ? "Your script is waiting. A shot list is the order things happen in — one line per shot, and the script is split into them on the next screen."
+              : "A shot list is the order things happen in — one line per shot. Each line becomes a picture, and each picture can become a clip."}
           </p>
           <button
             type="button"
@@ -1019,7 +1105,7 @@ function ShotList({
             onClick={() => onNewList("Untitled", "")}
             disabled={busy}
           >
-            Start one
+            {handoff ? "Start a list from your script" : "Start one"}
           </button>
         </div>
       </section>
@@ -1057,21 +1143,11 @@ function ShotList({
       </div>
 
       {current && (
-        <div className="cr-list-head">
-          <input
-            className="cr-field cr-list-title"
-            value={current.title}
-            aria-label="Shot list title"
-            onChange={(e) => onUpdateList(current.id, e.target.value, current.logline)}
-          />
-          <input
-            className="cr-field"
-            value={current.logline}
-            placeholder="One line about the whole thing — goes into every shot’s prompt"
-            aria-label="Logline"
-            onChange={(e) => onUpdateList(current.id, current.title, e.target.value)}
-          />
-        </div>
+        <ListHead
+          key={current.id}
+          list={current}
+          onCommit={(title, logline) => onUpdateList(current.id, title, logline)}
+        />
       )}
 
       {current && (
@@ -1206,11 +1282,13 @@ function ShotList({
                   clip, so each one picks up precisely where the last ended.
                 </span>
               </label>
-              {!canChain && board.shots.length > 0 && (
+              {!canChain && noFirstFrame.length > 0 && (
                 <span className="cr-hint">
-                  The clip model chosen here takes no starting picture at all,
-                  so shots cannot be joined on it. Nearly every other video
-                  model can.
+                  {noFirstFrame.join(" and ")}{" "}
+                  {noFirstFrame.length === 1 ? "takes" : "take"} no starting
+                  picture at all, so shots cannot be joined on{" "}
+                  {noFirstFrame.length === 1 ? "it" : "them"}. Nearly every
+                  other video model can.
                 </span>
               )}
             </div>
@@ -1248,6 +1326,50 @@ function ShotList({
         />
       )}
     </section>
+  );
+}
+
+/** This list's title and logline.
+ *
+ * Typed locally, written on blur — the same shape the shot's action row uses.
+ * Bound straight to the board, every keystroke was a write plus a full board
+ * reload, and the reload re-rendered the input with the value the DB had
+ * answered a keystroke ago, so anything typed in between was lost. It also
+ * flipped the tab-wide busy flag on each character.
+ *
+ * `key={list.id}` at the call site reseeds this when another list is selected;
+ * a reload of the SAME list must not, or it would fight the typing again. */
+function ListHead({
+  list,
+  onCommit,
+}: {
+  list: StoryList;
+  onCommit: (title: string, logline: string) => void;
+}) {
+  const [title, setTitle] = useState(list.title);
+  const [logline, setLogline] = useState(list.logline);
+  return (
+    <div className="cr-list-head">
+      <input
+        className="cr-field cr-list-title"
+        value={title}
+        aria-label="Shot list title"
+        onChange={(e) => setTitle(e.target.value)}
+        onBlur={() => {
+          if (title !== list.title) onCommit(title, logline);
+        }}
+      />
+      <input
+        className="cr-field"
+        value={logline}
+        placeholder="One line about the whole thing — goes into every shot’s prompt"
+        aria-label="Logline"
+        onChange={(e) => setLogline(e.target.value)}
+        onBlur={() => {
+          if (logline !== list.logline) onCommit(title, logline);
+        }}
+      />
+    </div>
   );
 }
 
@@ -1589,19 +1711,5 @@ function ShotRow({
         ✕
       </button>
     </li>
-  );
-}
-
-/** The seam line, said once for the whole tab. */
-export function StorySeam() {
-  return (
-    <div className="cr-seam">
-      <LockIcon size={14} />
-      <p>
-        Making a picture or a clip sends the prompt — and any face you attach —
-        to the provider. Nothing else in the story leaves this Mac: a
-        character’s written backstory is never sent.
-      </p>
-    </div>
   );
 }

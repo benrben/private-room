@@ -15,6 +15,19 @@ export interface Cue {
   endMs: number;
   /** The cue's text, with its internal line breaks kept. */
   text: string;
+  /** The line above the timing, when the file had one: SRT's cue number, or a
+   * WebVTT cue identifier. */
+  id?: string;
+  /** Whatever followed the end stamp on the timing line — `line:90%
+   * align:start`. It is where the caption sits on the picture, so a save that
+   * dropped it moved every positioned caption. */
+  settings?: string;
+  /** Blocks that stood before this cue and are not cues: the `WEBVTT` header
+   * with its own metadata lines, `NOTE`, `STYLE` and `REGION`. Kept verbatim
+   * so re-serializing gives the file back rather than a stripped copy. */
+  before?: string[];
+  /** The same, for blocks after the LAST cue. Only ever set on it. */
+  after?: string[];
 }
 
 /** `hh:mm:ss,mmm` (SRT) or `hh:mm:ss.mmm` / `mm:ss.mmm` (WebVTT) → ms.
@@ -50,32 +63,53 @@ export function shortStamp(ms: number): string {
   return h > 0 ? `${h}:${String(m).padStart(2, "0")}:${s}` : `${m}:${s}`;
 }
 
-/** Parse either dialect. Cue numbers, `WEBVTT` headers, `NOTE` and `STYLE`
- * blocks are structure, not speech, and are dropped. */
+/** Parse either dialect. The words are separated from everything around them —
+ * the cue's own id, its positioning settings, and the `WEBVTT` header,
+ * `NOTE`/`STYLE`/`REGION` blocks between cues — and all of it is carried on the
+ * cues so a save can put the file back together as it was. */
 export function parseCues(raw: string): Cue[] {
   const cues: Cue[] = [];
+  // Blocks seen since the last cue: not speech, but part of the file.
+  let stray: string[] = [];
   // Both dialects separate cues with a blank line; \r\n is normalized first so
   // a Windows-authored file doesn't leave a stray \r on every line of text.
   const blocks = raw.replace(/\r\n?/g, "\n").split(/\n{2,}/);
   for (const block of blocks) {
     const lines = block.split("\n").filter((l) => l.trim() !== "");
     if (lines.length === 0) continue;
-    if (/^WEBVTT/i.test(lines[0]) && lines.length === 1) continue;
-    if (/^(NOTE|STYLE|REGION)\b/i.test(lines[0])) continue;
+    if (/^WEBVTT/i.test(lines[0]) || /^(NOTE|STYLE|REGION)\b/i.test(lines[0])) {
+      stray.push(lines.join("\n"));
+      continue;
+    }
     // A leading bare number is SRT's cue index; WebVTT may use a cue id here.
     let at = 0;
-    if (!lines[at].includes("-->")) at++;
+    let id: string | undefined;
+    if (!lines[at].includes("-->")) {
+      id = lines[at].trim();
+      at++;
+    }
     if (at >= lines.length || !lines[at].includes("-->")) continue;
     const [rawStart, rawEnd] = lines[at].split("-->");
     const startMs = parseStamp(rawStart ?? "");
     // A WebVTT timing line can carry settings after the end stamp
     // ("... --> 00:02.000 line:90%"), so only the first token is the time.
-    const endMs = parseStamp((rawEnd ?? "").trim().split(/\s+/)[0] ?? "");
+    const tail = (rawEnd ?? "").trim().split(/\s+/);
+    const endMs = parseStamp(tail[0] ?? "");
     if (startMs == null || endMs == null) continue;
+    const settings = tail.slice(1).join(" ");
+    // A timed block with no words is still a cue. Dropping it deleted the
+    // timecode of every line the editor cleared, and renumbered the rest.
     const text = lines.slice(at + 1).join("\n").trim();
-    if (!text) continue;
-    cues.push({ index: cues.length + 1, startMs, endMs, text });
+    const cue: Cue = { index: cues.length + 1, startMs, endMs, text };
+    if (id) cue.id = id;
+    if (settings) cue.settings = settings;
+    if (stray.length) {
+      cue.before = stray;
+      stray = [];
+    }
+    cues.push(cue);
   }
+  if (stray.length && cues.length) cues[cues.length - 1].after = stray;
   return cues;
 }
 
@@ -92,16 +126,21 @@ export function toSrt(cues: Cue[]): string {
   );
 }
 
-/** Serialize back to WebVTT. */
+/** Serialize back to WebVTT, header, styles, cue ids and positioning included.
+ * Correcting one word must not cost a file its `STYLE` block or move a caption
+ * that was placed by hand. */
 export function toVtt(cues: Cue[]): string {
-  return (
-    "WEBVTT\n\n" +
-    cues
-      .map(
-        (c) =>
-          `${formatStamp(c.startMs, ".")} --> ${formatStamp(c.endMs, ".")}\n${c.text}`,
-      )
-      .join("\n\n") +
-    "\n"
-  );
+  const head = cues[0]?.before?.[0];
+  const headed = head != null && /^WEBVTT/i.test(head);
+  const out: string[] = [headed ? head : "WEBVTT"];
+  cues.forEach((c, i) => {
+    const before = c.before ?? [];
+    out.push(...(i === 0 && headed ? before.slice(1) : before));
+    const timing = `${formatStamp(c.startMs, ".")} --> ${formatStamp(c.endMs, ".")}${
+      c.settings ? ` ${c.settings}` : ""
+    }`;
+    out.push(`${c.id ? `${c.id}\n` : ""}${timing}\n${c.text}`);
+  });
+  out.push(...(cues[cues.length - 1]?.after ?? []));
+  return out.join("\n\n") + "\n";
 }

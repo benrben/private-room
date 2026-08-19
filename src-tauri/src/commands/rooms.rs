@@ -152,7 +152,12 @@ pub(crate) fn open_room_impl(
 ///
 /// The emit stays for the workspace that IS already up (an open-over-open
 /// unlock), and it re-checks that this room is still the open one, so locking up
-/// immediately can't produce a toast about a room that is gone.
+/// immediately can't produce a toast about a room that is gone. It emits a COPY
+/// and leaves the park alone: taking it here made the fallback the message's
+/// last consumer, so a cold start where the workspace mounted a moment after
+/// the timer found the park already empty and said nothing at all — the exact
+/// silence this reports. `take_rec_recovery_error` is the only consumer now,
+/// and the workspace ignores a repeat of a message it has already shown.
 fn report_rec_recovery_failure(app: &tauri::AppHandle, room_path: &str, err: String) {
     use tauri::Manager as _;
     eprintln!("recording recovery failed: {err}");
@@ -177,15 +182,15 @@ fn report_rec_recovery_failure(app: &tauri::AppHandle, room_path: &str, err: Str
         if !still_open {
             return;
         }
-        // Only if nobody has collected it yet — otherwise a workspace that was
-        // already listening gets the same failure twice.
-        let claimed = app
+        // Only if nobody has collected it yet — a workspace that was already
+        // listening must not get the same failure twice.
+        let still_parked = app
             .state::<AppState>()
             .rec_recovery_error
             .lock()
-            .map(|mut p| p.take().is_some())
+            .map(|p| p.is_some())
             .unwrap_or(false);
-        if !claimed {
+        if !still_parked {
             return;
         }
         let _ = app.emit(
@@ -579,6 +584,15 @@ pub(crate) fn teardown_open_room<R: tauri::Runtime>(app: &tauri::AppHandle<R>, s
     state.edit_pending.lock().unwrap().clear();
     // Wave 5 (Idea 13): drop any in-flight script-run approval requests too.
     state.script_pending.lock().unwrap().clear();
+    // A parked recording-recovery failure belongs to the room being closed.
+    // Nothing else emptied it: it is consumed by a workspace MOUNT, and the
+    // fallback timer deliberately returns without touching it once the room is
+    // gone. So a room locked within those two seconds left its message sitting
+    // there for the NEXT room's workspace to collect — an error toast about
+    // audio in "the room", shown to someone who is not in that room.
+    if let Ok(mut parked) = state.rec_recovery_error.lock() {
+        *parked = None;
+    }
     // ADD-24/ADD-25: a locked room leaves no decrypted media staged for the
     // streaming protocol, and no agent↔UI round-trip left hanging.
     clear_media(&app.state::<MediaStreams>());
@@ -906,6 +920,26 @@ mod tests {
             take_recovery_error(&state),
             None,
             "collecting it must clear it, or every mount re-reports the same failure",
+        );
+    }
+
+    #[test]
+    fn teardown_drops_a_parked_recovery_message_with_the_room_it_belongs_to() {
+        // Nothing else empties the park: it is collected by a workspace MOUNT,
+        // and the fallback timer returns without touching it once the room is
+        // no longer open. So locking room A before either happened left A's
+        // failure waiting for room B's workspace to collect and toast.
+        let (state, _reader) = open_room_with_reader("teardown-rec-recovery");
+        *state.rec_recovery_error.lock().unwrap() =
+            Some("Audio from an interrupted recording could not be restored".into());
+
+        let app = mock_app();
+        teardown_open_room(app.handle(), &state);
+
+        assert_eq!(
+            take_recovery_error(&state),
+            None,
+            "a locked room's recovery failure must not be waiting for the next room",
         );
     }
 

@@ -341,10 +341,47 @@ fn named_keys(v: &serde_json::Value) -> Vec<String> {
 
 // -------------------------------------------------------------------- icons
 
+/// Is this icon address one we are willing to open a connection to?
+///
+/// The URL comes from a registry record a stranger published, so it is exactly
+/// the shape the fetch tool's guard exists for: `http://127.0.0.1:11434/api/tags`
+/// or `http://192.168.1.1/` would otherwise be GET'd by the app, from inside the
+/// user's network, just for browsing the marketplace. This is the literal-address
+/// check only (a hostname that RESOLVES to a private address still gets through —
+/// `web::fetch`'s pinning is what covers that, and it is not reachable from a
+/// redirect policy, which must answer synchronously).
+fn icon_url_allowed(url: &str) -> bool {
+    crate::web::check_public_http_url(url).is_ok()
+}
+
+/// The icon client re-runs [`icon_url_allowed`] on every redirect hop, so an
+/// innocuous `https://cdn.example.com/i.png` cannot 302 its way to loopback.
+///
+/// The allowed branch hands the hop to `Policy::default()` rather than
+/// following it directly: a `Policy::custom` closure REPLACES the default, hop
+/// limit and all, so following by hand would let one hostile listing bounce the
+/// app between public hosts until `fetch_icon`'s 6-second budget ran out.
+/// Delegating keeps reqwest's ten-hop ceiling under our address check.
+fn icon_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .use_rustls_tls()
+        .user_agent(concat!("Arcelle/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(Duration::from_secs(8))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if icon_url_allowed(attempt.url().as_str()) {
+                reqwest::redirect::Policy::default().redirect(attempt)
+            } else {
+                attempt.stop()
+            }
+        }))
+        .build()
+        .map_err(|e| e.to_string())
+}
+
 /// Fetch one icon and return it as a `data:` URI, or `None` on any problem.
-/// Best-effort: only http(s) image responses under a size cap are inlined.
+/// Best-effort: only public http(s) image responses under a size cap are inlined.
 async fn fetch_icon(client: &reqwest::Client, url: &str) -> Option<String> {
-    if !(url.starts_with("https://") || url.starts_with("http://")) {
+    if !icon_url_allowed(url) {
         return None;
     }
     let resp = client
@@ -509,7 +546,10 @@ pub async fn mcp_registry_search(
         .await
         .map_err(|e| format!("Registry sent a reply we couldn't read: {e}"))?;
     let mut entries = normalize_servers(&payload);
-    inline_icons(&client, &mut entries).await;
+    // Icons go out on their own client: the registry's own address is ours and
+    // may redirect freely, but these URLs are attacker-chosen and every hop of
+    // theirs is re-checked.
+    inline_icons(&icon_client()?, &mut entries).await;
     Ok(entries)
 }
 
@@ -710,6 +750,26 @@ mod tests {
             entries[0].alt_install.is_none(),
             "a malformed remote must not be offered as the cloud alternative"
         );
+    }
+
+    /// A registry record's `icons[].src` is a stranger's string; browsing must
+    /// not turn it into a GET against this Mac or the user's LAN.
+    #[test]
+    fn icon_urls_pointing_inward_are_refused() {
+        for url in [
+            "http://127.0.0.1:11434/api/tags",
+            "http://localhost:8080/i.png",
+            "http://192.168.1.1/logo.png",
+            "http://10.0.0.5/logo.png",
+            "http://[::1]/logo.png",
+            "http://printer.local/logo.png",
+            "file:///etc/passwd",
+            "not a url",
+        ] {
+            assert!(!icon_url_allowed(url), "icon fetch should refuse {url}");
+        }
+        assert!(icon_url_allowed("https://icons.example.com/0.png"));
+        assert!(icon_url_allowed("http://8.8.8.8/logo.png"));
     }
 
     #[tokio::test]

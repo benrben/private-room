@@ -336,7 +336,9 @@
   text-align: center;
   color: var(--muted);
 }
-.sk-empty p {
+/* Direct child only: the Skills list's empty state wears the same class and
+   keeps its paragraph in the reading font, one wrapper down. */
+.sk-empty > p {
   font-family: var(--hand);
   font-size: var(--fs-hand-lg);
   margin: 0 0 var(--sp-3);
@@ -469,15 +471,15 @@
 /* ----- selection ----- */
 .sk-sel-box {
   fill: none;
-  stroke: var(--accent, #7aa2ff);
+  stroke: var(--accent);
   stroke-width: 1.5;
   stroke-dasharray: 5 4;
   vector-effect: non-scaling-stroke;
   opacity: 0.9;
 }
 .sk-grip {
-  fill: var(--page, #fff);
-  stroke: var(--accent, #7aa2ff);
+  fill: var(--page);
+  stroke: var(--accent);
   stroke-width: 1.5;
   vector-effect: non-scaling-stroke;
 }
@@ -488,9 +490,9 @@
 .sk-grip-e, .sk-grip-w { cursor: ew-resize; }
 
 .sk-marquee {
-  fill: var(--accent, #7aa2ff);
+  fill: var(--accent);
   fill-opacity: 0.08;
-  stroke: var(--accent, #7aa2ff);
+  stroke: var(--accent);
   stroke-width: 1;
   stroke-dasharray: 4 3;
   vector-effect: non-scaling-stroke;
@@ -499,7 +501,7 @@
 /* An alignment line is a statement about the drawing, not part of it: thin,
    accented, and gone the moment the drag ends. */
 .sk-guide {
-  stroke: var(--accent, #7aa2ff);
+  stroke: var(--accent);
   stroke-width: 1;
   stroke-dasharray: 3 3;
   vector-effect: non-scaling-stroke;
@@ -507,25 +509,34 @@
   pointer-events: none;
 }
 
-/* ----- the empty state ----- */
-.sk-empty {
+/* ----- the empty state, ON THE CANVAS -----
+   Every rule here is scoped to `.sk-stage`, because `.sk-empty` is worn by
+   three unrelated things: this floating offer, the Sketch destination's landing
+   and the Skills list's empty state. Unscoped, the absolute layer below took the
+   other two out of flow and made them transparent to the pointer — the
+   landing's "New sketch" button could be focused but not clicked. */
+.sk-stage .sk-empty {
   position: absolute;
   inset: 0;
   display: grid;
   place-items: center;
+  /* The dashed card the other two consumers want, drawn around the whole
+     drawing surface, reads as a drop target. */
+  padding: 0;
+  border: 0;
   /* THE WHOLE LAYER IS TRANSPARENT TO THE POINTER. An offer that swallows the
      first click on an empty canvas is worse than no offer at all; only the
      buttons themselves opt back in. */
   pointer-events: none;
 }
-.sk-empty-cards {
+.sk-stage .sk-empty-cards {
   display: flex;
   gap: 14px;
   flex-wrap: wrap;
   justify-content: center;
   max-width: 720px;
 }
-.sk-empty-card {
+.sk-stage .sk-empty-card {
   pointer-events: auto;
   width: 200px;
   padding: 18px 16px;
@@ -540,16 +551,18 @@
   text-align: start;
   cursor: pointer;
 }
-.sk-empty-card:hover {
+.sk-stage .sk-empty-card:hover {
   background: var(--hover);
 }
-.sk-empty-title {
+.sk-stage .sk-empty-title {
   font-family: var(--display);
   font-size: 14px;
 }
-.sk-empty-copy {
-  color: var(--ink-2, var(--faint));
-  font-size: var(--fs-micro, 11px);
+.sk-stage .sk-empty-copy {
+  color: var(--ink-2);
+  /* The 11px fallback that used to sit here was below --fs-micro's own floor,
+     so the trap it set was a size the app has ruled out. */
+  font-size: var(--fs-micro);
   line-height: 1.45;
 }
 
@@ -580,7 +593,7 @@
 }
 .sk-objects-toggle[aria-expanded="true"] {
   color: inherit;
-  border-color: var(--accent, #7aa2ff);
+  border-color: var(--accent);
 }
 /* One row that scrolls, until the count is clicked — then it wraps, up to a
    height that still leaves most of the window to the drawing. */
@@ -621,7 +634,7 @@
   color: inherit;
 }
 .sk-object.on {
-  border-color: var(--accent, #7aa2ff);
+  border-color: var(--accent);
   color: inherit;
 }
 .sk-object-locked {

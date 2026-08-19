@@ -8,9 +8,10 @@ import {
   type ShotPlan,
 } from "../../api";
 import { clock } from "./clock";
-import { CheckIcon, CreateIcon, LockIcon, SearchIcon } from "../../icons";
+import { CheckIcon, CreateIcon, LockIcon } from "../../icons";
 import { WSState } from "../state";
 import { WSActions } from "../actions";
+import { isCreationFile } from "../types";
 import { Attached, PicturePicker } from "./PicturePicker";
 import { StoryTab } from "./StoryTab";
 import {
@@ -131,6 +132,18 @@ export function CreatePage({ s, a }: { s: WSState; a: WSActions }) {
     setAspectRatio("");
   }, [selectedId]);
 
+  // A video model with no first-frame slot hides the attached picture AND its
+  // only Remove control, so a frame left in state could not be seen or taken
+  // off: the lock notice still counted it as something that would be sent, and
+  // Make it refused, telling the user to clear a picture the bench no longer
+  // showed. Dropped on the video bench only — the frame slot is video's, and
+  // clearing it because the reader glanced at the Images tab would throw away
+  // an attachment they never touched.
+  const dropsFrame = kind === "video" && !!selected && !takesFirstFrame(selected);
+  useEffect(() => {
+    if (dropsFrame) setFrame(null);
+  }, [dropsFrame]);
+
   const createJobs = s.jobs.filter((j) => j.kind === "create");
   const activeJobs = createJobs.filter(
     (j) => j.status === "running" || j.status === "queued",
@@ -141,7 +154,12 @@ export function CreatePage({ s, a }: { s: WSState; a: WSActions }) {
   // record in another pane. A paid call that produced nothing owes an answer
   // in the place the person is looking.
   const failedJobs = createJobs.filter((j) => j.status === "error").slice(0, 3);
-  const made = s.files.filter((f) => f.source === "generated");
+  // `source === "generated"` is written by every producer in the room — sketch
+  // creation, the deep summary, the organizer — so this grid used to claim the
+  // bench had made a drawing somebody drew by hand. `originDestination` is the
+  // destination contract's own answer, and the one the Creations sidebar reads,
+  // so the two lists can no longer disagree about what Create has made.
+  const made = s.files.filter(isCreationFile);
 
   // A clip may be made from a picture alone — several models animate a still
   // with no words at all, and the API marks the prompt optional for exactly
@@ -198,12 +216,16 @@ export function CreatePage({ s, a }: { s: WSState; a: WSActions }) {
       <div className="cr-body">
         {loading ? (
           <div className="cr-note">Reading what this room’s models can do…</div>
-        ) : loadError ? (
-          <div className="cr-note cr-note-bad">
-            Could not read the model list: {loadError}
-          </div>
         ) : (
           <>
+            {/* A catalogue we could not read is a line at the top, not the
+                whole page: it says what failed while everything that needs no
+                catalogue — the cast, the shot list — stays where it was. */}
+            {loadError && (
+              <div className="cr-note cr-note-bad">
+                Could not read the model list: {loadError}
+              </div>
+            )}
             <Ledger
               catalog={catalog}
               counts={counts}
@@ -211,106 +233,111 @@ export function CreatePage({ s, a }: { s: WSState; a: WSActions }) {
               onToggle={() => setWhyOpen((v) => !v)}
             />
 
-            {models.length === 0 ? (
+            {/* The tabs sit ABOVE the empty shelf, not inside it. A cast and a
+                shot list are work already stored in this room; hiding the
+                whole page behind the model shelf made them unreachable the
+                moment a catalogue failed to load — offline, key removed, the
+                room's internet switch off — for surfaces that need no
+                provider to read or edit. The shelf is the Images/Video
+                worktable's own empty state; Story reports a bare catalogue
+                through its per-shot model pickers. */}
+            <div className="cr-controls">
+              <div className="cr-tabs" role="tablist" aria-label="What to make">
+                {/* No catalogue means the count is UNKNOWN, not zero. Past the
+                    loading branch a null catalog is a fetch that failed, and
+                    "Images 0" beside it states a fact about this room's
+                    providers that nothing here has read — so the number is
+                    left off, the way the sidebar leaves off a badge it cannot
+                    count. */}
+                <Tab
+                  label="Images"
+                  count={catalog ? counts.image : undefined}
+                  on={surface === "image"}
+                  mark="var(--mk-blue)"
+                  onPick={() => setSurface("image")}
+                />
+                <Tab
+                  label="Video"
+                  count={catalog ? counts.video : undefined}
+                  on={surface === "video"}
+                  mark="var(--mk-green)"
+                  onPick={() => setSurface("video")}
+                />
+                <Tab
+                  label="Story"
+                  on={surface === "story"}
+                  mark="var(--mk-yellow)"
+                  onPick={() => setSurface("story")}
+                />
+              </div>
+              {/* The model filter lives on the bench, under the dropdown it
+                  filters. A second copy up here was bound to the same state —
+                  two boxes typing into each other, two controls with one
+                  accessible name — and it filtered a gallery that is no longer
+                  on this page. */}
+            </div>
+
+            {surface === "story" ? (
+              <StoryTab
+                s={s}
+                a={a}
+                models={models}
+                handoff={handoff}
+                onHandoffUsed={() => setHandoff(null)}
+              />
+            ) : models.length === 0 ? (
               <EmptyShelf catalog={catalog} />
             ) : (
               <>
-                <div className="cr-controls">
-                  <div className="cr-tabs" role="tablist" aria-label="What to make">
-                    <Tab
-                      label="Images"
-                      count={counts.image}
-                      on={surface === "image"}
-                      mark="var(--mk-blue)"
-                      onPick={() => setSurface("image")}
-                    />
-                    <Tab
-                      label="Video"
-                      count={counts.video}
-                      on={surface === "video"}
-                      mark="var(--mk-green)"
-                      onPick={() => setSurface("video")}
-                    />
-                    <Tab
-                      label="Story"
-                      on={surface === "story"}
-                      mark="var(--mk-yellow)"
-                      onPick={() => setSurface("story")}
-                    />
-                  </div>
-                  {surface !== "story" && (
-                    <label className="cr-search">
-                      <SearchIcon size={14} />
-                      <input
-                        type="search"
-                        value={query}
-                        placeholder="Filter by name…"
-                        aria-label="Filter models by name"
-                        onChange={(e) => setQuery(e.target.value)}
-                      />
-                    </label>
-                  )}
-                </div>
-
-                {surface === "story" ? (
-                  <StoryTab
+                <div className="cr-worktable">
+                  {/* THE WORKSPACE. This used to be a grid of model cards —
+                      forty of them, filling the page, to make one choice
+                      that is made once and then not thought about again.
+                      The models are a dropdown on the bench now, and the
+                      room's own work gets the space instead. */}
+                  <Canvas
                     s={s}
                     a={a}
-                    models={models}
-                    handoff={handoff}
-                    onHandoffUsed={() => setHandoff(null)}
+                    kind={kind}
+                    activeJobs={activeJobs}
+                    failedJobs={failedJobs}
+                    made={made}
+                    onDismiss={(id) => void a.dismissJob(id)}
                   />
-                ) : (
-                  <div className="cr-worktable">
-                    {/* THE WORKSPACE. This used to be a grid of model cards —
-                        forty of them, filling the page, to make one choice
-                        that is made once and then not thought about again.
-                        The models are a dropdown on the bench now, and the
-                        room's own work gets the space instead. */}
-                    <Canvas
-                      s={s}
-                      a={a}
-                      kind={kind}
-                      activeJobs={activeJobs}
-                      failedJobs={failedJobs}
-                      made={made}
-                      onDismiss={(id) => void a.dismissJob(id)}
-                    />
 
-                    <Bench
-                      models={visible}
-                      selected={selected}
-                      onPickModel={setPickedModel}
-                      query={query}
-                      onQuery={setQuery}
-                      total={kind === "video" ? counts.video : counts.image}
-                      kind={kind}
-                      prompt={prompt}
-                      onPrompt={setPrompt}
-                      variations={variations}
-                      onVariations={setVariations}
-                      frame={frame}
-                      refs={refs}
-                      seconds={seconds}
-                      onSeconds={setSeconds}
-                      resolution={resolution}
-                      onResolution={setResolution}
-                      aspectRatio={aspectRatio}
-                      onAspectRatio={setAspectRatio}
-                      onTakeToStory={() => {
-                        setHandoff(prompt);
-                        setSurface("story");
-                      }}
-                      onPickFrame={() => setPicking("frame")}
-                      onPickRef={() => setPicking("ref")}
-                      onClearFrame={() => setFrame(null)}
-                      onClearRef={(id) => setRefs((r) => r.filter((p) => p.fileId !== id))}
-                      busy={busy}
-                      canGo={canGo}
-                      onGenerate={() => void generate()}
-                    />
-                  </div>
-                )}
+                  <Bench
+                    models={visible}
+                    selected={selected}
+                    onPickModel={setPickedModel}
+                    query={query}
+                    onQuery={setQuery}
+                    total={kind === "video" ? counts.video : counts.image}
+                    kind={kind}
+                    prompt={prompt}
+                    onPrompt={setPrompt}
+                    variations={variations}
+                    onVariations={setVariations}
+                    frame={frame}
+                    refs={refs}
+                    seconds={seconds}
+                    onSeconds={setSeconds}
+                    resolution={resolution}
+                    onResolution={setResolution}
+                    aspectRatio={aspectRatio}
+                    onAspectRatio={setAspectRatio}
+                    onTakeToStory={() => {
+                      setHandoff(prompt);
+                      setSurface("story");
+                    }}
+                    onPickFrame={() => setPicking("frame")}
+                    onPickRef={() => setPicking("ref")}
+                    onClearFrame={() => setFrame(null)}
+                    onClearRef={(id) => setRefs((r) => r.filter((p) => p.fileId !== id))}
+                    busy={busy}
+                    canGo={canGo}
+                    onGenerate={() => void generate()}
+                  />
+                </div>
 
                 <PicturePicker
                   open={picking !== null}
@@ -332,7 +359,6 @@ export function CreatePage({ s, a }: { s: WSState; a: WSActions }) {
                 />
               </>
             )}
-
           </>
         )}
       </div>
@@ -522,27 +548,23 @@ function Canvas({
         </div>
       ))}
 
+      {/* No bar and no figure. `done` only moves at a VARIATION boundary, so
+          the ordinary one-picture job reported 0% from its first event to its
+          last — a determinate meter stuck at zero for three minutes, which
+          says something false about a paid call. The provider's own percentage
+          is already in the label when there is one, and the label says no
+          number when there is not. */}
       {activeJobs.map((j) => {
         const live = s.jobProgress[j.id];
-        const pct = live ? Math.min(100, Math.round(live.done)) : 0;
         return (
           <div key={j.id} className="nb-card cr-job" role="status">
             <span className="cr-job-dot" aria-hidden="true" />
             <span className="cr-job-text">
               <span className="cr-job-title">{j.title}</span>
-              <span className="cr-job-sub">{live?.label ?? "Queued"}</span>
+              <span className="cr-job-sub">
+                {live?.label ?? (j.status === "queued" ? "Queued" : "Working…")}
+              </span>
             </span>
-            <span
-              className="cr-job-bar"
-              role="progressbar"
-              aria-valuenow={pct}
-              aria-valuemin={0}
-              aria-valuemax={100}
-              aria-label="Generation progress"
-            >
-              <span className="cr-job-fill" style={{ width: `${pct}%` }} />
-            </span>
-            <span className="nb-num cr-dim">{pct}%</span>
           </div>
         );
       })}
@@ -964,7 +986,15 @@ function Bench({
         disabled={busy || !canGo}
         onClick={onGenerate}
       >
-        {busy ? "Starting…" : sending > 0 ? "Send and make it" : "Make it"}
+        {/* The quantity belongs on the button that spends it. "How many" is
+            chosen in one control and was disclosed only in the toast fired
+            after the press — up to four paid calls behind a word that says
+            one. */}
+        {busy
+          ? "Starting…"
+          : sending > 0
+            ? `Send and make ${variations === 1 ? "it" : variations}`
+            : `Make ${variations === 1 ? "it" : variations}`}
       </button>
       <p className="cr-bench-hint">
         {kind === "video"

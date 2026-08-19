@@ -37,18 +37,20 @@ export default class ErrorBoundary extends Component<
         <div className="crash-screen" role="alert">
           <div className="crash-card">
             <h2>Something went wrong</h2>
+            {/* A render boundary sees an exception and nothing else. The throw
+                can follow a save, a trash or a job start that already landed,
+                so "nothing was written" is a claim this class cannot make. */}
             <p>
               Arcelle hit an unexpected error while drawing the window. Your
-              room is untouched — it is an encrypted file on this Mac, and
-              nothing was written by this failure.
+              room is an encrypted file on this Mac and is still there. Anything
+              already saved is saved; unsaved work in the editor is gone.
             </p>
             <pre className="crash-detail">{detail}</pre>
             <div className="crash-actions">
+              {/* Only one door. Retrying re-renders the same props from the same
+                  store, so at the root it lands on the same throw. */}
               <button className="primary" onClick={() => window.location.reload()}>
                 Reload Arcelle
-              </button>
-              <button className="subtle" onClick={this.retry}>
-                Try again
               </button>
             </div>
           </div>

@@ -281,7 +281,12 @@ export default function ImageView({ fileId, name, mime, mediaToken, dataB64, tex
                 <path d="M12 2.5v3.5M12 18v3.5M2.5 12h3.5M18 12h3.5" />
                 <circle cx="12" cy="12" r="1.5" fill="currentColor" stroke="none" />
               </svg>
-              Find
+              {/* "Mark", not "Find". PdfView's toolbar has a Find that searches
+                  the document's own text; this asks a model to draw boxes on a
+                  picture. Two different acts under one word, in one family of
+                  viewers — and "mark" is the verb the rest of this component
+                  already uses (the placeholder, the status line, the offer). */}
+              Mark
             </>
           )}
         </button>
@@ -293,23 +298,24 @@ export default function ImageView({ fileId, name, mime, mediaToken, dataB64, tex
       </form>
 
       {/* Offer the vision helper when nothing installed can mark images.
-          Kept separate from the mark bar above so marking still works. */}
+          Kept separate from the mark bar above so marking still works.
+
+          `.rdr-note` is the viewer chrome's technical notice, so this card is
+          drawn from the same tokens as every other one. Its own dress is cut
+          for a one-line caption in the margin — 46ch of micro type — and this
+          note is an INSTRUCTION with two buttons and a download bar in it, so
+          it takes the width and the reading size back. */}
       {visionModel && !pullDone && (
         <div
-          className="vision-offer"
+          className="rdr-note"
           style={{
-            display: "flex",
             flexWrap: "wrap",
             alignItems: "center",
-            gap: 10,
-            padding: "8px 12px",
-            margin: "2px 0",
-            borderRadius: 8,
-            background: "color-mix(in srgb, var(--mk-berry) 12%, transparent)",
-            border: "1px solid color-mix(in srgb, var(--mk-berry) 26%, transparent)",
+            maxWidth: "none",
+            fontSize: "var(--fs-body)",
           }}
         >
-          <span style={{ color: "var(--text-dim)" }}>
+          <span>
             {/* Offered only when the backend says nothing can mark — and framed
                 as one way out, not the way. Switching this room to any model
                 that carries the "vision" badge works just as well and downloads
@@ -353,7 +359,16 @@ export default function ImageView({ fileId, name, mime, mediaToken, dataB64, tex
         <div className="viewer-status">Vision helper ready — try marking now.</div>
       )}
 
-      {status && <div className="viewer-status">{status}</div>}
+      {/* A live region, because this string is REPLACED as work finishes:
+          "Looking…" becomes the count of matches, or the reason nothing could
+          be marked. `.viewer-status` also dresses static captions elsewhere
+          (a figcaption, a cue count, "Slide 3 of 12") — those are not announced
+          and should not be. The rule is the readout changing, not the class. */}
+      {status && (
+        <div className="viewer-status" role="status">
+          {status}
+        </div>
+      )}
       <div className="pdf-zoombar img-zoombar">
         <button
           type="button"

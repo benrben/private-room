@@ -45,6 +45,14 @@ Follow this workflow when the skill applies.
 2. Apply the specialized procedure.
 3. Verify the result before replying.`;
 
+/** What the host will actually store: `validate_skill_name` lowercases and
+ * turns spaces and underscores into hyphens, so "Review Contracts" was saved
+ * as `review-contracts` and the field only admitted it after a reload. It
+ * TRIMS first, so a leading space is not a hyphen there and must not become
+ * one here — that would refuse a name the host accepts. */
+const normalizeSkillName = (value: string) =>
+  value.toLowerCase().replace(/[ _]/g, "-").replace(/^-+/, "");
+
 function pathLabel(path: string) {
   const parts = path.split("/");
   return { folder: parts.length > 1 ? parts.slice(0, -1).join("/") : "root", name: parts.at(-1) ?? path };
@@ -179,18 +187,22 @@ export default function SkillsView({ s, a, info }: Props) {
   const [bundle, setBundle] = useState<SkillBundle | null>(null);
   const [draft, setDraft] = useState<SkillDraft | null>(null);
   const [isNew, setIsNew] = useState(false);
-  const [dirty, setDirty] = useState(false);
+  const [dirty, setDirtyState] = useState(false);
   const [busy, setBusy] = useState(false);
   const [composeText, setComposeText] = useState("");
   const [composeBusy, setComposeBusy] = useState(false);
   const [composeSourceIds, setComposeSourceIds] = useState<string[]>([]);
   const [sourcePickerOpen, setSourcePickerOpen] = useState(false);
   const [sourceFilter, setSourceFilter] = useState("");
-  const [resource, setResource] = useState<SkillResourceContent | null>(null);
+  const [resource, setResourceState] = useState<SkillResourceContent | null>(null);
   const [resourceText, setResourceText] = useState("");
-  const [resourceDirty, setResourceDirty] = useState(false);
+  const [resourceDirty, setResourceDirtyState] = useState(false);
   const [newResourcePath, setNewResourcePath] = useState("");
   const [confirmDelete, setConfirmDelete] = useState(false);
+  /** The skill on screen vanished from the room while it was being edited
+   * (the assistant's `delete_skill`, another window). Its name, so the editor
+   * can say what happened instead of unmounting mid-sentence. */
+  const [deletedElsewhere, setDeletedElsewhere] = useState<string | null>(null);
   // The host's roster of valid owners — asked for, never written down here, so
   // the picker can only offer ids the save would accept.
   const [agentIds, setAgentIds] = useState<string[]>([]);
@@ -198,6 +210,34 @@ export default function SkillsView({ s, a, info }: Props) {
   // The builder's box had a placeholder and no accessible name at all; this
   // ties a real visible label to it.
   const composeId = useId();
+
+  /* Two readers run OUTSIDE the render that last set this state — the room's
+     `skills-changed` listener and the selection guard — and both decide
+     whether typed work is about to be thrown away. State they read a frame
+     late is a lost keystroke, so every setter below writes its mirror ref
+     synchronously and the readers use the ref. */
+  const dirtyRef = useRef(false);
+  const resourceDirtyRef = useRef(false);
+  const resourceRef = useRef<SkillResourceContent | null>(null);
+  const setDirty = (v: boolean) => {
+    dirtyRef.current = v;
+    setDirtyState(v);
+  };
+  const setResourceDirty = (v: boolean) => {
+    resourceDirtyRef.current = v;
+    setResourceDirtyState(v);
+  };
+  const setResource = (v: SkillResourceContent | null) => {
+    resourceRef.current = v;
+    setResourceState(v);
+  };
+  /** Which skill this editor is actually showing. `selectedSkillId` is changed
+   * from outside (the sidebar rows, the cards, `refreshSkills` when a skill
+   * disappears), so the guard has to sit on the CHANGE, not on a button. */
+  const shownId = useRef<string | null>(null);
+  /** This editor's own Delete, so the guard does not report it as someone
+   * else's. */
+  const selfDeleted = useRef(false);
 
   const selected = s.selectedSkillId;
 
@@ -213,6 +253,7 @@ export default function SkillsView({ s, a, info }: Props) {
       });
       setIsNew(false);
       setDirty(false);
+      setDeletedElsewhere(null);
       setResource(null);
       setResourceText("");
       setResourceDirty(false);
@@ -221,16 +262,116 @@ export default function SkillsView({ s, a, info }: Props) {
     }
   }
 
+  /** Everything the editor holds, dropped. Also clears the dirty flags: they
+   * belong to the draft that is going away, and a stale one would make the
+   * next selection change ask about work that no longer exists. */
+  function clearEditor() {
+    setBundle(null);
+    setDraft(null);
+    setDirty(false);
+    setDeletedElsewhere(null);
+    setResource(null);
+    setResourceText("");
+    setResourceDirty(false);
+  }
+
   useEffect(() => {
-    if (selected) void load(selected);
-    else if (!isNew) {
-      setBundle(null);
-      setDraft(null);
-      setResource(null);
+    if (selected === shownId.current) return;
+    const leaving = shownId.current;
+    const wasSelfDeleted = selfDeleted.current;
+    selfDeleted.current = false;
+    // The open skill is no longer in the room: someone else deleted it, so
+    // there is no "discard?" to ask — the answer was decided elsewhere. Say
+    // so, and keep unsaved text on screen to be copied rather than dropping
+    // the user back into the list mid-sentence.
+    if (leaving !== null && selected === null && !s.skills.some((x) => x.id === leaving)) {
+      shownId.current = null;
+      if (wasSelfDeleted) return;
+      const name = bundle?.skill.name ?? "That skill";
+      if (dirtyRef.current || resourceDirtyRef.current) {
+        setDeletedElsewhere(name);
+        s.pushToast(
+          "error",
+          `${name} was deleted — your unsaved changes were not saved. Copy anything you still need.`,
+        );
+        return;
+      }
+      s.pushToast("info", `${name} was deleted.`);
+      clearEditor();
+      return;
     }
+    // `leaving === null && isNew` is the unsaved NEW skill: putting the id
+    // back is putting it back to null, which the early return above then
+    // treats as "nothing changed" and the draft stays on screen.
+    if ((leaving !== null || isNew) && (dirtyRef.current || resourceDirtyRef.current)) {
+      let cancelled = false;
+      void (async () => {
+        const ok = await confirmDiscard("editor");
+        if (cancelled) return;
+        if (!ok) {
+          s.setSelectedSkillId(leaving);
+          return;
+        }
+        shownId.current = selected;
+        if (selected) await load(selected);
+        else clearEditor();
+      })();
+      return () => {
+        cancelled = true;
+      };
+    }
+    shownId.current = selected;
+    if (selected) void load(selected);
+    else if (!isNew) clearEditor();
     // `load` is intentionally keyed only by the selected id.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selected]);
+
+  /* The room can write to the skill that is open: the assistant's `save_skill`
+     / `write_skill_resource`, or another window. The editor used to show its
+     pre-write state until something else reloaded it, so the Enabled toggle
+     kept claiming a state the backend had already flipped. Only ever applied
+     when nothing is typed-but-unsaved — a foreign write that lands mid-edit is
+     caught by the save path instead, which asks before overwriting it. */
+  useEffect(() => {
+    const pending = api.onSkillsChanged(() => {
+      const id = shownId.current;
+      if (!id || dirtyRef.current || resourceDirtyRef.current) return;
+      void (async () => {
+        try {
+          const next = await api.getSkill(id);
+          // Anything the user did while this was in flight wins.
+          if (shownId.current !== id || dirtyRef.current || resourceDirtyRef.current) return;
+          setBundle(next);
+          setDraft({
+            name: next.skill.name,
+            description: next.skill.description,
+            instructions: next.skill.instructions,
+            agent: next.skill.agent ?? "",
+          });
+          const open = resourceRef.current;
+          if (!open) return;
+          if (!next.resources.some((r) => r.path === open.path)) {
+            setResource(null);
+            setResourceText("");
+            return;
+          }
+          const fresh = await api.getSkillResource(id, open.path);
+          if (resourceDirtyRef.current || resourceRef.current?.path !== open.path) return;
+          setResource(fresh);
+          setResourceText(fresh.text ?? "");
+        } catch {
+          // Nobody asked for this refresh, so nobody is waiting on a toast for
+          // it. The next thing the user does reports the room's failure.
+        }
+      })();
+    });
+    return () => {
+      void pending.then((un) => un()).catch(() => {});
+    };
+    // Reads only refs and setters, so it never needs rebuilding.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     api
@@ -291,6 +432,35 @@ export default function SkillsView({ s, a, info }: Props) {
     return s.files.filter((file) => !query || file.name.toLowerCase().includes(query));
   }, [s.files, sourceFilter]);
 
+  /* Inline, beside the fields — the first save of the first skill is the one
+     most likely to fail, and it failed into a toast that named a rule without
+     pointing at anything. Mirrors `validate_skill_name` /
+     `validate_skill_fields`, so Save is refused here for exactly what the host
+     would refuse there. */
+  const problems = useMemo(() => {
+    if (!draft) return [];
+    const list: string[] = [];
+    const name = draft.name.trim();
+    if (!name) {
+      list.push("Give the skill a name.");
+    } else if (
+      name.length > 64 ||
+      name.startsWith("-") ||
+      name.endsWith("-") ||
+      !/^[a-z0-9-]+$/.test(name)
+    ) {
+      list.push(
+        "Skill names must be 1–64 lowercase letters, numbers, or hyphens, without a leading or trailing hyphen.",
+      );
+    }
+    if (!draft.description.trim()) {
+      list.push(
+        "Describe what the skill does and when the assistant should use it.",
+      );
+    }
+    return list;
+  }, [draft]);
+
   function toggleComposeSource(id: string) {
     setComposeSourceIds((current) => {
       if (current.includes(id)) return current.filter((sourceId) => sourceId !== id);
@@ -303,11 +473,19 @@ export default function SkillsView({ s, a, info }: Props) {
   }
 
   function startNew() {
+    // What is on screen from here is the NEW draft, so the selection guard has
+    // nothing to ask about: this replaces the editor's contents itself, and a
+    // prompt raised afterwards would be about work that is already gone — and
+    // discarding it would take the new draft with it.
+    shownId.current = null;
     s.setSelectedSkillId(null);
     setBundle(null);
     setDraft({ name: "", description: "", instructions: STARTER, agent: "" });
     setIsNew(true);
-    setDirty(true);
+    // Nothing has been typed yet, so leaving must not raise the discard dialog
+    // — the same dialog that guards real work. `patchDraft` raises it on the
+    // first real edit, and `problems` is what keeps Save honest on an empty form.
+    setDirty(false);
     setResource(null);
     setConfirmDelete(false);
   }
@@ -317,8 +495,11 @@ export default function SkillsView({ s, a, info }: Props) {
     setDirty(true);
   }
 
-  async function saveMetadata() {
-    if (!draft || busy) return;
+  /** True only when the draft is now stored. Callers that go on to do
+   * something else with the skill (the Enabled switch) must not act on a save
+   * that never landed. */
+  async function saveMetadata(): Promise<boolean> {
+    if (!draft || busy || deletedElsewhere) return false;
     setBusy(true);
     try {
       if (isNew) {
@@ -327,14 +508,38 @@ export default function SkillsView({ s, a, info }: Props) {
         s.setSelectedSkillId(id);
         s.pushToast("success", "Skill draft created — review it, then enable it.");
       } else if (bundle) {
-        await api.updateSkill(bundle.skill.id, draft.name, draft.description, draft.instructions, draft.agent);
+        // The room may have written this skill since it was opened. Overwriting
+        // that without a word is the loss this asks about.
+        const stored = await api.getSkill(bundle.skill.id);
+        const changedElsewhere =
+          stored.skill.name !== bundle.skill.name ||
+          stored.skill.description !== bundle.skill.description ||
+          stored.skill.instructions !== bundle.skill.instructions ||
+          stored.skill.agent !== bundle.skill.agent;
+        if (
+          changedElsewhere &&
+          !(await confirm(
+            `${bundle.skill.name} was changed outside this editor since you opened it. Save your version over it?`,
+            { title: "Changed elsewhere", kind: "warning", okLabel: "Save mine" },
+          ))
+        ) {
+          return false;
+        }
+        // The owner travels only when the user actually chose one. A skill
+        // bound to a specialist this build no longer has would otherwise have
+        // every save refused ("agent must be one of…") over a field the edit
+        // never touched — `undefined` tells the host to leave the binding be.
+        const owner = draft.agent === bundle.skill.agent ? undefined : draft.agent;
+        await api.updateSkill(bundle.skill.id, draft.name, draft.description, draft.instructions, owner);
         await a.refreshSkills();
         await load(bundle.skill.id);
         s.pushToast("success", "SKILL.md saved.");
       }
       setDirty(false);
+      return true;
     } catch (e) {
       s.pushToast("error", String(e));
+      return false;
     } finally {
       setBusy(false);
     }
@@ -406,9 +611,13 @@ export default function SkillsView({ s, a, info }: Props) {
   }
 
   async function toggleEnabled(on: boolean) {
-    if (!bundle) return;
+    if (!bundle || deletedElsewhere) return;
     try {
-      if (dirty) await saveMetadata();
+      // The implicit save is not a courtesy — enabling advertises the skill to
+      // the model. If it did not land, the version about to be advertised is
+      // not the one on screen, so stop here and leave the switch and the draft
+      // exactly as they are. `saveMetadata` has already said why.
+      if (dirty && !(await saveMetadata())) return;
       await api.setSkillEnabled(bundle.skill.id, on);
       await a.refreshSkills();
       await load(bundle.skill.id);
@@ -422,9 +631,10 @@ export default function SkillsView({ s, a, info }: Props) {
     if (!bundle) return;
     try {
       await api.deleteSkill(bundle.skill.id);
+      // Ours: the guard must not report this back to us as someone else's.
+      selfDeleted.current = true;
       s.setSelectedSkillId(null);
-      setBundle(null);
-      setDraft(null);
+      clearEditor();
       await a.refreshSkills();
       s.pushToast("success", `Deleted ${bundle.skill.name}.`);
     } catch (e) {
@@ -475,25 +685,40 @@ export default function SkillsView({ s, a, info }: Props) {
     setResourceDirty(false);
   }
 
-  /** Back to the skill list — the whole editor, drafts included, goes with it. */
+  /** Back to the skill list — the whole editor, drafts included, goes with it.
+   * A skill deleted under us has nothing left to save, and the toast already
+   * said so, so that case leaves without a second question. */
   async function leaveEditor() {
-    if (!(await confirmDiscard("editor"))) return;
+    if (!deletedElsewhere && !(await confirmDiscard("editor"))) return;
     s.setSelectedSkillId(null);
-    setDraft(null);
-    setBundle(null);
-    setResource(null);
-    setResourceText("");
-    setResourceDirty(false);
+    clearEditor();
+  }
+
+  /** Re-read the folder listing, and nothing else. `load` also replaces the
+   * SKILL.md draft with the stored values — which silently threw away typed
+   * instructions every time a file was saved, added or removed. */
+  async function reloadResources() {
+    if (!bundle) return;
+    try {
+      const next = await api.getSkill(bundle.skill.id);
+      // The LISTING only. `bundle.skill` is the copy the SKILL.md save compares
+      // the stored one against, so taking the fresh `skill` here would quietly
+      // adopt a write from elsewhere as "what I opened" — and the next Save
+      // would find nothing to warn about and overwrite it.
+      setBundle((b) => (b ? { ...b, resources: next.resources } : b));
+    } catch (e) {
+      s.pushToast("error", String(e));
+    }
   }
 
   async function addResource() {
-    if (!bundle || !newResourcePath.trim()) return;
+    if (!bundle || !newResourcePath.trim() || deletedElsewhere) return;
     if (!(await confirmDiscard("resource"))) return;
     try {
       await api.saveSkillResource(bundle.skill.id, newResourcePath.trim(), { text: "" });
       const path = newResourcePath.trim();
       setNewResourcePath("");
-      await load(bundle.skill.id);
+      await reloadResources();
       await openResource(path);
     } catch (e) {
       s.pushToast("error", String(e));
@@ -501,10 +726,23 @@ export default function SkillsView({ s, a, info }: Props) {
   }
 
   async function saveResource() {
-    if (!bundle || !resource || resource.text == null) return;
+    if (!bundle || !resource || resource.text == null || deletedElsewhere) return;
     try {
+      // `resource.text` is the copy this editor opened; `resourceText` is what
+      // the user typed. A difference in the stored file is a write from
+      // somewhere else, and it is not ours to drop.
+      const stored = await api.getSkillResource(bundle.skill.id, resource.path);
+      if (
+        (stored.text ?? "") !== resource.text &&
+        !(await confirm(
+          `${resource.path} was changed outside this editor since you opened it. Save your version over it?`,
+          { title: "Changed elsewhere", kind: "warning", okLabel: "Save mine" },
+        ))
+      ) {
+        return;
+      }
       await api.saveSkillResource(bundle.skill.id, resource.path, { text: resourceText });
-      await load(bundle.skill.id);
+      await reloadResources();
       await openResource(resource.path);
       s.pushToast("success", `${resource.path} saved.`);
     } catch (e) {
@@ -513,7 +751,7 @@ export default function SkillsView({ s, a, info }: Props) {
   }
 
   async function removeResource() {
-    if (!bundle || !resource) return;
+    if (!bundle || !resource || deletedElsewhere) return;
     // Unlike an ordinary room file this has no version history, so the click IS
     // the point of no return — and deleting the whole skill already asks.
     const ok = await confirm(
@@ -524,7 +762,9 @@ export default function SkillsView({ s, a, info }: Props) {
     try {
       await api.deleteSkillResource(bundle.skill.id, resource.path);
       setResource(null);
-      await load(bundle.skill.id);
+      setResourceText("");
+      setResourceDirty(false);
+      await reloadResources();
     } catch (e) {
       s.pushToast("error", String(e));
     }
@@ -651,6 +891,7 @@ export default function SkillsView({ s, a, info }: Props) {
                   <button
                     type="button"
                     className={`subtle btn-ic${sourcePickerOpen ? " active" : ""}`}
+                    aria-expanded={sourcePickerOpen}
                     onClick={() => setSourcePickerOpen((open) => !open)}
                   >
                     <PaperclipIcon size={14} />
@@ -659,7 +900,22 @@ export default function SkillsView({ s, a, info }: Props) {
                       : "Add room files"}
                   </button>
                   {sourcePickerOpen && (
-                    <div className="sk-source-picker nb-float nb-float-draw" role="dialog" aria-label="Choose source files">
+                    /* Escape belongs to the SHEET, not to its filter field:
+                       one Tab into the checkboxes and the key used to reach
+                       the app-level handler instead and close the open file
+                       behind the picker. Not a dialog — it is a non-modal
+                       popover with real focusable content in DOM order after
+                       its trigger, so `aria-expanded` plus a labelled section
+                       is the honest description and no focus trap is owed. */
+                    <section
+                      className="sk-source-picker nb-float nb-float-draw"
+                      aria-label="Choose source files"
+                      onKeyDown={(event) => {
+                        if (event.key !== "Escape") return;
+                        event.stopPropagation();
+                        setSourcePickerOpen(false);
+                      }}
+                    >
                       <div className="sk-source-picker-head">
                         <strong>Build from room files</strong>
                         <button className="subtle" onClick={() => setSourcePickerOpen(false)}>Done</button>
@@ -669,9 +925,6 @@ export default function SkillsView({ s, a, info }: Props) {
                         value={sourceFilter}
                         placeholder="Find a file…"
                         onChange={(event) => setSourceFilter(event.target.value)}
-                        onKeyDown={(event) => {
-                          if (event.key === "Escape") setSourcePickerOpen(false);
-                        }}
                       />
                       <div className="sk-source-list">
                         {filteredSourceFiles.length === 0 && (
@@ -699,7 +952,7 @@ export default function SkillsView({ s, a, info }: Props) {
                           );
                         })}
                       </div>
-                    </div>
+                    </section>
                   )}
                 </div>
                 <span className="sk-source-hint">
@@ -774,6 +1027,14 @@ export default function SkillsView({ s, a, info }: Props) {
     { enabled: bundle?.skill.enabled ?? false, description: draft.description, agent: draft.agent, instructions: draft.instructions },
     agentIds,
   );
+  if (deletedElsewhere) {
+    flags.push({
+      key: "deleted",
+      word: "Deleted elsewhere",
+      mark: "nb-sem-urgent",
+      why: `${deletedElsewhere} was deleted from this room, so nothing here can be saved. Copy anything you still need, then go back to the list.`,
+    });
+  }
 
   return (
     <div className="sk-editor">
@@ -781,7 +1042,7 @@ export default function SkillsView({ s, a, info }: Props) {
         <button className="subtle" onClick={() => void leaveEditor()}>← All skills</button>
         <div className="sk-editor-actions">
           {bundle && <button className="subtle btn-ic" onClick={() => void exportFolder()}><FolderIcon size={14} /> Export folder</button>}
-          <button className="primary btn-ic" disabled={!dirty || busy} onClick={() => void saveMetadata()}><SaveIcon size={14} /> {busy ? "Saving…" : "Save SKILL.md"}</button>
+          <button className="primary btn-ic" disabled={!dirty || busy || deletedElsewhere !== null || problems.length > 0} title={problems[0]} onClick={() => void saveMetadata()}><SaveIcon size={14} /> {busy ? "Saving…" : "Save SKILL.md"}</button>
         </div>
       </div>
 
@@ -807,16 +1068,30 @@ export default function SkillsView({ s, a, info }: Props) {
             </div>
             {bundle && (
               <label className="sk-enable" title="Only enabled skills are advertised to the assistant">
-                <input type="checkbox" checked={bundle.skill.enabled} onChange={(e) => void toggleEnabled(e.target.checked)} />
+                <input type="checkbox" checked={bundle.skill.enabled} disabled={deletedElsewhere !== null} onChange={(e) => void toggleEnabled(e.target.checked)} />
                 <span className="mkt-sw" />
                 <span>{bundle.skill.enabled ? "Enabled" : "Disabled draft"}</span>
               </label>
             )}
           </div>
 
+          {/* Only once something has been typed: an untouched new form is not
+              yet a fault, and spending the urgent marker on it is how a reader
+              learns to look past it. */}
+          {dirty && problems.length > 0 && (
+            <div className="wf-errors">
+              Fix these before saving:
+              <ul>
+                {problems.map((p) => (
+                  <li key={p}>{p}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+
           <label className="sk-field">
             <span>Name <small>lowercase letters, numbers, hyphens</small></span>
-            <input value={draft.name} placeholder="review-contracts" onChange={(e) => patchDraft("name", e.target.value)} />
+            <input value={draft.name} placeholder="review-contracts" onChange={(e) => patchDraft("name", normalizeSkillName(e.target.value))} />
           </label>
           <label className="sk-field">
             <span>Description <small>the trigger: what it does and when to use it</small></span>
@@ -906,7 +1181,7 @@ export default function SkillsView({ s, a, info }: Props) {
             })}
             <div className="sk-res-add">
               <input value={newResourcePath} placeholder="references/policy.md" aria-label="New file path" onChange={(e) => setNewResourcePath(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") void addResource(); }} />
-              <button className="subtle" disabled={!newResourcePath.trim()} title="Add this file" aria-label="Add this file" onClick={() => void addResource()}><PlusIcon size={12} /></button>
+              <button className="subtle" disabled={!newResourcePath.trim() || deletedElsewhere !== null} title="Add this file" aria-label="Add this file" onClick={() => void addResource()}><PlusIcon size={12} /></button>
             </div>
             {/* Kept, not deleted: the convention this folder follows is real
                 guidance, it is simply not what the pane is FOR. */}
@@ -924,8 +1199,8 @@ export default function SkillsView({ s, a, info }: Props) {
             <div className="sk-file-head">
               <div><strong>{resource.path}</strong><small>{resource.kind}</small></div>
               <span>
-                <button className="subtle btn-ic danger" onClick={() => void removeResource()}><TrashIcon size={12} /> Remove</button>
-                {resource.text != null && <button className="primary btn-ic" disabled={!resourceDirty} onClick={() => void saveResource()}><SaveIcon size={12} /> Save</button>}
+                <button className="subtle btn-ic danger" disabled={deletedElsewhere !== null} onClick={() => void removeResource()}><TrashIcon size={12} /> Remove</button>
+                {resource.text != null && <button className="primary btn-ic" disabled={!resourceDirty || deletedElsewhere !== null} onClick={() => void saveResource()}><SaveIcon size={12} /> Save</button>}
               </span>
             </div>
             {resource.text != null ? (

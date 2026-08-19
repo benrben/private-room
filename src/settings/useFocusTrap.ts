@@ -74,5 +74,23 @@ export function useFocusTrap(onClose: () => void) {
     }
   }
 
-  return { modalRef, onModalKeyDown };
+  /** Put focus back inside the trapped subtree.
+   *
+   * The dimmed backdrop is the trap's PARENT, not part of it, and it is not
+   * focusable — so a click on it leaves focus on <body>. When that click only
+   * ASKS (unsaved work turns it into "closing now would discard them") the
+   * modal stays up with focus outside it: `onModalKeyDown` is bound to the
+   * modal, so it never fires again, Tab walks straight into the workspace this
+   * trap exists to fence off — the Lock button included — and Escape does
+   * nothing at all. Focusing the container (tabIndex=-1) restores both, and the
+   * first Tab from there lands on the first control inside. */
+  function refocusModal() {
+    const root = modalRef.current;
+    if (!root) return;
+    const active = document.activeElement as HTMLElement | null;
+    if (active && active !== root && root.contains(active)) return;
+    root.focus();
+  }
+
+  return { modalRef, onModalKeyDown, refocusModal };
 }

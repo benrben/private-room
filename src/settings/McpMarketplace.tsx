@@ -455,6 +455,33 @@ function InstallDrawer({
   const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
   const [runtimeBusy, setRuntimeBusy] = useState(false);
   const [runtimePct, setRuntimePct] = useState(0);
+  // What the connector itself reports once it has been added. Installing only
+  // writes JSON and asks Rust to spawn; the drawer used to show a green tick for
+  // that and sit over the Installed list, which is the only place a missing
+  // program or a refusing endpoint is ever shown. `null` = nothing reported yet.
+  const [connStatus, setConnStatus] = useState<McpServerStatus | null>(null);
+  // What the two connector powers say RIGHT NOW. The cloud note below used to
+  // promise redaction and a second ask flatly, at the exact moment the user
+  // decides whether to install something that reaches the internet — and either
+  // switch being on makes that promise false. `null` is "not answered yet" and
+  // is never rendered as either answer.
+  const [autoApprove, setAutoApprove] = useState<boolean | null>(null);
+  const [outboundUnmask, setOutboundUnmask] = useState<boolean | null>(null);
+  useEffect(() => {
+    if (!isRemote) return;
+    let live = true;
+    api
+      .getMcpAutoApprove()
+      .then((v) => live && setAutoApprove(v))
+      .catch(() => {});
+    api
+      .getMcpOutboundUnmask()
+      .then((v) => live && setOutboundUnmask(v))
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, [isRemote]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -502,6 +529,33 @@ function InstallDrawer({
     return () => un?.();
   }, []);
 
+  // `mcp_apply_config` answers with the statuses as they stand the instant it
+  // spawns — almost always "connecting". Keep listening so what the drawer says
+  // is where the connector ENDED up, not where it started.
+  useEffect(() => {
+    if (!done) return;
+    let alive = true;
+    let un: (() => void) | undefined;
+    // Also asked outright, so reopening the drawer on a connector installed
+    // earlier reads its state now instead of waiting for it to change.
+    api
+      .mcpStatus()
+      .then((all) => alive && setConnStatus(all.find((s) => s.name === entry.name) ?? null))
+      .catch(() => {});
+    api
+      .onMcpStatus((all) => setConnStatus(all.find((s) => s.name === entry.name) ?? null))
+      .then((u) => {
+        // A drawer closed while the subscription was still being set up would
+        // otherwise leave it listening for the life of the app.
+        if (alive) un = u;
+        else u();
+      });
+    return () => {
+      alive = false;
+      un?.();
+    };
+  }, [done, entry.name]);
+
   async function doProvision() {
     if (!runtime?.kind) return;
     setRuntimeBusy(true);
@@ -535,7 +589,8 @@ function InstallDrawer({
     setBusy(true);
     setErr("");
     try {
-      await installServer(entry.name, specToEntry(spec, secrets));
+      const statuses = await installServer(entry.name, specToEntry(spec, secrets));
+      setConnStatus(statuses.find((s) => s.name === entry.name) ?? null);
       setDone(true);
     } catch (e) {
       setErr(String(e));
@@ -683,9 +738,30 @@ function InstallDrawer({
               {ICON.warn}
               <b>This connector runs in the cloud.</b> When the assistant calls
               it, your prompt and the tool's arguments leave your Mac and reach{" "}
-              <b>{host || "an address this catalogue entry did not spell out"}</b>.
-              Arcelle redacts sensitive spans first and asks again the moment
-              data is about to leave.
+              <b>{host || "an address this catalogue entry did not spell out"}</b>.{" "}
+              {autoApprove === null || outboundUnmask === null ? (
+                // Two settings decide what happens next and neither answered —
+                // say where they are rather than guess one.
+                <>
+                  Whether Arcelle asks you before a call runs, and whether it
+                  replaces this room's listed private details with placeholders
+                  first, are the two switches at the top of Connectors.
+                </>
+              ) : (
+                <>
+                  Right now Arcelle{" "}
+                  {autoApprove
+                    ? "runs connector tools without asking you"
+                    : "asks you before each call runs"}
+                  , and{" "}
+                  {outboundUnmask
+                    ? "sends it this room's real values"
+                    : "replaces the private details listed under Cloud privacy with placeholders — anything not on that list goes as written"}
+                  . Both are switches at the top of Connectors, and each is only
+                  the default: this connector can answer either one for itself
+                  once installed.
+                </>
+              )}
             </p>
           ) : (
             <p className="mkt-note mkt-note--flag nb-sem-done">
@@ -809,7 +885,7 @@ function InstallDrawer({
             onClick={() => (confirming ? void doInstall() : setConfirming(true))}
           >
             {done
-              ? (<><CircleCheckIcon size={14} /> Installed</>)
+              ? (<><CircleCheckIcon size={14} /> Added to this room</>)
               : busy
                 ? "Installing…"
                 : confirming
@@ -820,6 +896,21 @@ function InstallDrawer({
                     ? "Review & connect"
                     : "Install to this room"}
           </button>
+          {/* The connector's OWN words about whether it started, in the drawer
+              that is covering the Installed list where they are otherwise the
+              only place to read them. Nothing invented: no spinner, no percent,
+              and nothing at all until the backend has reported something. */}
+          {done && connStatus &&
+            (connStatus.status === "failed" ? (
+              <div className="gate-error">{connStatus.error || "It didn't start."}</div>
+            ) : (
+              <p className="mkt-dr-note" role="status">
+                {connStatus.status === "connecting" && "Connecting…"}
+                {connStatus.status === "connected" &&
+                  `Connected · ${connStatus.tools.length} tool${connStatus.tools.length === 1 ? "" : "s"}`}
+                {connStatus.status === "disabled" && "Added, but switched off."}
+              </p>
+            ))}
           {confirming && !done && !busy && (
             <button className="subtle" onClick={() => setConfirming(false)}>
               Not now

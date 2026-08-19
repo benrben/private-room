@@ -17,10 +17,36 @@ const SERVICE: &str = "PrivateRoom";
 // Not exported by security-framework-sys; taken from <Security/SecBase.h>.
 const ERR_SEC_USER_CANCELED: i32 = -128;
 const ERR_SEC_INTERACTION_NOT_ALLOWED: i32 = -25308;
+// Restated from <Security/SecBase.h> so the message mapping below is a plain
+// function of an OSStatus rather than of a macOS-only error type; the test
+// module checks it against the real `errSecItemNotFound`.
+const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
+
+/// Turn a Security.framework OSStatus into a message the UI can show. Cancel,
+/// no-match and no-entry map to gentle text so the unlock screen falls back to
+/// a password. Anything else means the Keychain itself is unavailable, and
+/// those messages have to name the password: a bare status code on the unlock
+/// screen reads as the room being gone.
+fn message_for(code: i32) -> String {
+    match code {
+        ERR_SEC_USER_CANCELED => "Touch ID was cancelled.".into(),
+        -25293 /* errSecAuthFailed */ => "Touch ID did not match.".into(),
+        ERR_SEC_ITEM_NOT_FOUND => "No Touch ID entry for this room.".into(),
+        // errSecMissingEntitlement — the Keychain is unavailable to this
+        // build (unsigned/sandboxed run, or no Secure Enclave). Speak plainly
+        // and keep the raw code out of the user's face; password still works.
+        -34018 => "Touch ID isn't available on this Mac right now. You can still unlock with your password.".into(),
+        // Any other OSStatus: a friendly line, with the raw code tucked at
+        // the end in brackets for support without leading with jargon.
+        code => format!(
+            "Touch ID isn't available right now. You can still unlock with your password. [code {code}]"
+        ),
+    }
+}
 
 #[cfg(target_os = "macos")]
 mod imp {
-    use super::{ERR_SEC_INTERACTION_NOT_ALLOWED, ERR_SEC_USER_CANCELED, SERVICE};
+    use super::{ERR_SEC_INTERACTION_NOT_ALLOWED, SERVICE};
     use core_foundation::base::{CFType, TCFType};
     use core_foundation::boolean::CFBoolean;
     use core_foundation::dictionary::CFDictionary;
@@ -39,23 +65,8 @@ mod imp {
     };
     use security_framework_sys::keychain_item::SecItemCopyMatching;
 
-    /// Turn a Security.framework error into a message the UI can show. Cancel /
-    /// no-match map to gentle text so the unlock screen falls back to a password.
     fn map_err(e: SfError) -> String {
-        match e.code() {
-            ERR_SEC_USER_CANCELED => "Touch ID was cancelled.".into(),
-            -25293 /* errSecAuthFailed */ => "Touch ID did not match.".into(),
-            code if code == errSecItemNotFound => "No Touch ID entry for this room.".into(),
-            // errSecMissingEntitlement — the Keychain is unavailable to this
-            // build (unsigned/sandboxed run, or no Secure Enclave). Speak plainly
-            // and keep the raw code out of the user's face; password still works.
-            -34018 => "Touch ID isn't available on this Mac right now. You can still unlock with your password.".into(),
-            // Any other OSStatus: a friendly line, with the raw code tucked at
-            // the end in brackets for support without leading with jargon.
-            code => format!(
-                "Touch ID isn't available right now. You can still unlock with your password. [code {code}]"
-            ),
-        }
+        super::message_for(e.code())
     }
 
     /// Does a biometric entry exist for this room? Queries attributes ONLY (no
@@ -161,3 +172,47 @@ mod imp {
 }
 
 pub use imp::{delete, has, read, store};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn not_found_constant_matches_the_framework() {
+        assert_eq!(
+            ERR_SEC_ITEM_NOT_FOUND,
+            security_framework_sys::base::errSecItemNotFound
+        );
+    }
+
+    #[test]
+    fn each_branch_says_what_happened() {
+        assert_eq!(
+            message_for(ERR_SEC_USER_CANCELED),
+            "Touch ID was cancelled."
+        );
+        assert_eq!(message_for(-25293), "Touch ID did not match.");
+        assert_eq!(
+            message_for(ERR_SEC_ITEM_NOT_FOUND),
+            "No Touch ID entry for this room."
+        );
+        assert!(message_for(-34018).contains("isn't available on this Mac"));
+        assert!(message_for(-9999).contains("[code -9999]"));
+    }
+
+    /// "Touch ID is unavailable" reads as "the room is gone" unless the message
+    /// names the way back in, and the way back in is the password. Cancel,
+    /// no-match and no-entry are excluded: those say Touch ID itself refused or
+    /// was never set up, with the password field still on screen underneath.
+    #[test]
+    fn an_unavailable_keychain_still_offers_the_password() {
+        for code in [-34018, -25308, -1, 0, 12345] {
+            let msg = message_for(code);
+            assert!(
+                msg.contains("password"),
+                "message for {code} leaves the user no way in: {msg}"
+            );
+        }
+    }
+}

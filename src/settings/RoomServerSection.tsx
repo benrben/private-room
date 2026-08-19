@@ -102,12 +102,19 @@ export default function RoomServerSection({
                     </span>
                   </label>
                 ))}
+                {/* The full tier maps to ToolScope::ExternalAgent, which has no
+                    allow_cloud sub-option — so the switch below is not merely
+                    hidden, it does not exist here. Said out loud because a user
+                    who deliberately left it off would otherwise cross that line
+                    by picking a tier and see nothing about it. */}
                 {scope === "full" && (
                   <p className="set-note set-note--flag nb-sem-pending">
                     <AlertIcon size={16} className="warn-ic" /> An external
                     agent at this level can start hours of local compute and
                     run the local model. It still can't see your screen or
-                    drive the app.
+                    drive the app. This level has no local-only restriction —
+                    the cloud CLIs named above are exactly who it is for, so
+                    “Allow cloud AI clients” does not apply here and is hidden.
                   </p>
                 )}
                 <label className="settings-label">Address</label>

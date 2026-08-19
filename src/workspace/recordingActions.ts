@@ -374,33 +374,23 @@ export function makeRecordingActions(
     // NotAllowedError even though permission was granted long ago.
     const withSystem = opts?.systemAudio ?? true;
     let mic: MediaStream | null = null;
+    // Held, not announced: what a dead microphone COSTS depends on whether the
+    // Mac's audio lane actually comes up, and no lane exists until rec_start
+    // has run. Announcing it here promised a recording that a denied Screen
+    // Recording permission (or a failed start) never made.
+    let micError: string | null = null;
     try {
       mic = await acquireMic();
     } catch (e) {
-      // Meeting audio can still be recorded — but ONLY if it was ticked. With
-      // it off, a dead microphone means nothing at all is being captured, and
-      // promising otherwise hands the user an empty recording.
-      const msg = e instanceof Error ? e.message : String(e);
-      s.pushToast(
-        "error",
-        withSystem
-          ? `${msg} (the Mac's audio keeps recording)`
-          : `${msg} — and the Mac's audio is off, so nothing at all is being captured. Stop, then start again with "Include the Mac's audio" ticked.`,
-      );
+      micError = e instanceof Error ? e.message : String(e);
     }
+    let res;
     try {
-      const res = await api.recStart({
+      res = await api.recStart({
         fileId: fileId ?? null,
         systemAudio: withSystem,
         liveTranslate: opts?.liveTranslate ?? null,
       });
-      // The engine always starts with live transcription ON — sync the
-      // session-scoped UI mirror (a previous session may have turned it off).
-      noteLiveStt(true);
-      s.setRecLive({ fileId: res.fileId, status: "recording" });
-      s.setFiles(await api.listFiles());
-      await viewFile(res.fileId);
-      if (mic) await attachMicTap(mic);
     } catch (e) {
       mic?.getTracks().forEach((t) => t.stop());
       if (String(e).includes("STT_MODEL_MISSING")) {
@@ -412,6 +402,54 @@ export function makeRecordingActions(
       } else {
         s.pushToast("error", String(e));
       }
+      return;
+    }
+    // Past this line the engine IS recording. Nothing below may report itself
+    // as a failure to start, and nothing below may tear the microphone down.
+    // The engine always starts with live transcription ON — sync the
+    // session-scoped UI mirror (a previous session may have turned it off).
+    noteLiveStt(true);
+    s.setRecLive({ fileId: res.fileId, status: "recording" });
+    if (micError) {
+      // The meeting-audio tap is brought up on a helper thread and takes
+      // SECONDS to land (recording.rs `sys_tap_starting`); its lane reads
+      // "off" until then. So "on" is not yet a fact here and its absence
+      // proves nothing — only a lane that has already errored, or one that
+      // was never asked for, means nothing at all is being captured.
+      // `resumeLiveRecording` asks the same question of a session whose lanes
+      // are long since settled, which is why it can read the lane directly.
+      const live = await api.recLiveStatus().catch(() => null);
+      const nothingCaptured = !withSystem || live?.sys[0] === "error";
+      // The remedy belongs only to the case it actually fixes. With the box
+      // ticked there is nothing left to tick: the lane was asked for and did
+      // not come up (in practice the Screen Recording permission), which
+      // RecordingView's own banner names, with the settings button beside it.
+      const remedy = withSystem
+        ? ""
+        : ' Stop, then start again with "Include the Mac\'s audio" ticked.';
+      s.pushToast(
+        "error",
+        nothingCaptured
+          ? `${micError} — and the Mac's audio is not being recorded, so nothing at all is being captured.${remedy}`
+          : `${micError} (the Mac's audio keeps recording)`,
+      );
+    }
+    if (mic) {
+      try {
+        await attachMicTap(mic);
+      } catch (e) {
+        mic.getTracks().forEach((t) => t.stop());
+        s.pushToast(
+          "error",
+          `The recording started, but your microphone could not be attached, so your voice is not being captured: ${e}`,
+        );
+      }
+    }
+    try {
+      s.setFiles(await api.listFiles());
+      await viewFile(res.fileId);
+    } catch (e) {
+      s.pushToast("error", `The recording started, but the room could not be refreshed: ${e}`);
     }
   }
 
@@ -456,21 +494,34 @@ export function makeRecordingActions(
     const fileId = s.recLive?.fileId;
     s.setRecLive((r) => (r ? { ...r, status: "saving" } : r));
     try {
-      await api.recStop();
+      // What was actually written decides the sentence: live transcription can
+      // be switched off mid-session, and a session where nobody spoke has no
+      // segments either. Claiming a transcript that isn't in the file is the
+      // one thing this receipt must not do.
+      const meta = await api.recStop();
       // The receipt carries a direct way to the output — success must never
       // require hunting the sidebar for a new row.
       s.pushToast(
         "success",
-        "Recording saved — transcript included.",
+        meta.segments.length > 0
+          ? "Recording saved — transcript included."
+          : "Recording saved. No transcript was written — use Re-transcribe to build one.",
         fileId ? { label: "Open", run: () => void viewFile(fileId) } : undefined,
       );
     } catch (e) {
       s.pushToast("error", String(e));
     }
     s.setRecLive(null);
-    s.setFiles(await api.listFiles());
-    // Refresh the open view so the player gets the freshly written audio.
-    if (fileId && s.openFileRef.current?.id === fileId) await viewFile(fileId);
+    try {
+      s.setFiles(await api.listFiles());
+      // Refresh the open view so the player gets the freshly written audio.
+      if (fileId && s.openFileRef.current?.id === fileId) await viewFile(fileId);
+    } catch (e) {
+      // Every caller runs this as `void stopLiveRecording()`, so an escaping
+      // rejection here would be an unhandled one — with a success toast already
+      // on screen and a sidebar that never gained the row.
+      s.pushToast("error", `The recording was saved, but the room could not be refreshed: ${e}`);
+    }
   }
 
   /** Abandon the running model download. `pull_model` registers its cancel flag

@@ -2,8 +2,9 @@
 //! via yt-dlp) into the room as a durable background job with live progress
 //! and cancel. A download is a SINGLE atomic unit like a studio run: no
 //! mid-work checkpoint, so a Stop or crash parks the job and resuming
-//! re-downloads from scratch. `total` is 100 so the existing job card renders
-//! the percentage as its bar.
+//! re-downloads from scratch. The live `job-progress` events carry the 0–100
+//! byte percentage, and that is what draws the card's bar; the ROW's total is
+//! 0, because nothing ever advances its cursor (see `create_job` below).
 
 use super::*;
 
@@ -48,7 +49,12 @@ pub(crate) async fn start_download_job_inner(
         if queue::at_capacity(&room.conn) {
             return Err(queue::QUEUE_FULL.into());
         }
-        let id = db::create_job(&room.conn, "download", &title, &plan, 100)?;
+        // No step count, for the Studio row's reason: the cursor never moves,
+        // so a total of 100 turned that absence into a claim — a finished
+        // download sat in History reading "Finished — 0 of 100 steps". The
+        // percentage the user watches comes from the live event, which still
+        // carries its own 0–100; the row itself states no fraction.
+        let id = db::create_job(&room.conn, "download", &title, &plan, 0)?;
         Ok((id, room.path.clone()))
     })?;
     if queue::try_reserve(state, &job_id) {
@@ -238,6 +244,30 @@ mod tests {
         assert_eq!(
             download_title("not a url", DOWNLOAD_ENGINE_FETCH),
             "Download not a url"
+        );
+    }
+
+    /// The Studio row's defect, one kind over: nothing in `spawn_download`
+    /// ever calls `checkpoint_job`, so the cursor of a download row is 0 for
+    /// the whole of its life — including after it succeeded. Created with a
+    /// total of 100, the finished row read "Finished — 0 of 100 steps": a job
+    /// stating it completed none of the hundred steps it had just completed.
+    ///
+    /// Zero is the honest total. `HistoryRow` already drops the "N of M steps"
+    /// clause when `total > 0` is false, and the live bar is unaffected — it
+    /// reads the `job-progress` event, which carries its own 0–100 byte
+    /// percentage.
+    #[test]
+    fn a_download_job_claims_no_step_count_it_never_advances() {
+        let src = include_str!("download.rs");
+        let line = src
+            .lines()
+            .find(|l| l.contains(concat!("create_job(&room.conn, \"down", "load\"")))
+            .expect("the download job creation site moved — find it and re-pin this");
+        assert!(
+            line.trim_end().ends_with(", 0)?;"),
+            "a download row must be created with no step count, got: {}",
+            line.trim()
         );
     }
 }

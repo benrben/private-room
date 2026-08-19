@@ -107,7 +107,11 @@ export async function checkForUpdatesQuietly(): Promise<void> {
   // runs from main.tsx at launch, before any UI has settled — bury that
   // release for good. Only a real "no" is remembered.
   const answer = await confirm(
-    `Version ${update.version} is available.\n\nInstall it now and relaunch Arcelle?`,
+    // The download says so up front because it cannot be taken back:
+    // `downloadAndInstall` is awaited with no abort handle and no backend
+    // cancel exists, so the banner it draws has no Stop button to offer.
+    `Version ${update.version} is available.\n\nInstall it now and relaunch Arcelle? ` +
+      `The download can't be stopped once it starts.`,
     {
       title: "Update available",
       kind: "info",
@@ -134,7 +138,9 @@ export async function checkForUpdatesQuietly(): Promise<void> {
     await update.downloadAndInstall((ev) => {
       if (ev.event === "Started") {
         total = ev.data.contentLength ?? 0;
-        progress.set(0);
+        // 0% is a MEASUREMENT. Without a `Content-Length` there is no share to
+        // be at the start of, so the same `null` the Progress branch sends.
+        progress.set(total > 0 ? 0 : null);
       } else if (ev.event === "Progress") {
         got += ev.data.chunkLength;
         progress.set(total > 0 ? Math.min(99, Math.round((got / total) * 100)) : null);
@@ -168,6 +174,7 @@ function showDownloadProgress(version: string): {
 } {
   let host: HTMLDivElement | null = null;
   let fill: HTMLElement | null = null;
+  let track: HTMLElement | null = null;
   let label: HTMLElement | null = null;
   try {
     host = document.createElement("div");
@@ -177,6 +184,7 @@ function showDownloadProgress(version: string): {
       '<span class="update-progress-text"></span>' +
       '<span class="update-progress-track"><span class="update-progress-fill"></span></span>';
     label = host.querySelector(".update-progress-text");
+    track = host.querySelector(".update-progress-track");
     fill = host.querySelector(".update-progress-fill");
     if (label) label.textContent = `Downloading Arcelle ${version}…`;
     document.body.appendChild(host);
@@ -193,6 +201,12 @@ function showDownloadProgress(version: string): {
               ? `Installing Arcelle ${version}…`
               : `Downloading Arcelle ${version} — ${pct}%`;
       }
+      // A server that sends no `Content-Length` leaves the share unknowable.
+      // An empty track that never moves reads as a stalled download rather
+      // than an unmeasured one, so the label stands alone — the same choice
+      // ModelSection and jobProgress already make for "running, position
+      // unknown".
+      if (track) track.style.display = pct === null ? "none" : "";
       if (fill) fill.style.width = `${pct ?? 0}%`;
     },
     done() {

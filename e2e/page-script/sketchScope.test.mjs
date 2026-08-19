@@ -193,32 +193,60 @@ test("the chat only trusts a selection published by the file it has open", () =>
   assert.match(AI_PANE, /focus\?\.fileId === openFile\.id \? focus\.selection : \[\]/);
 });
 
+/** `applyScope` — the one place the strip's promise is made good. */
+const APPLY_SCOPE = CHAT_ACTIONS.slice(
+  CHAT_ACTIONS.indexOf("async function applyScope"),
+  CHAT_ACTIONS.indexOf("async function holdingSendLatch"),
+);
+
 test("the scope's files are added to the pinned ones on every send path", () => {
-  // Two paths reach the engine — the send, and the retry that re-asks the last
-  // question. The retry carried less evidence than the turn it was retrying:
-  // the saved text holds any prepended block, but never the file it named.
-  const blocks = CHAT_ACTIONS.split("const attachmentIds").slice(1);
-  assert.equal(blocks.length, 2);
-  for (const block of blocks) {
-    const set = block.slice(0, block.indexOf("];"));
-    assert.match(set, /s\.attachments\.map\(\(f\) => f\.id\)/);
-    assert.match(set, /fileIds/);
-  }
+  // Four paths reach the engine — the plain send, the send that carries a
+  // scoped page, the retry that re-asks the last question, and the rewrite of
+  // an earlier message. The retry carried less evidence than the turn it was
+  // retrying: the saved text holds any prepended block, but never the file it
+  // named. Every one of them still carries the scope's own files, and THAT is
+  // what this guards — the count is here so a fifth path cannot be added
+  // without someone reading this sentence.
+  const blocks = CHAT_ACTIONS.split("const attachmentIds")
+    .slice(1)
+    .map((b) => b.slice(0, b.indexOf("];")));
+  assert.equal(blocks.length, 4);
+  for (const set of blocks) assert.match(set, /fileIds/);
+  // The paperclip belongs to the composer, so the three paths that send FROM it
+  // keep what is pinned there; a rewrite of an old message has no paperclip of
+  // its own to add.
+  assert.equal(
+    blocks.filter((b) => /s\.attachments\.map\(\(f\) => f\.id\)/.test(b)).length,
+    3,
+  );
 });
 
 test("the preamble is applied on the path the page text does not take", () => {
   // Both in one branch would send a page block AND a selection block, or drop
   // one of them silently — the two scopes are mutually exclusive by construction.
-  assert.match(CHAT_ACTIONS, /if \(!parsed\.command && scope\.sendsPageText\) \{/);
-  assert.match(CHAT_ACTIONS, /\} else if \(!parsed\.command\) \{\s*\n[\s\S]{0,400}?withPreamble\(outgoing, scope\.preamble\)/);
+  assert.match(APPLY_SCOPE, /if \(scope\.sendsPageText\) \{/);
+  const paged = APPLY_SCOPE.indexOf("scopedQuestion(scope, outgoing)");
+  const preamble = APPLY_SCOPE.indexOf("withPreamble(outgoing, scope.preamble)");
+  assert.ok(paged > 0 && preamble > paged, "the page read comes first");
+  assert.match(
+    APPLY_SCOPE.slice(paged, preamble),
+    /return \{ ok: true, text: scoped\.text/,
+    "a page turn returns before the preamble path can add a second block",
+  );
 });
 
 test("a #command is exempt from both, as it always was", () => {
   // A command picks its own sources and carries its own arguments; a block
   // prepended to it rides along in something that never reads it.
-  const send = CHAT_ACTIONS.slice(
-    CHAT_ACTIONS.lastIndexOf("const scope = currentTurnScope()"),
-  );
-  const guarded = send.slice(0, send.indexOf("const optimistic"));
-  assert.equal((guarded.match(/!parsed\.command/g) ?? []).length, 2);
+  assert.match(APPLY_SCOPE, /if \(isCommand\) return \{ ok: true, text: outgoing/);
+});
+
+test("every way of asking goes through the one scope funnel", () => {
+  // The rewrite used to re-ask the question RAW: edited under "This page", it
+  // was answered from the room while the strip above it still promised the
+  // page. One funnel, so no path can forget — including its refusal, which is
+  // what stops a scope that cannot be read becoming a quiet room answer.
+  const calls = CHAT_ACTIONS.match(/applyScope\(outgoing, !!parsed\.command\)/g) ?? [];
+  assert.equal(calls.length, 2, "send and edit-and-resend both apply the scope");
+  assert.equal((CHAT_ACTIONS.match(/if \(!scoped\.ok\) \{/g) ?? []).length, 2);
 });

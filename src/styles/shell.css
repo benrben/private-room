@@ -867,7 +867,7 @@ body.resizing-col * {
   border-radius: var(--radius-xs);
   background: var(--raised);
   color: var(--text);
-  font-size: 11px;
+  font-size: var(--fs-micro);
   white-space: nowrap;
 }
 .pane-new-btn:hover {
@@ -1004,7 +1004,7 @@ body.resizing-col * {
   gap: 7px;
   color: var(--muted);
   border-bottom: 1px solid var(--line-soft);
-  font-size: 11px;
+  font-size: var(--fs-micro);
   min-width: 0;
   /* A status readout, not content the user wrote (P0-3). */
   user-select: none;
@@ -1176,7 +1176,7 @@ button.status-trust.danger:hover {
   width: 100%;
   height: 26px;
   padding: 0 6px;
-  font-size: 11.5px;
+  font-size: var(--fs-micro);
   color: var(--muted);
   background: var(--panel-2);
   border: 1px solid var(--line);
@@ -1246,7 +1246,7 @@ button.status-trust.danger:hover {
   align-items: center;
   gap: 6px;
   color: var(--faint);
-  font-size: 10px;
+  font-size: var(--fs-micro);
   font-weight: 500;
   letter-spacing: 0.075em;
   text-transform: uppercase;
@@ -1366,12 +1366,12 @@ button.status-trust.danger:hover {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: 12.5px;
+  font-size: var(--fs-meta);
 }
 .source-meta {
   padding-left: 23px;
   color: var(--faint);
-  font-size: 10px;
+  font-size: var(--fs-micro);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1387,7 +1387,7 @@ button.status-trust.danger:hover {
 .area-nav-intro {
   margin: 4px 7px 12px;
   color: var(--muted);
-  font-size: 11px;
+  font-size: var(--fs-micro);
   line-height: 1.5;
 }
 /* Name the AI's source scope explicitly, so "nothing checked" reads as a chosen
@@ -1400,7 +1400,7 @@ button.status-trust.danger:hover {
 }
 .scope-tag {
   display: inline-block;
-  font-size: 11px;
+  font-size: var(--fs-micro);
   font-weight: 600;
   padding: 2px var(--sp-2);
   border-radius: 999px;
@@ -1454,20 +1454,29 @@ button.status-trust.danger:hover {
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
-  font-size: 12.5px;
+  font-size: var(--fs-meta);
 }
 .area-nav-copy {
   display: block;
   color: var(--faint);
-  font-size: 10px;
+  font-size: var(--fs-micro);
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
 }
 .area-nav-state {
   color: var(--faint);
-  font-size: 10px;
+  font-size: var(--fs-micro);
   white-space: nowrap;
+}
+/* --faint is solved against --hover, the lightest ground in the dark theme
+   (tokens.css). --selected is a translucent wash that lands lighter still, so
+   the secondary line inside the one row a reader looks at longest was the
+   least legible text in the sidebar. It steps up a tier there. */
+.area-nav-row.is-current .area-nav-copy,
+.area-nav-row.is-current .area-nav-state,
+.source-row.is-current .source-meta {
+  color: var(--muted);
 }
 
 /* ----- the private browser's pages, in the contextual sidebar ----- */
@@ -1531,7 +1540,7 @@ button.status-trust.danger:hover {
   border-radius: 999px;
   background: transparent;
   color: var(--faint);
-  font-size: 10px;
+  font-size: var(--fs-micro);
   white-space: nowrap;
 }
 .library-chip.is-linked {
@@ -1542,7 +1551,7 @@ button.status-trust.danger:hover {
   background: color-mix(in srgb, var(--accent) 12%, transparent);
 }
 .library-chip-btn {
-  font-size: 11px;
+  font-size: var(--fs-micro);
 }
 .library-chip-pop {
   position: absolute;
@@ -1558,12 +1567,12 @@ button.status-trust.danger:hover {
   display: grid;
   gap: 4px;
   color: var(--muted);
-  font-size: 11.5px;
+  font-size: var(--fs-micro);
   line-height: 1.45;
 }
 .library-chip-q strong {
   color: var(--text-strong);
-  font-size: 12.5px;
+  font-size: var(--fs-meta);
 }
 .library-chip-actions {
   padding: 0 var(--sp-3) var(--sp-3);
@@ -1747,7 +1756,7 @@ button.status-trust.danger:hover {
   border: none;
   border-radius: 5px 3px 6px 4px / 4px 6px 3px 5px;
   padding: 7px 10px;
-  font-size: 12.5px;
+  font-size: var(--fs-meta);
   color: var(--text);
   white-space: nowrap;
 }
@@ -1793,7 +1802,7 @@ button.status-trust.danger:hover {
   border: 1px solid var(--line);
   border-radius: var(--radius-xs);
   background: var(--panel-2);
-  font-size: 11px;
+  font-size: var(--fs-micro);
   color: var(--muted);
 }
 .import-strip-count {
@@ -1807,91 +1816,15 @@ button.status-trust.danger:hover {
   color: var(--faint);
 }
 
-/* ----- Studio tab ----- */
+/* ----- Studio tab -----
+
+   Drawn in aiPane.css, scoped to `.pane-ai`. Only the scroll box is left here:
+   that sheet restates every other rule this band used to carry. */
 
 .studio-tab-view {
   flex: 1;
   min-height: 0;
   overflow: auto;
-  padding: 13px 12px 40px;
-}
-.studio-intro {
-  margin: 0 2px var(--sp-3);
-  color: var(--muted);
-  font-size: var(--fs-micro);
-  line-height: 1.5;
-}
-.studio-section-title {
-  margin: 18px 2px 7px;
-  color: var(--faint);
-  font-size: 10px;
-  text-transform: uppercase;
-  letter-spacing: 0.07em;
-}
-.studio-row {
-  width: 100%;
-  min-height: 48px;
-  padding: var(--sp-2);
-  display: grid;
-  grid-template-columns: 29px minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 7px;
-  text-align: left;
-  color: var(--text);
-  background: transparent;
-  border: 0;
-  border-radius: var(--radius-xs);
-  border-bottom: 1px solid var(--line-soft);
-}
-.studio-row:hover:not(:disabled) {
-  background: var(--hover);
-  border-color: var(--line-soft);
-}
-.studio-row:disabled {
-  opacity: 0.55;
-}
-.studio-row-icon {
-  width: 27px;
-  height: 27px;
-  border-radius: var(--radius-xs);
-  display: grid;
-  place-items: center;
-  color: var(--accent-2);
-  background: var(--selected);
-}
-.studio-row-text {
-  min-width: 0;
-}
-.studio-row-title {
-  display: block;
-  color: var(--text-strong);
-  font-size: var(--fs-micro);
-}
-.studio-row-copy {
-  display: block;
-  color: var(--faint);
-  font-size: 10px;
-  overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
-}
-.studio-row-state {
-  color: var(--faint);
-  font-size: 10px;
-}
-.studio-note {
-  margin-top: 18px;
-  padding: 11px;
-  border: 1px solid var(--line);
-  border-radius: var(--radius-xs);
-  color: var(--muted);
-  background: var(--panel-2);
-  font-size: 11px;
-  line-height: 1.5;
-}
-.studio-note strong {
-  color: var(--green);
-  font-weight: 500;
 }
 
 /* Center-pane content header: quiet toolbar over the document. */
@@ -1917,7 +1850,7 @@ button.status-trust.danger:hover {
   row-gap: 2px;
 }
 .viewer-actions .subtle {
-  font-size: 11.5px;
+  font-size: var(--fs-micro);
   padding: 4px 7px;
   border-radius: 5px 3px 6px 4px / 4px 6px 3px 5px;
 }
@@ -1964,7 +1897,7 @@ button.status-trust.danger:hover {
 .settings-nav-heading {
   padding: 6px 10px 3px;
   color: var(--faint);
-  font-size: 9.5px;
+  font-size: var(--fs-micro);
   font-weight: 500;
   text-transform: uppercase;
   letter-spacing: 0.075em;
@@ -1973,7 +1906,7 @@ button.status-trust.danger:hover {
   flex: 0 0 158px;
 }
 .settings-nav-item {
-  font-size: 12.5px;
+  font-size: var(--fs-meta);
   padding: 5px 10px;
   border-radius: 5px 3px 6px 4px / 4px 6px 3px 5px;
   color: var(--muted);
@@ -2025,77 +1958,22 @@ button.status-trust.danger:hover {
   backdrop-filter: blur(1.5px);
 }
 
-/* The Studio shelf inherits the tab's flat list language — never a card. */
-.studio-shelf {
-  background: transparent;
-  border: 0;
-  padding: 0;
-  margin: 0;
-}
+/* ----- Activity tab -----
 
-/* ----- Activity tab ----- */
+   The tab is drawn in aiPane.css, scoped to `.pane-ai` so it wins the tie with
+   this sheet, which loads last. What is left here is what that file does not
+   restate: the scroll box, and the fill's geometry — the fill is a <span>, so
+   without these three it has no box to fill at all. */
 
 .activity-view {
   flex: 1;
   min-height: 0;
   overflow: auto;
-  padding: var(--sp-3) 10px 40px;
-}
-.activity-summary {
-  margin: 0 2px 11px;
-  color: var(--muted);
-  font-size: 11px;
-}
-.activity-group-title {
-  margin: 16px 2px 5px;
-  color: var(--faint);
-  font-size: 10px;
-  text-transform: uppercase;
-  letter-spacing: 0.07em;
-}
-.activity-row {
-  padding: 9px 4px;
-  border-bottom: 1px solid var(--line-soft);
-}
-.activity-row-head {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-}
-.activity-row-title {
-  min-width: 0;
-  flex: 1;
-  color: var(--text);
-  font-size: var(--fs-micro);
-  overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
-}
-.activity-state {
-  color: var(--faint);
-  font-size: 10px;
-  white-space: nowrap;
-}
-.activity-copy {
-  margin: var(--sp-1) 0 0;
-  color: var(--muted);
-  font-size: 10.5px;
-  line-height: 1.5;
-  min-width: 0;
-}
-.activity-progress {
-  height: 3px;
-  margin: 7px 0 0;
-  background: var(--hover);
-  border-radius: 999px;
-  overflow: hidden;
 }
 .activity-progress span {
   display: block;
   height: 100%;
   width: 0;
-  background: var(--accent);
-  transition: width 0.3s ease;
 }
 .activity-progress span.indeterminate {
   width: 40%;
@@ -2118,66 +1996,6 @@ button.status-trust.danger:hover {
        started. Reduced motion removes the movement, never the meaning. */
     opacity: 0.5;
   }
-}
-.activity-row-actions,
-.activity-row-foot {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--sp-2);
-  margin-top: 5px;
-}
-.activity-row-foot .activity-copy {
-  margin: 0;
-}
-.activity-row.job.error .activity-row-title {
-  color: var(--red);
-}
-
-/* Decision #12: Activity is a live MANAGER and an audit LOG, and the split has
-   to be visible without reading a single row. The log gets a rule across the
-   pane, its own indent and a lower contrast — so the eye lands on the section
-   boundary, not on which card happens to have a button. */
-/* …and the assistant's Library changes are a record too: same fold, same
-   lower contrast, its own heading because a promotion is not a run. */
-.activity-history,
-.activity-organized {
-  margin-top: 26px;
-  padding-top: var(--sp-1);
-  border-top: 1px solid var(--line);
-}
-.activity-history .activity-group-title,
-.activity-organized .activity-group-title {
-  display: flex;
-  align-items: baseline;
-  gap: 7px;
-  flex-wrap: wrap;
-}
-.activity-history-note {
-  color: var(--faint);
-  font-size: 9.5px;
-  text-transform: none;
-  letter-spacing: 0;
-  opacity: 0.85;
-}
-.activity-row.history {
-  padding-left: 9px;
-  border-left: 2px solid var(--line-soft);
-  border-bottom: none;
-}
-.activity-row.history .activity-row-title {
-  color: var(--muted);
-}
-.activity-empty {
-  margin: 28px 10px;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 10px;
-  color: var(--faint);
-  text-align: center;
-  font-size: 11.5px;
-  line-height: 1.5;
 }
 
 /* ----- Room home (center) -----
@@ -2251,7 +2069,7 @@ button.status-trust.danger:hover {
   gap: 10px;
   padding: var(--sp-2) var(--sp-1);
   border-bottom: 1px solid var(--line-soft);
-  font-size: 12.5px;
+  font-size: var(--fs-meta);
   color: var(--text);
   line-height: 1.5;
 }
@@ -2263,7 +2081,7 @@ button.status-trust.danger:hover {
   flex: 1;
 }
 .memory-view .memory-row-when {
-  font-size: 11px;
+  font-size: var(--fs-micro);
   color: var(--faint);
 }
 .memory-view .memory-row.editing {
@@ -2593,7 +2411,7 @@ button.status-trust.danger:hover {
   background: var(--panel-2);
   color: var(--faint);
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 11px;
+  font-size: var(--fs-micro);
   line-height: 1.45;
   white-space: pre-wrap;
   overflow: auto;
@@ -2642,7 +2460,7 @@ button.status-trust.danger:hover {
   border: 1px solid var(--line);
   border-radius: 999px;
   color: var(--faint);
-  font-size: 9.5px;
+  font-size: var(--fs-micro);
   letter-spacing: 0.02em;
   white-space: nowrap;
 }

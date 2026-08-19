@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
-import { WSState } from "./state";
+import { PendingLeave, WSState } from "./state";
+import { useFocusTrap } from "../settings/useFocusTrap";
 import "./unsaved.css";
 
 /**
@@ -18,23 +19,34 @@ import "./unsaved.css";
  * Save writes and then continues; Discard continues; Cancel stays put. Save is
  * the default because the edit is the thing the user made and the navigation is
  * the thing they can repeat.
+ *
+ * The dialog body is a CHILD component, mounted only while a question is up:
+ * this component is rendered for the whole life of the workspace and returns
+ * null most of the time, so a focus trap called here would run its move-focus-in
+ * effect once, at workspace mount, and never again.
  */
 export default function UnsavedEditsDialog({ s }: { s: WSState }) {
   const pending = s.pendingLeave;
+  if (!pending) return null;
+  return <UnsavedEditsBody s={s} pending={pending} />;
+}
+
+function UnsavedEditsBody({ s, pending }: { s: WSState; pending: PendingLeave }) {
   const [saving, setSaving] = useState(false);
   const [failed, setFailed] = useState("");
   const saveRef = useRef<HTMLButtonElement>(null);
+  // It says aria-modal, so Tab must not walk out of it onto the workspace
+  // chrome behind the veil — which includes the file list that decides which
+  // file this very dialog is about.
+  const { modalRef, onModalKeyDown } = useFocusTrap(() => s.setPendingLeave(null));
 
-  const open = pending !== null;
   useEffect(() => {
-    if (!open) return;
-    setSaving(false);
-    setFailed("");
+    // Save is the default answer. The trap's own mount effect has just put
+    // focus on the first control, and this one runs after it.
     saveRef.current?.focus();
-  }, [open]);
+  }, []);
 
   useEffect(() => {
-    if (!open) return;
     function onKey(e: KeyboardEvent) {
       if (e.key !== "Escape") return;
       // Capture phase: the app-level Escape closes the open file, which is
@@ -45,16 +57,14 @@ export default function UnsavedEditsDialog({ s }: { s: WSState }) {
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open]);
-
-  if (!pending) return null;
+  }, []);
 
   /** Run the held-up navigation. The dirty flag is cleared FIRST: the guard
    * reads it, and a stale `true` would stop the very action being resumed. */
   function go() {
     s.editorDirtyRef.current = false;
     s.setPendingLeave(null);
-    pending!.proceed();
+    pending.proceed();
   }
 
   async function saveThenGo() {
@@ -82,6 +92,9 @@ export default function UnsavedEditsDialog({ s }: { s: WSState }) {
     <div className="unsaved-backdrop" onClick={() => s.setPendingLeave(null)}>
       <div
         className="unsaved-modal"
+        ref={modalRef}
+        tabIndex={-1}
+        onKeyDown={onModalKeyDown}
         role="alertdialog"
         aria-modal="true"
         aria-labelledby="unsaved-title"

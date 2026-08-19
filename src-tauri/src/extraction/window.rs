@@ -8,16 +8,20 @@
 pub const READ_WINDOW_MIN: usize = 200;
 
 /// Drop the low-signal lines a 20 MB extraction is full of — binary/base64
-/// junk, repeated boilerplate lines, runs of blank lines — so every character
-/// the model reads is worth reading. Conservative on purpose: normal prose,
-/// code and tables pass through untouched.
+/// junk, runs of blank lines, a boilerplate line repeated past all meaning —
+/// so every character the model reads is worth reading. Conservative on
+/// purpose: normal prose, code and tables pass through untouched, and a long
+/// run that IS cut says how many lines it stood for.
 pub fn smart_filter(text: &str) -> String {
     let mut out = String::with_capacity(text.len().min(1 << 22));
     let mut prev_line = "";
+    let mut run = 0usize; // how many times prev_line has arrived in a row
+    let mut omitted = 0usize; // lines of the current run left out of `out`
     let mut blank_run = 0usize;
     for line in text.lines() {
         let trimmed = line.trim_end();
         if trimmed.trim().is_empty() {
+            push_omitted_note(&mut out, &mut omitted);
             blank_run += 1;
             if blank_run == 1 {
                 out.push('\n');
@@ -25,9 +29,15 @@ pub fn smart_filter(text: &str) -> String {
             continue;
         }
         blank_run = 0;
-        // Identical consecutive lines: page headers/footers repeated per page.
         if trimmed == prev_line {
-            continue;
+            run += 1;
+            if run > MAX_IDENTICAL_RUN {
+                omitted += 1;
+                continue;
+            }
+        } else {
+            push_omitted_note(&mut out, &mut omitted);
+            run = 1;
         }
         if looks_like_noise(trimmed) {
             continue;
@@ -36,7 +46,30 @@ pub fn smart_filter(text: &str) -> String {
         out.push('\n');
         prev_line = trimmed;
     }
+    push_omitted_note(&mut out, &mut omitted);
     out
+}
+
+/// How many identical lines in a row are carried through unchanged.
+///
+/// Collapsing every consecutive duplicate to one — which is what this used to
+/// do — is not a noise rule, it is a silent edit of the data: three identical
+/// rows in a ledger, a log or a spreadsheet reached the model as one, so "how
+/// many zero-value cash entries are there" was answered 1 instead of 3 with
+/// nothing anywhere saying rows had been dropped. A repeated line is only
+/// noise once the repetition is longer than any table anyone reads row by row.
+const MAX_IDENTICAL_RUN: usize = 6;
+
+/// Close off a collapsed run by writing down what it stood for. Nothing is
+/// removed silently: the count is the part that carries the meaning, so a
+/// shortened block can never be read downstream as the whole block.
+fn push_omitted_note(out: &mut String, omitted: &mut usize) {
+    if *omitted == 0 {
+        return;
+    }
+    let plural = if *omitted == 1 { "line" } else { "lines" };
+    out.push_str(&format!("[{} more identical {plural} omitted]\n", *omitted));
+    *omitted = 0;
 }
 
 /// A long line that is mostly symbols, or that IS one unbroken 80+ char run
@@ -180,12 +213,32 @@ mod tests {
     }
 
     #[test]
-    fn filter_collapses_repeats_and_blanks() {
-        let text = "Page header — Annual Report\nBody text one.\n\n\n\n\
-                    Page header — Annual Report\nPage header — Annual Report\nBody text two.";
-        let f = smart_filter(&text);
-        // Consecutive duplicate header collapses; blank run becomes one break.
-        assert_eq!(f.matches("Annual Report").count(), 2);
+    fn filter_keeps_repeated_rows_and_collapses_only_long_runs() {
+        // A ledger's repeated rows ARE the answer to "how many"; collapsing
+        // consecutive duplicates to one used to delete them silently.
+        let row = "Cash | 0.00 | 0.00";
+        let ledger = format!("Opening balance\n{row}\n{row}\n{row}\nClosing balance");
+        let f = smart_filter(&ledger);
+        assert_eq!(f.matches(row).count(), 3, "ledger rows dropped: {f}");
+
+        // Past the run cap the lines go, but the count stays — a collapsed run
+        // never reads as a complete block.
+        let flood = format!("Intro\n{}\nOutro", vec![row; MAX_IDENTICAL_RUN + 4].join("\n"));
+        let f = smart_filter(&flood);
+        assert_eq!(f.matches(row).count(), MAX_IDENTICAL_RUN, "cap ignored: {f}");
+        assert!(f.contains("[4 more identical lines omitted]"), "loss unrecorded: {f}");
+        assert!(f.contains("Outro"), "text after the run lost: {f}");
+
+        // Exactly at the cap nothing is removed and nothing is claimed.
+        let at_cap = vec![row; MAX_IDENTICAL_RUN].join("\n");
+        assert!(!smart_filter(&at_cap).contains("omitted"), "noted a run it kept");
+
+        // One line past the cap reads in the singular.
+        let one_over = vec![row; MAX_IDENTICAL_RUN + 1].join("\n");
+        assert!(smart_filter(&one_over).contains("[1 more identical line omitted]"));
+
+        // Blank runs still collapse to a single break.
+        let f = smart_filter("Body text one.\n\n\n\nBody text two.");
         assert!(!f.contains("\n\n\n"));
     }
 

@@ -40,9 +40,28 @@ const VIEW = read("src/workspace/BrowserView.tsx");
 const READER = read("src/workspace/BrowserReader.tsx");
 const CSS = read("src/styles/browser.css");
 
+/* A COMPONENT module cannot be loaded the way the pure ones above are: its
+ * react/api/icon specifiers do not resolve from a data: URL. Nothing runs at
+ * module scope, so the imports are dropped and the JSX is emitted as
+ * `React.createElement` calls inside functions this file never renders — which
+ * leaves the page's pure exports callable for real. */
+const loadPureExports = async (source) => {
+  const js = ts.transpileModule(source, {
+    compilerOptions: {
+      module: ts.ModuleKind.ESNext,
+      target: ts.ScriptTarget.ES2022,
+      jsx: ts.JsxEmit.React,
+    },
+  }).outputText;
+  return import(
+    `data:text/javascript,${encodeURIComponent(js.replace(/^import[^;]*;$/gm, ""))}`
+  );
+};
+
 const privacy = await load(read("src/workspace/browserPrivacy.ts"));
 const chrome = await load(read("src/workspace/browserChrome.ts"));
 const journal = await load(read("src/workspace/browserJournal.ts"));
+const search = await loadPureExports(read("src/workspace/BrowserSearch.tsx"));
 
 // --------------------------------------------------------------------------
 // P0 — the shield must not claim protection it has not got
@@ -177,6 +196,74 @@ test("the stylesheet has ink for all four privacy states", () => {
       `.browser-shield.${tone} has no rule, so it would render as verified green`,
     );
   }
+});
+
+// --------------------------------------------------------------------------
+// P0 — the results page's own privacy sentence
+//
+// The toolbar's claim has twelve tests above it. The sentence under the search
+// heading — the other place this feature says what left the Mac — had none, and
+// it is the harder one: previews are ON by default and read the top result
+// pages from their own origins, INCLUDING on a cache hit, because only the
+// search itself is cached.
+// --------------------------------------------------------------------------
+
+test("a cache hit does not claim nothing left the Mac while previews are on", () => {
+  // The defect this wording replaced: "no network touched", printed beside a
+  // pass that had just fetched six result pages.
+  const line = search.searchPrivacyLine({
+    cached: true,
+    previewsEnabled: true,
+    previewCount: 6,
+  });
+  assert.doesNotMatch(line.text, /nothing left this Mac/);
+  assert.match(line.text, /6 result pages/);
+});
+
+test("previews off plus a cache hit is the one state that contacted nobody", () => {
+  const line = search.searchPrivacyLine({
+    cached: false,
+    previewsEnabled: false,
+    previewCount: 6,
+  });
+  assert.equal(line.text, "only your query left this Mac");
+  assert.equal(
+    search.searchPrivacyLine({ cached: true, previewsEnabled: false, previewCount: 6 })
+      .text,
+    "nothing left this Mac",
+  );
+});
+
+test("a live search with previews names the query AND the pages", () => {
+  const line = search.searchPrivacyLine({
+    cached: false,
+    previewsEnabled: true,
+    previewCount: 4,
+  });
+  assert.match(line.text, /your query/);
+  assert.match(line.text, /4 result pages/);
+  assert.match(line.title, /Online features/, "no way back to the setting");
+});
+
+test("previews on with nothing to preview promises no preview", () => {
+  // An empty result set enriches nothing, so the sentence must not describe a
+  // request that will never be made.
+  const line = search.searchPrivacyLine({
+    cached: false,
+    previewsEnabled: true,
+    previewCount: 0,
+  });
+  assert.equal(line.text, "only your query left this Mac");
+});
+
+test("one result page is not one result pages", () => {
+  const line = search.searchPrivacyLine({
+    cached: false,
+    previewsEnabled: true,
+    previewCount: 1,
+  });
+  assert.match(line.text, /result page/);
+  assert.doesNotMatch(line.text, /result pages/);
 });
 
 // --------------------------------------------------------------------------

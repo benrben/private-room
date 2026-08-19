@@ -79,6 +79,148 @@ function spoken(text) {
   return drain();
 }
 
+// ---- slice: the turn lifecycle, plus the done signal it ends in ------------
+
+/* Hands-free lives or dies on `onTurnAudioDone`, and the lifecycle that fires
+ * it is pure bookkeeping over module flags. The only things stubbed are the
+ * three seams that touch the world: `stopAudio` (Web Audio nodes),
+ * `extractSentences` (the chunker, exercised above) and `autoSpeakOn` (the
+ * settings object). `liveGroups` stands in for audio that is still playing. */
+
+const lifeStart = VOICE_SOURCE.indexOf("// ---- turn lifecycle");
+const lifeEnd = VOICE_SOURCE.indexOf("// ---- sentence chunker");
+const doneStart = VOICE_SOURCE.indexOf("/** All audio for a finished turn");
+assert.ok(
+  lifeStart > 0 && lifeEnd > lifeStart && doneStart > lifeEnd,
+  "expected the turn lifecycle and maybeFireTurnDone at their usual markers — did voice.ts get reshuffled?",
+);
+
+const pumpStart = VOICE_SOURCE.indexOf("async function pump()");
+const pumpEnd = VOICE_SOURCE.indexOf("// ---- DSP graphs");
+assert.ok(pumpStart > lifeEnd && pumpEnd > pumpStart, "expected pump() before the DSP-graphs banner");
+
+const lifeHarness = `
+let ctx = null;
+let speakImpl = async () => "";
+const api = { speakTextNeural: (text, voice) => speakImpl(text, voice) };
+const base64ToBytes = () => new Uint8Array();
+function scheduleChunk() {}
+let epoch = 0, turnEpoch = -1;
+let pending = "", carry = "", sentenceQueue = [];
+let firstChunkSent = false, deltasFed = false, turnEnded = false, streamedTurn = false;
+let problemReported = false, liveGroups = 0, pumping = false;
+let onTurnAudioDone = null, onManualState = null, onVoiceProblem = null;
+const cfg = { archetype: "off", params: { reverb: 0, distortion: 0 }, autoSpeak: true, neuralVoiceId: null };
+let spokenText = [];
+function stopAudio() { liveGroups = 0; }
+function autoSpeakOn() { return cfg.autoSpeak; }
+function extractSentences() { if (pending) spokenText.push(pending); pending = ""; }
+`;
+const lifeExports = `
+export function playingAudio(groups) { liveGroups = groups; }
+export function audioPlayedOut() { liveGroups = 0; maybeFireTurnDone(); }
+export function drainSpoken() { const out = spokenText.slice(); spokenText = []; return out; }
+export function onSynthesize(fn) { speakImpl = fn; }
+export async function synthesize(text) { sentenceQueue.push(text); await pump(); }
+`;
+const lifeJS = ts.transpileModule(
+  lifeHarness +
+    VOICE_SOURCE.slice(lifeStart, lifeEnd) +
+    VOICE_SOURCE.slice(pumpStart, pumpEnd) +
+    VOICE_SOURCE.slice(doneStart) +
+    lifeExports,
+  { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 } },
+).outputText;
+const life = await import(`data:text/javascript,${encodeURIComponent(lifeJS)}`);
+
+/** A fresh pipeline with a hands-free listener counting its re-arms. */
+function handsFree() {
+  life.cancelAll();
+  const arms = { count: 0 };
+  life.setTurnAudioDoneListener(() => {
+    arms.count += 1;
+  });
+  return arms;
+}
+
+test("an ordinary streamed turn re-arms the mic exactly once, after its audio", () => {
+  const arms = handsFree();
+  life.beginTurn("chat-1");
+  life.feedStreamDelta("Here is the answer.");
+  life.playingAudio(1);
+  life.endOfTurn();
+  assert.equal(arms.count, 0, "the mic must not re-arm while the answer is still audible");
+  life.audioPlayedOut();
+  assert.equal(arms.count, 1, "hands-free re-arms when the turn's audio has played out");
+  life.audioPlayedOut();
+  assert.equal(arms.count, 1, "the signal fires once per turn, not once per settled chunk");
+});
+
+test("a manual play mid-answer does not swallow the streamed turn's done signal", () => {
+  // The reported failure: with hands-free on, pressing Play on an older message
+  // while an answer streams took the pipeline (`streamedTurn = false`), so the
+  // ask's own endOfTurn no-opped and the mic was never re-armed — hands-free was
+  // dead until the user typed or clicked, with nothing on screen saying why.
+  const arms = handsFree();
+  life.beginTurn("chat-1");
+  life.feedStreamDelta("The streamed answer.");
+  life.speakText("an older answer the user pressed Play on");
+  life.playingAudio(1);
+  life.endOfTurn();
+  assert.equal(arms.count, 0, "the manual play is still audible — the mic waits for it");
+  life.audioPlayedOut();
+  assert.equal(arms.count, 1, "the ask that closed still gets its re-arm");
+});
+
+test("Stop kills the turn for good — a later endOfTurn re-arms nothing", () => {
+  const arms = handsFree();
+  life.beginTurn("chat-1");
+  life.feedStreamDelta("Half an answer.");
+  life.cancelAll();
+  life.endOfTurn("Half an answer.");
+  life.audioPlayedOut();
+  assert.equal(arms.count, 0, "a stopped turn is dead: no re-arm, now or later");
+});
+
+test("a preview with no ask behind it re-arms nothing", () => {
+  const arms = handsFree();
+  life.speakText("Settings preview");
+  life.audioPlayedOut();
+  assert.equal(arms.count, 0, "hands-free only follows a real turn");
+});
+
+test("a synthesis failure that lands after Stop is not reported", async () => {
+  // Stop (or a room autolock) while the first sentence is still synthesizing:
+  // the request fails afterwards and used to pop a red "Couldn't read that
+  // aloud…" toast about a turn the user had deliberately ended.
+  handsFree();
+  const problems = [];
+  life.setVoiceProblemListener((m) => problems.push(m));
+  life.beginTurn("chat-1");
+  life.onSynthesize(async () => {
+    life.cancelAll(); // the user presses Stop while this call is in flight
+    throw new Error("the voice service didn't answer");
+  });
+  await life.synthesize("Here is the answer.");
+  assert.deepEqual(problems, [], "a stopped turn's failure is not a problem to report");
+  life.setVoiceProblemListener(null);
+});
+
+test("a synthesis failure during a live turn is still reported, once", async () => {
+  handsFree();
+  const problems = [];
+  life.setVoiceProblemListener((m) => problems.push(m));
+  life.beginTurn("chat-1");
+  life.onSynthesize(async () => {
+    throw new Error("the voice service didn't answer");
+  });
+  await life.synthesize("First sentence.");
+  await life.synthesize("Second sentence.");
+  assert.equal(problems.length, 1, `one answer that cannot be spoken is ONE problem: ${JSON.stringify(problems)}`);
+  assert.match(problems[0], /Couldn't read that aloud/);
+  life.setVoiceProblemListener(null);
+});
+
 // ---- what the slice cannot execute, pinned as source text ------------------
 
 test("every path that starts new speech resets the first-chunk floor", () => {
@@ -148,6 +290,42 @@ test("an UNCLOSED fence is held back, then dropped at end of turn", () => {
 });
 
 // ---- where the cuts fall ---------------------------------------------------
+
+test("a dotted URL is not a sentence end, so a link is still spoken as its label", () => {
+  // Cutting at "example." split the markdown link across two chunks, where
+  // `stripForSpeech` could no longer match it: the voice read out
+  // "[guide](https://example. com/setup. html)" instead of "guide".
+  const out = spoken("Check the [guide](https://example.com/setup.html) first.");
+  assert.equal(out.length, 1, `the URL must not split the sentence — got ${JSON.stringify(out)}`);
+  assert.ok(out[0].includes("Check the guide first."), `the link is spoken as its label: ${out[0]}`);
+  assert.ok(!out[0].includes("example.com"), "a link's target is never read aloud");
+  assert.ok(!out[0].includes("["), "no link syntax survives into speech");
+});
+
+test("a full stop before a capital still ends the sentence", () => {
+  // The other side of the guard above: cutting only on whitespace would leave a
+  // missing space ("…done.Next…") growing to the force-flush size.
+  const out = spoken("The lease has been signed already.Next comes the deposit.");
+  assert.equal(out.length, 2, `both sentences ship separately — got ${JSON.stringify(out)}`);
+});
+
+test("a script with no capitals still splits at its full stops", () => {
+  // Hebrew and Arabic are first-class here (Hebrew PDFs, Hebrew voices) and
+  // have no uppercase letters at all. Deciding the cut by the character AFTER
+  // the dot held an entire Hebrew answer in one chunk until the force-flush
+  // size, then cut it mid-clause — speech that only starts once ~300
+  // characters have piled up is the "answer arrives as one chunk" fault the
+  // CJK enders were added to fix. The dot is separated from what follows by a
+  // space, and that is what makes it a sentence end.
+  // Long enough to clear MIN_FIRST_CHUNK_CHARS, or the merge floor — not the
+  // cut — would be what joins them, and the test would prove nothing.
+  const he = spoken("החוזה על הדירה החדשה נחתם בחודש ינואר. המפתחות נמסרו רק בחודש מרץ.");
+  assert.equal(he.length, 2, `two Hebrew sentences, two chunks — got ${JSON.stringify(he)}`);
+  // The same holds inside English whenever the next sentence opens with
+  // something that is not a capital letter.
+  const en = spoken("We tested three models this morning. 5 of them failed the first check.");
+  assert.equal(en.length, 2, `a sentence opening on a digit is still a sentence — got ${JSON.stringify(en)}`);
+});
 
 test("a decimal point is not a sentence end", () => {
   const out = spoken("The model is qwen3.5b and it fits in 7.5 GB of memory here.");

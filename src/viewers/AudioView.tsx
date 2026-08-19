@@ -120,21 +120,44 @@ export default function AudioView({
   const [kicked, setKicked] = useState(false);
   const [retranscribeErr, setRetranscribeErr] = useState<string | null>(null);
   const busy = transcribing || kicked;
+  // Asked for, but the lane hasn't spoken about this file yet. The transcriber
+  // runs one job at a time, so behind a long import "queued" is the truth for
+  // minutes — and it is a different sentence from "Transcribing on this Mac…".
+  const queued = kicked && !transcribing;
   // Why the transcriber gave up, when it did. A file macOS cannot decode is
   // not a silent recording, and saying "no transcript yet" to someone whose
   // file simply needs converting sends them away to wait for nothing.
   const sttWhy = busy ? null : sttFailure(sttStage);
+  // The two other endings the backend names. Both fell through to "No
+  // transcript yet", which tells someone with no speech model installed to
+  // wait for a model that is never going to run.
+  const sttEnd =
+    !busy && (sttStage === "model-missing" || sttStage === "none") ? sttStage : null;
+  // What the lane had last said about this file when Transcribe was pressed.
+  // The flag clears when that changes — the job started, failed or finished —
+  // never on a timer: reverting the button to "Transcribe" after six seconds
+  // while the job was still queued let a second and third decode of the very
+  // same file be enqueued behind it.
+  const stageWhenKicked = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    if (!kicked) return;
+    // "model-missing" is the one answer that repeats itself: the job reports it
+    // and returns before it ever starts, so waiting for the stage to CHANGE
+    // would leave the button queued for a run that already ended.
+    if (sttStage !== stageWhenKicked.current || sttStage === "model-missing") {
+      setKicked(false);
+    }
+  }, [kicked, sttStage]);
   async function retranscribe() {
     setRetranscribeErr(null);
+    stageWhenKicked.current = sttStage;
     setKicked(true);
     try {
       await api.retranscribeFile(fileId);
     } catch (e) {
       setKicked(false);
       setRetranscribeErr(String(e));
-      return;
     }
-    window.setTimeout(() => setKicked(false), 6000);
   }
   // A file the decoder rejects (empty, truncated, unsupported codec) must say
   // so — "No transcript yet" on a 0-duration recording reads as "keep waiting"
@@ -260,6 +283,10 @@ export default function AudioView({
   }, [src]);
   useEffect(() => {
     setMediaDead(false);
+    // A pending "I just asked for this one" belongs to the file it was pressed
+    // on; carrying it over would call the next file queued.
+    setKicked(false);
+    setRetranscribeErr(null);
     setDur(null);
     forcedDurRef.current = false;
     resumeAtRef.current = 0;
@@ -455,15 +482,21 @@ export default function AudioView({
               {" · "}
             </>
           )}
-          {busy
+          {transcribing
             ? "Transcribing on this Mac…"
-            : hasSpeech
-              ? "Transcript ready"
-              : rows.length > 0
-                ? "No speech detected"
-                : sttWhy
-                  ? "Transcription failed"
-                  : "No transcript yet"}
+            : queued
+              ? "Queued for transcription"
+              : hasSpeech
+                ? "Transcript ready"
+                : rows.length > 0
+                  ? "No speech detected"
+                  : sttWhy
+                    ? "Transcription failed"
+                    : sttEnd === "model-missing"
+                      ? "No speech model"
+                      : sttEnd === "none"
+                        ? "No speech detected"
+                        : "No transcript yet"}
         </span>
         {!mediaDead && (
           <button
@@ -476,8 +509,14 @@ export default function AudioView({
                 : "Run the on-device transcriber on this file"
             }
           >
-            <RefreshIcon size={12} className={busy ? "spin" : undefined} />
-            {busy ? "Transcribing…" : hasSpeech ? "Re-transcribe" : "Transcribe"}
+            <RefreshIcon size={12} className={transcribing ? "spin" : undefined} />
+            {queued
+              ? "Queued…"
+              : transcribing
+                ? "Transcribing…"
+                : hasSpeech
+                  ? "Re-transcribe"
+                  : "Transcribe"}
           </button>
         )}
       </div>
@@ -583,6 +622,12 @@ export default function AudioView({
           No speech detected — this {kind === "video" ? "video" : "recording"}{" "}
           appears to be silent or contains no recognizable speech.
         </div>
+      ) : queued ? (
+        <div className="empty-hint">
+          Queued for transcription — the voice model takes one file at a time,
+          so this starts when the file ahead of it is done. You can keep working
+          meanwhile.
+        </div>
       ) : busy ? (
         <div className="empty-hint">
           Transcribing on this Mac… the transcript will appear here on its
@@ -597,6 +642,19 @@ export default function AudioView({
           This {kind === "video" ? "video" : "recording"} couldn’t be
           transcribed: {sttWhy}. Converting it to a common format (M4A, MP3,
           WAV or MP4) and importing it again usually fixes this.
+        </div>
+      ) : sttEnd === "model-missing" ? (
+        // The backend named this reason and the app was holding it: without
+        // this branch the button ran, nothing happened, and the hint below
+        // still promised a transcript that no installed model could write.
+        <div className="empty-hint">
+          No speech model is installed, so nothing has read this{" "}
+          {kind === "video" ? "video" : "recording"} yet. Install one in
+          Settings → Model → Dictation and this will transcribe itself.
+        </div>
+      ) : sttEnd === "none" ? (
+        <div className="empty-hint">
+          The audio was read all the way through and held no speech.
         </div>
       ) : (
         <div className="empty-hint">

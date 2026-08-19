@@ -408,6 +408,21 @@ mod tests {
     }
 
     #[test]
+    fn moving_refuses_a_file_that_is_not_in_the_room() {
+        // A batch used to report every id it was HANDED as moved, so an id
+        // trashed in another window a moment earlier came back as `ok` — named
+        // by raw uuid — and told the UI to re-read a room nothing happened to.
+        let conn = room();
+        let gone = add(&conn, "lease.txt");
+        trash_files_in(&conn, std::slice::from_ref(&gone), db::TrashActor::User);
+
+        let report = move_files_in(&conn, &[gone, "does-not-exist".into()], None);
+        assert!(report.ok.is_empty(), "nothing moved: {:?}", report.ok);
+        assert_eq!(report.failed.len(), 2);
+        assert!(!report.changed_anything(), "no room-files-changed emit");
+    }
+
+    #[test]
     fn a_receipt_never_claims_more_than_it_did() {
         let mut report = BulkReport::default();
         assert_eq!(report.sentence("moved"), "Nothing was moved.");

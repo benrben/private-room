@@ -574,6 +574,39 @@ class OpenAICompatibleChatModel:
         )
         return out
 
+    def _fit_one_shot(
+        self,
+        messages: list[Message],
+        format: dict[str, Any] | None,  # noqa: A002
+        images: list[str] | None,
+    ) -> list[Message]:
+        """Cut a one-shot request down to this provider's stated window.
+
+        The local twin (:meth:`chat.ChatModel.generate`) has always cut here
+        with ``fit_to_window``; the gateway sent every one of these calls —
+        ``/handoff_summary``, ``/generate``, ``/file_pass_section``,
+        ``/ai_action``, ``/knowledge_extract`` — completely unbounded, so a
+        conversation a local room trims with a visible marker came back from an
+        OpenRouter room as a bare provider 400 the UI could only repeat.
+
+        No compaction on this path: it is a single billed call with no digest
+        cache behind it, and :func:`budget.fit_oversized_results` cuts the
+        oversized RESULT first and leaves a marker where it cut. The grammar
+        and any top-level images ride the same window and cannot be cut, so
+        they are reserved rather than trimmed.
+        """
+        from .budget import IMAGE_BYTES, fit_oversized_results, json_chars
+        from .compaction import CLOUD_SPEND_FRACTION, fit_budget_bytes
+
+        reserved = (json_chars(format) if format else 0) + IMAGE_BYTES * len(images or [])
+        window = self.provider.context_window or DEFAULT_PROVIDER_CONTEXT
+        send, _did = fit_oversized_results(
+            messages,
+            fit_budget_bytes(window, reserved, CLOUD_SPEND_FRACTION),
+            reserved,
+        )
+        return send
+
     async def generate(
         self,
         messages: list[Message],
@@ -581,7 +614,8 @@ class OpenAICompatibleChatModel:
         format: dict[str, Any] | None = None,  # noqa: A002
         images: list[str] | None = None,
     ) -> str:
-        payload = self._payload(messages, format=format, images=images)
+        send = self._fit_one_shot(messages, format, images)
+        payload = self._payload(send, format=format, images=images)
         async with httpx.AsyncClient(timeout=provider_timeout_secs()) as client:
             response = await client.post(self.endpoint, headers=self.headers, json=payload)
             # Not every OpenRouter model supports strict structured outputs. The
@@ -612,7 +646,8 @@ class OpenAICompatibleChatModel:
         format: dict[str, Any] | None = None,  # noqa: A002
         images: list[str] | None = None,
     ) -> AsyncIterator[str]:
-        payload = self._payload(messages, stream=True, format=format, images=images)
+        send = self._fit_one_shot(messages, format, images)
+        payload = self._payload(send, stream=True, format=format, images=images)
         async with httpx.AsyncClient(timeout=provider_timeout_secs()) as client:
             async with client.stream(
                 "POST", self.endpoint, headers=self.headers, json=payload
@@ -647,67 +682,65 @@ class OpenAICompatibleChatModel:
             # module for the agents that broke when it was. An agent whose tools
             # were removed does not say so; it answers as though it had never
             # had them.
-            while True:
-                async with client.stream(
-                    "POST", self.endpoint, headers=self.headers, json=payload
-                ) as response:
-                    if not response.is_success:
-                        await response.aread()
-                        if response.status_code == 400 and payload.get("tools"):
-                            _log.warning(
-                                "provider rejected a tool request: %s | shape: %s",
-                                _error_message(response),
-                                _message_skeleton(payload.get("messages") or []),
+            async with client.stream(
+                "POST", self.endpoint, headers=self.headers, json=payload
+            ) as response:
+                if not response.is_success:
+                    await response.aread()
+                    if response.status_code == 400 and payload.get("tools"):
+                        _log.warning(
+                            "provider rejected a tool request: %s | shape: %s",
+                            _error_message(response),
+                            _message_skeleton(payload.get("messages") or []),
+                        )
+                        raise ProviderApiError(
+                            _rejected_catalog_error(response, payload["tools"])
+                        )
+                    raise ProviderApiError(_error_message(response))
+                # Poll Stop WHILE the next SSE event is outstanding. The
+                # in-body check this replaces only ran once an event had
+                # arrived, so a provider holding the connection open with no
+                # data — the shape live QA saw on OpenRouter — never sampled
+                # the flag at all. `iter_with_stop` also bounds the silence,
+                # which httpx's timeout does not: that one covers a single
+                # socket read, not a stream that keeps the connection warm.
+                events = _stall_as_error(
+                    iter_with_stop(
+                        _sse_events(response), cancel, provider_timeout_secs()
+                    ),
+                    self.composite_model,
+                )
+                async for event in events:
+                    usage = event.get("usage") or {}
+                    input_tokens = usage.get("prompt_tokens", input_tokens)
+                    for choice in event.get("choices") or []:
+                        delta = choice.get("delta") or {}
+                        text = delta.get("content") or ""
+                        if restorer is not None:
+                            text = restorer.feed(str(text))
+                        if text:
+                            parts.append(str(text))
+                            await on_delta(str(text))
+                        for fragment in delta.get("tool_calls") or []:
+                            raw_index = fragment.get("index")
+                            index = raw_index if isinstance(raw_index, int) else 0
+                            current = calls_by_index.setdefault(
+                                index, {"id": "", "name": "", "arguments": ""}
                             )
-                            raise ProviderApiError(
-                                _rejected_catalog_error(response, payload["tools"])
+                            current["id"] = _merge_stream_piece(
+                                current["id"], fragment.get("id")
                             )
-                        raise ProviderApiError(_error_message(response))
-                    # Poll Stop WHILE the next SSE event is outstanding. The
-                    # in-body check this replaces only ran once an event had
-                    # arrived, so a provider holding the connection open with no
-                    # data — the shape live QA saw on OpenRouter — never sampled
-                    # the flag at all. `iter_with_stop` also bounds the silence,
-                    # which httpx's timeout does not: that one covers a single
-                    # socket read, not a stream that keeps the connection warm.
-                    events = _stall_as_error(
-                        iter_with_stop(
-                            _sse_events(response), cancel, provider_timeout_secs()
-                        ),
-                        self.composite_model,
-                    )
-                    async for event in events:
-                        usage = event.get("usage") or {}
-                        input_tokens = usage.get("prompt_tokens", input_tokens)
-                        for choice in event.get("choices") or []:
-                            delta = choice.get("delta") or {}
-                            text = delta.get("content") or ""
-                            if restorer is not None:
-                                text = restorer.feed(str(text))
-                            if text:
-                                parts.append(str(text))
-                                await on_delta(str(text))
-                            for fragment in delta.get("tool_calls") or []:
-                                raw_index = fragment.get("index")
-                                index = raw_index if isinstance(raw_index, int) else 0
-                                current = calls_by_index.setdefault(
-                                    index, {"id": "", "name": "", "arguments": ""}
+                            fn = fragment.get("function") or {}
+                            current["name"] = _merge_stream_piece(
+                                current["name"], fn.get("name")
+                            )
+                            arguments = fn.get("arguments") or ""
+                            if isinstance(arguments, str):
+                                current["arguments"] += arguments
+                            else:
+                                current["arguments"] += json.dumps(
+                                    arguments, ensure_ascii=False, separators=(",", ":")
                                 )
-                                current["id"] = _merge_stream_piece(
-                                    current["id"], fragment.get("id")
-                                )
-                                fn = fragment.get("function") or {}
-                                current["name"] = _merge_stream_piece(
-                                    current["name"], fn.get("name")
-                                )
-                                arguments = fn.get("arguments") or ""
-                                if isinstance(arguments, str):
-                                    current["arguments"] += arguments
-                                else:
-                                    current["arguments"] += json.dumps(
-                                        arguments, ensure_ascii=False, separators=(",", ":")
-                                    )
-                    break
 
         if restorer is not None:
             tail = restorer.flush()

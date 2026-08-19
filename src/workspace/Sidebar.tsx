@@ -4,7 +4,6 @@ import {
   CollapseLeftIcon,
   CreateIcon,
   DownloadIcon,
-  FocusIcon,
   FolderIcon,
   GlobeIcon,
   LinkIcon,
@@ -116,6 +115,24 @@ export default function LibraryPane({
     return () => window.removeEventListener("keydown", onKey, true);
   }, [s.addMenuOpen, s]);
 
+  // A checked file that leaves the trash leaves the selection with it.
+  // Restoring or destroying it from its OWN row emptied the panel's bar while
+  // the footer below still counted the id — "Put 1 file back in the library",
+  // enabled, over a trash that no longer holds it, and an error toast naming a
+  // file that is gone when pressed. Lives here, above TrashPanel, because that
+  // component returns early on an empty trash — which is exactly when this has
+  // to run.
+  const trashed = s.trashed;
+  const setSelectedTrashIds = s.setSelectedTrashIds;
+  useEffect(() => {
+    setSelectedTrashIds((cur) => {
+      if (cur.size === 0) return cur;
+      const live = new Set(trashed.map((f) => f.id));
+      const next = new Set([...cur].filter((id) => live.has(id)));
+      return next.size === cur.size ? cur : next;
+    });
+  }, [trashed, setSelectedTrashIds]);
+
   // null = this destination has no list to count, so no badge is drawn. A hard
   // "0" beside a destination that never lists anything reads as "empty", which
   // is a different and untrue claim.
@@ -170,15 +187,14 @@ export default function LibraryPane({
             <PlusIcon size={12} /> {newLabel}
           </button>
         )}
+        {/* Collapse, and no Focus. Focusing THIS pane made the visible set
+            exactly ["library"], hiding the workspace — the one pane the layout
+            model says cannot be hidden — and the way out, Escape, declines
+            while a text field has the keyboard, which this pane's own filter
+            box two rows below took the moment you reached for it. "Focus the
+            workspace" is the thing people want and it is already in the Layout
+            menu, the native View menu and ⌘K. */}
         <div className="pane-actions">
-          <button
-            className="pane-icon-btn"
-            data-tip="Focus this pane"
-            aria-label={`Give ${heading} the full width`}
-            onClick={() => layout.toggleFocus("library")}
-          >
-            <FocusIcon size={14} />
-          </button>
           <button
             className="pane-icon-btn"
             data-tip="Collapse"
@@ -231,16 +247,12 @@ export default function LibraryPane({
         </div>
       )}
 
-      {/* ADD-31: live import queue — a multi-file import used to be invisible
-          until it was over. Names the current file and counts progress. */}
-      {s.importProgress && (
-        <div className="import-strip" role="status">
-          <span className="import-strip-count">
-            Importing {s.importProgress.done + 1} of {s.importProgress.total}
-          </span>
-          <span className="import-strip-name">{s.importProgress.name}</span>
-        </div>
-      )}
+      {/* No import strip here. The same `s.importProgress` already draws a full
+          activity row in the assistant pane — the same count, the same
+          filename, a measured bar and a Running tape — and neither surface can
+          stop an import, so the second copy added no control either. It also
+          appeared mid-scroll and pushed the file list down under the reader's
+          cursor. */}
 
       {/* Trash is a record of what left the room, not a list you browse — a
           filter box and a "Newest first" sort control that don't move the
@@ -331,7 +343,12 @@ export default function LibraryPane({
 
       {/* Trash has nothing to add — you cannot add a source to what has been
           removed — so its footer does the one bulk action the tab actually
-          needs instead of duplicating "+ Add page or source" from Browse. */}
+          needs instead of duplicating "+ Add page or source" from Browse.
+
+          Home only. Recordings drew this menu too, and of its seven entries two
+          were the same two verbs its own column already offers at the top and
+          five made things a list of recordings can never show. Home's footer is
+          one rail click away and ⌘K carries the rest. */}
       {fileArea && s.libraryTab === "trash" ? (
         <div className="source-footer">
           <button
@@ -351,7 +368,7 @@ export default function LibraryPane({
             <UndoIcon size={14} /> Restore selected
           </button>
         </div>
-      ) : (fileArea || area === "recordings") && (
+      ) : fileArea && (
         <div className="source-footer">
           <div className="add-menu-wrap" style={{ width: "100%" }}>
             <button
@@ -539,6 +556,19 @@ function SelectionBar({ s, a }: { s: WSState; a: WSActions }) {
         return;
       }
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "a") {
+        // Only when the library is the surface being worked in — hovered, or
+        // holding focus. This listener is on the window and the pane stays
+        // mounted (hidden panes are `visibility: hidden`, so neither test can
+        // match one), so an unscoped ⌘A took select-all away from the whole
+        // room: over a PDF or a note it selected library rows instead of the
+        // document's text, and with the sidebar collapsed it armed a
+        // multi-file selection nothing on screen showed. Same hover-or-focus
+        // scoping the PDF viewer uses for ⌘F.
+        const pane = document.querySelector(".pane-library");
+        const mine =
+          !!pane &&
+          (pane.matches(":hover") || pane.contains(document.activeElement));
+        if (!mine) return;
         e.preventDefault();
         a.selectAllVisible();
       }
@@ -550,7 +580,10 @@ function SelectionBar({ s, a }: { s: WSState; a: WSActions }) {
   if (n === 0) return null;
   const ids = picked.map((f) => f.id);
   return (
-    <div className="selection-bar" role="toolbar" aria-label={`${n} files selected`}>
+    /* A GROUP, not a `toolbar`: `role="toolbar"` promises arrow-key navigation
+       between its controls, and these are plain tab stops. Claiming the role
+       without the behaviour is a lie to assistive tech. */
+    <div className="selection-bar" role="group" aria-label={`${n} files selected`}>
       <span className="selection-count" role="status">
         {n} selected
       </span>
@@ -743,13 +776,6 @@ function BrowsePanel({
                 if (ids.length) void a.moveFiles(ids, folder.id);
               }}
             >
-              <button
-                className="folder-caret-btn"
-                title={collapsed ? "Expand" : "Collapse"}
-                onClick={() => a.toggleFolderCollapse(folder.id)}
-              >
-                {collapsed ? "▸" : "▾"}
-              </button>
               {s.renamingFolder?.id === folder.id ? (
                 <input
                   className="folder-rename"
@@ -766,10 +792,20 @@ function BrowsePanel({
                   }}
                 />
               ) : (
+                /* ONE control per folder, not two. The caret was its own
+                   button doing the identical thing, and because it had text
+                   content ("▸") that glyph WAS its accessible name — announced
+                   as "▸ button", with its title never read. The state is on
+                   the label button now, where `aria-expanded` says it out loud
+                   instead of drawing it. */
                 <button
                   className="folder-label"
+                  aria-expanded={!collapsed}
                   onClick={() => a.toggleFolderCollapse(folder.id)}
                 >
+                  <span className="folder-caret" aria-hidden>
+                    {collapsed ? "▸" : "▾"}
+                  </span>
                   <span className="folder-name" title={folder.name}>
                     {folder.name}
                   </span>
@@ -1091,8 +1127,15 @@ function SkillsNav({ s, a }: { s: WSState; a: WSActions }) {
           <span className="browse-icon"><BookOpenIcon size={14} /></span>
           <span className="area-nav-main">
             <span className="area-nav-title">{skill.name}</span>
+            {/* A skill with no description is offered to the assistant with
+                nothing to choose it BY, so "Enabled" over one is the wrong
+                fact to lead with — the card in the centre pane already marks
+                it Incomplete. Owner checks stay there; only that pane holds
+                the agent roster. */}
             <span className="area-nav-copy">
-              {skill.enabled ? "Enabled" : "Disabled draft"} · {skill.resourceCount} resource{skill.resourceCount === 1 ? "" : "s"}
+              {skill.description.trim()
+                ? `${skill.enabled ? "Enabled" : "Disabled draft"} · ${skill.resourceCount} resource${skill.resourceCount === 1 ? "" : "s"}`
+                : "Needs a description — can't be chosen"}
             </span>
           </span>
           <span className="area-nav-state">{skill.createdBy === "agent" ? "AI" : skill.createdBy}</span>
@@ -1465,8 +1508,13 @@ function CreationsNav({ s, a }: { s: WSState; a: WSActions }) {
                 {/* The job's own reported step, or its plain status. Never a
                     made-up percentage: `jobProgress` is absent until the run
                     reports one, and inventing a number for the gap is the
-                    fake-progress-bar problem this app has ruled out. */}
-                {p ? `${p.label} ${p.done}/${p.total}` : j.status === "queued" ? "Queued" : "Working…"}
+                    fake-progress-bar problem this app has ruled out.
+                    The label ALONE, with no done/total after it: a create run
+                    carries its real percentage inside the label and leaves the
+                    pair at the variation it started on, so the fraction read
+                    "Filming… 43% 0/100" — two numbers contradicting each other
+                    in one sentence. */}
+                {p ? p.label : j.status === "queued" ? "Queued" : "Working…"}
               </span>
             </span>
           </div>

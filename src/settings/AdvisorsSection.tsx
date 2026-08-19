@@ -19,6 +19,13 @@ export default function AdvisorsSection({
   ENGINE_LABELS,
   AlertIcon,
 }: Props) {
+  // `ai.external` is not the advisor list: `ai_status` appends "openrouter" to
+  // it whenever a key is saved, while `consult_advisor` is only ever offered for
+  // the CLIs `detected_advisors` finds on PATH (claude-cli / codex-cli). Reading
+  // it raw put a live switch labelled "Enable AI advisors (OpenRouter)" in front
+  // of a Mac with no CLI at all, and turning it on bought nothing — no advisor
+  // step can ever run. Ask only about the CLIs.
+  const advisorClis = (ai?.external ?? []).filter((e) => e !== "openrouter");
   return (
     <section id="set-advisors">
       <h3>AI advisors (advanced)</h3>
@@ -39,7 +46,7 @@ export default function AdvisorsSection({
               account. That text leaves this Mac. Each consult is shown as a
               step while it happens, and it's capped at one per question.
             </p>
-            {ai && ai.external.length > 0 ? (
+            {advisorClis.length > 0 ? (
               <>
                 <label className="settings-label">
                   <input
@@ -47,7 +54,7 @@ export default function AdvisorsSection({
                     checked={advisorsOn}
                     onChange={onAdvisorsToggle}
                   />{" "}
-                  Enable AI advisors ({ai.external
+                  Enable AI advisors ({advisorClis
                     .map((e) => ENGINE_LABELS[e] ?? e)
                     .join(", ")})
                 </label>
@@ -66,10 +73,10 @@ export default function AdvisorsSection({
                         above it is on — so it is attached to that switch. */}
                     <p className="set-note set-note--flag nb-sem-urgent">
                       When consulted, the advisor can list, search, open and
-                      edit this room's files — and drive any Connected tools
-                      (MCP) below — through a private, one-question-long local
-                      bridge. A second, separate way for content to leave this
-                      Mac.
+                      edit this room's files — and drive any connector you have
+                      turned on (Connectors, in the sidebar) — through a
+                      private, one-question-long local bridge. A second,
+                      separate way for content to leave this Mac.
                     </p>
                   </>
                 )}

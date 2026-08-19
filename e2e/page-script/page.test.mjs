@@ -724,7 +724,11 @@ test("ping and info answer before any snapshot has been taken", () => {
   const info = api.call("info", {});
   assert.equal(info.ok, true);
   assert.equal(info.title, "Test Page");
-  assert.equal(info.canGoBack, true);
+  // `canGoBack` used to ride along here and was read by nobody: Rust's
+  // `BrowserInfo` never carried it, so Back and Forward were enabled
+  // unconditionally either way. The poll is on a 1.2s beat — it must not pay
+  // to measure answers nothing consumes.
+  assert.equal(info.canGoBack, undefined);
 });
 
 test("click_at rejects a point with nothing under it and reports what it hit", async () => {
@@ -829,4 +833,169 @@ test("an open modal outranks the rest of the page when the mark cap bites", () =
     labels.includes("Search ticker"),
     "the modal's field lost the cap to background nav links",
   );
+});
+
+test("a revealed password field stays fenced, and its value never reaches the snapshot", () => {
+  // The site's own "show password" toggle sets type="text". From that moment
+  // the only signal left is the field's name — and the tool spec promises
+  // password fields are never listed.
+  const { api, doc } = fresh();
+  stack(doc.body, [
+    new El("input", { type: "text", name: "user", value: "ada" }),
+    new El("input", { type: "text", name: "password", id: "password", value: "hunter2" }),
+  ]);
+  const snap = api.call("snapshot", {});
+  assert.equal(snap.count, 1, "only the username is actionable");
+  assert.equal(snap.secrets, 1, "a revealed password field is still a password field");
+  assert.ok(
+    !JSON.stringify(snap).includes("hunter2"),
+    "the password must not appear anywhere in what the model reads",
+  );
+});
+
+test("a card number is reported as filled rather than quoted back", () => {
+  // Not fenced — the agent can legitimately be asked to fill one — but copying
+  // the digits into the transcript is a copy of them nobody asked for.
+  const { api, doc } = fresh();
+  stack(doc.body, [
+    new El("input", {
+      type: "text",
+      autocomplete: "cc-number",
+      name: "cardNumber",
+      value: "4111111111111111",
+    }),
+  ]);
+  const snap = api.call("snapshot", {});
+  assert.equal(snap.count, 1);
+  assert.equal(snap.elements[0].state, "filled");
+  assert.ok(!JSON.stringify(snap).includes("4111"), "the number must not be echoed");
+});
+
+test("find never renumbers a page whose marks have merely scrolled out of view", () => {
+  const { api, doc } = fresh();
+  const [save] = stack(doc.body, [
+    new El("button", { __text: "Save" }),
+    new El("button", { __text: "Sign in" }),
+  ]);
+  const first = api.call("snapshot", {});
+  assert.equal(first.count, 2);
+  // The user scrolls with the trackpad: the marks are all still out there,
+  // they are simply far above the viewport now.
+  for (const el of doc.body.children) el.rect = { ...el.rect, top: 90000 };
+
+  const found = api.call("find", { text: "sign in" });
+  assert.equal(found.ok, true);
+  assert.deepEqual(found.matches, [], "nothing is offered from a numbering it cannot see");
+  assert.equal(
+    found.generation,
+    first.generation,
+    "a silent re-snapshot would renumber the page and point every ref the model holds at a different control",
+  );
+  assert.equal(save.getAttribute("data-arcelle-mark"), "1", "the marks are left in place");
+});
+
+test("find re-numbers a page whose marks left with the document they were written on", () => {
+  // The other side of the same gate. An SPA route swap detaches every marked
+  // element, so every ref the model holds is already dead and renumbering
+  // invalidates nothing — refusing to re-scan would leave `browse_find` unable
+  // to answer anything at all until a snapshot was asked for by name.
+  const { api, doc } = fresh();
+  const [, signIn] = stack(doc.body, [
+    new El("button", { __text: "Save" }),
+    new El("button", { __text: "Sign in" }),
+  ]);
+  const first = api.call("snapshot", {});
+  for (const el of [...doc.body.children]) {
+    el.isConnected = false;
+    doc.body.removeChild(el);
+  }
+  assert.equal(signIn.isConnected, false);
+  stack(doc.body, [new El("button", { __text: "Sign in" })]);
+
+  const found = api.call("find", { text: "sign in" });
+  assert.equal(found.ok, true);
+  assert.equal(found.matches.length, 1, "the control that IS on the page is offered");
+  assert.notEqual(found.generation, first.generation, "and the model is told it is a new numbering");
+});
+
+test("wait_for gone refuses a ref that was not there to begin with", async () => {
+  const { api, doc } = fresh();
+  stack(doc.body, [new El("button", { __text: "Save" })]);
+  api.call("snapshot", {});
+  const out = await drain(api, "act", { actions: [{ wait_for: { gone: "e99" } }] });
+  assert.equal(out.results[0].ok, false);
+  assert.match(out.results[0].error, /not one of this page's refs/);
+  assert.equal(out.ok, false, "the batch stops rather than pretending it waited");
+});
+
+test("waiting for something an earlier action in the same batch removed is a wait, not a refusal", async () => {
+  // The commonest gone-batch there is: close the banner, then wait for the
+  // banner to go. The ref IS one this numbering issued, and by the time the
+  // wait starts it is already detached — refusing it would call a batch that
+  // did exactly what it was asked a failure, word it "was not on the page to
+  // begin with" about something that plainly was, and bill for a screenshot.
+  const { api, doc } = fresh();
+  const [close, save] = stack(doc.body, [
+    new El("button", { __text: "Dismiss" }),
+    new El("button", { __text: "Save" }),
+  ]);
+  api.call("snapshot", {});
+  close.click = function () {
+    this.clicked++;
+    this.isConnected = false;
+  };
+  const out = await drain(api, "act", {
+    actions: [{ click: "e1" }, { wait_for: { gone: "e1" } }, { click: "e2" }],
+  });
+  assert.equal(out.results[1].ok, true, "the banner went away, which is what was waited for");
+  assert.equal(out.results[1].did, "waited until it disappeared");
+  assert.equal(out.ok, true, "nothing failed, so nothing pays for a picture of the page");
+  assert.equal(save.clicked, 1, "the batch was allowed to finish");
+});
+
+test("a show-password toggle is not counted as a password field the user must fill", () => {
+  // The name test is a substring one, so the very control that motivated it —
+  // the site's reveal checkbox — carries the word as plainly as the field it
+  // reveals. Fencing it made the snapshot's "N password field(s) present"
+  // line a count of fields to fill that included one nobody fills.
+  const { api, doc } = fresh();
+  stack(doc.body, [
+    new El("input", { type: "text", name: "password", id: "password", value: "hunter2" }),
+    new El("input", { type: "checkbox", id: "showPassword" }),
+  ]);
+  const snap = api.call("snapshot", {});
+  assert.equal(snap.secrets, 1, "one field to type into, not two");
+  assert.equal(snap.count, 1, "and the toggle is still something the agent can press");
+  assert.equal(snap.elements[0].role, "checkbox");
+  assert.ok(!JSON.stringify(snap).includes("hunter2"), "the password is still fenced");
+});
+
+test("a wait for something to disappear is reported as that, not as its opposite", async () => {
+  const { api, doc } = fresh();
+  const [spinner] = stack(doc.body, [new El("button", { __text: "Loading" })]);
+  api.call("snapshot", {});
+  setTimeout(() => {
+    spinner.isConnected = false;
+  }, 150);
+  const out = await drain(api, "act", { actions: [{ wait_for: { gone: "e1" } }] });
+  assert.equal(out.results[0].ok, true);
+  assert.equal(out.results[0].did, "waited until it disappeared");
+});
+
+test("a batch cut short by a same-document navigation is reported as navigated, not as failed", async () => {
+  const { api, doc } = fresh();
+  const [link, other] = stack(doc.body, [
+    new El("a", { href: "#section", __text: "Jump" }),
+    new El("button", { __text: "Save" }),
+  ]);
+  api.call("snapshot", {});
+  link.click = function () {
+    this.clicked++;
+    globalThis.location.href = "https://example.com/page#section";
+  };
+  const out = await drain(api, "act", { actions: [{ click: "e1" }, { click: "e2" }] });
+  assert.equal(out.results[0].ok, true, "the click itself succeeded");
+  assert.equal(out.navigated, true, "the batch was cut short on purpose, not by a failure");
+  assert.equal(out.urlChanged, true);
+  assert.equal(other.clicked, 0, "the later action never ran");
 });

@@ -271,8 +271,17 @@ export default function PrivacySection({
 
             {/* SEC-7 — compact room */}
             <label className="settings-label">Compact room</label>
+            {/* The fact that earns the red on "Confirm compact": a VACUUM
+                rewrites the file, so the pages deleted files still occupied
+                are overwritten rather than merely unlinked. Without this
+                sentence the arming and the danger class read as decoration,
+                which is what makes the red stop meaning anything where it
+                has to. */}
             <p className="settings-hint">
-              Reclaims space left by deleted files.
+              Rewrites the room file so the space deleted files were using is
+              released. Nothing still in the room is touched, but the remains
+              of deleted files are gone for good afterwards, and this cannot be
+              undone.
             </p>
             <div className="settings-actions">
               {compactMsg && (

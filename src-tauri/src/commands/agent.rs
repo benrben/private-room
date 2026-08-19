@@ -171,6 +171,46 @@ fn write_file_summary(real_name: &str, before: &str, after: &str, new_chars: usi
 /// question. Caller has already handled the empty case.
 const MAX_LISTED_MEMORIES: usize = 50;
 
+/// How many enabled general skills the per-turn preamble advertises, and how
+/// much of each description it carries.
+///
+/// The preamble is prepended to EVERY question, and the editor accepts a
+/// 2,000-character description — so forty verbose skills spent ~80 KB of every
+/// turn advertising themselves, and on a local model the fit-to-window trim
+/// pays for it out of the retrieved file excerpts. Level 1 of progressive
+/// disclosure only has to be enough for the model to pick one and call
+/// `read_skill`; `list_skills` still shows the rest in full.
+const MAX_ADVERTISED_SKILLS: usize = 12;
+const MAX_ADVERTISED_SKILL_CHARS: usize = 200;
+
+/// Level 1 of skill disclosure: the block that offers the room's enabled
+/// general skills at the top of every question. Empty when there are none.
+///
+/// A cut always says it was cut — in the block itself, because the model is
+/// the only reader and a list that silently ends at twelve is a list it thinks
+/// is complete.
+fn advertise_skills(skills: &[(&str, &str)]) -> String {
+    if skills.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "Available Agent Skills (specialized instructions). If one clearly matches the question, call read_skill before doing the work:\n",
+    );
+    for (name, description) in skills.iter().take(MAX_ADVERTISED_SKILLS) {
+        let desc = clamp_chars((*description).to_string(), MAX_ADVERTISED_SKILL_CHARS);
+        let ellipsis = if desc.len() < description.len() { "…" } else { "" };
+        out.push_str(&format!("- {name}: {desc}{ellipsis}\n"));
+    }
+    if skills.len() > MAX_ADVERTISED_SKILLS {
+        out.push_str(&format!(
+            "(…and {} more enabled skills, not listed here — call list_skills to see them all.)\n",
+            skills.len() - MAX_ADVERTISED_SKILLS
+        ));
+    }
+    out.push('\n');
+    out
+}
+
 fn format_memory_list(memories: Vec<Memory>) -> String {
     let total = memories.len();
     let mut lines: Vec<String> = memories
@@ -394,6 +434,10 @@ pub async fn ask(
     if state.rolling_back() {
         return Err(ROLLBACK_BUSY.into());
     }
+    // The room this turn belongs to, before anything can await. Every write
+    // this function makes at the end is checked against it — a straggler must
+    // not land in whichever room happens to be open by the time it returns.
+    let pin = RoomPin::take(&state);
 
     // ADD-7: register this ask's cancel flag; the guard removes it on return
     // (success, error, or cancel) so `close_room`'s wait can see us finish.
@@ -446,7 +490,6 @@ pub async fn ask(
         web_enabled,
         advisors_on,
         advisor_tools_on,
-        injected_rowids,
     } = gather_context_and_save_question(
         &window,
         &state,
@@ -493,7 +536,14 @@ pub async fn ask(
             let mut fx = ToolEffects::default();
             fx.wrote = true;
             let fx = effects_json(&fx);
-            return persist_assistant_reply(&state, &chat_id, text, vec![meta.name.clone()], fx);
+            return persist_assistant_reply_pinned(
+                &state,
+                pin.as_ref(),
+                &chat_id,
+                text,
+                vec![meta.name.clone()],
+                fx,
+            );
         }
     }
 
@@ -515,7 +565,7 @@ pub async fn ask(
     let mut effects = ToolEffects::default();
     // ADD-25: perception tools attach pixels only when the chat model can
     // read them; otherwise they fall back to a local vision-model description.
-    effects.vision_chat = chat_model_sees_images(&model).await;
+    effects.vision_chat = pixels_reach_chat_model(&model, chat_model_sees_images(&model).await);
 
     // Phase 2 (unlocked): answer — through a cloud CLI if selected, or the
     // local model with full app-control tools.
@@ -531,7 +581,6 @@ pub async fn ask(
         advisors_on,
         advisor_tools_on,
         cancel.clone(),
-        &injected_rowids,
         privacy_bypass.unwrap_or(false),
         &turn,
     )
@@ -611,7 +660,7 @@ pub async fn ask(
     let effects_value = effects_json(&effects);
 
     // Phase 3 (locked): save the assistant reply.
-    persist_assistant_reply(&state, &chat_id, content, sources, effects_value)
+    persist_assistant_reply_pinned(&state, pin.as_ref(), &chat_id, content, sources, effects_value)
 }
 
 /// Everything Phase 1 (the room-locked pass) produces for the rest of `ask`:
@@ -677,7 +726,6 @@ struct QuestionContext {
     web_enabled: bool,
     advisors_on: bool,
     advisor_tools_on: bool,
-    injected_rowids: HashSet<i64>,
 }
 
 /// Phase 1 (locked): gather the room's context and save the user's message.
@@ -771,42 +819,61 @@ fn gather_context_and_save_question(
 
         let (context_chunks, context_fallback) =
             retrieve_context(conn, effective_question, question_embedding)?;
-        // CHG-16: rowids already injected as context, so a search_room repeat
-        // of the same question returns the next-best chunks instead of dupes.
-        let injected_rowids: HashSet<i64> = if context_fallback {
-            HashSet::new()
-        } else {
-            context_chunks.iter().map(|c| c.rowid).filter(|r| *r >= 0).collect()
-        };
-
         // Attachments: images go to the model as vision input, text files as
         // guaranteed context.
         let mut images: Vec<String> = Vec::new();
         let mut attached_notes: Vec<String> = Vec::new();
         let mut sources: Vec<String> = Vec::new();
         let mut first_image: Option<(String, String, Vec<u8>, f64, f64)> = None;
+        // How many paperclipped files actually REACHED the model. A dropped
+        // one is not a source (it is not what the answer was built from), so
+        // this — not `attachments.len()` — is what the viewing hint below asks.
+        let mut carried = 0usize;
         for file_id in attachments {
             let (name, mime, bytes, text) = match db::get_file_full(conn, file_id) {
                 Ok(v) => v,
                 Err(_) => continue,
             };
             let mime = mime.unwrap_or_default();
+            // Every skipped attachment SAYS it was skipped. The composer counts
+            // what the user clipped ("Attached 6"); the turn carried four, and
+            // the model, told nothing, answered about six. A file still waiting
+            // on OCR or transcription went the same way — no pixels, no text,
+            // no note — and an answer that ignored the pinned evidence read
+            // exactly like one that had weighed it.
             if extraction::is_image(&mime) {
-                if images.len() < MAX_ATTACHED_IMAGES {
-                    if let Some(bytes) = bytes {
-                        let (prepared, w, h) = prepare_image(&bytes);
-                        if first_image.is_none() {
-                            first_image =
-                                Some((file_id.clone(), name.clone(), prepared.clone(), w, h));
-                        }
-                        images.push(base64::engine::general_purpose::STANDARD.encode(&prepared));
-                        attached_notes.push(format!("(Attached image: {name})"));
-                        sources.push(name);
-                    }
+                let Some(bytes) = bytes else {
+                    attached_notes.push(format!(
+                        "(Attached image: {name} — NOT sent: the room has no image data stored \
+                         for it. Say so rather than describing it.)"
+                    ));
+                    continue;
+                };
+                if images.len() >= MAX_ATTACHED_IMAGES {
+                    attached_notes.push(format!(
+                        "(Attached image: {name} — NOT sent: this turn carries at most \
+                         {MAX_ATTACHED_IMAGES} images. Say so rather than describing it.)"
+                    ));
+                    continue;
                 }
-            } else if let Some(text) = text {
+                let (prepared, w, h) = prepare_image(&bytes);
+                if first_image.is_none() {
+                    first_image = Some((file_id.clone(), name.clone(), prepared.clone(), w, h));
+                }
+                images.push(base64::engine::general_purpose::STANDARD.encode(&prepared));
+                attached_notes.push(format!("(Attached image: {name})"));
+                sources.push(name);
+                carried += 1;
+            } else if let Some(text) = text.filter(|t| !t.trim().is_empty()) {
                 attached_notes.push(format!("[attached file: {name}]\n{text}"));
                 sources.push(name);
+                carried += 1;
+            } else {
+                attached_notes.push(format!(
+                    "(Attached file: {name} — no readable text has been extracted from it yet \
+                     (a scan still to be read, a recording still to be transcribed), so its \
+                     content is NOT in this turn. Say so rather than guessing at it.)"
+                ));
             }
         }
 
@@ -998,15 +1065,11 @@ fn gather_context_and_save_question(
         }
 
         let mut user_content = String::new();
-        if !available_skills.is_empty() {
-            user_content.push_str(
-                "Available Agent Skills (specialized instructions). If one clearly matches the question, call read_skill before doing the work:\n",
-            );
-            for skill in &available_skills {
-                user_content.push_str(&format!("- {}: {}\n", skill.name, skill.description));
-            }
-            user_content.push('\n');
-        }
+        let advertised: Vec<(&str, &str)> = available_skills
+            .iter()
+            .map(|s| (s.name.as_str(), s.description.as_str()))
+            .collect();
+        user_content.push_str(&advertise_skills(&advertised));
         if let Some((skill, resources)) = &explicit_skill {
             let tree = if resources.is_empty() {
                 "(no bundled resources)".to_string()
@@ -1017,7 +1080,8 @@ fn gather_context_and_save_question(
                     .collect::<Vec<_>>()
                     .join("\n")
             };
-            let instructions = clamp_bytes(skill.instructions.clone(), 20_000);
+            let instructions =
+                clamp_bytes_marked(skill.instructions.clone(), 20_000, SKILL_BODY_TRUNCATED);
             user_content.push_str(&format!(
                 "Explicitly selected Agent Skill: /{}\n\
                  Follow this skill for the current request. The slash selection overrides automatic skill choice, but never the user's request or safety/privacy rules. Read listed resources with read_skill_resource when the instructions call for them.\n\
@@ -1071,7 +1135,11 @@ fn gather_context_and_save_question(
         // choice about what this question is about, and a hint that points
         // somewhere else would argue with the person who made it. There is also
         // no anaphora left to resolve — the attachments already answer "this".
-        if attachments.is_empty() {
+        //
+        // What was CARRIED, not what was clipped: a paperclip whose content
+        // never reached the model resolves nothing, and suppressing the hint
+        // for it left the turn with neither.
+        if carried == 0 {
             if let Some(open) = viewing.map(str::trim).filter(|v| !v.is_empty()) {
                 user_content.push_str(&format!(
                     "The user has \"{open}\" open in the workspace. If their question says \
@@ -1120,7 +1188,6 @@ fn gather_context_and_save_question(
             web_enabled,
             advisors_on,
             advisor_tools_on,
-            injected_rowids,
         })
 }
 
@@ -1220,7 +1287,6 @@ pub(crate) async fn stream_answer(
     advisors_on: bool,
     advisor_tools_on: bool,
     cancel: Arc<AtomicBool>,
-    _injected_rowids: &HashSet<i64>,
     // PRIV-1: "send real details this once" — the user confirmed sharing real
     // values for THIS turn only.
     privacy_bypass: bool,
@@ -1313,13 +1379,17 @@ pub(crate) async fn stream_answer(
             // running in the Sidebar. Retrying on that instruction starts the
             // work a second time. `background_work_live` reads the jobs table
             // rather than guessing, and the notice points at it.
-            SidecarOutcome::Done(text) if text.trim().is_empty() => Ok(if effects.wrote {
-                LOST_REPLY_AFTER_WRITE.to_string()
-            } else if background_work_live(state) {
-                LOST_REPLY_WITH_JOB.to_string()
-            } else {
-                LOST_REPLY_CLEAN.to_string()
-            }),
+            // An empty result AFTER Stop is what the user asked for, so calling it
+            // a reply lost before it reached the app — and asking for a retry —
+            // reports an app failure that did not happen. The other two facts hold
+            // either way: a Stop does not un-write a file, and it does not cancel
+            // a job already under way.
+            SidecarOutcome::Done(text) if text.trim().is_empty() => Ok(empty_reply_notice(
+                cancel.load(Ordering::SeqCst),
+                effects.wrote,
+                background_work_live(state),
+            )
+            .to_string()),
             SidecarOutcome::Done(text) => Ok(text),
             SidecarOutcome::Failed { text, error } => {
                 // A tool already committed a side-effect this turn (the write/
@@ -1373,6 +1443,38 @@ pub(crate) async fn stream_answer(
     }
 }
 
+/// The room a turn began in: which file, and which OPEN of it.
+///
+/// The path alone is not enough — the same room can be closed and reopened
+/// while an answer is in flight, and the chat ids of the previous session mean
+/// nothing to the new one. The epoch (bumped by every open/teardown) is what
+/// distinguishes them, and it is the pin the OCR, STT and video lanes already
+/// take for the same reason.
+#[derive(Clone)]
+pub(crate) struct RoomPin {
+    path: String,
+    epoch: u64,
+}
+
+impl RoomPin {
+    /// The open room, or `None` when there is none to pin to.
+    pub(crate) fn take(state: &State<'_, AppState>) -> Option<Self> {
+        let epoch = state.room_epoch();
+        let guard = state.room_guard();
+        guard.as_ref().map(|room| RoomPin {
+            path: room.path.clone(),
+            epoch,
+        })
+    }
+
+    /// Is the room open now — at `epoch`, from `path` — the same OPEN this pin
+    /// was taken from? Both halves are needed: the same file closed and
+    /// reopened is a different session, whose chat ids are not this turn's.
+    fn holds(&self, epoch: u64, path: &str) -> bool {
+        path == self.path && epoch == self.epoch
+    }
+}
+
 /// Phase 3 (locked): save the assistant reply. HLT-7: if the room was locked
 /// mid-answer it is already closed — return quietly with the (unsaved) content
 /// instead of surfacing "No room is open" to the UI.
@@ -1383,8 +1485,33 @@ pub(crate) fn persist_assistant_reply(
     sources: Vec<String>,
     effects_value: Option<serde_json::Value>,
 ) -> Result<Message, String> {
+    persist_assistant_reply_pinned(state, None, chat_id, content, sources, effects_value)
+}
+
+/// As [`persist_assistant_reply`], but the row is written ONLY if the room the
+/// turn started in is still the room that is open.
+///
+/// Without the pin, a call that blocked for longer than it took the user to
+/// open a second `.roomai` had its epilogue write this turn's assistant row —
+/// text, sources, effects — into the NEW room's encrypted database, keyed by a
+/// chat id that exists only in the old one. Content crossing the room boundary
+/// onto disk is the one thing this app must never do; a straggler that cannot
+/// be saved returns its message in memory, exactly as the closed-room branch
+/// below already does.
+pub(crate) fn persist_assistant_reply_pinned(
+    state: &State<'_, AppState>,
+    pin: Option<&RoomPin>,
+    chat_id: &str,
+    content: String,
+    sources: Vec<String>,
+    effects_value: Option<serde_json::Value>,
+) -> Result<Message, String> {
+    let epoch = state.room_epoch();
     let guard = state.room.lock().unwrap();
-    match guard.as_ref() {
+    let open = guard
+        .as_ref()
+        .filter(|room| pin.is_none_or(|p| p.holds(epoch, &room.path)));
+    match open {
         Some(room) => db::insert_message(
             &room.conn,
             chat_id,
@@ -2436,6 +2563,26 @@ pub(crate) fn tools_catalog(web_enabled: bool) -> serde_json::Value {
 /// abilities. A switch that leaves three inlets open is a false privacy claim.
 pub(crate) const DOWNLOAD_TOOL_NAMES: &[&str] = &["save_link", "download_url", "download_media"];
 
+/// PRIV-4: the refusal a URL-taking tool owes the model when the address itself
+/// carries a protected name, or `None` when it carries none.
+///
+/// The door is the URL LEAVING this Mac, not which tool is holding it: reading
+/// a page, saving one into the room and downloading a file all put the same
+/// string on the wire, and the exfiltration shape is what matters — a cloud
+/// model that saw "[Person A]" can restore the real name into
+/// `https://anywhere/?q=…`. Refusing rather than masking, because a placeholder
+/// in a path or query string only 404s. `outbound_url_hides`, not
+/// `mask_outbound_web`: a URL is ENCODED, so "?q=Ben%20Reich" (or "Ben+Reich")
+/// carries the real name past a redactor that reads only the raw string.
+pub(crate) fn outbound_url_refusal(url: &str) -> Option<String> {
+    let hidden = privacy::outbound_url_hides(url)?;
+    Some(format!(
+        "Not fetched: this URL carries {hidden} protected name(s) from this room's block list, \
+         and Cloud privacy is on, so it must not leave this Mac (Settings → Cloud privacy). \
+         Tell the user rather than retrying."
+    ))
+}
+
 /// BROWSE-2 (D17): the download/save tools. Web-gated like `fetch_page`, but
 /// served only to the engine tiers (`include_browse_tools` class in the room
 /// bridge) — downloading into the room is an ACTION, so a merely consulted
@@ -2979,22 +3126,20 @@ pub(crate) async fn exec_tool(
             let query_embedding = embed_question(query).await;
             let guard = state.room.lock().unwrap();
             let room = guard.as_ref().ok_or("No room is open.")?;
-            // CHG-16: skip chunks already injected into the prompt as context.
+            // CHG-16: chunks already injected into this run's prompt are
+            // excluded when the caller knows which they were. Every live
+            // caller reaches this over the room bridge, which does NOT know —
+            // so the exclusion set is empty here and the results may repeat the
+            // excerpts above. That is worth saying plainly rather than keeping
+            // a branch that promises an exclusion nothing performs.
             let (chunks, fallback) = retrieve_context_excluding(
                 &room.conn,
                 query,
                 query_embedding.as_deref(),
                 injected_rowids,
             )?;
-            if fallback {
+            if fallback || chunks.is_empty() {
                 return Ok("No matching content found.".into());
-            }
-            if chunks.is_empty() {
-                // Exclusion removed everything → the best matches are the
-                // excerpts already shown above.
-                return Ok("The best matches are already in the context excerpts above; \
-                           try different keywords for anything else."
-                    .into());
             }
             Ok(chunks
                 .iter()
@@ -3169,8 +3314,14 @@ pub(crate) async fn exec_tool(
                         "outcome": p.method.map(EditMethod::outcome).unwrap_or("exact"),
                         "n": p.count
                     }));
+                    // What is knowable from here, and no more. The file is
+                    // usually not open, and when it IS open with unsaved
+                    // changes the viewer deliberately does not reload — so
+                    // "the user sees the updated file" sent the answer on to
+                    // tell them to look at something that was not on screen.
                     let base = format!(
-                        "Replaced {} occurrence(s) in \"{}\". The user sees the updated file.",
+                        "Replaced {} occurrence(s) in \"{}\". Saved to the room — it is in \
+                         that file's History and can be undone.",
                         p.count, p.real_name
                     );
                     Ok(if p.method == Some(EditMethod::Fuzzy) {
@@ -3256,8 +3407,7 @@ pub(crate) async fn exec_tool(
             let name = args["name"].as_str().unwrap_or_default().to_string();
             let sheet = args["sheet"].as_str().map(str::to_string);
             // CHG-2: accept a batch of {cell, value} in one call so filling a
-            // column doesn't burn one inference round per cell. Fall back to the
-            // legacy single top-level cell/value for older prompts.
+            // column doesn't burn one inference round per cell.
             // `None` for a missing/`null` value. Only the CELL used to be
             // checked: an absent value stringified to the literal text "null",
             // was written into the sheet, and the turn reported success.
@@ -3283,13 +3433,6 @@ pub(crate) async fn exec_tool(
                         let value = value_of(&u["value"]).ok_or_else(|| missing_value(&cell))?;
                         updates.push((cell, value));
                     }
-                }
-            }
-            if updates.is_empty() {
-                let cell = args["cell"].as_str().unwrap_or_default().trim().to_uppercase();
-                if !cell.is_empty() {
-                    let value = value_of(&args["value"]).ok_or_else(|| missing_value(&cell))?;
-                    updates.push((cell, value));
                 }
             }
             if updates.is_empty() {
@@ -3549,12 +3692,8 @@ pub(crate) async fn exec_tool(
             // `outbound_url_hides`, not `mask_outbound_web`: a URL is ENCODED,
             // so "?q=Ben%20Reich" (or "Ben+Reich") carries the real name past a
             // redactor that only reads the raw string.
-            if let Some(hidden) = crate::commands::privacy::outbound_url_hides(url) {
-                return Ok(format!(
-                    "Not fetched: this URL carries {hidden} protected name(s) from this room's \
-                     block list, and Cloud privacy is on, so it must not leave this Mac \
-                     (Settings → Cloud privacy). Tell the user rather than retrying."
-                ));
+            if let Some(refusal) = outbound_url_refusal(url) {
+                return Ok(refusal);
             }
             // CHG-5/CHG-28: continue reading a long page from a char offset.
             let start = args["start"].as_u64().unwrap_or(0) as usize;
@@ -3596,6 +3735,12 @@ pub(crate) async fn exec_tool(
         // in the one ingestion funnel (D13).
         "save_link" => {
             let url = args["url"].as_str().unwrap_or_default().trim().to_string();
+            // PRIV-4: the door is the URL leaving this Mac, not which tool holds
+            // it — saving a page puts the same string on the wire that reading
+            // one does.
+            if let Some(refusal) = outbound_url_refusal(&url) {
+                return Ok(refusal);
+            }
             let enabled = {
                 let guard = state.room.lock().unwrap();
                 let room = guard.as_ref().ok_or("No room is open.")?;
@@ -3632,6 +3777,9 @@ pub(crate) async fn exec_tool(
         "download_url" => {
             use tauri::Manager;
             let url = args["url"].as_str().unwrap_or_default().trim().to_string();
+            if let Some(refusal) = outbound_url_refusal(&url) {
+                return Ok(refusal);
+            }
             let enabled = {
                 let guard = state.room.lock().unwrap();
                 let room = guard.as_ref().ok_or("No room is open.")?;
@@ -3668,6 +3816,9 @@ pub(crate) async fn exec_tool(
         }
         "download_media" => {
             let url = args["url"].as_str().unwrap_or_default().trim().to_string();
+            if let Some(refusal) = outbound_url_refusal(&url) {
+                return Ok(refusal);
+            }
             let enabled = {
                 let guard = state.room.lock().unwrap();
                 let room = guard.as_ref().ok_or("No room is open.")?;
@@ -3974,7 +4125,12 @@ pub(crate) async fn exec_tool(
                 // Only a run that CHANGED something counts as a write — a
                 // preview must not arm the undo affordance for edits it never
                 // made, and a plan that matched nothing must not either.
-                effects.wrote = !report.moved.is_empty()
+                //
+                // `|=`, never `=`: the flag belongs to the whole TURN, and a
+                // plan that matched nothing used to erase an earlier tool's
+                // real write — so a truthful "I created plan.md and tidied up"
+                // was handed the "no file was actually changed" correction.
+                effects.wrote |= !report.moved.is_empty()
                     || !report.renamed.is_empty()
                     || !report.folders_made.is_empty()
                     || !report.folders_removed.is_empty();
@@ -3991,7 +4147,9 @@ pub(crate) async fn exec_tool(
             let room = guard.as_ref().ok_or("No room is open.")?;
             let (report, misses) = super::organize::trash_named(&room.conn, &names);
             let _ = window.emit("room-files-changed", ());
-            effects.wrote = report.changed_anything();
+            // `|=` for the same reason `organize_files` uses it: a name that
+            // matched nothing must not un-say an earlier write in this turn.
+            effects.wrote |= report.changed_anything();
             let mut out = report.sentence("moved to the trash");
             if !misses.is_empty() {
                 out.push_str(&format!(
@@ -4319,7 +4477,7 @@ pub(crate) async fn exec_tool(
                 ))
                 .collect::<Vec<_>>()
                 .join("\n");
-            Ok(clamp_bytes(lines, 12_000))
+            Ok(clamp_bytes_marked(lines, 12_000, SKILL_LIST_TRUNCATED))
         }
         "read_skill" => {
             let key = args["skill"].as_str().unwrap_or_default();
@@ -4332,9 +4490,20 @@ pub(crate) async fn exec_tool(
             } else {
                 resources.iter().map(|r| format!("- {} ({})", r.path, r.kind)).collect::<Vec<_>>().join("\n")
             };
-            Ok(clamp_bytes(
-                format!("# Skill: {}\nStatus: {}\nDescription: {}\n\n{}\n\nBundled resources:\n{}", skill.name, if skill.enabled { "enabled" } else { "disabled draft" }, skill.description, skill.instructions, tree),
-                20_000,
+            // Clamp the PARTS, not the finished string. Clamping the whole cut
+            // a long skill off mid-sentence and took the resource list with it,
+            // so the model never learned that references/ or scripts/ existed
+            // and never called read_skill_resource or run_skill_script.
+            let instructions =
+                clamp_bytes_marked(skill.instructions, 16_000, SKILL_BODY_TRUNCATED);
+            let tree = clamp_bytes_marked(tree, 3_000, SKILL_RESOURCES_TRUNCATED);
+            Ok(format!(
+                "# Skill: {}\nStatus: {}\nDescription: {}\n\n{}\n\nBundled resources:\n{}",
+                skill.name,
+                if skill.enabled { "enabled" } else { "disabled draft" },
+                skill.description,
+                instructions,
+                tree
             ))
         }
         "read_skill_resource" => {
@@ -4710,6 +4879,50 @@ pub(crate) const LOST_REPLY_WITH_JOB: &str =
 /// The mid-run failure note's stable fragment (the rest carries the error text).
 pub(crate) const STOPPED_MID_RUN: &str = "hit an error and stopped mid-run";
 
+/// The stop notices' stable fragment. Every one of the three below carries it,
+/// which is how `is_failure_notice` recognises them.
+pub(crate) const STOPPED_NO_ANSWER: &str = "was stopped before it produced an answer";
+
+/// Stop pressed before any answer arrived, and nothing was written.
+pub(crate) const STOPPED_NO_ANSWER_CLEAN: &str =
+    "*(The agent was stopped before it produced an answer, and nothing was written.)*";
+
+/// Stopped with no answer, but a write ALREADY COMMITTED — the same fact
+/// `LOST_REPLY_AFTER_WRITE` exists to state, which a Stop does not undo.
+pub(crate) const STOPPED_NO_ANSWER_AFTER_WRITE: &str =
+    "*(The agent was stopped before it produced an answer. A change was already applied to \
+     this room before the stop; check the file and undo it if it was not what you wanted.)*";
+
+/// Stopped with no answer and no write, but durable background work in this
+/// room is STILL RUNNING. Stop cancels the turn, not a job that is already
+/// under way, so the Jobs-list warning stands here exactly as it does on the
+/// lost-reply path.
+pub(crate) const STOPPED_NO_ANSWER_WITH_JOB: &str =
+    "*(The agent was stopped before it produced an answer, and nothing was written. \
+     Background work in this room is still running: check the Jobs list before asking \
+     again, so you don't start the same job twice.)*";
+
+/// Which of the app's own notices stands in for an EMPTY reply.
+///
+/// `stopped` splits the table in two, and that split is the honesty: an empty
+/// result after Stop is what the user asked for, so reporting it as a reply
+/// LOST before it reached the app — and asking for a retry — describes an app
+/// failure that did not happen. Live QA: Stop pressed before the first token
+/// put "the reply was lost … Please try again" in the transcript.
+///
+/// The other two facts hold either way. A Stop does not un-write a file, and it
+/// does not cancel a background job that is already running.
+pub(crate) fn empty_reply_notice(stopped: bool, wrote: bool, job_live: bool) -> &'static str {
+    match (stopped, wrote, job_live) {
+        (true, true, _) => STOPPED_NO_ANSWER_AFTER_WRITE,
+        (true, false, true) => STOPPED_NO_ANSWER_WITH_JOB,
+        (true, false, false) => STOPPED_NO_ANSWER_CLEAN,
+        (false, true, _) => LOST_REPLY_AFTER_WRITE,
+        (false, false, true) => LOST_REPLY_WITH_JOB,
+        (false, false, false) => LOST_REPLY_CLEAN,
+    }
+}
+
 /// Is durable background work still live in the OPEN room? The jobs table is
 /// the deterministic ground truth behind `LOST_REPLY_WITH_JOB` — the same rows
 /// the Sidebar draws — so the notice can never describe a job the user cannot
@@ -4731,7 +4944,10 @@ pub(crate) fn is_failure_notice(text: &str) -> bool {
     let t = text.trim_start();
     t.starts_with("*(The agent ")
         && (t.contains("the reply was lost before it reached the app")
-            || t.contains(STOPPED_MID_RUN))
+            || t.contains(STOPPED_MID_RUN)
+            // A stop notice is the app's own prose too. Left out, an answered
+            // Stop would be filed as a real reply from the model.
+            || t.contains(STOPPED_NO_ANSWER))
 }
 
 /// Largest byte index <= `max` that is a char boundary. Stable-Rust stand-in
@@ -4756,6 +4972,36 @@ pub(crate) fn clamp_bytes(mut s: String, max: usize) -> String {
     }
     s
 }
+
+/// As [`clamp_bytes`], but a cut SAYS SO — `marker` is appended, and the total
+/// still fits `max`.
+///
+/// A tool result that stops mid-sentence with nothing to mark it does not read
+/// to a model as a truncation; it reads as a document that ends there. A skill
+/// whose SKILL.md ran past the cap was followed half-way with no idea there
+/// was a second half, and no reason to say so to the user.
+pub(crate) fn clamp_bytes_marked(s: String, max: usize, marker: &str) -> String {
+    if s.len() <= max {
+        return s;
+    }
+    let mut out = clamp_bytes(s, max.saturating_sub(marker.len()));
+    out.push_str(marker);
+    out
+}
+
+/// Said at the end of a skill body that was cut. Worded for the model that has
+/// to act on the half it got — and, in this app, tell the user which half.
+pub(crate) const SKILL_BODY_TRUNCATED: &str =
+    "\n\n… (instructions truncated — the full SKILL.md is longer than this tool can return. \
+     Work from what is above and say so if the rest was needed.)";
+
+/// The same for a skill LIST that did not fit.
+pub(crate) const SKILL_LIST_TRUNCATED: &str =
+    "\n… (list truncated — this room holds more skills than this tool can return.)";
+
+/// …and for a bundled-resource tree that did not fit.
+pub(crate) const SKILL_RESOURCES_TRUNCATED: &str =
+    "\n… (more bundled resources than this tool can list.)";
 
 /// Truncate a string to at most `max` CHARACTERS. The sibling of
 /// [`clamp_bytes`], for the caps that are stated in characters — a memory's
@@ -4826,6 +5072,29 @@ pub(crate) fn runs_on_this_mac(model: &str) -> bool {
 /// model? See the `mark_image` call site for the full story.
 pub(crate) fn image_grounding_blocked_by_privacy(vmodel: &str) -> bool {
     !runs_on_this_mac(vmodel) && privacy::active_policy().is_some()
+}
+
+/// Will the pixels a perception tool captures actually REACH the chat model?
+///
+/// Two answers, and `perceive_image` needs both. `engine_sees_images` is the
+/// engine's own (`chat_model_sees_images`); [`image_reaches_model`] is the
+/// room's privacy door, which strips every image out of a request bound off
+/// this Mac and only COUNTS what it removed rather than failing the call. With
+/// only the first answer, a capable cloud model in a door-on room was told "the
+/// image is attached to your context — look at it before answering" about
+/// pixels the door had already taken out, and answered about a picture it never
+/// received. Marked blind instead, the same tool has a LOCAL vision model
+/// describe the capture and only that text crosses — the guarantee the bridge's
+/// scope rules already rest on.
+///
+/// The capability answer is passed IN rather than asked for here: it needs the
+/// network, and this decision is worth testing without one. Same pairing
+/// `grounding_pick` makes one screen away.
+pub(crate) fn pixels_reach_chat_model(model: &str, engine_sees_images: bool) -> bool {
+    // Capability is necessary but not sufficient: the door removes the pixels
+    // from anything bound off this Mac and only counts what it took, so a
+    // capable cloud model in a door-on room is handed none.
+    engine_sees_images && (runs_on_this_mac(model) || privacy::active_policy().is_none())
 }
 
 /// ADD-25: hand a captured image (screenshot / video frame) to the model.
@@ -6511,6 +6780,130 @@ mod tests {
         assert!(LOST_REPLY_WITH_JOB.contains("nothing was written"));
     }
 
+    /// Pressing Stop before the first token used to be reported as the app's
+    /// own failure: "the reply was lost before it reached the app … Please try
+    /// again". The turn produced no text because the user said so, and blaming
+    /// the transport for it is the app fabricating a fault of its own.
+    #[test]
+    fn a_stop_before_the_first_token_is_reported_as_a_stop_not_a_lost_reply() {
+        let stopped = empty_reply_notice(true, false, false);
+        assert_eq!(stopped, STOPPED_NO_ANSWER_CLEAN);
+        assert!(!stopped.contains("was lost"), "{stopped}");
+        assert!(!stopped.contains("Please try again"), "{stopped}");
+
+        // A Stop does not un-write a file, and it does not stop a job that is
+        // already running — both facts survive into the stopped wording.
+        assert!(empty_reply_notice(true, true, false).contains("already applied"));
+        assert!(!empty_reply_notice(true, true, false).contains("nothing was written"));
+        assert!(empty_reply_notice(true, false, true).contains("Jobs list"));
+
+        // A turn that really did lose its reply is untouched by any of this.
+        assert_eq!(empty_reply_notice(false, false, false), LOST_REPLY_CLEAN);
+        assert_eq!(empty_reply_notice(false, true, false), LOST_REPLY_AFTER_WRITE);
+        assert_eq!(empty_reply_notice(false, false, true), LOST_REPLY_WITH_JOB);
+
+        // And each stop notice is one of OUR notices, so nothing downstream
+        // saves it as an answer or offers it as a memory.
+        for notice in [
+            STOPPED_NO_ANSWER_CLEAN,
+            STOPPED_NO_ANSWER_AFTER_WRITE,
+            STOPPED_NO_ANSWER_WITH_JOB,
+        ] {
+            assert!(notice.contains(STOPPED_NO_ANSWER), "{notice}");
+            assert!(is_failure_notice(notice), "{notice}");
+        }
+    }
+
+    /// The picker above is only worth anything if the arm that renders an empty
+    /// reply actually asks it — with the turn's real Stop flag.
+    #[test]
+    fn the_empty_reply_arm_asks_whether_the_user_pressed_stop() {
+        let src = include_str!("agent.rs");
+        let head = concat!("SidecarOutcome::Done(text) if text.trim()", ".is_empty()");
+        let arm = src.split_once(head).expect("the empty-reply arm moved — re-pin this").1;
+        let arm = &arm[..arm.find("SidecarOutcome::Failed").unwrap_or(arm.len())];
+        assert!(
+            arm.contains(concat!("empty_reply", "_notice(")),
+            "the empty-reply arm must pick its notice through empty_reply_notice"
+        );
+        assert!(
+            arm.contains("cancel.load("),
+            "…and it must read the turn's Stop flag, or every Stop reads as a lost reply"
+        );
+    }
+
+    /// PRIV-4: `fetch_page` refused a URL carrying a protected name; the three
+    /// tools that SAVE or DOWNLOAD one went straight to the network. The door
+    /// is the URL leaving the Mac, not which tool holds it.
+    #[test]
+    fn every_url_taking_tool_refuses_an_address_the_privacy_door_would_leak() {
+        let src = include_str!("agent.rs");
+        for tool in ["fetch_page", "save_link", "download_url", "download_media"] {
+            let head = format!("\"{tool}\" => {{");
+            let arm = src
+                .split_once(head.as_str())
+                .unwrap_or_else(|| panic!("the {tool} arm moved — re-pin this"))
+                .1;
+            // Up to the next arm of the same match, so one tool's guard cannot
+            // stand in for the next one's.
+            let arm = &arm[..arm.find("\n        \"").unwrap_or(arm.len())];
+            assert!(
+                arm.contains(concat!("outbound_url", "_refusal(")),
+                "{tool} reaches the network without the outbound-URL guard"
+            );
+        }
+    }
+
+    #[test]
+    fn the_outbound_url_refusal_names_the_count_and_the_setting() {
+        let _guard = privacy::policy_test_lock();
+        privacy::clear_policy();
+        assert_eq!(outbound_url_refusal("https://x.test/?q=Ben%20Reich"), None);
+
+        privacy::set_policy_for_test(true);
+        let refusal = outbound_url_refusal("https://x.test/?q=Ben+Reich")
+            .expect("a protected name in a URL must not leave");
+        assert!(refusal.contains('1'), "{refusal}");
+        assert!(refusal.contains("Cloud privacy"), "{refusal}");
+        // Ordinary browsing is untouched.
+        assert_eq!(outbound_url_refusal("https://x.test/weather?q=Haifa"), None);
+        privacy::clear_policy();
+    }
+
+    /// ADD-25 + PRIV: `perceive_image` says "the image is attached to your
+    /// context" whenever the turn marked the chat model vision-capable. The
+    /// privacy door strips every image out of a request bound off this Mac and
+    /// only COUNTS what it removed, so for a cloud model in a door-on room that
+    /// sentence was a promise about pixels the model never received.
+    #[test]
+    fn a_turn_claims_vision_only_when_the_pixels_can_actually_arrive() {
+        let _guard = privacy::policy_test_lock();
+        privacy::clear_policy();
+        // Door off: capability is the whole question, as it always was.
+        assert!(pixels_reach_chat_model("openrouter::vendor/sees", true));
+        assert!(!pixels_reach_chat_model("openrouter::vendor/blind", false));
+
+        privacy::set_policy_for_test(true);
+        // Door on: a model off this Mac is handed no pixels, however capable.
+        assert!(!pixels_reach_chat_model("openrouter::vendor/sees", true));
+        assert!(!pixels_reach_chat_model("vendor-vl:cloud", true));
+        // …while a model running here is untouched by the door.
+        assert!(pixels_reach_chat_model("some-local-model", true));
+        privacy::clear_policy();
+
+        // The turn's own answer has to come through it, or the claim above is
+        // true of nothing the user can reach.
+        let src = include_str!("agent.rs");
+        let line = src
+            .lines()
+            .find(|l| l.contains(concat!("effects.vision", "_chat = ")))
+            .expect("the vision_chat decision moved — re-pin this");
+        assert!(
+            line.contains(concat!("pixels_reach", "_chat_model(")),
+            "the turn must ask whether the pixels arrive, not only whether the engine can see: {line}"
+        );
+    }
+
     /// The frontend recovery strip (`markup.ts` `lostReplyNotice`) matches on
     /// these exact fragments to decide when to offer Try again — it cannot
     /// import a Rust constant, so this is the contract between the two.
@@ -6594,6 +6987,160 @@ mod tests {
     fn a_start_past_the_end_of_a_page_does_not_panic() {
         let out = fetch_page_window("T", "https://e.com", "short", 9_000);
         assert!(!out.contains("call fetch_page"), "{out}");
+    }
+
+
+    /// A skill body that ran past the cap was cut mid-sentence with nothing to
+    /// mark it, and the "Bundled resources:" tree — which was INSIDE the same
+    /// clamp — vanished with it, so the model never learned that references/
+    /// or scripts/ existed and never called read_skill_resource.
+    #[test]
+    fn a_clamped_skill_body_says_it_was_clamped_and_keeps_the_resource_list() {
+        // Nothing to cut: byte-identical, no marker.
+        assert_eq!(clamp_bytes_marked("short".to_string(), 20, "…more"), "short");
+        assert_eq!(clamp_bytes_marked(String::new(), 0, "…more"), "");
+        // One byte over is a cut, and a cut says so — within the budget.
+        let cut = clamp_bytes_marked("abcdef".to_string(), 5, "!");
+        assert!(cut.ends_with('!'), "{cut}");
+        assert!(cut.len() <= 5, "{}", cut.len());
+        // Multibyte text is never split down the middle of a character, and
+        // what survives is the START of the skill, not the marker alone.
+        let heb = clamp_bytes_marked("שלום עולם".repeat(20), 300, SKILL_BODY_TRUNCATED);
+        assert!(heb.ends_with(SKILL_BODY_TRUNCATED), "{heb}");
+        assert!(heb.starts_with("שלום"), "{heb}");
+        assert!(heb.len() <= 300, "{}", heb.len());
+
+        // …and the arm that serves a skill clamps the BODY, not the whole
+        // reply, so the tree below it survives however long the body was.
+        let src = include_str!("agent.rs");
+        let arm = src
+            .split_once(concat!("\"read_skill\"", " => {"))
+            .expect("the read_skill arm moved — re-pin this")
+            .1;
+        let arm = &arm[..arm.find("\n        \"").unwrap_or(arm.len())];
+        assert!(
+            arm.contains(concat!("clamp_bytes", "_marked(skill.instructions")),
+            "the skill body must be clamped on its own, with a marker"
+        );
+        // …and the finished reply is NOT clamped again, because clamping it as
+        // a whole is exactly what took the resource tree away with the body.
+        assert!(arm.contains("Bundled resources:"), "the tree must still be served");
+        assert!(
+            !arm.contains(concat!("Ok(clamp", "_bytes(")),
+            "a clamp around the finished string cuts the tree off the end of it"
+        );
+    }
+
+    /// The per-turn advert is prepended to EVERY question, and the skill editor
+    /// accepts a 2,000-character description — forty of them spent ~80 KB of
+    /// each turn advertising themselves, out of the same window the retrieved
+    /// file excerpts have to fit in.
+    #[test]
+    fn the_per_turn_skill_advert_is_bounded_in_count_and_in_length() {
+        assert_eq!(advertise_skills(&[]), "", "no skills, no preamble");
+
+        let verbose = "x".repeat(2_000);
+        let one = advertise_skills(&[("planner", verbose.as_str())]);
+        assert!(one.contains("- planner: "), "{one}");
+        assert!(one.contains('…'), "a cut description has to show it was cut");
+        assert!(one.len() < 500, "one verbose skill still costs {} bytes", one.len());
+
+        let many: Vec<(&str, &str)> = (0..40).map(|_| ("s", "d")).collect();
+        let all = advertise_skills(&many);
+        assert_eq!(all.matches("- s: d\n").count(), MAX_ADVERTISED_SKILLS);
+        assert!(
+            all.contains(&format!("{} more enabled skills", 40 - MAX_ADVERTISED_SKILLS)),
+            "the model must be told the list was cut: {all}"
+        );
+        // The boundary: exactly the cap is a complete list, and says nothing.
+        let exact: Vec<(&str, &str)> = (0..MAX_ADVERTISED_SKILLS).map(|_| ("s", "d")).collect();
+        assert!(!advertise_skills(&exact).contains("more enabled skills"));
+    }
+
+    /// A turn whose model call blocked while the user opened a SECOND room had
+    /// its epilogue insert the assistant row into the new room's database,
+    /// keyed by the old room's chat id — content crossing the room boundary
+    /// onto disk.
+    #[test]
+    fn a_reply_is_only_saved_into_the_room_the_turn_began_in() {
+        let pin = RoomPin { path: "/Users/x/A.roomai".into(), epoch: 7 };
+        assert!(pin.holds(7, "/Users/x/A.roomai"), "the ordinary turn still saves");
+        assert!(!pin.holds(7, "/Users/x/B.roomai"), "a different room must refuse");
+        assert!(
+            !pin.holds(8, "/Users/x/A.roomai"),
+            "the same file reopened is a different session, with different chat ids",
+        );
+
+        // And the turn actually takes the pin and hands it to both of its save
+        // sites — an unpinned save is the bug with a struct beside it.
+        let src = include_str!("agent.rs");
+        let ask = src
+            .split_once(concat!("pub async fn ", "ask("))
+            .expect("the ask command moved — re-pin this")
+            .1;
+        let ask = &ask[..ask.find("\n/// Everything Phase 1").unwrap_or(ask.len())];
+        assert!(ask.contains(concat!("RoomPin::", "take(&state)")), "the turn takes no pin");
+        assert_eq!(
+            ask.matches(concat!("persist_assistant_reply", "_pinned(")).count(),
+            2,
+            "every save in `ask` goes through the pinned path",
+        );
+        assert!(ask.contains("pin.as_ref()"), "…carrying this turn's own pin");
+    }
+
+    /// `organize_files` and `trash_files` ASSIGNED the turn's write flag, so a
+    /// no-op tidy after a real write erased it and the honest answer above it
+    /// was handed "(Correction: no file was actually changed this turn…)".
+    #[test]
+    fn a_no_op_tidy_cannot_un_say_an_earlier_write_in_the_same_turn() {
+        let src = include_str!("agent.rs");
+        for tool in ["organize_files", "trash_files"] {
+            let arm = src
+                .split_once(format!("\"{tool}\" => {{").as_str())
+                .unwrap_or_else(|| panic!("the {tool} arm moved — re-pin this"))
+                .1;
+            let arm = &arm[..arm.find("\n        \"").unwrap_or(arm.len())];
+            assert!(
+                arm.contains(concat!("effects.wrote ", "|= ")),
+                "{tool} must not overwrite the turn's write flag"
+            );
+        }
+    }
+
+    /// `set_cells` carried a documented fallback for a legacy `{name, cell,
+    /// value}` call. The central required-arg guard rejects that shape before
+    /// the arm runs, so the fallback could not serve the one shape it existed
+    /// for — this is what makes deleting it safe, and would fail if `updates`
+    /// ever stopped being required.
+    #[test]
+    fn the_legacy_single_cell_shape_never_reaches_the_set_cells_arm() {
+        let legacy = serde_json::json!({"name": "budget.csv", "cell": "B2", "value": "120"});
+        let err = missing_required_arg("set_cells", &legacy)
+            .expect("a call with no `updates` must be refused centrally");
+        assert!(err.starts_with("updates is required"), "{err}");
+        // The batch shape the schema documents is untouched.
+        assert!(missing_required_arg(
+            "set_cells",
+            &serde_json::json!({"name": "b.csv", "updates": [{"cell": "B2", "value": "1"}]})
+        )
+        .is_none());
+    }
+
+    /// The edit tools cannot see the workspace: the file is usually not open,
+    /// and when it IS open with unsaved changes the viewer deliberately does
+    /// not reload. Asserting the user is looking at the change sent the answer
+    /// on to say so, with nothing on screen.
+    #[test]
+    fn a_finished_edit_claims_only_what_the_backend_can_know() {
+        let src = include_str!("agent.rs");
+        assert!(
+            !src.contains(concat!("The user sees the ", "updated file")),
+            "the edit_file result must not claim visibility it cannot observe"
+        );
+        assert!(
+            src.contains(concat!("Saved to the room ", "— it is in")),
+            "…and must still say where the change went, and how to undo it"
+        );
     }
 
     /// The window is measured in CHARS, so a Hebrew page must not be sliced

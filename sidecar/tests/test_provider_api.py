@@ -754,3 +754,77 @@ def test_the_skeleton_names_shapes_without_leaking_content() -> None:
     )
     assert skeleton == "system assistant[calls:x] tool[for:x]"
     assert "SECRET" not in skeleton
+
+
+@pytest.mark.asyncio
+async def test_a_one_shot_call_is_cut_to_the_providers_window(monkeypatch) -> None:
+    """A handoff summary on a small-window room reached the provider whole.
+
+    The local twin cuts every one of these calls (`chat.ChatModel.generate` →
+    `fit_to_window`) and says where it cut; the gateway sent them unbounded, so
+    a long conversation came back as a bare provider 400.
+    """
+    sent: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.update(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "ok"}}]},
+            headers={"content-type": "application/json"},
+        )
+
+    real_client = httpx.AsyncClient
+    transport = httpx.MockTransport(handler)
+    monkeypatch.setattr(
+        provider_api.httpx,
+        "AsyncClient",
+        lambda **kwargs: real_client(transport=transport, **kwargs),
+    )
+    small = config()
+    small.context_window = 8_000
+    model = provider_api.OpenAICompatibleChatModel("openrouter::vendor/model", small)
+    transcript = "the tide turns at four. " * 40_000  # ~920 KB, far past 8k tokens
+    answer = await model.generate(
+        [
+            {"role": "system", "content": "Summarise the handover."},
+            {"role": "user", "content": transcript},
+        ]
+    )
+
+    assert answer == "ok"
+    posted = sum(len(str(m.get("content", ""))) for m in sent["messages"])
+    # An 8k window is ~16 KB of text at the cloud spend fraction. The bound is
+    # generous rather than exact — the point is that what went out is of that
+    # ORDER, not that 23 bytes of system prompt came off a 920 KB turn.
+    assert posted < 40_000, f"the turn went out at {posted} bytes"
+    # The instruction survives the cut it exists to protect.
+    assert sent["messages"][0]["content"] == "Summarise the handover."
+    # And the cut says where it cut, rather than handing the model a transcript
+    # that simply stops.
+    assert "cut here to fit this model's context" in sent["messages"][1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_a_one_shot_call_that_already_fits_is_sent_untouched(monkeypatch) -> None:
+    posted: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        posted.update(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "ok"}}]},
+            headers={"content-type": "application/json"},
+        )
+
+    real_client = httpx.AsyncClient
+    transport = httpx.MockTransport(handler)
+    monkeypatch.setattr(
+        provider_api.httpx,
+        "AsyncClient",
+        lambda **kwargs: real_client(transport=transport, **kwargs),
+    )
+    model = provider_api.OpenAICompatibleChatModel("openrouter::vendor/model", config())
+    await model.generate([{"role": "user", "content": "who signed the lease?"}])
+
+    assert posted["messages"] == [{"role": "user", "content": "who signed the lease?"}]

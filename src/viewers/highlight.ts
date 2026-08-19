@@ -204,38 +204,74 @@ const HIGHLIGHT_NAME = "pr-annotation";
 let highlightGen = 0;
 const MAX_HIGHLIGHT_RETRY_FRAMES = 6;
 
-/** Concatenate the text nodes under `root` into one string with a
- * per-character map back to {node, offset}, so a match found on the joined
- * text can be resolved to a DOM Range even when it spans several nodes. */
-function buildDomSource(root: HTMLElement): {
-  text: string;
-  map: { node: Text; offset: number }[];
-} {
+/** One text node's placement in the joined text: it covers
+ * [start, start + node.data.length) of it. */
+interface TextSpan {
+  node: Text;
+  start: number;
+}
+
+/** Concatenate the text nodes under `root` into one string, recording one
+ * span PER NODE (not per character — a 9 MB document would otherwise cost a
+ * million objects on every retry frame). `resolveOffset` maps a match back
+ * to {node, offset}, so a match may still span several nodes. */
+function buildDomSource(root: HTMLElement): { text: string; spans: TextSpan[] } {
   const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
-  let text = "";
-  const map: { node: Text; offset: number }[] = [];
+  const parts: string[] = [];
+  const spans: TextSpan[] = [];
+  let at = 0;
   for (
     let node = walker.nextNode() as Text | null;
     node;
     node = walker.nextNode() as Text | null
   ) {
     const s = node.data;
-    for (let i = 0; i < s.length; i++) {
-      text += s[i];
-      map.push({ node, offset: i });
-    }
+    if (!s) continue; // empty node: covers nothing, would break the search
+    spans.push({ node, start: at });
+    parts.push(s);
+    at += s.length;
   }
-  return { text, map };
+  return { text: parts.join(""), spans };
+}
+
+/** Character offset into the joined text -> the text node holding it.
+ * Binary search for the last span that starts at or before `at`. */
+function resolveOffset(
+  spans: TextSpan[],
+  at: number,
+): { node: Text; offset: number } | null {
+  if (at < 0 || spans.length === 0) return null;
+  let lo = 0;
+  let hi = spans.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (spans[mid].start <= at) lo = mid;
+    else hi = mid - 1;
+  }
+  const span = spans[lo];
+  const offset = at - span.start;
+  return offset < span.node.data.length ? { node: span.node, offset } : null;
 }
 
 /** Find `quote` across the text nodes under `root` as a DOM Range,
- * tolerant of whitespace/case/soft-hyphen/line-break differences. */
-function findQuoteRange(root: HTMLElement, quote: string): Range | null {
-  const { text, map } = buildDomSource(root);
+ * tolerant of whitespace/case/soft-hyphen/line-break differences.
+ * `seen`, when passed, carries the joined text of the previous attempt: a
+ * retry frame over a DOM that hasn't changed yet cannot find anything the
+ * last frame missed, so it skips the normalize-and-search. */
+function findQuoteRange(
+  root: HTMLElement,
+  quote: string,
+  seen?: { text: string | null },
+): Range | null {
+  const { text, spans } = buildDomSource(root);
+  if (seen) {
+    if (text === seen.text) return null;
+    seen.text = text;
+  }
   const hit = locateQuote(text, quote);
   if (!hit) return null;
-  const start = map[hit.start];
-  const end = map[hit.end];
+  const start = resolveOffset(spans, hit.start);
+  const end = resolveOffset(spans, hit.end);
   if (!start || !end) return null;
   const range = document.createRange();
   range.setStart(start.node, start.offset);
@@ -290,7 +326,8 @@ function paintQuoteRange(range: Range): void {
  */
 export function applyQuoteHighlight(root: HTMLElement, quote: string): boolean {
   const gen = ++highlightGen;
-  const range = findQuoteRange(root, quote);
+  const seen: { text: string | null } = { text: null };
+  const range = findQuoteRange(root, quote, seen);
   if (range) {
     paintQuoteRange(range);
     return true;
@@ -298,7 +335,7 @@ export function applyQuoteHighlight(root: HTMLElement, quote: string): boolean {
   let frames = 0;
   const retry = () => {
     if (gen !== highlightGen || !root.isConnected) return;
-    const r = findQuoteRange(root, quote);
+    const r = findQuoteRange(root, quote, seen);
     if (r) {
       if (gen === highlightGen) paintQuoteRange(r);
       return;

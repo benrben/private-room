@@ -467,3 +467,85 @@ async def test_pull_error_becomes_a_final_line(fake_client: type[FakeAsyncClient
         resp = await c.post("/pull", json={"model": "m", "base_url": "http://h:1"})
     last = json.loads(resp.text.strip().split("\n")[-1])
     assert last["code"] == "OLLAMA_DOWN"
+
+
+# --- which seam actually failed ---------------------------------------------
+
+
+class DeadProviderChat:
+    """An OpenAI-compatible provider that cannot be reached at all."""
+
+    def __init__(self, model: str, provider: Any, temperature: float | None = None) -> None:
+        self.provider = provider
+
+    async def generate(self, messages: Any, format: Any = None, images: Any = None) -> str:
+        raise httpx.ConnectError("All connection attempts failed")
+
+    async def generate_stream(self, messages: Any, format: Any = None, images: Any = None) -> Any:
+        raise httpx.ReadTimeout("timed out")
+        yield ""  # pragma: no cover - makes this an async generator
+
+
+def _openrouter() -> SimpleNamespace:
+    return SimpleNamespace(
+        base_url="https://openrouter.ai/api/v1",
+        model="anthropic/claude-sonnet-4",
+        api_key="sk-or-test",
+        supports_tools=True,
+    )
+
+
+async def test_provider_transport_failure_is_not_blamed_on_ollama(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A room whose engine is OpenRouter never touches Ollama. Reporting a dead
+    # network as OLLAMA_DOWN made the UI say "The local AI isn't running." and
+    # offer to start a daemon the room does not use.
+    monkeypatch.setattr(llm, "OpenAICompatibleChatModel", DeadProviderChat)
+    with pytest.raises(llm.LlmError) as caught:
+        await llm.generate(
+            "openrouter/anthropic/claude-sonnet-4",
+            [{"role": "user", "content": "hi"}],
+            "http://127.0.0.1:11434",
+            provider=_openrouter(),
+        )
+    assert caught.value.code == "ENGINE_ERROR"
+    assert "openrouter.ai" in caught.value.message
+    assert "All connection attempts failed" in caught.value.message
+
+
+async def test_provider_stream_transport_failure_is_not_blamed_on_ollama(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(llm, "OpenAICompatibleChatModel", DeadProviderChat)
+    with pytest.raises(llm.LlmError) as caught:
+        async for _ in llm.generate_stream(
+            "openrouter/anthropic/claude-sonnet-4",
+            [{"role": "user", "content": "hi"}],
+            "http://127.0.0.1:11434",
+            provider=_openrouter(),
+        ):
+            pass
+    assert caught.value.code == "ENGINE_ERROR"
+    assert "openrouter.ai" in caught.value.message
+
+
+async def test_local_transport_failure_still_says_ollama_down(
+    fake_client: type[FakeAsyncClient],
+) -> None:
+    # The sentinel keeps its meaning for calls that really did target the
+    # loopback daemon — jobs.rs / summarize.rs branch on it.
+    fake_client.script["chat"] = httpx.ConnectError("refused")
+    with pytest.raises(llm.LlmError) as caught:
+        await llm.generate("m", [{"role": "user", "content": "hi"}], "http://127.0.0.1:11434")
+    assert caught.value.code == "OLLAMA_DOWN"
+
+
+def test_provider_host_falls_back_when_the_base_url_is_unusable() -> None:
+    # A provider row with no base_url must not turn a transport failure into a
+    # message that names nothing — and must still not say OLLAMA_DOWN.
+    err = llm._classify(httpx.ConnectError(""), provider_host=None)
+    assert err.code == "OLLAMA_DOWN"
+    err = llm._classify(httpx.ConnectError(""), provider_host="openrouter.ai")
+    assert err.code == "ENGINE_ERROR"
+    assert err.message.strip() and "openrouter.ai" in err.message

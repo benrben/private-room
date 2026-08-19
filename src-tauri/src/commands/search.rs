@@ -1,5 +1,36 @@
 use super::*;
 
+/// How many FILES the overlay's Files group may list from content hits.
+const FILE_CONTENT_HITS: usize = 15;
+
+/// The file-CONTENT expression for a search the user typed, requiring EVERY
+/// term — the rule the other three queries already follow.
+///
+/// [`fts_match_expr`] OR-joins its terms, which is right where it came from:
+/// retrieval feeds a question to a model and wants recall. In a result list a
+/// person reads it meant one query had two meanings at once — "deposit refund"
+/// listed every document mentioning only deposits, next to a Messages group
+/// restricted (by `like_all_clause`) to rows containing both words. Quoting
+/// stays with `fts_match_expr` so a term with punctuation, or an FTS keyword
+/// like "near", is escaped exactly once and in one place.
+///
+/// What "every term" means here is the FTS row, which for file content is ONE
+/// ~1,200-character chunk — not the whole document. So a long file that says
+/// "deposit" on page 2 and "refund" on page 30 is not a content hit for
+/// "deposit refund", the same way a chat message is only a hit when one message
+/// holds both words. Say so rather than let the AND read as document-wide.
+fn fts_match_all<'a>(terms: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    let quoted: Vec<String> = terms
+        .into_iter()
+        .filter_map(|t| fts_match_expr(std::iter::once(t)))
+        .collect();
+    if quoted.is_empty() {
+        None
+    } else {
+        Some(quoted.join(" AND "))
+    }
+}
+
 /// ADD-6: search the user's own room across file names + content, chat
 /// messages, and memories. File content rides the FTS5 index (HLT-3); messages
 /// and memories use LIKE. Every hit carries a short snippet for the overlay.
@@ -21,10 +52,18 @@ pub fn search_all(state: State<'_, AppState>, query: String) -> Result<SearchRes
     // Files: content hits (FTS) first, then name-only matches not already shown.
     let mut files: Vec<FileHit> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    if let Some(expr) = fts_match_expr(question_terms(trimmed).iter().map(String::as_str))
-        .or_else(|| fts_match_expr(std::iter::once(needle.as_str())))
+    if let Some(expr) = fts_match_all(question_terms(trimmed).iter().map(String::as_str))
+        .or_else(|| fts_match_all(std::iter::once(needle.as_str())))
     {
-        for (id, name, chunk) in db::files_content_fts(conn, &expr, 15)? {
+        // `files_content_fts` limits CHUNKS, and one long document can own all
+        // of the best-ranked ones — a 15-chunk fetch then listed a single file
+        // and dropped every other document that matched, unreachably. Over-fetch
+        // and stop at the first N distinct files instead (the shape
+        // `db::fts_file_matches` already uses for the room map).
+        for (id, name, chunk) in db::files_content_fts(conn, &expr, FILE_CONTENT_HITS * 20)? {
+            if files.len() >= FILE_CONTENT_HITS {
+                break;
+            }
             if seen.insert(id.clone()) {
                 files.push(FileHit {
                     id,
@@ -71,6 +110,36 @@ pub fn search_all(state: State<'_, AppState>, query: String) -> Result<SearchRes
         messages,
         memories,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_file_content_search_requires_every_word_the_user_typed() {
+        // The Files group used to OR its terms while names, messages and
+        // memories all required ALL of them: one query, two meanings, side by
+        // side in one result list.
+        assert_eq!(
+            fts_match_all(["deposit", "refund"]).as_deref(),
+            Some("\"deposit\" AND \"refund\""),
+        );
+        // A single term is that term — including the whole-phrase fallback the
+        // caller uses when every word was a stopword.
+        assert_eq!(fts_match_all(["rent"]).as_deref(), Some("\"rent\""));
+        assert_eq!(
+            fts_match_all(["what about rent"]).as_deref(),
+            Some("\"what about rent\""),
+        );
+        // Terms that quote away to nothing are dropped, not AND-ed in as an
+        // empty phrase that no row can contain.
+        assert_eq!(fts_match_all(["", "rent"]).as_deref(), Some("\"rent\""));
+        // Nothing usable stays None, so the caller skips the content query
+        // rather than running a MATCH with no expression in it.
+        assert_eq!(fts_match_all(std::iter::empty::<&str>()), None);
+        assert_eq!(fts_match_all([""]), None);
+    }
 }
 
 // ---------------------------------------------------------------- settings

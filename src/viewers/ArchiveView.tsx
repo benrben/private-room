@@ -107,20 +107,30 @@ export default function ArchiveView({
     let alive = true;
     setError("");
     setEntries(null);
-    // fflate's async unzip runs off the main thread, so a large archive
-    // doesn't freeze the window while its directory is read.
-    unzip(bytes, (err, files) => {
-      if (!alive) return;
-      if (err) {
-        setError(`This archive could not be read: ${err.message}`);
-        return;
-      }
-      setEntries(
-        Object.entries(files)
-          .filter(([path]) => !path.endsWith("/"))
-          .map(([path, data]) => ({ path, size: data.length })),
-      );
-    });
+    // The filter runs once per central-directory record and reports the name
+    // and the unpacked size before anything is inflated. Returning false for
+    // every entry means a multi-gigabyte archive is listed without a single
+    // byte of it ever being decompressed into this renderer.
+    const listed: Entry[] = [];
+    unzip(
+      bytes,
+      {
+        filter: (f) => {
+          if (!f.name.endsWith("/")) {
+            listed.push({ path: f.name, size: f.originalSize });
+          }
+          return false;
+        },
+      },
+      (err) => {
+        if (!alive) return;
+        if (err) {
+          setError(`This archive could not be read: ${err.message}`);
+          return;
+        }
+        setEntries(listed);
+      },
+    );
     return () => {
       alive = false;
     };

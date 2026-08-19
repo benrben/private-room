@@ -23,7 +23,6 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 /// Default script timeout (seconds) — the first `uv` run resolves and downloads
@@ -355,49 +354,96 @@ fn home() -> String {
     std::env::var("HOME").unwrap_or_default()
 }
 
+/// One binary's probe result, cached against the runtime PATH prefix it was
+/// probed under.
+///
+/// A plain `OnceLock` cached the FIRST answer for the life of the process, and
+/// the candidate lists knew nothing about the runtimes the app downloads itself
+/// — so a `uv` fetched for an MCP connector (`runtimes::path_prefix`) was
+/// invisible here, and a script with dependencies was refused with "install uv
+/// (`brew install uv`)" while uv sat in the app's own data folder. Keying the
+/// cache on the published prefix means a mid-session download is picked up on
+/// the next run, without re-running the `zsh -ilc` probe on every call.
+type BinCache = std::sync::RwLock<Option<(String, Option<String>)>>;
+
+fn cached_bin(
+    cell: &'static BinCache,
+    candidates: impl FnOnce(&str) -> Vec<String>,
+    login_probe: &str,
+) -> Option<String> {
+    let prefix = crate::commands::cached_path_prefix();
+    if let Ok(seen) = cell.read() {
+        if let Some((at, found)) = seen.as_ref() {
+            if *at == prefix {
+                return found.clone();
+            }
+        }
+    }
+    let found = probe_bin(&candidates(&prefix), login_probe);
+    if let Ok(mut slot) = cell.write() {
+        *slot = Some((prefix, found.clone()));
+    }
+    found
+}
+
+/// `<dir>/<leaf>` for every directory in the app's published runtime prefix —
+/// the copies the app downloaded, ahead of anything on the system.
+fn provisioned_first(prefix: &str, leaf: &str, system: &[&str]) -> Vec<String> {
+    prefix
+        .split(':')
+        .filter(|d| !d.is_empty())
+        .map(|d| format!("{d}/{leaf}"))
+        .chain(system.iter().map(|s| s.to_string()))
+        .collect()
+}
+
 fn uv_bin() -> Option<String> {
-    static BIN: OnceLock<Option<String>> = OnceLock::new();
-    BIN.get_or_init(|| {
-        probe_bin(
-            &[
-                format!("{}/.local/bin/uv", home()),
-                "/opt/homebrew/bin/uv".into(),
-                "/usr/local/bin/uv".into(),
-            ],
-            "command -v uv",
-        )
-    })
-    .clone()
+    static BIN: BinCache = BinCache::new(None);
+    cached_bin(
+        &BIN,
+        |prefix| {
+            let mut c = provisioned_first(prefix, "uv", &[]);
+            c.push(format!("{}/.local/bin/uv", home()));
+            c.push("/opt/homebrew/bin/uv".into());
+            c.push("/usr/local/bin/uv".into());
+            c
+        },
+        "command -v uv",
+    )
 }
 
 fn python3_bin() -> Option<String> {
-    static BIN: OnceLock<Option<String>> = OnceLock::new();
-    BIN.get_or_init(|| {
-        probe_bin(
-            &[
+    static BIN: BinCache = BinCache::new(None);
+    cached_bin(
+        &BIN,
+        |_| {
+            vec![
                 "/usr/bin/python3".into(),
                 "/opt/homebrew/bin/python3".into(),
                 "/usr/local/bin/python3".into(),
-            ],
-            "command -v python3",
-        )
-    })
-    .clone()
+            ]
+        },
+        "command -v python3",
+    )
 }
 
 fn node_bin() -> Option<String> {
-    static BIN: OnceLock<Option<String>> = OnceLock::new();
-    BIN.get_or_init(|| {
-        probe_bin(
-            &[
-                "/opt/homebrew/bin/node".into(),
-                "/usr/local/bin/node".into(),
-                "/usr/bin/node".into(),
-            ],
-            "command -v node",
-        )
-    })
-    .clone()
+    static BIN: BinCache = BinCache::new(None);
+    cached_bin(
+        &BIN,
+        |prefix| {
+            provisioned_first(
+                prefix,
+                "node",
+                &[
+                    "/opt/homebrew/bin/node",
+                    "/usr/local/bin/node",
+                    "/usr/bin/node",
+                ],
+            )
+        },
+        "command -v node",
+    )
 }
 
 /// Resolve the runtime for a script, per `interpreter_policy` + the probes.
@@ -668,8 +714,8 @@ pub async fn execute_script_in_workspace(
 
     // Drain stdout/stderr on blocking threads into 32 KB ring tails (the
     // sidecar_lifecycle BufReader-on-a-thread pattern).
-    let out_buf = Arc::new(Mutex::new(Vec::<u8>::new()));
-    let err_buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let out_buf = Arc::new(Mutex::new(RingTail::default()));
+    let err_buf = Arc::new(Mutex::new(RingTail::default()));
     let mut readers: Vec<std::thread::JoinHandle<()>> = Vec::new();
     if let Some(o) = child.stdout.take() {
         readers.push(spawn_ring_reader(o, out_buf.clone()));
@@ -690,7 +736,11 @@ pub async fn execute_script_in_workspace(
         }
         if start.elapsed() > timeout {
             terminate_group(&mut child, pgid).await;
-            return Err(format!("This script timed out after {timeout_secs}s."));
+            return Err(with_printed_output(
+                format!("This script timed out after {timeout_secs}s."),
+                &out_buf,
+                &err_buf,
+            ));
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     };
@@ -737,9 +787,20 @@ fn kill_group(pgid: u32, signal: &str) {
         .status();
 }
 
+/// The last [`RING_BYTES`] of a stream, plus how many bytes fell out of the
+/// FRONT of it. Without the counter a chatty script's output was silently cut at
+/// the beginning and then labelled "(output truncated)" at the end, so the
+/// assistant — told to quote the output as the answer — could not tell that the
+/// figure it was looking for had been dropped.
+#[derive(Default)]
+struct RingTail {
+    bytes: Vec<u8>,
+    dropped: usize,
+}
+
 fn spawn_ring_reader<Rd: Read + Send + 'static>(
     mut rd: Rd,
-    buf: Arc<Mutex<Vec<u8>>>,
+    buf: Arc<Mutex<RingTail>>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut chunk = [0u8; 8192];
@@ -748,10 +809,11 @@ fn spawn_ring_reader<Rd: Read + Send + 'static>(
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     if let Ok(mut b) = buf.lock() {
-                        b.extend_from_slice(&chunk[..n]);
-                        if b.len() > RING_BYTES {
-                            let drop = b.len() - RING_BYTES;
-                            b.drain(0..drop);
+                        b.bytes.extend_from_slice(&chunk[..n]);
+                        if b.bytes.len() > RING_BYTES {
+                            let drop = b.bytes.len() - RING_BYTES;
+                            b.bytes.drain(0..drop);
+                            b.dropped += drop;
                         }
                     }
                 }
@@ -760,10 +822,60 @@ fn spawn_ring_reader<Rd: Read + Send + 'static>(
     })
 }
 
-fn tail_string(buf: &Arc<Mutex<Vec<u8>>>) -> String {
-    buf.lock()
-        .map(|b| String::from_utf8_lossy(&b).into_owned())
-        .unwrap_or_default()
+/// What survived the ring, with the missing beginning named when there is one.
+fn tail_string(buf: &Arc<Mutex<RingTail>>) -> String {
+    let Ok(b) = buf.lock() else {
+        return String::new();
+    };
+    if b.dropped == 0 {
+        return String::from_utf8_lossy(&b.bytes).into_owned();
+    }
+    // The ring cuts on a byte, so what survives can begin mid-character. Drop
+    // the orphaned continuation bytes rather than emit a stray U+FFFD.
+    let start = b
+        .bytes
+        .iter()
+        .position(|c| c & 0xC0 != 0x80)
+        .unwrap_or(b.bytes.len());
+    format!(
+        "[earlier output omitted — {} bytes]\n{}",
+        b.dropped,
+        String::from_utf8_lossy(&b.bytes[start..])
+    )
+}
+
+/// Attach what the script printed to a message that ends the run without an exit
+/// code. A timeout used to be a single sentence: a script that printed its
+/// progress and then hung left the user and the assistant nothing to diagnose
+/// with, while an ordinary non-zero exit surfaces its stderr tail.
+fn with_printed_output(
+    mut msg: String,
+    out: &Arc<Mutex<RingTail>>,
+    err: &Arc<Mutex<RingTail>>,
+) -> String {
+    let mut printed = String::new();
+    for tail in [tail_string(out), tail_string(err)] {
+        let tail = tail.trim_end();
+        if tail.trim().is_empty() {
+            continue;
+        }
+        if !printed.is_empty() {
+            printed.push('\n');
+        }
+        printed.push_str(tail);
+    }
+    if !printed.is_empty() {
+        msg.push_str("\n\nOutput before it was stopped:\n");
+        // Marked, not silently clamped: two 32 KB tails do not fit in 4 KB, and
+        // an unmarked cut reads to the model — and the user — as the whole of
+        // what the script printed before it hung.
+        msg.push_str(&clamp_bytes_marked(
+            printed,
+            4_000,
+            "\n… (the rest of what it printed is not shown)",
+        ));
+    }
+    msg
 }
 
 // ---------------------------------------------------------------- import-back
@@ -816,7 +928,21 @@ pub fn import_outputs(
             skipped.push(format!("{want}: over the {}MB import cap", MAX_IMPORT_BYTES / 1024 / 1024));
             continue;
         }
-        let meta = write_output(conn, want, &bytes, cause)?;
+        // The input==output shape the empty state itself teaches
+        // (`# room-inputs: portfolio.csv` + `# room-outputs: portfolio.csv`)
+        // means the RUNNER put this file here, so "it exists" proved nothing: a
+        // script that wrote nothing still added an identical version on every
+        // run and was reported as having created it.
+        if materialized
+            .iter()
+            .any(|m| m.name == safe && m.sha == script_fingerprint(&bytes))
+        {
+            skipped.push(format!(
+                "{want}: unchanged from the room's copy — no new version was saved"
+            ));
+            continue;
+        }
+        let (meta, _replaced) = write_output(conn, want, &bytes, cause)?;
         imported.push(meta);
     }
 
@@ -850,8 +976,18 @@ pub fn import_outputs(
             let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
             new_bytes += bytes.len() as u64;
             new_count += 1;
-            let meta = write_output(conn, &name, &bytes, cause)?;
+            let (meta, replaced) = write_output(conn, &name, &bytes, cause)?;
             imported.push(meta);
+            if replaced {
+                // A room file of this name existed, and NOTHING said so: the name
+                // is in no `room-outputs:` header, on no line of the consent card,
+                // and (a script can compose the name at run time) possibly nowhere
+                // in the script text either. The report would otherwise hand the
+                // assistant "Created: <name>" for a file it replaced.
+                skipped.push(format!(
+                    "{name}: a room file of that name already existed — the script's version was saved over it as a new version (undo via Time Machine); declare it in room-outputs to make that explicit"
+                ));
+            }
         }
     }
 
@@ -881,7 +1017,7 @@ pub fn import_outputs(
             ));
             continue;
         }
-        let meta = write_output(conn, &m.name, &bytes, cause)?;
+        let (meta, _replaced) = write_output(conn, &m.name, &bytes, cause)?;
         imported.push(meta);
         // Surfaced in the report's notes so the user sees it was an in-place
         // overwrite (a new version they can undo), not a brand-new file.
@@ -895,26 +1031,30 @@ pub fn import_outputs(
 }
 
 /// Write one output into the room: a versioned overwrite when the name already
-/// exists (undo via Time Machine), else a new `source='script'` file.
+/// exists (undo via Time Machine), else a new `source='script'` file. The bool
+/// says which happened — an overwrite the user was never told about is the one
+/// case the report must not call "Created".
 fn write_output(
     conn: &Connection,
     name: &str,
     bytes: &[u8],
     cause: &str,
-) -> Result<FileMeta, String> {
+) -> Result<(FileMeta, bool), String> {
     let display = safe_name(name);
     let text = extraction::extract_text(&display, bytes);
     if let Some(existing) = db::file_by_exact_name(conn, &display)? {
         // Snapshot-then-overwrite: every script run is undoable for free.
         store_file_bytes(conn, &existing.id, bytes, text.as_deref(), cause)?;
-        db::get_file_meta(conn, &existing.id)
-    } else {
-        let mime = mime_guess::from_path(&display)
-            .first_or(mime_guess::mime::TEXT_PLAIN)
-            .essence_str()
-            .to_string();
-        db::insert_file(conn, &display, &mime, bytes, text.as_deref(), "script")
+        return Ok((db::get_file_meta(conn, &existing.id)?, true));
     }
+    let mime = mime_guess::from_path(&display)
+        .first_or(mime_guess::mime::TEXT_PLAIN)
+        .essence_str()
+        .to_string();
+    Ok((
+        db::insert_file(conn, &display, &mime, bytes, text.as_deref(), "script")?,
+        false,
+    ))
 }
 
 // ---------------------------------------------------------------- runner core
@@ -1100,7 +1240,12 @@ async fn run_and_import<R: tauri::Runtime>(
                 program: runner.program.clone(),
                 argv_prefix: argv,
             };
-            out = execute_script_in_workspace(ws, &healed_runner, safe_script, left, cancel, stdin).await?;
+            // The script's OWN declared timeout bounds every attempt;
+            // TOTAL_TIMEOUT_MULTIPLE bounds only their sum. Handing the retry
+            // the whole remaining budget let a `# room-timeout: 300` script run
+            // for 595s and then report a limit that is in no manifest.
+            let attempt = left.min(manifest.timeout_secs);
+            out = execute_script_in_workspace(ws, &healed_runner, safe_script, attempt, cancel, stdin).await?;
         }
     }
 
@@ -1139,7 +1284,7 @@ async fn run_and_import<R: tauri::Runtime>(
     }
     // (g) exit 0 → import back under the room lock, room-pinned.
     let cause = format!("Script ran — {script_name}");
-    let (imported, skipped) = {
+    let (imported, mut skipped) = {
         let state = app.state::<AppState>();
         let guard = state.room.lock().unwrap();
         let room = guard
@@ -1148,6 +1293,20 @@ async fn run_and_import<R: tauri::Runtime>(
             .ok_or("The room this script belongs to is no longer open.")?;
         import_outputs(&room.conn, ws, manifest, materialized, script_name, &cause)?
     };
+    if !healed.is_empty() {
+        // The consent card's "Installs" row is the script's DECLARED list, so
+        // these were downloaded from PyPI and executed without ever being named
+        // to the user. Say so where the other after-the-fact notes are said —
+        // and say only that, because a script CAN declare some dependencies and
+        // still import one it never named (`manifest.deps` is not empty then).
+        skipped.insert(
+            0,
+            format!(
+                "installed {} from PyPI: the script imports these without declaring them, so the run-consent card could not name them",
+                healed.join(", ")
+            ),
+        );
+    }
     Ok(ScriptRunReport {
         exit_code: out.exit_code,
         imported,
@@ -1594,13 +1753,144 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn timeout_returns_the_timeout_message() {
+    async fn timeout_returns_the_timeout_message_and_what_the_script_printed() {
         let ws = tmp_ws();
-        std::fs::write(ws.join("sleep.sh"), b"#!/bin/sh\nsleep 30\n").unwrap();
+        // Prints its progress, then hangs. The tails used to be thrown away, so
+        // the incident card was one sentence and the progress was gone — while a
+        // plain non-zero exit surfaces its stderr.
+        std::fs::write(
+            ws.join("sleep.sh"),
+            b"#!/bin/sh\necho 'step 1 of 3'\necho 'reading ledger' 1>&2\nsleep 30\n",
+        )
+        .unwrap();
         let runner = Runner { program: "/bin/sh".into(), argv_prefix: vec![] };
         let cancel = Arc::new(AtomicBool::new(false));
         let res = execute_script_in_workspace(&ws, &runner, "sleep.sh", MIN_TIMEOUT_SECS, &cancel, None).await;
-        assert!(res.unwrap_err().contains("timed out"));
+        let err = res.unwrap_err();
+        assert!(err.contains("timed out"), "{err}");
+        assert!(err.contains("step 1 of 3"), "the printed progress survives: {err}");
+        assert!(err.contains("reading ledger"), "stderr survives too: {err}");
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn a_ring_that_dropped_the_beginning_says_so() {
+        // 32 KB of ring, then the line that matters. The assistant is told to
+        // quote the output as the answer, so a middle slice presented as the
+        // whole thing (labelled "(output truncated)" at the END) is a wrong
+        // answer with no marker.
+        let buf = Arc::new(Mutex::new(RingTail::default()));
+        let mut stream = "A".repeat(RING_BYTES * 2).into_bytes();
+        stream.extend_from_slice(b"\nTOTAL: 42\n");
+        let dropped = stream.len() - RING_BYTES;
+        spawn_ring_reader(std::io::Cursor::new(stream), buf.clone())
+            .join()
+            .unwrap();
+        let tail = tail_string(&buf);
+        assert!(tail.contains("TOTAL: 42"), "the end is what survives: {tail}");
+        assert!(
+            tail.starts_with(&format!("[earlier output omitted — {dropped} bytes]")),
+            "the missing beginning is named: {}",
+            tail.chars().take(60).collect::<String>()
+        );
+
+        // Under the ring, nothing is claimed to be missing — and the marker is
+        // not glued onto a short output.
+        let small = Arc::new(Mutex::new(RingTail::default()));
+        spawn_ring_reader(std::io::Cursor::new(b"TOTAL: 42\n".to_vec()), small.clone())
+            .join()
+            .unwrap();
+        assert_eq!(tail_string(&small), "TOTAL: 42\n");
+
+        // A multi-byte character cut in half by the ring is trimmed, not turned
+        // into a stray U+FFFD.
+        let utf8 = Arc::new(Mutex::new(RingTail::default()));
+        let mut wide = "מ".repeat(RING_BYTES).into_bytes();
+        wide.extend_from_slice(b"end");
+        spawn_ring_reader(std::io::Cursor::new(wide), utf8.clone())
+            .join()
+            .unwrap();
+        let tail = tail_string(&utf8);
+        assert!(
+            !tail.contains('\u{fffd}'),
+            "no replacement character: {:?}",
+            tail.chars().take(60).collect::<String>()
+        );
+        assert!(tail.ends_with("end"));
+    }
+
+    #[test]
+    fn a_declared_output_the_script_never_wrote_is_not_re_imported() {
+        // The ScriptsPage empty state teaches `# room-inputs: portfolio.csv` +
+        // `# room-outputs: portfolio.csv`. The RUNNER puts that file in the
+        // workspace, so step 1 always found it: a body of `pass` still added a
+        // byte-identical version on every run and reported "Created".
+        let conn = db::mem();
+        let file = db::insert_file(&conn, "portfolio.csv", "text/csv", b"a,b\n", Some("a,b"), "upload").unwrap();
+        let ws = tmp_ws();
+        std::fs::write(ws.join("portfolio.csv"), b"a,b\n").unwrap();
+        let materialized = vec![Materialized {
+            name: "portfolio.csv".into(),
+            sha: script_fingerprint(b"a,b\n"),
+        }];
+        let (imported, skipped) = import_outputs(
+            &conn,
+            &ws,
+            &manifest_out(&["portfolio.csv"]),
+            &materialized,
+            "sync.py",
+            "c",
+        )
+        .unwrap();
+        assert!(imported.is_empty(), "nothing was written, so nothing is imported");
+        assert!(
+            skipped.iter().any(|s| s.contains("portfolio.csv") && s.contains("unchanged")),
+            "the report says why: {skipped:?}"
+        );
+        assert!(
+            db::list_file_versions(&conn, &file.id).unwrap().is_empty(),
+            "no version for a file the script left alone"
+        );
+
+        // …and the same declared output, actually written, still imports.
+        std::fs::write(ws.join("portfolio.csv"), b"a,b\n1,2\n").unwrap();
+        let (imported, _) = import_outputs(
+            &conn,
+            &ws,
+            &manifest_out(&["portfolio.csv"]),
+            &materialized,
+            "sync.py",
+            "c",
+        )
+        .unwrap();
+        assert_eq!(imported.len(), 1);
+        assert_eq!(imported[0].id, file.id);
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn an_undeclared_write_over_an_existing_room_file_is_reported_as_a_replacement() {
+        // A script can compose the name at run time (`open(f"{base}.md","w")`),
+        // so the name is in no room-outputs header, on no line of the consent
+        // card, and nowhere in the script text — and the report handed the
+        // assistant "Created: notes.md" for a file it had replaced.
+        let conn = db::mem();
+        let existing = db::insert_file(&conn, "notes.md", "text/markdown", b"mine", Some("mine"), "upload").unwrap();
+        let ws = tmp_ws();
+        std::fs::write(ws.join("notes.md"), b"x").unwrap();
+        std::fs::write(ws.join("brand-new.md"), b"y").unwrap();
+        let (imported, skipped) =
+            import_outputs(&conn, &ws, &manifest_out(&[]), &[], "s.py", "c").unwrap();
+        assert_eq!(imported.len(), 2);
+        assert!(
+            skipped.iter().any(|s| s.starts_with("notes.md:") && s.contains("already existed")),
+            "the overwrite is named: {skipped:?}"
+        );
+        assert!(
+            !skipped.iter().any(|s| s.starts_with("brand-new.md:")),
+            "a genuinely new file gets no replacement note: {skipped:?}"
+        );
+        assert_eq!(db::get_file_bytes(&conn, &existing.id).unwrap().unwrap(), b"x");
         let _ = std::fs::remove_dir_all(&ws);
     }
 

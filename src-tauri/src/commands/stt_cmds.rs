@@ -485,6 +485,10 @@ pub struct DictState {
 
 pub struct DictSession {
     tx: std::sync::mpsc::Sender<DictMsg>,
+    /// Milliseconds of audio handed to the worker so far. Stop's wait is
+    /// derived from it (see [`dict_stop_timeout`]) — the command has no other
+    /// way to know how much there is left to decode.
+    captured_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 enum DictMsg {
@@ -524,7 +528,10 @@ pub fn dict_start(app: tauri::AppHandle, dict: State<'_, DictState>) -> Result<(
     let (tx, rx) = std::sync::mpsc::channel();
     // Replacing a stale session drops its sender; that worker sees the
     // disconnect and exits on its own.
-    *dict.session.lock().unwrap() = Some(DictSession { tx });
+    *dict.session.lock().unwrap() = Some(DictSession {
+        tx,
+        captured_ms: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+    });
     std::thread::spawn(move || dict_worker(app, model, rx));
     Ok(())
 }
@@ -548,8 +555,29 @@ pub async fn dict_push_audio(
         .collect();
     let guard = dict.session.lock().unwrap();
     let session = guard.as_ref().ok_or("No dictation in progress.")?;
+    session.captured_ms.fetch_add(
+        samples.len() as u64 * 1000 / rate.max(1) as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     let _ = session.tx.send(DictMsg::Audio { rate, samples });
     Ok(())
+}
+
+/// The wait Stop allows the final decode, given how much audio was captured.
+///
+/// The final decode is ONE whole-utterance pass over everything spoken, so its
+/// cost grows with the dictation — while a flat ceiling does not. At 120 s flat,
+/// stopping a several-minute dictation threw away a transcript that was still
+/// being produced (and the composer's painted partials with it): the words were
+/// decoded and then discarded by a stopwatch. The base still covers a short
+/// dictation that is merely queued behind a busy STT context.
+const DICT_STOP_BASE: std::time::Duration = std::time::Duration::from_secs(120);
+/// Seconds of grace per second of audio — a decode slower than this is wedged,
+/// not working.
+const DICT_STOP_PER_AUDIO_SEC: u32 = 2;
+
+fn dict_stop_timeout(captured: std::time::Duration) -> std::time::Duration {
+    DICT_STOP_BASE + captured * DICT_STOP_PER_AUDIO_SEC
 }
 
 /// Close the session and return the final whole-utterance transcript (may be
@@ -558,19 +586,23 @@ pub async fn dict_push_audio(
 /// samples on the worker's channel and the last word is never clipped.
 #[tauri::command]
 pub async fn dict_stop(dict: State<'_, DictState>) -> Result<String, String> {
-    let done_rx = {
+    let (done_rx, captured) = {
         let mut guard = dict.session.lock().unwrap();
         let session = guard.take().ok_or("No dictation in progress.")?;
+        let captured = std::time::Duration::from_millis(
+            session.captured_ms.load(std::sync::atomic::Ordering::Relaxed),
+        );
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         session
             .tx
             .send(DictMsg::Stop { done: done_tx })
             .map_err(|_| "The dictation engine stopped unexpectedly.".to_string())?;
-        done_rx
+        (done_rx, captured)
     };
+    let wait = dict_stop_timeout(captured);
     tauri::async_runtime::spawn_blocking(move || {
         done_rx
-            .recv_timeout(std::time::Duration::from_secs(120))
+            .recv_timeout(wait)
             .map_err(|_| "Transcribing the dictation timed out.".to_string())?
     })
     .await
@@ -765,14 +797,19 @@ pub async fn shape_text(
         model = best_local_default(&models);
     }
 
-    // Pass 1: translate on its own. A failure/empty result keeps the prior text.
+    // Pass 1: translate on its own.
+    //
+    // A FAILED translate used to be swallowed, so the words came back in the
+    // language they were spoken in, presented as a translation — the one
+    // outcome that misrepresents what happened. The caller's error path keeps
+    // the exact transcript AND says so ("Kept the exact transcript — …"), which
+    // is the same treatment the shape pass below already gets.
     let mut text = text;
     if translate {
-        if let Ok(t) = run_dict_pass(&model, &[DICT_TRANSLATE], &text).await {
-            let t = t.trim();
-            if !t.is_empty() {
-                text = t.to_string();
-            }
+        let t = run_dict_pass(&model, &[DICT_TRANSLATE], &text).await?;
+        let t = t.trim();
+        if !t.is_empty() {
+            text = t.to_string();
         }
     }
     // Pass 2: cleanup + optional mode shaping (or the prompt optimizer).
@@ -864,6 +901,23 @@ mod tests {
         // fresh audio — roughly half the machine, never more.
         assert_eq!(dict_partial_step(rate, Duration::from_secs(3)), rate as usize * 3);
         assert!(dict_partial_step(rate, Duration::from_secs(30)) > dict_partial_step(rate, Duration::from_secs(3)));
+    }
+
+    /// The final decode is one whole-utterance pass, so what it costs grows
+    /// with the dictation. A flat 120 s ceiling gave up on a five-minute
+    /// dictation while it was still decoding — and the transcript, plus the
+    /// partials already painted in the composer, went with it.
+    #[test]
+    fn the_stop_wait_grows_with_the_audio_it_has_to_decode() {
+        use std::time::Duration;
+        // A dictation with nothing captured still gets the base wait: Stop can
+        // also be queued behind an STT context another decode is holding.
+        assert_eq!(dict_stop_timeout(Duration::ZERO), DICT_STOP_BASE);
+        // Five minutes of speech is given far more than the old flat ceiling.
+        let five_min = dict_stop_timeout(Duration::from_secs(300));
+        assert!(five_min > Duration::from_secs(120) * 4, "{five_min:?}");
+        // …and every extra second of audio buys more, never less.
+        assert!(dict_stop_timeout(Duration::from_secs(301)) > five_min);
     }
 
     /// The 574 MB weights are fetched, renamed into place and mmapped. Nothing

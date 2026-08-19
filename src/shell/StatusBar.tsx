@@ -28,8 +28,8 @@ function useOnline(): boolean {
 }
 
 /** The status strip. Every item reflects real state: the trust route (local /
- * protected cloud / raw cloud), indexed file count, connected tools,
- * background work, and the current pane layout.
+ * protected cloud / raw cloud, and what leaves through online search or a
+ * connector), indexed file count, and background work.
  *
  * It is the quietest thing on screen and stays that way: one hairline above
  * it, no cell borders, no fills, and everything in the faint ink except the
@@ -39,7 +39,6 @@ function useOnline(): boolean {
  * design system's 12px floor; a status bar earns its lightness from restraint,
  * not from being too small to read. */
 export default function StatusBar({
-  layout,
   fileCount,
   cloud,
   engineLabel,
@@ -65,7 +64,39 @@ export default function StatusBar({
   pendingApprovals: number;
   onShowActivity: () => void;
 }) {
-  const trust = trustState(cloud, protectedOn);
+  const engine = trustState(cloud, protectedOn);
+  /* `trustState` answers from the engine route and the privacy door alone.
+   * Online search and connectors are a second way off this Mac that it cannot
+   * see, and "nothing leaves the device" is false while either is on — so the
+   * chip that owns the claim carries them, instead of being contradicted by the
+   * cell that used to sit beside it. The breakdown is the chip's visible text,
+   * not its tooltip: what is reaching the internet cannot be hover-only. */
+  const outbound = [
+    webOn ? "online search on" : null,
+    mcpToolCount > 0
+      ? `${mcpToolCount} connected tool${mcpToolCount === 1 ? "" : "s"}`
+      : null,
+  ].filter((x): x is string => x !== null);
+  const sendsOut = outbound.length > 0;
+  /* Said separately, because only one of the two is certain. Online search is
+   * the internet by definition. A connector is a process this room hands the
+   * AI's request to, and `mcpToolCount` cannot tell a remote server from a
+   * local one — so the chip says what the tools receive, not where it goes. */
+  const outboundNote = [
+    webOn ? "Online search sends what the AI asks for off this Mac." : null,
+    mcpToolCount > 0
+      ? "Connected tools receive what the AI asks for, and a remote connector takes it off this Mac."
+      : null,
+  ]
+    .filter((x): x is string => x !== null)
+    .join(" ");
+  const trust = !sendsOut
+    ? engine
+    : {
+        tone: cloud ? engine.tone : ("warn" as const),
+        label: `${cloud ? engine.label : "Local model"} · ${outbound.join(" · ")}`,
+        title: `${cloud ? engine.title : "The AI runs on this Mac."} ${outboundNote}`,
+      };
   const online = useOnline();
   return (
     <footer className="pr-statusbar" aria-label="Workspace status">
@@ -82,33 +113,15 @@ export default function StatusBar({
       <div className="status-left">
         <button
           className={`status-item status-trust ${trust.tone}`}
-          title={`${trust.title} (${engineLabel})${cloud ? " Click to review." : ""}`}
+          title={`${trust.title} (${engineLabel})${cloud || sendsOut ? " Click to review." : ""}`}
           onClick={onOpenPrivacy}
         >
-          {cloud ? <CloudIcon size={12} /> : <ShieldIcon size={12} />} {trust.label}
+          {cloud || sendsOut ? <CloudIcon size={12} /> : <ShieldIcon size={12} />}{" "}
+          {trust.label}
         </button>
         <span className="status-item" title="Files stored in this room">
           <DatabaseIcon size={12} /> {fileCount} file{fileCount === 1 ? "" : "s"}
         </span>
-        {webOn || mcpToolCount > 0 ? (
-          <span
-            className="status-item warn"
-            title={
-              [
-                webOn ? "Online search is on" : null,
-                mcpToolCount > 0 ? `${mcpToolCount} connected tools` : null,
-              ]
-                .filter(Boolean)
-                .join(" · ") || undefined
-            }
-          >
-            <CloudIcon size={12} /> Internet tools on
-          </span>
-        ) : (
-          <span className="status-item" title="No online search or connected tools">
-            <CloudOffIcon size={12} /> No external tools
-          </span>
-        )}
       </div>
       <div className="status-right">
         {!online && (
@@ -139,18 +152,18 @@ export default function StatusBar({
         {runningJobs > 0 && (
           <button
             className="status-item"
-            title="Background work is running — open Activity"
+            title="Background work — open Activity"
             onClick={onShowActivity}
           >
             {/* The dot's colour lives in the stylesheet, where both themes can
                 be checked at once — an inline var() could only ever be one. */}
             <span className="status-dot busy" />
-            {runningJobs} job{runningJobs === 1 ? "" : "s"} running
+            {/* "running" was a claim this number cannot make: `runningJobCount`
+                counts queued jobs too, and Activity one click away shows them
+                as Waiting. The wording covers what is actually counted. */}
+            {runningJobs} job{runningJobs === 1 ? "" : "s"} running or waiting
           </button>
         )}
-        <span className="status-item" title="Current pane layout">
-          {layout.layoutLabel}
-        </span>
       </div>
     </footer>
   );

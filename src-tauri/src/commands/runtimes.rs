@@ -41,6 +41,33 @@ use tokio::io::AsyncWriteExt;
 /// Node LTS we pin for the bundled-on-demand Node runtime.
 const NODE_VERSION: &str = "v22.11.0";
 
+/// uv release we pin. It used to be fetched from `releases/latest`, which means
+/// two installs of the SAME build of this app could execute different binaries —
+/// and no digest could be written down for a moving target.
+const UV_VERSION: &str = "0.12.5";
+
+/// What the pinned asset must hash to, per arch, taken from the publishers'
+/// own checksums for these exact versions:
+///   - nodejs.org/dist/v22.11.0/SHASUMS256.txt
+///   - the `.sha256` beside each asset of astral-sh/uv 0.12.5
+///
+/// Written down here rather than fetched beside the download on purpose: a
+/// checksum served by the same host over the same session proves only that the
+/// tarball is the one that host meant to send. These bytes ship inside a signed
+/// app, so a substituted download is refused even when the session itself is
+/// the thing that was tampered with. They must be updated with the version
+/// above — [`asset`] returns both together so they cannot drift apart.
+const UV_SHA256_AARCH64: &str = "5bb0e5fe008a773c3dbcb97ff79cd89e1241464fe9d2f986d52ad8f1b037bd62";
+const UV_SHA256_X86_64: &str = "b3b2137477cf96c9686ebfb71524614cec780c673fd73e59bce099aef02e70e8";
+const NODE_SHA256_ARM64: &str = "2e89afe6f4e3aa6c7e21c560d8a0453d84807e97850bbb819b998531a22bdfde";
+const NODE_SHA256_X64: &str = "668d30b9512137b5f5baeef6c1bb4c46efff9a761ba990a034fb6b28b9da2465";
+
+/// A pinned download: the URL, and the SHA-256 the bytes must have.
+struct Asset {
+    url: String,
+    sha256: &'static str,
+}
+
 /// A runtime the app can download on demand.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -93,29 +120,37 @@ impl RuntimeKind {
         }
     }
 
-    /// The download asset URL for the current CPU arch. Pure — unit-tested.
-    fn asset_url(self) -> Result<String, String> {
+    /// The download for the current CPU arch: where it comes from, and what it
+    /// must hash to. One function so a URL can never be changed without its
+    /// digest. Pure — unit-tested.
+    fn asset(self) -> Result<Asset, String> {
         let arch = std::env::consts::ARCH;
         match self {
             RuntimeKind::Uv => {
-                let a = match arch {
-                    "aarch64" => "aarch64",
-                    "x86_64" => "x86_64",
+                let (a, sha256) = match arch {
+                    "aarch64" => ("aarch64", UV_SHA256_AARCH64),
+                    "x86_64" => ("x86_64", UV_SHA256_X86_64),
                     other => return Err(format!("no uv build for {other}")),
                 };
-                Ok(format!(
-                    "https://github.com/astral-sh/uv/releases/latest/download/uv-{a}-apple-darwin.tar.gz"
-                ))
+                Ok(Asset {
+                    url: format!(
+                        "https://github.com/astral-sh/uv/releases/download/{UV_VERSION}/uv-{a}-apple-darwin.tar.gz"
+                    ),
+                    sha256,
+                })
             }
             RuntimeKind::Node => {
-                let a = match arch {
-                    "aarch64" => "arm64",
-                    "x86_64" => "x64",
+                let (a, sha256) = match arch {
+                    "aarch64" => ("arm64", NODE_SHA256_ARM64),
+                    "x86_64" => ("x64", NODE_SHA256_X64),
                     other => return Err(format!("no node build for {other}")),
                 };
-                Ok(format!(
-                    "https://nodejs.org/dist/{NODE_VERSION}/node-{NODE_VERSION}-darwin-{a}.tar.gz"
-                ))
+                Ok(Asset {
+                    url: format!(
+                        "https://nodejs.org/dist/{NODE_VERSION}/node-{NODE_VERSION}-darwin-{a}.tar.gz"
+                    ),
+                    sha256,
+                })
             }
         }
     }
@@ -283,13 +318,39 @@ fn status_for(app: &tauri::AppHandle, command: &str) -> RuntimeStatus {
 
 // ------------------------------------------------------------- provisioning
 
+/// Lower-case hex, the spelling every published checksum file uses.
+fn hex_digest(bytes: &[u8]) -> String {
+    bytes.iter().fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
+        use std::fmt::Write as _;
+        let _ = write!(s, "{b:02x}");
+        s
+    })
+}
+
+/// Why this download must not be unpacked, or `None` when it is the pinned one.
+///
+/// Said in full: what was expected, what arrived, and that nothing was
+/// installed — a runtime that silently declined to install would send the user
+/// back to the same button for ever.
+fn checksum_refusal(kind: RuntimeKind, expected: &str, got: &str) -> Option<String> {
+    if got.eq_ignore_ascii_case(expected) {
+        return None;
+    }
+    Some(format!(
+        "the {} download is not the one this app expects, so it was deleted \
+         rather than installed (expected SHA-256 {expected}, got {got}). \
+         Check the network you are on and try again.",
+        kind.label()
+    ))
+}
+
 /// Download + extract a runtime, emitting `runtime-progress` events. Idempotent:
 /// a runtime that's already installed returns immediately.
 async fn provision(app: &tauri::AppHandle, kind: RuntimeKind) -> Result<(), String> {
     if is_installed(app, kind) {
         return Ok(());
     }
-    let url = kind.asset_url()?;
+    let Asset { url, sha256: expected } = kind.asset()?;
     let root = runtimes_root(app)?;
     let dir = install_dir(app, kind)?;
     let tmp = root.join(format!("{}.download", kind.slug()));
@@ -325,15 +386,28 @@ async fn provision(app: &tauri::AppHandle, kind: RuntimeKind) -> Result<(), Stri
         .map_err(|e| format!("could not write the download: {e}"))?;
     let mut got = 0u64;
     let mut stream = resp.bytes_stream();
+    // Hashed as it arrives, so nothing is read from disk twice and the bytes
+    // that are checked are exactly the bytes that were written.
+    let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
     emit("download", 0, total);
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| format!("download interrupted: {e}"))?;
+        sha2::Digest::update(&mut hasher, &chunk);
         file.write_all(&chunk).await.map_err(|e| e.to_string())?;
         got += chunk.len() as u64;
         emit("download", got, total);
     }
     file.flush().await.map_err(|e| e.to_string())?;
     drop(file);
+
+    // BEFORE anything is unpacked, let alone put on a connector's PATH: this
+    // is executable content, and TLS alone only says the bytes came from
+    // whoever terminated the connection.
+    let digest = hex_digest(&sha2::Digest::finalize(hasher));
+    if let Some(why) = checksum_refusal(kind, expected, &digest) {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(why);
+    }
 
     // Extract into a clean dir. macOS ships bsdtar at /usr/bin/tar, which
     // auto-detects gzip; strip the archive's single top-level dir.
@@ -404,13 +478,56 @@ mod tests {
     #[test]
     fn asset_urls_are_platform_correct() {
         // Whatever arch the test runs on, the URL is well-formed for it.
-        let uv = RuntimeKind::Uv.asset_url().unwrap();
-        assert!(uv.starts_with("https://github.com/astral-sh/uv/releases/latest/download/uv-"));
-        assert!(uv.ends_with("-apple-darwin.tar.gz"));
-        let node = RuntimeKind::Node.asset_url().unwrap();
-        assert!(node.contains("nodejs.org/dist/"));
-        assert!(node.ends_with(".tar.gz"));
-        assert!(node.contains("-darwin-"));
+        let uv = RuntimeKind::Uv.asset().unwrap();
+        assert!(uv.url.starts_with("https://github.com/astral-sh/uv/releases/download/"));
+        assert!(uv.url.ends_with("-apple-darwin.tar.gz"));
+        let node = RuntimeKind::Node.asset().unwrap();
+        assert!(node.url.contains("nodejs.org/dist/"));
+        assert!(node.url.ends_with(".tar.gz"));
+        assert!(node.url.contains("-darwin-"));
+    }
+
+    /// Both halves of a pinned download: a version in the URL, and a digest to
+    /// hold the bytes to. `latest` in a URL means two installs of the same
+    /// build of this app can run different binaries, and there is nothing a
+    /// checksum could even be written against.
+    #[test]
+    fn every_runtime_download_is_pinned_and_carries_a_digest() {
+        for kind in [RuntimeKind::Uv, RuntimeKind::Node] {
+            let a = kind.asset().unwrap();
+            assert!(!a.url.contains("/latest/"), "{} is not pinned: {}", kind.slug(), a.url);
+            assert!(
+                a.url.contains(UV_VERSION) || a.url.contains(NODE_VERSION),
+                "{} names no version: {}",
+                kind.slug(),
+                a.url
+            );
+            assert_eq!(a.sha256.len(), 64, "{} has no SHA-256", kind.slug());
+            assert!(
+                a.sha256.chars().all(|c| c.is_ascii_hexdigit()),
+                "{} digest is not hex",
+                kind.slug()
+            );
+        }
+    }
+
+    #[test]
+    fn a_download_that_hashes_wrong_is_refused_by_name() {
+        // SHA-256 of the empty input, as every implementation gives it — the
+        // hex spelling the published checksum files use.
+        let empty = hex_digest(&sha2::Digest::finalize(<sha2::Sha256 as sha2::Digest>::new()));
+        assert_eq!(empty, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+
+        assert_eq!(checksum_refusal(RuntimeKind::Uv, &empty, &empty), None);
+        // Case is not a difference: checksum files are published both ways.
+        assert_eq!(
+            checksum_refusal(RuntimeKind::Uv, &empty.to_uppercase(), &empty),
+            None
+        );
+        let why = checksum_refusal(RuntimeKind::Node, &empty, "00").expect("a mismatch passed");
+        assert!(why.contains("Node.js runtime"), "{why}");
+        assert!(why.contains(&empty), "the expected digest is not named: {why}");
+        assert!(why.contains("deleted"), "{why}");
     }
 
     #[test]

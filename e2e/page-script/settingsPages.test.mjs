@@ -98,7 +98,12 @@ test("closing Settings with unsaved work asks first", () => {
   assert.match(read("src/settings/useRemoteAi.ts"), /closetDirty:/);
 
   // …and BOTH silent exits must go through the guard, not straight to onClose.
-  assert.match(settings, /className="settings-backdrop"[^>]*onClick=\{requestClose\}/);
+  assert.match(settings, /className="settings-backdrop"[^>]*onClick=\{backdropClick\}/);
+  assert.match(
+    settings,
+    /function backdropClick\(\)\s*\{\s*requestClose\(\);/,
+    "the backdrop click no longer runs the unsaved guard",
+  );
   assert.match(settings, /useFocusTrap\(requestClose\)/, "Escape still closes unguarded");
   // The guard must offer a way out that keeps the work.
   assert.match(settings, /Keep editing/);

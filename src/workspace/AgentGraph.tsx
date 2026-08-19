@@ -13,16 +13,29 @@
  * keeps every edge short and non-crossing — all edges originate at the hub,
  * because the hub is what dispatched them, including later batches.
  *
+ * THE DRAWING LIVES BEHIND "Expand", not in the transcript. Inline, the turn is
+ * a caption, a count and a row of specialist chips; the hub-and-spoke picture
+ * needs width the ~290px AI pane does not have, and the transcript would pay
+ * for it under every past answer.
+ *
  * Hand-rolled: HTML nodes over an SVG edge layer, no graph library. The nodes
  * are real buttons, so they get focus, hover, ellipsis and the app's tokens for
  * free; only the curves need SVG. Every colour is a token — light and dark both
  * resolve — and no state is signalled by colour alone: each carries its own
  * glyph and outline weight.
  */
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import {
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import { createPortal } from "react-dom";
 import type { AgentNodeStatus, AskPlanStep, AskActiveAgent } from "../apiTypes";
 import { prefersReducedMotion } from "../rooms/helpers";
+import { useFocusTrap } from "../settings/useFocusTrap";
 import { MAIN_KEY, chipClass, toBands, toNodes, type GraphNode } from "./agentNodes";
 
 /** Mirror of the sidecar's `agents.REGISTRY` descriptions (agents.py), for the
@@ -185,16 +198,6 @@ export function AgentGraph({
     return () => window.clearInterval(id);
   }, [anyRunning]);
 
-  // Escape closes the expanded overlay, as every other layer in this app does.
-  useEffect(() => {
-    if (!expanded) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setExpanded(false);
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [expanded]);
-
   const elapsedFor = (key: string): string | null => {
     const t = timings.current[key];
     if (!t) return null;
@@ -297,7 +300,33 @@ export function AgentGraph({
           ? `${runningCount} of ${children.length} specialist agents running`
           : `${doneCount} of ${children.length} specialist agents finished`}
       </p>
-      <GraphCanvas {...canvasProps} />
+      {/* INLINE IS A ROSTER, NOT A DIAGRAM. The chat pane is often ~290px wide
+          and this sits under every past answer, so the column pays for the
+          drawing on every turn forever. What a reader wants from a delegating
+          turn is who ran, whether it finished, how long it took and what it
+          reported — which is this row and the inspector it opens. Rounds,
+          batches and which spoke leaves the hub are debugging information, and
+          they have a home: Expand. */}
+      <div className="agraph-roster">
+        {children.map((c) => {
+          const el = elapsedFor(c.key);
+          return (
+            <button
+              key={c.key}
+              type="button"
+              className={`agraph-mini-chip ${c.status}`}
+              onClick={() => toggle(c.key)}
+              aria-pressed={selected === c.key}
+              aria-label={`${c.label}, ${STATUS_WORD[c.status]}. ${c.instruction}`}
+              title={c.instruction}
+            >
+              <span aria-hidden>{GLYPH[c.status]} </span>
+              {c.label}
+              {el && <span className="agraph-elapsed">&nbsp;{el}</span>}
+            </button>
+          );
+        })}
+      </div>
       {!expanded && selectedNode && inspectorFor(selectedNode, true)}
 
       {/* Expanded: an overlay, not an in-place resize. The chat pane is often
@@ -313,9 +342,11 @@ export function AgentGraph({
           resolved against the AI column instead of the window and was then
           clipped by that column's `overflow: hidden`, so an 880px window was
           drawn inside a ~290px box. Same escape SchedulePopover already makes,
-          for the same reason. Nothing else moves: the Escape handler is on
-          `window`, the backdrop keeps its own click target, and a modal at the
-          end of the body is where the focus order wants it anyway. */}
+          for the same reason.
+
+          Being last in the body is exactly why it needs a focus trap: the
+          trigger that opened it is back in the chat pane, so without one, Tab
+          walks the whole application before it ever reaches this dialog. */}
       {expanded &&
         createPortal(
           <div
@@ -324,12 +355,7 @@ export function AgentGraph({
               if (e.target === e.currentTarget) setExpanded(false);
             }}
           >
-            <div
-              className="agraph-modal"
-              role="dialog"
-              aria-modal="true"
-              aria-label="Agents working on this request"
-            >
+            <ExpandedPanel onClose={() => setExpanded(false)}>
               <div className="agraph-modal-head">
                 <span className="agraph-modal-title">Agents on this turn</span>
                 <span className="agraph-summary">
@@ -349,10 +375,41 @@ export function AgentGraph({
                 <GraphCanvas {...canvasProps} roomy />
                 {selectedNode && inspectorFor(selectedNode, false)}
               </div>
-            </div>
+            </ExpandedPanel>
           </div>,
           document.body,
         )}
+    </div>
+  );
+}
+
+/** The expanded graph's panel, a component of its own so `useFocusTrap`'s mount
+ * and unmount effects line up with the overlay opening and closing rather than
+ * with the chat bubble that owns it. */
+function ExpandedPanel({
+  onClose,
+  children,
+}: {
+  onClose: () => void;
+  children: ReactNode;
+}) {
+  const { modalRef, onModalKeyDown } = useFocusTrap(onClose);
+  return (
+    <div
+      ref={modalRef}
+      tabIndex={-1}
+      onKeyDown={(e) => {
+        // The app-level Escape (effects.ts) closes the open FILE. This dialog is
+        // in front of it, so the key it answers must not carry past it.
+        if (e.key === "Escape") e.stopPropagation();
+        onModalKeyDown(e);
+      }}
+      className="agraph-modal"
+      role="dialog"
+      aria-modal="true"
+      aria-label="Agents working on this request"
+    >
+      {children}
     </div>
   );
 }

@@ -15,7 +15,23 @@ pub fn mcp_apply_config(
     json: String,
 ) -> Result<Vec<mcp::ServerStatus>, String> {
     let servers = mcp::parse_config(&json)?;
-    state.with_room(|room| db::set_setting(&room.conn, MCP_CONFIG_KEY, &json))?;
+    state.with_room(|room| {
+        // A stored sign-in belongs to an ENDPOINT, but it is filed under the
+        // connector's NAME. This is the path behind the marketplace install and
+        // the Advanced editor, and it never cleared one: change `url` for
+        // `fetch` and the connect-time renewal merged a fresh access token for
+        // the OLD provider into an entry now pointing at the new one, which
+        // received it — while the drawer reported the new connector as "Signed
+        // in". `agent_save_mcp` already clears on retarget; this closes the same
+        // hole on the two paths a person actually uses.
+        let previous = db::get_setting(&room.conn, MCP_CONFIG_KEY).unwrap_or_default();
+        for name in resigned_servers(&previous, &json) {
+            if super::mcp_oauth::load_tokens(&room.conn, &name).is_some() {
+                super::mcp_oauth::clear_tokens(&room.conn, &name)?;
+            }
+        }
+        db::set_setting(&room.conn, MCP_CONFIG_KEY, &json)
+    })?;
     // SEC-1: the user just typed and saved this config, which counts as
     // approval — remember its fingerprint so reopening the room won't re-ask.
     add_mcp_approval(&app, &mcp_fingerprint(&json));
@@ -132,10 +148,13 @@ pub(crate) fn parse_connector_flag(raw: Option<&str>) -> bool {
         .unwrap_or(false)
 }
 
-fn write_mcp_flag(path: Result<std::path::PathBuf, String>, on: bool) {
-    if let Ok(path) = path {
-        let _ = std::fs::write(path, if on { "true" } else { "false" });
-    }
+/// Persist one connector power. The failure is REPORTED: these files are the
+/// only record of a consent decision, and a switch that reads "on" over a flag
+/// that was never written promises a power the next launch will not have.
+fn write_mcp_flag(path: Result<std::path::PathBuf, String>, on: bool) -> Result<(), String> {
+    let path = path?;
+    std::fs::write(&path, if on { "true" } else { "false" })
+        .map_err(|e| format!("This setting could not be saved to {}: {e}", path.display()))
 }
 
 // ------------------------------------------------- per-connector overrides
@@ -292,15 +311,64 @@ pub fn set_mcp_connector_power(
     value: Option<bool>,
 ) -> Result<String, String> {
     let which = ConnectorPower::parse(&power)?;
+    // The lock is held across the write so two connectors edited at once cannot
+    // each save a map built before the other's change.
     let mut map = state.mcp_connector_powers.lock().unwrap();
     let raw = serde_json::to_string(&*map).unwrap_or_else(|_| "{}".to_string());
     let next = set_connector_power(&raw, &server, which, value)?;
+    // Persist FIRST, and say so when it fails. This return value is what the
+    // Connectors page renders, so an unwritten grant used to be shown as
+    // deliberately set ("set here, so the setting above doesn't apply") until
+    // the next launch quietly dropped it.
+    let path = mcp_connector_powers_file(&app)?;
+    std::fs::write(&path, &next).map_err(|e| {
+        format!(
+            "This connector's setting could not be saved to {}: {e}",
+            path.display()
+        )
+    })?;
     *map = parse_connector_powers(&next);
-    drop(map);
-    if let Ok(path) = mcp_connector_powers_file(&app) {
-        let _ = std::fs::write(path, &next);
-    }
     Ok(next)
+}
+
+/// Forget every permission this Mac holds for ONE connector: its per-connector
+/// overrides on disk and its "always allow" for this session.
+///
+/// Both are keyed by NAME alone, and they used to outlive the connector. A
+/// later connector landing on the same name — a marketplace install, a
+/// hand-written entry in Advanced, a retarget — silently inherited "run without
+/// asking" and "send remote connectors real values", so its very first call ran
+/// with no consent card and carried the room's real entity values to an
+/// endpoint nobody had granted anything, while the Connectors row stated both
+/// as deliberate ("set here, so the setting above doesn't apply").
+///
+/// Called AFTER the connector is gone, and its failure is reported by the
+/// caller rather than swallowed: the session grant is dropped either way, but a
+/// grants file that could not be rewritten still holds the overrides and would
+/// hand them to whatever takes the name next.
+///
+/// Answers whether the connector had any saved override to clear, so a caller
+/// that reports what it did can name it without inventing one.
+pub(crate) fn forget_connector_grants(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    server: &str,
+) -> Result<bool, String> {
+    state.mcp_session_ok.lock().unwrap().remove(server);
+    let mut map = state.mcp_connector_powers.lock().unwrap();
+    if map.remove(server).is_none() {
+        return Ok(false); // nothing was ever set for it
+    }
+    let next = serde_json::to_string(&*map).unwrap_or_else(|_| "{}".to_string());
+    let path = mcp_connector_powers_file(app)?;
+    std::fs::write(&path, next).map(|()| true).map_err(|e| {
+        format!(
+            "\"{server}\" is gone, but the permissions saved for that name could not be \
+             cleared ({e}). Until {} can be written, a connector added under the same name \
+             would inherit them.",
+            path.display()
+        )
+    })
 }
 
 /// Whether one connector call may skip its consent card.
@@ -327,12 +395,21 @@ pub fn get_mcp_auto_approve(state: State<'_, AppState>) -> bool {
 /// per-Mac. Takes effect immediately for the next connector call (the flag is
 /// read live in `mcp_call_approved`); the file makes it survive a restart.
 /// Does NOT touch masking — that is `set_mcp_outbound_unmask`.
+///
+/// The file is written BEFORE the live flag moves, so a failed write leaves the
+/// running app and the disk agreeing — and the page's re-read after the error
+/// shows the power that is really in force rather than the one it hoped for.
 #[tauri::command]
-pub fn set_mcp_auto_approve(app: tauri::AppHandle, state: State<'_, AppState>, on: bool) {
+pub fn set_mcp_auto_approve(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    on: bool,
+) -> Result<(), String> {
+    write_mcp_flag(mcp_auto_approve_file(&app), on)?;
     state
         .mcp_auto_approve
         .store(on, std::sync::atomic::Ordering::SeqCst);
-    write_mcp_flag(mcp_auto_approve_file(&app), on);
+    Ok(())
 }
 
 /// Connectors → "Send remote connectors real values": read the live state for
@@ -348,12 +425,22 @@ pub fn get_mcp_outbound_unmask(state: State<'_, AppState>) -> bool {
 /// per-Mac. Read live at the outbound seam (`exec_tool`), so the next call
 /// carries whatever this says. Does NOT grant consent — with the card still on,
 /// the user sees the real arguments and approves them before they leave.
+///
+/// Persisted before the live flag moves, for the reason `set_mcp_auto_approve`
+/// gives — and here the direction matters twice over: a failed write that still
+/// flipped the flag would send this room's real values out for the rest of the
+/// session on the strength of a setting nothing recorded.
 #[tauri::command]
-pub fn set_mcp_outbound_unmask(app: tauri::AppHandle, state: State<'_, AppState>, on: bool) {
+pub fn set_mcp_outbound_unmask(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    on: bool,
+) -> Result<(), String> {
+    write_mcp_flag(mcp_outbound_unmask_file(&app), on)?;
     state
         .mcp_outbound_unmask
         .store(on, std::sync::atomic::Ordering::SeqCst);
-    write_mcp_flag(mcp_outbound_unmask_file(&app), on);
+    Ok(())
 }
 
 /// SEC-1: the spawn/approval decision for a room's MCP config, decided PURELY
@@ -817,8 +904,22 @@ pub async fn mcp_oauth_authorize(
     state: State<'_, AppState>,
     server: String,
 ) -> Result<Vec<mcp::ServerStatus>, String> {
-    let config = state
-        .with_room(|room| Ok(db::get_setting(&room.conn, MCP_CONFIG_KEY).unwrap_or_default()))?;
+    // Pinned before the browser round-trip below, which waits up to five
+    // minutes. The write at the end used to merge into THIS snapshot through an
+    // unpinned `with_room`: a connector installed while the browser tab was
+    // open vanished again, and a room locked and another opened in that window
+    // took room A's whole connector config and room A's OAuth token into room
+    // B's settings. Same room-path + epoch convention `AppState::room_epoch`
+    // documents.
+    let (room_path, epoch, config) = {
+        let guard = state.room_guard();
+        let room = guard.as_ref().ok_or("No room is open.")?;
+        (
+            room.path.clone(),
+            state.room_epoch(),
+            db::get_setting(&room.conn, MCP_CONFIG_KEY).unwrap_or_default(),
+        )
+    };
     let url = mcp::parse_config(&config)?
         .into_iter()
         .find(|(n, _)| n == &server)
@@ -852,8 +953,19 @@ pub async fn mcp_oauth_authorize(
     // config change is a deliberate user action (they just signed in), so its
     // new fingerprint is approved like a saved config (SEC-1).
     let merged = state.with_room(|room| {
+        if room.path != room_path || state.room_epoch() != epoch {
+            return Err(format!(
+                "The room this sign-in belongs to was closed while the browser was open, so \
+                 nothing was saved. Open it again and connect \"{server}\" from there."
+            ));
+        }
         super::mcp_oauth::save_tokens(&room.conn, &server, &token)?;
-        let json = merge_bearer(&config, &server, &token.access_token)?;
+        // Re-read rather than merging into the snapshot taken before the
+        // browser round-trip: anything the user changed about their connectors
+        // while signing in is still in the config, and merging into the old
+        // text would revert it.
+        let current = db::get_setting(&room.conn, MCP_CONFIG_KEY).unwrap_or_default();
+        let json = merge_bearer(&current, &server, &token.access_token)?;
         db::set_setting(&room.conn, MCP_CONFIG_KEY, &json)?;
         Ok(json)
     })?;
@@ -1419,21 +1531,76 @@ pub(crate) fn agent_save_mcp(
             super::mcp_oauth::clear_tokens(&room.conn, &name)?;
         }
         db::set_setting(&room.conn, MCP_CONFIG_KEY, &json)?;
-        Ok((json, existed, retargeted && (had_credentials || had_signin)))
+        Ok((
+            json,
+            existed,
+            retargeted && (had_credentials || had_signin),
+            retargeted,
+        ))
     })?;
-    let (json, existed, dropped_credentials) = json;
+    let (json, existed, dropped_credentials, retargeted) = json;
+    let app = window.app_handle().clone();
     let servers = mcp::parse_config(&json)?;
-    start_mcp_connections(window.app_handle().clone(), servers);
+    start_mcp_connections(app.clone(), servers);
     let dropped = if dropped_credentials {
         " Its saved credentials and sign-in were NOT carried over, because this edit changed where the connector points."
     } else {
         ""
     };
+    // Same reason the credentials stay behind: "run without asking" and "send
+    // real values" were granted to the place this connector used to reach, and
+    // they are keyed by its NAME, so leaving them would hand both to the new
+    // destination without anyone being asked.
+    let mut permissions = String::new();
+    if retargeted {
+        match forget_connector_grants(&app, state, &name) {
+            Ok(true) => permissions.push_str(
+                " The permissions saved for it (\"run without asking\" / \"send real values\") \
+                 were cleared for the same reason.",
+            ),
+            Ok(false) => {}
+            Err(e) => {
+                permissions.push(' ');
+                permissions.push_str(&e);
+            }
+        }
+    }
     Ok(format!(
-        "{} connector \"{}\" as disabled.{dropped} Review it in Connectors, add any credentials there, then explicitly enable and approve it before it can run or reach the network.",
+        "{} connector \"{}\" as disabled.{dropped}{permissions} Review it in Connectors, add any credentials there, then explicitly enable and approve it before it can run or reach the network.",
         if existed { "Updated" } else { "Saved" },
         name
     ))
+}
+
+/// Which connectors' stored sign-ins no longer belong to them: every server the
+/// PREVIOUS config had that the next one drops, or points somewhere else, or
+/// leaves unreadable. Names only — the caller decides what to do with them.
+/// Pure — unit-tested.
+///
+/// A config that cannot be parsed at all yields nothing: this answers "which of
+/// these entries moved", and with no readable previous config nothing is known
+/// to have moved. The caller has already refused an unreadable NEW config.
+pub(crate) fn resigned_servers(previous: &str, next: &str) -> Vec<String> {
+    let entries = |raw: &str| -> serde_json::Map<String, serde_json::Value> {
+        serde_json::from_str::<serde_json::Value>(raw)
+            .ok()
+            .and_then(|v| v.get("mcpServers").and_then(|m| m.as_object()).cloned())
+            .unwrap_or_default()
+    };
+    let old = entries(previous);
+    let new = entries(next);
+    old.iter()
+        .filter(|(name, cfg)| {
+            let (Some(was), Some(now)) = (
+                cfg.as_object(),
+                new.get(name.as_str()).and_then(|v| v.as_object()),
+            ) else {
+                return true; // dropped entirely, or not an entry we can compare
+            };
+            !same_destination(was, now)
+        })
+        .map(|(name, _)| name.clone())
+        .collect()
 }
 
 /// Does an edited connector still reach the same place? Compares only the fields
@@ -1483,9 +1650,16 @@ pub(crate) async fn agent_delete_mcp(
         db::set_setting(&room.conn, MCP_CONFIG_KEY, &json)?;
         Ok(json)
     })?;
-    start_mcp_connections(window.app_handle().clone(), mcp::parse_config(&json)?);
+    let app = window.app_handle().clone();
+    start_mcp_connections(app.clone(), mcp::parse_config(&json)?);
+    // Reported rather than raised: the connector IS deleted, and answering with
+    // an error would have the model tell the user nothing happened.
+    let kept = match forget_connector_grants(&app, state, &name) {
+        Ok(_) => String::new(),
+        Err(e) => format!(" {e}"),
+    };
     Ok(format!(
-        "Deleted connector \"{name}\" and its saved OAuth token."
+        "Deleted connector \"{name}\" and its saved OAuth token.{kept}"
     ))
 }
 
@@ -1572,7 +1746,10 @@ pub fn mcp_remove_server(
         db::set_setting(&room.conn, MCP_CONFIG_KEY, &json)?;
         Ok(json)
     })?;
-    apply_edited_config(&app, &state, json)
+    let statuses = apply_edited_config(&app, &state, json)?;
+    // The connector is out of the room; its standing permissions go with it.
+    let _cleared = forget_connector_grants(&app, &state, &server)?;
+    Ok(statuses)
 }
 
 /// Remove the Authorization header from one server's config entry. Pure.
@@ -1977,22 +2154,69 @@ mod tests {
         assert!(!read_mcp_flag(auto.clone()), "no file yet = OFF");
         assert!(!read_mcp_flag(unmask.clone()), "no file yet = OFF");
 
-        write_mcp_flag(auto.clone(), true);
+        write_mcp_flag(auto.clone(), true).unwrap();
         assert!(read_mcp_flag(auto.clone()));
         assert!(
             !read_mcp_flag(unmask.clone()),
             "granting standing consent must not create or set the unmasking flag"
         );
 
-        write_mcp_flag(unmask.clone(), true);
-        write_mcp_flag(auto.clone(), false);
+        write_mcp_flag(unmask.clone(), true).unwrap();
+        write_mcp_flag(auto.clone(), false).unwrap();
         assert!(
             read_mcp_flag(unmask.clone()),
             "withdrawing consent must not silently re-mask behind the user's back"
         );
         assert!(!read_mcp_flag(auto));
 
+        // A power that could not be written is REPORTED. The page's switch is
+        // optimistic and re-reads on failure, so a swallowed error left it
+        // showing a consent decision that the next launch would not have.
+        let unwritable = dir.join("not-a-dir.json").join("mcp_auto_approve.json");
+        let err = write_mcp_flag(Ok(unwritable), true)
+            .expect_err("a failed write must not report success");
+        assert!(err.contains("could not be saved"), "{err}");
+        assert!(
+            write_mcp_flag(Err("no app data dir".into()), true).is_err(),
+            "no path at all is a failure too"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A stored sign-in belongs to an ENDPOINT and is filed under a NAME. The
+    /// Advanced editor and the marketplace both save through `mcp_apply_config`,
+    /// which never cleared one — so re-pointing `fetch` left `oauth:fetch` in
+    /// place, and the connect-time renewal merged a fresh token for the old
+    /// provider into an entry that now reached the new one.
+    #[test]
+    fn a_retargeted_or_dropped_connector_gives_up_its_sign_in() {
+        let with = |body: &str| format!(r#"{{"mcpServers":{body}}}"#);
+        let a = with(r#"{"fetch":{"url":"https://a.test/mcp","type":"http"}}"#);
+        let b = with(r#"{"fetch":{"url":"https://b.test/mcp","type":"http"}}"#);
+        assert_eq!(resigned_servers(&a, &b), vec!["fetch".to_string()]);
+
+        // The same destination with other fields edited keeps its sign-in —
+        // otherwise every save would log the user out.
+        let a_disabled =
+            with(r#"{"fetch":{"url":"https://a.test/mcp","type":"http","disabled":true}}"#);
+        assert!(resigned_servers(&a, &a_disabled).is_empty());
+        let a_with_header = with(
+            r#"{"fetch":{"url":"https://a.test/mcp","type":"http","headers":{"Authorization":"Bearer x"}}}"#,
+        );
+        assert!(resigned_servers(&a, &a_with_header).is_empty());
+
+        // Dropped entirely: the name is free for something else, so the token
+        // must not be waiting for whatever takes it.
+        assert_eq!(resigned_servers(&a, &with("{}")), vec!["fetch".to_string()]);
+        // A local connector re-pointed at another program is the same story.
+        let local = with(r#"{"tools":{"command":"uvx","args":["one"]}}"#);
+        let moved = with(r#"{"tools":{"command":"uvx","args":["two"]}}"#);
+        assert_eq!(resigned_servers(&local, &moved), vec!["tools".to_string()]);
+        // Nothing stored, or nothing readable: nothing is known to have moved.
+        assert!(resigned_servers(&with("{}"), &a).is_empty());
+        assert!(resigned_servers("", &a).is_empty());
+        assert!(resigned_servers("not json", &a).is_empty());
     }
 
     #[test]

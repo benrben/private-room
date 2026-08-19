@@ -262,6 +262,15 @@ fn check_media_shape(plan: &mut CreatePlan) -> Result<(), String> {
     let slug = plan.model.split("::").nth(1).unwrap_or(&plan.model).to_string();
     let limits = limits_for(&slug);
 
+    // HOW MANY FACES THIS MODEL WILL TAKE. Published as `input_references.max`
+    // and, until now, consulted only by the bench's attach button — so a shot
+    // list handed four cast portraits to a model that publishes two, showed all
+    // four on the review sheet as "looks like" evidence, and collected a
+    // provider refusal per shot. Dropped rather than refused, like resolution
+    // and aspect ratio: a picture with two of the four faces guided is the
+    // picture that was asked for, drawn with less help.
+    cap_references(&mut plan.reference_file_ids, limits.as_ref().and_then(|l| l.max_references));
+
     if !plan.is_video() {
         // Stills take no length, and a stray one would be sent to an endpoint
         // that has no such parameter.
@@ -318,6 +327,17 @@ fn check_media_shape(plan: &mut CreatePlan) -> Result<(), String> {
     drop_unpublished(&mut plan.resolution, &limits.resolutions);
     drop_unpublished(&mut plan.aspect_ratio, &limits.aspect_ratios);
     Ok(())
+}
+
+/// Keep only as many guiding pictures as the model says it will look at.
+///
+/// An unpublished ceiling (`None`) is the provider declining to say, and every
+/// other reader here treats that as "send what was asked for" — inventing a cap
+/// would drop a face the model would happily have taken.
+fn cap_references(ids: &mut Vec<String>, max: Option<u32>) {
+    if let Some(max) = max {
+        ids.truncate(max as usize);
+    }
 }
 
 /// Clear a size or shape this model does not publish.
@@ -395,10 +415,10 @@ fn spawn_create(
         // exist. It un-pauses ITSELF when that clip lands (see the completion
         // hook), so the pause is a promise deferred, not abandoned.
         let mut chain_wait: Option<String> = None;
-        let outcome: Result<Vec<FileMeta>, Option<String>> = {
+        let outcome: Result<CreateRun, Option<String>> = {
             let run = run_create(&state, &window, &job_id, &room_path, &plan, &cancel).await;
             match run {
-                Ok(files) => Ok(files),
+                Ok(made) => Ok(made),
                 Err(RunStop::ChainWait(reason)) => {
                     chain_wait = Some(reason);
                     Err(None)
@@ -411,11 +431,18 @@ fn spawn_create(
         // How many others were abandoned because this failure will repeat for
         // them too. Read out of the lock so the message below can say it.
         let mut also_stopped = 0usize;
+        // How many chain-parked shots were let go because this clip will never
+        // exist for them to open on. Read out of the lock for the same reason.
+        let mut released = 0usize;
         {
             let guard = state.room.lock().unwrap();
             if let Some(r) = guard.as_ref().filter(|r| r.path == room_path) {
                 let (status, err) = match &outcome {
-                    Ok(_) => ("done", None),
+                    // A partial run is FINISHED — the files it made are real —
+                    // and it still records why the rest are missing. History
+                    // already reads `error` on a done row as "not all of it
+                    // went through" (`allSucceeded` in AiPane.tsx).
+                    Ok(run) => ("done", run.partial.as_deref()),
                     Err(None) => ("paused", None),
                     Err(Some(e)) => ("error", Some(e.as_str())),
                 };
@@ -433,22 +460,47 @@ fn spawn_create(
                 // than queued up to rediscover it one at a time.
                 if let Err(Some(e)) = &outcome {
                     also_stopped = abandon_doomed_queue(&r.conn, e, &plan.model);
+                    // This clip will not exist, so the shot after it is waiting
+                    // for nothing. Whatever `abandon_doomed_queue` did not
+                    // already settle is put back in the queue to open on its
+                    // drawn still — the answer `decide_chain` gives once a
+                    // predecessor has neither a clip nor a live job.
+                    released = release_chain_waiters(&r.conn);
                 }
             }
         }
         state.job_cancels.lock().unwrap().remove(&job_id);
 
         use tauri::Emitter;
+        // The join is what a chain-parked shot was waiting for, and it is what
+        // it loses when this clip fails — said on the card rather than left for
+        // the finished video to reveal.
+        let released_note = if released > 0 {
+            format!(
+                " {released} shot(s) waiting on this clip start on their own \
+                 picture instead."
+            )
+        } else {
+            String::new()
+        };
         let payload = match outcome {
-            Ok(files) => {
-                let noun = made_noun(&kind, files.len());
+            Ok(run) => {
+                let noun = made_noun(&kind, run.made.len());
+                // The count alone would be a green card for a run that lost
+                // half of what was asked for, in the provider's own words —
+                // which are the only thing that says whether trying again is
+                // worth paying for.
+                let label = match &run.partial {
+                    Some(why) => format!("{noun} ready — the rest could not be made: {why}"),
+                    None => format!("{noun} ready in this room"),
+                };
                 serde_json::json!({
                     "jobId": job_id,
-                    "label": format!("{noun} ready in this room"),
+                    "label": label,
                     "done": 100, "total": 100, "finished": true,
                     // The FIRST file, so the terminal event opens one picture
                     // rather than four fighting over the viewer.
-                    "fileId": files.first().map(|f| f.id.clone()),
+                    "fileId": run.made.first().map(|f| f.id.clone()),
                 })
             }
             Err(None) => serde_json::json!({
@@ -461,10 +513,10 @@ fn spawn_create(
                 "label": if also_stopped > 0 {
                     format!(
                         "Nothing was made — {e}. The other {also_stopped} waiting \
-                         were stopped too, for the same reason."
+                         were stopped too, for the same reason.{released_note}"
                     )
                 } else {
-                    format!("Nothing was made — {e}")
+                    format!("Nothing was made — {e}{released_note}")
                 },
                 "done": 0, "total": 100, "failed": true,
             }),
@@ -523,7 +575,14 @@ fn abandon_doomed_queue(conn: &rusqlite::Connection, error: &str, model: &str) -
     };
     let reason = format!("{error} — stopped without being sent, after the one before it failed the same way");
     let mut stopped = 0usize;
-    for job in jobs.iter().filter(|j| j.kind == "create" && j.status == "queued") {
+    // Chain-parked rows count as waiting. They are not queued — they are
+    // holding for a clip — but the answer this failure gave settles them
+    // exactly as it settles the queue, and leaving them parked would leave a
+    // card promising an automatic start that can no longer come.
+    for job in jobs
+        .iter()
+        .filter(|j| j.kind == "create" && (j.status == "queued" || is_chain_parked(j)))
+    {
         if matches!(scope, Doomed::ThisModel) {
             // Only the ones pointing at the same model. An unreadable plan is
             // left alone rather than guessed at.
@@ -570,7 +629,7 @@ async fn run_create(
     room_path: &str,
     plan: &CreatePlan,
     cancel: &Arc<AtomicBool>,
-) -> Result<Vec<FileMeta>, RunStop> {
+) -> Result<CreateRun, RunStop> {
     let mut made: Vec<FileMeta> = Vec::new();
     let mut last_error: Option<String> = None;
 
@@ -746,7 +805,19 @@ async fn run_create(
             last_error.unwrap_or_else(|| "nothing came back".into()),
         ));
     }
-    Ok(made)
+    // Some landed and some did not. `last_error` travels with them: a run that
+    // kept two of four pictures and dropped the provider's reason for the other
+    // two reports as a plain success, and the user is left comparing a count
+    // they never see against a number they asked for.
+    Ok(CreateRun { made, partial: last_error })
+}
+
+/// What one create job produced, and — when it made SOME of what was asked
+/// for — what stopped it short. A Stop is not a shortfall: the loop breaks on
+/// `cancel` without recording a reason, so `partial` stays empty there.
+struct CreateRun {
+    made: Vec<FileMeta>,
+    partial: Option<String>,
 }
 
 /// One still, through the dedicated images endpoint.
@@ -986,25 +1057,75 @@ fn chain_gate(state: &AppState, room_path: &str, shot_id: &str, model: &str) -> 
     let Ok(Some(prev)) = db::prev_shot(&room.conn, shot_id) else {
         return ChainGate::Proceed;
     };
-    // Only a VIDEO job for the predecessor is worth waiting for. An image job
-    // (its still being drawn) never produces the clip whose end frame we
-    // need, and waking happens only on clip completion — waiting on it would
-    // park this shot with nothing coming to wake it.
-    let busy = prev.clip_file_id.is_none()
-        && db::unfinished_jobs(&room.conn)
-            .ok()
-            .into_iter()
-            .flatten()
-            .filter(|j| j.kind == "create")
-            .any(|j| {
-                serde_json::from_value::<CreatePlan>(j.plan.clone())
-                    .ok()
-                    .filter(|p| p.kind == CREATE_KIND_VIDEO)
-                    .and_then(|p| p.shot_id)
-                    .as_deref()
-                    == Some(prev.id.as_str())
-            });
+    let busy = prev.clip_file_id.is_none() && filming_job_exists(&room.conn, &prev.id);
     decide_chain(Some((&prev.clip_file_id, &prev.video_model, busy)))
+}
+
+/// Is a clip for this shot still coming?
+///
+/// Only a VIDEO job counts. An image job (its still being drawn) never produces
+/// the clip whose end frame a successor needs, and waking happens only on clip
+/// completion — waiting on one would park a shot with nothing coming to wake
+/// it. One reader for both sides of the promise: the gate that parks a job, and
+/// the release that lets it go when the predecessor stops being a prospect.
+fn filming_job_exists(conn: &rusqlite::Connection, shot_id: &str) -> bool {
+    db::unfinished_jobs(conn)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter(|j| j.kind == "create")
+        .any(|j| {
+            serde_json::from_value::<CreatePlan>(j.plan.clone())
+                .ok()
+                .filter(|p| p.kind == CREATE_KIND_VIDEO)
+                .and_then(|p| p.shot_id)
+                .as_deref()
+                == Some(shot_id)
+        })
+}
+
+/// A job parked by `ChainGate::Wait`, and not by the user's own Stop. Matched
+/// on the reason's PREFIX, exactly as `wake_chain_waiter` does — a pause the
+/// user asked for must never be resumed or cancelled behind their back.
+fn is_chain_parked(job: &db::Job) -> bool {
+    job.kind == "create"
+        && job.status == "paused"
+        && job
+            .parked_reason
+            .as_deref()
+            .is_some_and(|r| r.starts_with(CHAIN_WAIT_REASON))
+}
+
+/// Let go the chain-parked jobs whose predecessor will never film.
+///
+/// `wake_chain_waiter` is the promise kept: the clip landed, so the waiter may
+/// open on it. This is the promise that CANNOT be kept — the shot before it
+/// errored, or was abandoned with the queue — where nothing is coming to wake
+/// the waiter and its card goes on saying "It starts by itself when that clip
+/// is ready". Re-queued rather than rewritten, because that is the answer the
+/// gate itself now gives: no clip and no live job means proceed on the drawn
+/// still. Returns how many were let go.
+fn release_chain_waiters(conn: &rusqlite::Connection) -> usize {
+    let Ok(jobs) = db::unfinished_jobs(conn) else {
+        return 0;
+    };
+    let mut freed = 0usize;
+    for job in jobs.iter().filter(|j| is_chain_parked(j)) {
+        let shot_id = serde_json::from_value::<CreatePlan>(job.plan.clone())
+            .ok()
+            .and_then(|p| p.shot_id);
+        let Some(shot_id) = shot_id else { continue };
+        let Ok(Some(prev)) = db::prev_shot(conn, &shot_id) else { continue };
+        // A predecessor that HAS its clip is `wake_chain_waiter`'s business,
+        // and one still queued or running is a wait that is still honest.
+        if prev.clip_file_id.is_some() || filming_job_exists(conn, &prev.id) {
+            continue;
+        }
+        if db::set_job_status(conn, &job.id, "queued", None).is_ok() {
+            freed += 1;
+        }
+    }
+    freed
 }
 
 /// Capture the predecessor clip's real final frame, file it in the room, and
@@ -1077,14 +1198,7 @@ fn wake_chain_waiter(state: &AppState, room_path: &str, shot_id: &str) {
     let Ok(Some(next_shot)) = db::next_shot_id(&room.conn, shot_id) else { return };
     let Ok(jobs) = db::unfinished_jobs(&room.conn) else { return };
     for job in jobs {
-        if job.kind != "create" || job.status != "paused" {
-            continue;
-        }
-        if !job
-            .parked_reason
-            .as_deref()
-            .is_some_and(|r| r.starts_with(CHAIN_WAIT_REASON))
-        {
+        if !is_chain_parked(&job) {
             continue;
         }
         let is_next = serde_json::from_value::<CreatePlan>(job.plan.clone())
@@ -1250,11 +1364,6 @@ pub struct FilmPlan {
 pub(crate) struct PlannedRow {
     pub plan: Option<CreatePlan>,
     pub preview: ShotPreview,
-    /// The PREVIOUS shot's finished clip, when it already has one. The resume
-    /// path captures this clip's real end frame as this shot's opening — the
-    /// live path cannot do it, because "the previous clip finished" never
-    /// fires for a clip that was finished before the run began.
-    pub prev_clip_file_id: Option<String>,
 }
 
 fn plan_shot_list(
@@ -1338,7 +1447,7 @@ fn plan_shot_list(
             } else {
                 "already being drawn — a job for it is queued or running".into()
             });
-            out.push(PlannedRow { plan: None, preview, prev_clip_file_id: None });
+            out.push(PlannedRow { plan: None, preview });
             continue;
         }
         // Already made — skipped rather than charged for twice. Re-making one
@@ -1350,7 +1459,7 @@ fn plan_shot_list(
             } else {
                 "already drawn".into()
             });
-            out.push(PlannedRow { plan: None, preview, prev_clip_file_id: None });
+            out.push(PlannedRow { plan: None, preview });
             continue;
         }
         if model.trim().is_empty() {
@@ -1359,7 +1468,7 @@ fn plan_shot_list(
             } else {
                 "no picture model chosen".into()
             });
-            out.push(PlannedRow { plan: None, preview, prev_clip_file_id: None });
+            out.push(PlannedRow { plan: None, preview });
             continue;
         }
 
@@ -1439,15 +1548,11 @@ fn plan_shot_list(
                     && chain
                     && receiver_ok
                     && (prev_clip.is_some() || prev_will_film);
-                out.push(PlannedRow {
-                    prev_clip_file_id: if preview.starts_on_previous { prev_clip } else { None },
-                    plan: Some(plan),
-                    preview,
-                });
+                out.push(PlannedRow { plan: Some(plan), preview });
             }
             Err(why) => {
                 preview.skip = Some(why);
-                out.push(PlannedRow { plan: None, preview, prev_clip_file_id: None });
+                out.push(PlannedRow { plan: None, preview });
             }
         }
     }
@@ -1809,9 +1914,17 @@ mod tests {
             two.preview.starts_on_previous,
             "shot two opens on shot one's captured end frame"
         );
+        // Shot one has no clip YET, so nothing is captured at plan time: the
+        // row promises the join and the gate decides it at shot two's start.
+        // What the gate then answers is pinned by its own test, not re-asserted
+        // here with hand-made arguments this list never produced.
+        let plan_two = two.plan.as_ref().unwrap();
+        assert!(plan_two.chained, "the promise rides on the plan");
         assert_eq!(
-            two.prev_clip_file_id, None,
-            "shot one has no clip YET — the handoff happens live, when it lands"
+            plan_two.frame_file_id.as_deref(),
+            Some("still-2"),
+            "the queued opening is shot two's OWN drawn still — the real end frame \
+             is captured at its start, from a clip that does not exist yet"
         );
 
         // The prompt shown is the prompt sent, logline and all — not the row.
@@ -1848,17 +1961,19 @@ mod tests {
         let two = rows.iter().find(|r| r.preview.shot_id == second.id).unwrap();
         assert!(two.plan.is_some());
         assert!(two.preview.starts_on_previous);
-        assert_eq!(
-            two.prev_clip_file_id.as_deref(),
-            Some("clip-1"),
-            "the run captures shot two's opening from this existing clip"
-        );
+        // …and the capture itself is the gate's, at shot two's start. The row
+        // carries no copy of shot one's clip: it queues shot two's own drawn
+        // still and the promise, and the run looks left when it begins. (What
+        // the gate then answers is pinned by the gate's own test.)
+        let plan_two = two.plan.as_ref().unwrap();
+        assert!(plan_two.chained);
+        assert_eq!(plan_two.frame_file_id.as_deref(), Some("still-2"));
 
         // With the chain OFF, the existing clip is nobody's business.
         let rows = plan_shot_list(&conn, &list, CREATE_KIND_VIDEO, false).unwrap();
         let two = rows.iter().find(|r| r.preview.shot_id == second.id).unwrap();
         assert!(!two.preview.starts_on_previous);
-        assert_eq!(two.prev_clip_file_id, None);
+        assert!(two.plan.as_ref().is_some_and(|p| !p.chained));
     }
 
     #[test]
@@ -1891,6 +2006,111 @@ mod tests {
             decide_chain(Some((&none, "", true))),
             ChainGate::Proceed
         ));
+    }
+
+    /// `input_references.max` was read in exactly one place — the bench's
+    /// attach button — so a shot list handed four cast faces to a model that
+    /// publishes two and collected a refusal per shot, after the review sheet
+    /// had already shown those four as "looks like" evidence.
+    #[test]
+    fn a_models_published_reference_ceiling_is_applied_to_what_is_sent() {
+        let four = || {
+            vec!["a".to_string(), "b".to_string(), "c".to_string(), "d".to_string()]
+        };
+        let mut ids = four();
+        cap_references(&mut ids, Some(2));
+        assert_eq!(ids, vec!["a".to_string(), "b".to_string()], "the first two are sent");
+
+        // Unpublished: the provider declined to say, so nothing is dropped.
+        let mut ids = four();
+        cap_references(&mut ids, None);
+        assert_eq!(ids.len(), 4);
+
+        // Exactly at the ceiling, and one under it: nothing goes.
+        let mut ids = four();
+        cap_references(&mut ids, Some(4));
+        assert_eq!(ids.len(), 4);
+        let mut ids = four();
+        cap_references(&mut ids, Some(5));
+        assert_eq!(ids.len(), 4);
+
+        // A model that takes none, and a plan that has none.
+        let mut ids = four();
+        cap_references(&mut ids, Some(0));
+        assert!(ids.is_empty());
+        let mut ids: Vec<String> = Vec::new();
+        cap_references(&mut ids, Some(2));
+        assert!(ids.is_empty());
+    }
+
+    /// A chain-parked job is woken by its predecessor's SUCCESS. When the
+    /// predecessor fails instead, nothing used to move it: it sat 'paused'
+    /// forever with a card saying "It starts by itself when that clip is
+    /// ready", which by then was untrue.
+    #[test]
+    fn a_shot_parked_on_a_clip_that_will_never_exist_is_let_go() {
+        let conn = room();
+        let list = db::create_story_list(&conn, "Episode 1", "").unwrap();
+        let first = db::add_shot(&conn, &list, "one").unwrap();
+        let second = db::add_shot(&conn, &list, "two").unwrap();
+        let park = |shot: &str| {
+            let plan = serde_json::json!({
+                "prompt": "two", "model": "openrouter::kling/v3",
+                "kind": CREATE_KIND_VIDEO, "shotId": shot,
+            });
+            let id = db::create_job(&conn, "create", "Filming", &plan, 100).unwrap();
+            db::set_job_status(&conn, &id, "paused", None).unwrap();
+            db::set_parked_reason(&conn, &id, CHAIN_WAIT_REASON).unwrap();
+            id
+        };
+        let waiter = park(&second.id);
+
+        // Shot one is still being filmed: the wait is honest, so nothing moves.
+        let live = serde_json::json!({
+            "prompt": "one", "model": "openrouter::kling/v3",
+            "kind": CREATE_KIND_VIDEO, "shotId": first.id,
+        });
+        let running = db::create_job(&conn, "create", "Filming", &live, 100).unwrap();
+        assert_eq!(release_chain_waiters(&conn), 0);
+        let still = db::unfinished_jobs(&conn)
+            .unwrap()
+            .into_iter()
+            .find(|j| j.id == waiter)
+            .expect("still waiting");
+        assert_eq!(still.status, "paused");
+
+        // Shot one fails. Nothing is coming, so shot two goes back in the queue
+        // and will open on its own drawn still.
+        db::set_job_status(&conn, &running, "error", Some("insufficient credits")).unwrap();
+        assert_eq!(release_chain_waiters(&conn), 1);
+        let freed = db::unfinished_jobs(&conn)
+            .unwrap()
+            .into_iter()
+            .find(|j| j.id == waiter)
+            .expect("queued again");
+        assert_eq!(freed.status, "queued");
+        assert_eq!(freed.parked_reason, None, "and it stops promising the join");
+    }
+
+    /// The user's own pause is not a chain wait, and must never be re-queued
+    /// behind their back.
+    #[test]
+    fn a_pause_the_user_asked_for_is_left_alone() {
+        let conn = room();
+        let list = db::create_story_list(&conn, "Episode 1", "").unwrap();
+        let _first = db::add_shot(&conn, &list, "one").unwrap();
+        let second = db::add_shot(&conn, &list, "two").unwrap();
+        let plan = serde_json::json!({
+            "prompt": "two", "model": "openrouter::kling/v3",
+            "kind": CREATE_KIND_VIDEO, "shotId": second.id,
+        });
+        let id = db::create_job(&conn, "create", "Filming", &plan, 100).unwrap();
+        db::set_job_status(&conn, &id, "paused", None).unwrap();
+
+        assert_eq!(release_chain_waiters(&conn), 0);
+        assert_eq!(abandon_doomed_queue(&conn, "insufficient credits", "openrouter::kling/v3"), 0);
+        let job = db::unfinished_jobs(&conn).unwrap().remove(0);
+        assert_eq!(job.status, "paused");
     }
 
     #[test]

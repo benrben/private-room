@@ -1,12 +1,14 @@
-/* Four Settings/start-screen gaps the audit found, pinned.
+/* Settings/start-screen gaps the audit found, pinned, and the sentences a
+ * password change owes the user when only half of it worked.
  *
- * Runs under `npm run test:page` (node --test). `duplicateFileName` is exercised
- * for real — `src/rooms/helpers.ts` imports nothing, so it type-strips and
- * imports from memory like localModel.test.mjs does. The other three are SOURCE
- * scans, the same way approveCardFocus.test.mjs pins the consent cards: each of
- * those lives inside a React section that needs the whole Tauri backend and a
- * settings state object before it renders one node, and what actually went
- * wrong in each case is a control that was never wired at all.
+ * Runs under `npm run test:page` (node --test). `duplicateFileName` and
+ * `src/rooms/passwordChange.ts` are exercised for real — both import nothing,
+ * so they type-strip and import from memory like localModel.test.mjs does. The
+ * rest are SOURCE scans, the same way approveCardFocus.test.mjs pins the
+ * consent cards: each of those lives inside a React section that needs the
+ * whole Tauri backend and a settings state object before it renders one node,
+ * and what actually went wrong in each case is a control that was never wired
+ * at all.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -18,12 +20,19 @@ import ts from "typescript";
 const here = dirname(fileURLToPath(import.meta.url));
 const src = (p) => readFileSync(join(here, "../../src", p), "utf8");
 
-const JS = ts.transpileModule(src("rooms/helpers.ts"), {
-  compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
-}).outputText;
-const { duplicateFileName } = await import(
-  `data:text/javascript,${encodeURIComponent(JS)}`
-);
+const load = async (file) => {
+  const js = ts.transpileModule(src(file), {
+    compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
+  }).outputText;
+  return import(`data:text/javascript,${encodeURIComponent(js)}`);
+};
+const { duplicateFileName } = await load("rooms/helpers.ts");
+const {
+  newPasswordProblem,
+  revokedRecoveryWarning,
+  strandedCheckpointWarning,
+  touchIdLostWarning,
+} = await load("rooms/passwordChange.ts");
 
 test("a duplicate is suggested under the room's own name, not 'Copy of room'", () => {
   // The save sheet offered the same generic name for every room, so duplicating
@@ -130,4 +139,67 @@ test("changing a password gets the same guidance as choosing one", () => {
     /at least 8 characters/,
     "the minimum must not be typed out by hand",
   );
+});
+
+test("a new password is refused for the reason it was refused", () => {
+  assert.equal(newPasswordProblem("hunter2hunter2", "hunter2hunter2", 8), null);
+  assert.equal(
+    newPasswordProblem("hunter2hunter2", "hunter2hunter", 8),
+    "The new passwords do not match.",
+  );
+  // Mismatch is checked first: telling someone their typo is too short sends
+  // them to fix the wrong box.
+  assert.equal(newPasswordProblem("abc", "xyz", 8), "The new passwords do not match.");
+  assert.equal(
+    newPasswordProblem("abc", "abc", 8),
+    "New password must be at least 8 characters.",
+  );
+  assert.equal(
+    newPasswordProblem("abcdefghij", "abcdefghij", 12),
+    "New password must be at least 12 characters.",
+  );
+});
+
+test("a password change that half-worked says which half", () => {
+  // `change_password` returns null for a room that never had a recovery key
+  // AND for one whose key could not be re-wrapped. Only the second is a
+  // credential the user has permanently lost, and only the second is said.
+  assert.match(revokedRecoveryWarning(true, null), /revoked/);
+  assert.equal(revokedRecoveryWarning(false, null), null);
+  assert.equal(revokedRecoveryWarning(true, "ABCD-EFGH"), null);
+
+  // A stranded restore point still opens — with the OLD password. Saying so
+  // now is the difference between keeping that password and losing the data.
+  assert.equal(strandedCheckpointWarning([]), null);
+  const one = strandedCheckpointWarning(["Before the import"]);
+  assert.match(one, /^1 restore point could not be re-locked/);
+  assert.match(one, /\(Before the import\)/);
+  assert.match(one, /PREVIOUS password/);
+  assert.match(
+    strandedCheckpointWarning(["a", "b"]),
+    /^2 restore points could not be re-locked with the new password \(a, b\)\./,
+  );
+
+  // The Keychain drops the entry rather than keep a stale password in it, so
+  // the switch has to stop claiming the room is biometric-unlockable.
+  assert.match(touchIdLostWarning(true, false), /Touch ID unlock was turned off/);
+  assert.equal(touchIdLostWarning(true, true), null);
+  assert.equal(touchIdLostWarning(false, false), null);
+  assert.equal(touchIdLostWarning(false, true), null);
+});
+
+test("a partial failure is said ALONGSIDE the success, never instead of it", () => {
+  // That the two warnings share an accumulator rather than one string slot is
+  // pinned by settingsClaims.test.mjs; what is pinned here is the other half —
+  // the password DID change, and a warning must not read as a failed change.
+  const hook = src("settings/usePrivacy.ts");
+  const saved = hook.indexOf("setPwSaved(true)");
+  assert.ok(saved > 0, "the change must still report itself as saved");
+  assert.ok(
+    saved < hook.indexOf("const warnings"),
+    "the saved state is set before the warnings are gathered, so both show",
+  );
+  const section = src("settings/PrivacySection.tsx");
+  assert.match(section, /\{pwError && /, "the panel must render the warning");
+  assert.match(section, /pwSaved \?/, "and the changed state at the same time");
 });

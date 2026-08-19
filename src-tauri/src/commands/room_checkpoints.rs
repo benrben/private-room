@@ -445,8 +445,14 @@ pub(crate) fn perform_swap(room_path: &str, ck_path: &str) -> Result<(), String>
         let _ = std::fs::remove_file(format!("{room_path}{suffix}"));
     }
     let swap_tmp = format!("{room_path}.swap-{}", Uuid::new_v4());
-    std::fs::copy(ck_path, &swap_tmp)
-        .map_err(|e| format!("Could not stage the rollback copy: {e}"))?;
+    // Clear the partial copy the same way the rename branch below does: a
+    // failure part-way through (a volume that filled after the pre-check, an
+    // ejected disk) otherwise leaves a room-sized file beside the room that
+    // nothing in the app ever sweeps, and every retry adds another.
+    std::fs::copy(ck_path, &swap_tmp).map_err(|e| {
+        let _ = std::fs::remove_file(&swap_tmp);
+        format!("Could not stage the rollback copy: {e}")
+    })?;
     std::fs::rename(&swap_tmp, room_path).map_err(|e| {
         let _ = std::fs::remove_file(&swap_tmp);
         format!("Could not swap in the checkpoint: {e}")
@@ -604,8 +610,19 @@ pub async fn rollback_room_checkpoint(
     // copy failed before the rename, or the rename left the original in place),
     // so reopen the ORIGINAL file and surface the error.
     if let Err(e) = perform_swap(&room_path, &ck_path) {
-        let _ = open_room_impl(&app, state.inner(), room_path.clone(), password.clone());
-        return Err(e);
+        // The recovery reopen's own failure used to be discarded, so a user
+        // whose room was left CLOSED was told only that the swap failed, and
+        // every later action answered "No room is open." with no explanation.
+        return Err(match open_room_impl(&app, state.inner(), room_path.clone(), password.clone()) {
+            Ok(_) => e,
+            // The swap error is an io message that ends in no punctuation of
+            // its own, so the two sentences need a separator or they run
+            // together in the toast.
+            Err(reopen) => format!(
+                "{e} — nothing was rolled back, but this room could not be reopened either \
+                 ({reopen}), so it is now CLOSED. Unlock it again from the start screen."
+            ),
+        });
     }
 
     // Reopen the swapped file via the unguarded impl (our flag is still up).

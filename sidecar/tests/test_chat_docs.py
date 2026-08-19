@@ -496,3 +496,48 @@ async def test_an_unreadable_answer_is_not_reported_as_an_empty_cast(
         )
     assert resp.status_code == 502
     assert "could not read" in resp.json()["error"]
+
+
+@pytest.mark.asyncio
+async def test_a_dead_engine_during_a_cast_import_is_not_blamed_on_the_document(
+    fake_client: type[FakeAsyncClient],
+) -> None:
+    """Every window fails identically when Ollama is down, which used to satisfy
+    `failures == len(windows)` and answer "this file is not a character sheet".
+    The sentinel has to survive: it is what the Rust gateway rebuilds
+    OLLAMA_DOWN from, and what puts "start Ollama" on the screen."""
+    fake_client.script["chat"] = httpx.ConnectError("refused")
+    app = create_app()
+    async with client_for(app) as c:
+        resp = await c.post(
+            "/knowledge_extract",
+            json={
+                "model": "llama3.2",
+                "base_url": "http://h:1",
+                "mode": "cast",
+                "document": "## Mira\nTall.",
+            },
+        )
+    assert resp.status_code == 502
+    assert resp.json()["code"] == "OLLAMA_DOWN"
+    assert "character sheet" not in resp.json()["error"]
+
+
+@pytest.mark.asyncio
+async def test_an_unpulled_model_during_a_cast_import_keeps_its_sentinel(
+    fake_client: type[FakeAsyncClient],
+) -> None:
+    fake_client.script["chat"] = ResponseError("model 'x' not found", 404)
+    app = create_app()
+    async with client_for(app) as c:
+        resp = await c.post(
+            "/knowledge_extract",
+            json={
+                "model": "x",
+                "base_url": "http://h:1",
+                "mode": "cast",
+                "document": "## Mira\nTall.",
+            },
+        )
+    assert resp.status_code == 502
+    assert resp.json()["code"] == "MODEL_MISSING"

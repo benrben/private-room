@@ -362,28 +362,29 @@ export default function Waveform({
     if (!duration || !regions?.length) return empty;
     const order = Array.from(new Set(regions.map((r) => r.speaker)));
     const tone = new Map<string, { cls: string; band: number }>();
+    // How many voices already wear each hue. The band has to be counted off
+    // the HUE THAT WAS ACTUALLY CHOSEN, not off the voice's position: a caller
+    // supplying `tone` (the recording viewer keys it off the machine label)
+    // can hand two voices the same class at any two indices — Speaker 1 and
+    // Speaker 5 both land on nb-mark-blue — and deriving the band from `i`
+    // then gave them the same texture too, so their turns on the shared ribbon
+    // were drawn identically. The Nth voice wearing a hue gets band N.
+    //
+    // A ladder, not a boolean. It used to be `% 2 === 1`, which made speakers
+    // 8-11 plain again and therefore identical to speakers 0-3 — in the exact
+    // view a nine-speaker meeting gets, since lanes cap at MAX_LANES and fall
+    // back to the single ribbon. The diarizer really does produce those (see
+    // the AMI testbed).
+    const worn = new Map<string, number>();
     order.forEach((sp, i) => {
-      tone.set(sp, {
-        cls: regions.find((r) => r.speaker === sp)?.tone
-          || SPEAKER_TONES[i % SPEAKER_TONES.length],
-        // Which time round the palette this voice is, which selects a
-        // texture. Texture only appears once the palette has actually had to
-        // repeat, so a normal two- or three-voice meeting is drawn in four
-        // clean strokes.
-        //
-        // A ladder, not a boolean. It used to be `% 2 === 1`, which made
-        // speakers 8-11 plain again and therefore identical to speakers 0-3 —
-        // in the exact view a nine-speaker meeting gets, since lanes cap at
-        // MAX_LANES and fall back to the single ribbon. The diarizer really
-        // does produce those (see the AMI testbed).
-        band:
-          order.length > SPEAKER_TONES.length
-            ? Math.min(
-                Math.floor(i / SPEAKER_TONES.length),
-                TONE_BANDS - 1,
-              )
-            : 0,
-      });
+      const cls =
+        regions.find((r) => r.speaker === sp)?.tone
+        || SPEAKER_TONES[i % SPEAKER_TONES.length];
+      const lap = worn.get(cls) ?? 0;
+      worn.set(cls, lap + 1);
+      // Texture only appears where a hue has actually had to repeat, so a
+      // meeting whose voices all differ is drawn in clean strokes.
+      tone.set(sp, { cls, band: Math.min(lap, TONE_BANDS - 1) });
     });
     const spans = regions
       .filter((r) => r.end > r.start)

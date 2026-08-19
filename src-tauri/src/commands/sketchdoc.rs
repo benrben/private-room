@@ -328,6 +328,27 @@ impl Sketch {
             doc.width = CANVAS_W;
             doc.height = CANVAS_H;
         }
+        // A CONNECTOR NEEDS TWO ENDS. An arrow or line carrying one point (a
+        // hand-edited file, an import, a half-written stroke) reads as an
+        // element everywhere else in this module, and three readers — the SVG
+        // renderer, `to_script` and the layout checker — index `points[1]`
+        // directly. Dropped on the way in, the way the editor's own `isElement`
+        // refuses it, so a bad file opens as a drawing missing one mark rather
+        // than panicking whichever command touched it first.
+        // Pen rides along because the editor drops it on the same rule: a file
+        // that opens as two different drawings depending on which side read it
+        // is the one thing this module exists to prevent.
+        // BEFORE the counter recovery below, again to match: `parseSketch`
+        // filters and then reduces over what survived, so both sides recover
+        // the same `seq` from the same list. (A dropped element's id is
+        // therefore free to be minted again — it is no longer on the page, so
+        // nothing can collide with it.)
+        doc.elements.retain(|e| match &e.shape {
+            Shape::Arrow { points } | Shape::Line { points } | Shape::Pen { points } => {
+                points.len() >= 2
+            }
+            _ => true,
+        });
         // A file hand-edited to reuse an id, or written by an older build that
         // did not persist `seq`, would otherwise mint a duplicate on the next
         // add. Recover the counter from the ids actually present.
@@ -598,9 +619,20 @@ pub(crate) struct ScriptOutcome {
     pub(crate) changed: Vec<String>,
     pub(crate) removed: Vec<String>,
     pub(crate) cleared: bool,
+    /// The page size this script set, when it set one. A `canvas` line changes
+    /// no element, so without it recorded here a script that ONLY resizes read
+    /// as "nothing changed": the editor was handed the wider page and the file
+    /// on disk kept the old one.
+    pub(crate) resized: Option<(i32, i32)>,
     /// One line per statement, in order, describing what it did. This is the
-    /// step-by-step trace the editor animates and the tool result summarises.
+    /// step-by-step trace the editor animates; it is emitted with the
+    /// `sketch-drawn` event and goes nowhere near the tool result.
     pub(crate) steps: Vec<String>,
+    /// Lines this deliberately did not carry out, in words the model can act
+    /// on. `summary()` is the WHOLE of what `tool_draw` hands back, so a
+    /// refusal recorded only in `steps` is one the model never hears — and it
+    /// sends the same line again on the next turn.
+    pub(crate) refused: Vec<String>,
 }
 
 impl ScriptOutcome {
@@ -609,6 +641,7 @@ impl ScriptOutcome {
             && self.changed.is_empty()
             && self.removed.is_empty()
             && !self.cleared
+            && self.resized.is_none()
     }
 
     /// A one-line receipt naming real ids.
@@ -616,6 +649,9 @@ impl ScriptOutcome {
         let mut parts = Vec::new();
         if self.cleared {
             parts.push("cleared the page".to_string());
+        }
+        if let Some((w, h)) = self.resized {
+            parts.push(format!("set the page to {w}×{h}"));
         }
         if !self.added.is_empty() {
             parts.push(format!("added {}", id_list(&self.added)));
@@ -626,6 +662,10 @@ impl ScriptOutcome {
         if !self.removed.is_empty() {
             parts.push(format!("deleted {}", id_list(&self.removed)));
         }
+        // Last, and never suppressed by a change on another line: a script
+        // whose fourth line was refused must not read as a script that did
+        // everything it was asked.
+        parts.extend(self.refused.iter().cloned());
         if parts.is_empty() {
             return "nothing changed".into();
         }
@@ -677,10 +717,19 @@ pub(crate) fn apply_script(doc: &mut Sketch, script: &str) -> Result<ScriptOutco
     let mut created: Vec<String> = Vec::new();
     let mut live: Vec<String> = doc.elements.iter().map(|e| e.id.clone()).collect();
     let mut projected_seq = doc.seq;
+    // The page each line is placed on. A `canvas` line takes effect for the
+    // lines BELOW it — the same order pass 2 applies them in — because every
+    // coordinate is clamped at parse time: read against the default 1600×1000
+    // instead, `canvas 2400 1200` grew the page and then piled everything the
+    // script drew in it against the old right-hand edge.
+    let mut page = (doc.width, doc.height);
 
     for (lineno, line) in &lines {
-        match parse_stmt(line, &live, &created) {
+        match parse_stmt(line, &live, &created, page) {
             Ok(stmt) => {
+                if let Stmt::Canvas { w, h } = &stmt {
+                    page = (*w, *h);
+                }
                 if stmt.creates() {
                     projected_seq += 1;
                     let id = format!("e{projected_seq}");
@@ -720,8 +769,11 @@ pub(crate) fn apply_script(doc: &mut Sketch, script: &str) -> Result<ScriptOutco
         ));
     }
 
-    let projected = doc.elements.len()
-        + stmts.iter().filter(|(_, s)| s.creates()).count();
+    // What the page will actually hold: `live` is the projected id list pass 1
+    // has been keeping all along, so it already counts this script's deletions
+    // and its `clear`. Summing only the creations refused `clear` + a full
+    // redraw with a number the script would never reach.
+    let projected = live.len();
     if projected > MAX_ELEMENTS {
         return Err(format!(
             "That would put {projected} things on the page; {MAX_ELEMENTS} is the limit. \
@@ -788,7 +840,15 @@ const SCRIPT_HELP: &str = "Commands (one per line, whole numbers, colours are \
      FROM/TO/ID is an existing id like e7, or #1 for the first shape THIS \
      script creates.";
 
-fn parse_stmt(line: &str, live: &[String], created: &[String]) -> Result<Stmt, String> {
+/// `page` is the document's size as of this line — see `apply_script`. Every
+/// coordinate below is clamped against it rather than against the default
+/// canvas, so a script that widens the page can then draw in the new space.
+fn parse_stmt(
+    line: &str,
+    live: &[String],
+    created: &[String],
+    page: (i32, i32),
+) -> Result<Stmt, String> {
     let raw = tokenize(line);
     if raw.is_empty() {
         return Err("nothing on the line".into());
@@ -852,7 +912,7 @@ fn parse_stmt(line: &str, live: &[String], created: &[String]) -> Result<Stmt, S
                      HEIGHT, not two corners"
                 ));
             }
-            let (x, y, w, h) = clamp_box(x, y, w, h);
+            let (x, y, w, h) = clamp_box(x, y, w, h, page);
             let shape = if verb == "rect" {
                 Shape::Rect { x, y, w, h }
             } else {
@@ -878,8 +938,8 @@ fn parse_stmt(line: &str, live: &[String], created: &[String]) -> Result<Stmt, S
             let size = t.num(&["size"], 2).unwrap_or(30).clamp(10, 160) as i32;
             Ok(Stmt::Add {
                 shape: Shape::Text {
-                    x: x.clamp(0, CANVAS_W),
-                    y: y.clamp(0, CANVAS_H),
+                    x: x.clamp(0, page.0),
+                    y: y.clamp(0, page.1),
                     text,
                     size,
                 },
@@ -896,8 +956,8 @@ fn parse_stmt(line: &str, live: &[String], created: &[String]) -> Result<Stmt, S
             let (x1, y1, x2, y2) =
                 four(&t, ["x1", "y1", "x2", "y2"], ["from_x", "from_y", "to_x", "to_y"])?;
             let p = vec![
-                [x1.clamp(0, CANVAS_W), y1.clamp(0, CANVAS_H)],
-                [x2.clamp(0, CANVAS_W), y2.clamp(0, CANVAS_H)],
+                [x1.clamp(0, page.0), y1.clamp(0, page.1)],
+                [x2.clamp(0, page.0), y2.clamp(0, page.1)],
             ];
             if p[0] == p[1] {
                 return Err("start and end are the same point".into());
@@ -921,7 +981,7 @@ fn parse_stmt(line: &str, live: &[String], created: &[String]) -> Result<Stmt, S
                 .nums
                 .chunks(2)
                 .take(MAX_POINTS)
-                .map(|c| [(c[0] as i32).clamp(0, CANVAS_W), (c[1] as i32).clamp(0, CANVAS_H)])
+                .map(|c| [(c[0] as i32).clamp(0, page.0), (c[1] as i32).clamp(0, page.1)])
                 .collect();
             Ok(Stmt::Add { shape: Shape::Pen { points }, ink, fill: false, label: t.label() })
         }
@@ -1009,11 +1069,13 @@ fn four(
 /// Keep a shape on the page. Clamping rather than refusing: a model that put a
 /// box at x=1700 meant it to be near the right edge, and moving it there is a
 /// better answer than a syntax error — the layout report tells it what moved.
-fn clamp_box(x: i32, y: i32, w: i32, h: i32) -> (i32, i32, i32, i32) {
-    let w = w.clamp(1, CANVAS_W);
-    let h = h.clamp(1, CANVAS_H);
-    let x = x.clamp(0, CANVAS_W - w);
-    let y = y.clamp(0, CANVAS_H - h);
+///
+/// `page` is the document's OWN size, which `canvas` may have just changed.
+fn clamp_box(x: i32, y: i32, w: i32, h: i32, (pw, ph): (i32, i32)) -> (i32, i32, i32, i32) {
+    let w = w.clamp(1, pw);
+    let h = h.clamp(1, ph);
+    let x = x.clamp(0, pw - w);
+    let y = y.clamp(0, ph - h);
     (x, y, w, h)
 }
 
@@ -1078,7 +1140,25 @@ fn apply_stmt(doc: &mut Sketch, stmt: Stmt, back: &mut Vec<String>, out: &mut Sc
         }
         Stmt::Move { target, dx, dy } => {
             if let Some(i) = doc.index_of(&target) {
-                translate(&mut doc.elements[i].shape, dx, dy);
+                // A connector's points are `reflow`'s to write: it re-routes
+                // both ends against its shapes at the end of every script, so
+                // moving one here would be reported as done and then discarded
+                // in the same call — and the model, reading the drawing back
+                // unchanged, moves it again, and again.
+                if let Some((from, to)) = attached_ends(doc, i) {
+                    // One sentence, both carriers: the editor's trace and the
+                    // tool result have to say the same thing, and writing it
+                    // twice is how they stop agreeing.
+                    let why = format!(
+                        "left {target} where it is (a connector between {from} and {to} — \
+                         move {from} or {to} instead)"
+                    );
+                    out.steps.push(why.clone());
+                    out.refused.push(why);
+                    return;
+                }
+                let page = (doc.width, doc.height);
+                translate(&mut doc.elements[i].shape, dx, dy, page);
                 out.steps.push(format!("moved {target} by {dx},{dy}"));
                 note_changed(out, target);
             }
@@ -1117,11 +1197,36 @@ fn apply_stmt(doc: &mut Sketch, stmt: Stmt, back: &mut Vec<String>, out: &mut Sc
             out.steps.push(format!("cleared the page ({n} removed)"));
         }
         Stmt::Canvas { w, h } => {
+            // Only a real change counts. `to_script` opens every reading with
+            // the drawing's own `canvas` line, so a script the agent edited and
+            // sent back would otherwise re-save the file on every round trip
+            // and claim a change nobody made.
+            if (doc.width, doc.height) != (w, h) {
+                out.resized = Some((w, h));
+            }
             doc.width = w;
             doc.height = h;
             out.steps.push(format!("set the page to {w}×{h}"));
         }
     }
+}
+
+/// The two shapes a connector is attached to, when both are still on the page.
+///
+/// Both, deliberately: `reflow` re-routes only a connector whose ends it can
+/// BOTH find, and drops the attachment otherwise — so an arrow with one end
+/// missing is an ordinary arrow again and moves like one.
+fn attached_ends(doc: &Sketch, index: usize) -> Option<(String, String)> {
+    let e = &doc.elements[index];
+    if !matches!(e.shape, Shape::Arrow { .. } | Shape::Line { .. }) {
+        return None;
+    }
+    let from = e.from.as_deref()?;
+    let to = e.to.as_deref()?;
+    if doc.index_of(from).is_none() || doc.index_of(to).is_none() {
+        return None;
+    }
+    Some((from.to_string(), to.to_string()))
 }
 
 fn note_changed(out: &mut ScriptOutcome, id: String) {
@@ -1137,20 +1242,23 @@ fn resolve_back(r: &Ref, back: &[String]) -> String {
     }
 }
 
-fn translate(shape: &mut Shape, dx: i32, dy: i32) {
+fn translate(shape: &mut Shape, dx: i32, dy: i32, (pw, ph): (i32, i32)) {
     match shape {
         Shape::Rect { x, y, w, h } | Shape::Ellipse { x, y, w, h } => {
-            *x = (*x + dx).clamp(0, CANVAS_W - *w);
-            *y = (*y + dy).clamp(0, CANVAS_H - *h);
+            // `.max(0)`: a shape can be WIDER than the page it sits on — a
+            // `canvas` line may shrink the page under it, and a hand-edited
+            // file can hold anything — and an inverted clamp range panics.
+            *x = (*x + dx).clamp(0, (pw - *w).max(0));
+            *y = (*y + dy).clamp(0, (ph - *h).max(0));
         }
         Shape::Text { x, y, .. } => {
-            *x = (*x + dx).clamp(0, CANVAS_W);
-            *y = (*y + dy).clamp(0, CANVAS_H);
+            *x = (*x + dx).clamp(0, pw);
+            *y = (*y + dy).clamp(0, ph);
         }
         Shape::Arrow { points } | Shape::Line { points } | Shape::Pen { points } => {
             for p in points {
-                p[0] = (p[0] + dx).clamp(0, CANVAS_W);
-                p[1] = (p[1] + dy).clamp(0, CANVAS_H);
+                p[0] = (p[0] + dx).clamp(0, pw);
+                p[1] = (p[1] + dy).clamp(0, ph);
             }
         }
     }
@@ -1207,29 +1315,55 @@ pub(crate) fn reflow(doc: &mut Sketch) {
 /// boxes it will confidently emit endpoints that start inside one shape and
 /// stop short of the other, and that error is invisible in text — it only
 /// shows up in the picture, which the model usually cannot see.
+///
+/// An endpoint belongs to the SHAPE it touches, not to the page. Nothing is
+/// clamped here — `routeBetween` clamps nothing either, and the two must agree
+/// to the unit or every alternation between the agent and the editor rewrites
+/// the same connector. Clamping to the canvas was how `layout_graph`'s fifth
+/// column lost its arrows; clamping to the page instead only moved the line,
+/// and a shape CAN sit past the page edge (a page shrunk under it, a file
+/// written by hand) with a connector that must still reach it.
 fn route(a: Rect, b: Rect) -> ([i32; 2], [i32; 2]) {
-    const GAP: f64 = 10.0;
     let (ax, ay, bx, by) = (a.cx(), a.cy(), b.cx(), b.cy());
     let (dx, dy) = (bx - ax, by - ay);
-    let len = (dx * dx + dy * dy).sqrt().max(1.0);
+    let len = (dx * dx + dy * dy).sqrt();
+    // Two shapes sharing a centre have no direction between them. Both ends
+    // land on the centres — the same answer `routeBetween` gives — rather than
+    // dividing by a fabricated length of 1, which sent the ray to infinity and
+    // wrote [0,0] into the file as `NaN as i32`.
+    if len == 0.0 {
+        return (
+            [ax.round() as i32, ay.round() as i32],
+            [bx.round() as i32, by.round() as i32],
+        );
+    }
     let (ux, uy) = (dx / len, dy / len);
-    let s = edge_point(a, ux, uy, GAP);
-    let e = edge_point(b, -ux, -uy, GAP);
-    (s, e)
+    (edge_point(a, ux, uy, CONNECT_GAP), edge_point(b, -ux, -uy, CONNECT_GAP))
 }
+
+/// How far a connector stops short of the shape it points at. The editor's
+/// `CONNECT_GAP` (`src/viewers/sketch/model.ts`) is the same number, and it has
+/// to be: the two sides route the SAME connector, so a difference of two units
+/// meant every alternation between the agent and the editor rewrote the file.
+const CONNECT_GAP: f64 = 8.0;
 
 /// Walk from a box's centre along a unit vector until leaving the box, plus a
 /// gap. Uses the slab method so it is exact for any direction.
+///
+/// The gap grows the box rather than extending the ray, which is what
+/// `edgePoint` does — on a diagonal the two are several units apart.
 fn edge_point(r: Rect, ux: f64, uy: f64, gap: f64) -> [i32; 2] {
-    let hw = (r.w as f64 / 2.0).max(1.0);
-    let hh = (r.h as f64 / 2.0).max(1.0);
-    let tx = if ux.abs() < 1e-6 { f64::INFINITY } else { hw / ux.abs() };
-    let ty = if uy.abs() < 1e-6 { f64::INFINITY } else { hh / uy.abs() };
-    let t = tx.min(ty) + gap;
-    [
-        (r.cx() + ux * t).round().clamp(0.0, CANVAS_W as f64) as i32,
-        (r.cy() + uy * t).round().clamp(0.0, CANVAS_H as f64) as i32,
-    ]
+    let hw = r.w as f64 / 2.0 + gap;
+    let hh = r.h as f64 / 2.0 + gap;
+    let tx = if ux == 0.0 { f64::INFINITY } else { (hw / ux).abs() };
+    let ty = if uy == 0.0 { f64::INFINITY } else { (hh / uy).abs() };
+    let t = tx.min(ty);
+    // Neither axis was crossed: the direction is the zero vector, so there is
+    // no edge to walk to. The centre is the honest answer.
+    if !t.is_finite() {
+        return [r.cx().round() as i32, r.cy().round() as i32];
+    }
+    [(r.cx() + ux * t).round() as i32, (r.cy() + uy * t).round() as i32]
 }
 
 // ---------------------------------------------------------------------------
@@ -1263,6 +1397,14 @@ pub(crate) fn to_script(doc: &Sketch) -> String {
             ),
             Shape::Text { x, y, text, size } => {
                 format!("{} text {x} {y} {ink} {size} {}", e.id, quote(text))
+            }
+            // Both ends or nothing: an arrow with one point has no line to
+            // describe, and reading it back as script is what an agent does
+            // with a file it did not write.
+            Shape::Arrow { points } | Shape::Line { points }
+                if points.len() < 2 =>
+            {
+                continue
             }
             Shape::Arrow { points } => format!(
                 "{} arrow {} {} {} {} {ink}{label}",
@@ -1354,7 +1496,9 @@ pub(crate) fn layout_report(doc: &Sketch) -> Vec<String> {
     // sit nearby is almost always intended to connect them.
     for e in &doc.elements {
         let Shape::Arrow { points } = &e.shape else { continue };
-        let (s, t) = (points[0], points[1]);
+        // `from_json` drops a one-point arrow, but a document built in memory
+        // does not pass through it, and this loop reads both ends.
+        let (Some(&s), Some(&t)) = (points.first(), points.get(1)) else { continue };
         let touches = |p: [i32; 2]| {
             solids.iter().any(|o| grow(o.bbox(), 14).contains(p[0], p[1]))
         };
@@ -1549,6 +1693,11 @@ pub(crate) fn to_svg(doc: &Sketch) -> String {
                     xml_escape(text)
                 );
             }
+            // One point is not a line, so there is nothing to stroke. Drawn as
+            // nothing rather than indexed into: this renderer serves the
+            // exported file and the raster the agent inspects, and neither may
+            // panic on a document somebody else wrote.
+            Shape::Line { points } | Shape::Arrow { points } if points.len() < 2 => {}
             Shape::Line { points } => {
                 let d = wobbly_segment(
                     &mut r,
@@ -2269,6 +2418,71 @@ mod tests {
     }
 
     #[test]
+    fn a_flow_deeper_than_the_default_canvas_keeps_its_arrows_on_the_boxes() {
+        // Five columns grow the page past 1600 wide, and every connector out
+        // there has to land on the shape it names — not on the old page edge.
+        let nodes = [
+            node("a", "Draft"),
+            node("b", "Review"),
+            node("c", "Legal"),
+            node("d", "Sign"),
+            node("e", "Publish"),
+        ];
+        let edges = [edge("a", "b"), edge("b", "c"), edge("c", "d"), edge("d", "e")];
+        let doc = layout_graph(&nodes, &edges);
+        assert!(doc.width > CANVAS_W, "five columns should widen the page: {}", doc.width);
+
+        let boxes: HashMap<&str, Rect> =
+            doc.elements.iter().map(|e| (e.id.as_str(), e.bbox())).collect();
+        let mut checked = 0;
+        for el in &doc.elements {
+            let Shape::Arrow { points } = &el.shape else { continue };
+            let (Some(from), Some(to)) = (el.from.as_deref(), el.to.as_deref()) else { continue };
+            let (a, b) = (boxes[from], boxes[to]);
+            assert!(
+                grow(a, 14).contains(points[0][0], points[0][1]),
+                "{} starts at {:?}, off its box {a:?}",
+                el.id,
+                points[0]
+            );
+            assert!(
+                grow(b, 14).contains(points[1][0], points[1][1]),
+                "{} ends at {:?}, off its box {b:?}",
+                el.id,
+                points[1]
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 4, "every described link should have been drawn");
+    }
+
+    #[test]
+    fn a_page_narrower_than_the_default_still_reaches_a_box_placed_past_its_edge() {
+        // A shape CAN sit off the page — the editor may resize the page under
+        // one, and a file can be written by hand — so routing must not pull a
+        // connector back to the new edge and off the box it names. (A script
+        // cannot produce this any more: `canvas` takes effect for the lines
+        // below it, so anything it draws lands on the page it just set.)
+        //
+        // The far box sits past the DEFAULT canvas as well as past this page:
+        // a clamp to whichever of the two is larger passes a box at 1500 and
+        // still detaches this one, which is the case that has to hold.
+        let raw = r#"{"version":1,"width":800,"height":600,"seq":2,"elements":[
+            {"id":"e1","type":"rect","x":100,"y":200,"w":200,"h":100,"ink":"blue","label":"Here"},
+            {"id":"e2","type":"rect","x":1900,"y":200,"w":200,"h":100,"ink":"green","label":"Far"}
+        ]}"#;
+        let mut d = Sketch::from_json(raw).expect("parses");
+        apply_script(&mut d, "link e1 e2").expect("script");
+        let far = d.elements[1].bbox();
+        let Shape::Arrow { points } = &d.elements[2].shape else { panic!("expected an arrow") };
+        assert!(
+            grow(far, 14).contains(points[1][0], points[1][1]),
+            "arrow ends at {:?}, off {far:?}",
+            points[1]
+        );
+    }
+
+    #[test]
     fn the_drawing_rasterises_to_a_real_picture_with_ink_on_it() {
         let d = draw(
             "rect 100 100 400 200 blue \"Login form\"\n\
@@ -2383,19 +2597,200 @@ mod tests {
         }
     }
 
-    /// The editor routes with its own port of `edge_point`, so the two halves
-    /// have to produce the same connector for the same pair of boxes — or the
-    /// exported file draws differently from the page it was exported from.
+    /// The endpoints the editor's `routeBetween` produces for the same boxes.
+    ///
+    /// Not a re-derivation of the formula — that would pass whatever the
+    /// formula did. These are the numbers the TS port yields (gap 8, grown box,
+    /// `Math.round`), so a change on either side that pulls the two apart shows
+    /// up here as a wrong endpoint. The two routers used to differ by two units
+    /// on a horizontal pair and more on a diagonal, which meant every
+    /// alternation between the agent and the editor rewrote the same connector.
+    const ROUTER_FIXTURES: &[(Rect, Rect, [i32; 2], [i32; 2])] = &[
+        // Side by side, 200×100 boxes: the gap is the whole difference.
+        (
+            Rect { x: 100, y: 100, w: 200, h: 100 },
+            Rect { x: 700, y: 100, w: 200, h: 100 },
+            [308, 150],
+            [692, 150],
+        ),
+        // One above the other.
+        (
+            Rect { x: 100, y: 100, w: 200, h: 100 },
+            Rect { x: 100, y: 500, w: 200, h: 100 },
+            [200, 208],
+            [200, 492],
+        ),
+        // Diagonal: the leg the ray crosses first decides, and growing the box
+        // by the gap is not the same as extending the ray by it.
+        (
+            Rect { x: 0, y: 0, w: 200, h: 200 },
+            Rect { x: 400, y: 400, w: 200, h: 200 },
+            [208, 208],
+            [392, 392],
+        ),
+        // Concentric: no direction at all.
+        (
+            Rect { x: 100, y: 100, w: 200, h: 100 },
+            Rect { x: 150, y: 125, w: 100, h: 50 },
+            [200, 150],
+            [200, 150],
+        ),
+    ];
+
     #[test]
-    fn the_editors_router_is_a_port_of_this_one() {
-        let ts = std::fs::read_to_string("../src/viewers/sketch/model.ts")
-            .expect("the editor's model");
-        assert!(ts.contains("export function edgePoint"), "ported edge_point");
-        assert!(ts.contains("export function routeBetween"), "ported route");
-        assert!(
-            ts.contains("export function reflow"),
-            "and the reflow that keeps a link true"
+    fn the_router_agrees_with_the_editors_port() {
+        for (a, b, start, end) in ROUTER_FIXTURES {
+            let got = route(*a, *b);
+            assert_eq!(
+                (got.0, got.1),
+                (*start, *end),
+                "routing {a:?} → {b:?} must match the editor"
+            );
+        }
+    }
+
+    /// Two shapes sharing a centre used to route to the page corner: `len` was
+    /// forced to 1, the unit vector stayed (0,0), and `NaN as i32` is 0.
+    #[test]
+    fn a_connector_between_concentric_shapes_is_not_the_page_origin() {
+        let mut doc = Sketch::default();
+        apply_script(
+            &mut doc,
+            "rect 100 100 200 100 blue \"outer\"\nellipse 150 125 100 50 green \"inner\"\nlink e1 e2",
+        )
+        .expect("script");
+        match &doc.elements[2].shape {
+            Shape::Arrow { points } => {
+                assert_ne!(points[0], [0, 0], "an arrow must not spring to the corner");
+                assert_eq!(points[0], [200, 150]);
+                assert_eq!(points[1], [200, 150]);
+            }
+            other => panic!("expected an arrow, got {other:?}"),
+        }
+    }
+
+    /// `canvas` used to be applied in pass 2 only, so every coordinate on the
+    /// lines below it was still clamped to the DEFAULT page: a script that
+    /// widened the page and then drew in the new space had everything piled
+    /// against x=1600, and `read_drawing` reported coordinates nobody wrote.
+    #[test]
+    fn a_script_that_widens_the_page_may_draw_in_the_space_it_just_made() {
+        let d = draw("canvas 2400 1200\nrect 1800 200 300 120 blue \"Right\"");
+        assert_eq!((d.width, d.height), (2400, 1200));
+        assert_eq!(
+            d.elements[0].bbox(),
+            Rect { x: 1800, y: 200, w: 300, h: 120 },
+            "the box belongs where the widened page has room for it"
         );
+        // …and a `move` in the same call is bounded by the new page too.
+        let mut d = d;
+        apply_script(&mut d, "move e1 400 0").expect("move");
+        assert_eq!(d.elements[0].bbox().x, 2100, "clamped to 2400, not to 1600");
+    }
+
+    /// A script that ONLY resizes still changes the drawing, and the caller
+    /// saves on `is_empty()`. It read as "nothing changed", so the editor was
+    /// handed the wider page and the file kept the old one.
+    #[test]
+    fn resizing_the_page_is_a_change_worth_saving() {
+        let mut d = Sketch::default();
+        let out = apply_script(&mut d, "canvas 2400 1200").expect("script");
+        assert!(!out.is_empty(), "a resize is a change: {out:?}");
+        assert_eq!(out.resized, Some((2400, 1200)));
+        assert!(out.summary().contains("2400×1200"), "{}", out.summary());
+
+        // …and re-sending the page it already has is not a change. Every
+        // reading of a drawing starts with its own `canvas` line, so counting
+        // that as an edit would re-save the file on every round trip.
+        let again = apply_script(&mut d, "canvas 2400 1200").expect("script");
+        assert!(again.is_empty(), "nothing moved: {again:?}");
+    }
+
+    /// The ceiling counted a script's additions and ignored its deletions, so
+    /// redrawing a busy page from scratch in one call was refused with a number
+    /// the script would never reach.
+    #[test]
+    fn clearing_the_page_first_makes_room_for_the_redraw() {
+        let mut d = Sketch::default();
+        for i in 0..100 {
+            apply_script(&mut d, &format!("rect {} 10 40 30 blue \"b{i}\"", i * 5)).unwrap();
+        }
+        let mut script = String::from("clear\n");
+        for i in 0..350 {
+            let _ = writeln!(script, "rect {} 10 40 30 blue \"n{i}\"", i * 4);
+        }
+        let out = apply_script(&mut d, &script).expect("clear + 350 is 350, not 450");
+        assert!(out.cleared);
+        assert_eq!(d.elements.len(), 350);
+        // …and the ceiling still holds for a script that really would exceed it.
+        let mut over = String::new();
+        for i in 0..60 {
+            let _ = writeln!(over, "rect {} 100 40 30 blue \"x{i}\"", i * 4);
+        }
+        let err = apply_script(&mut d, &over).expect_err("410 is past the limit");
+        assert!(err.contains("410"), "{err}");
+    }
+
+    /// A connector's points belong to `reflow`. Moving one was reported as done
+    /// and then thrown away in the same call, so the model moved it again, and
+    /// again — the arrow never budged and the receipt never said so.
+    #[test]
+    fn moving_a_connector_says_it_follows_its_shapes_instead_of_claiming_a_move() {
+        let mut d = Sketch::default();
+        apply_script(&mut d, "rect 100 100 200 100 blue \"A\"\nrect 700 100 200 100 blue \"B\"\nlink e1 e2")
+            .expect("script");
+        let before = d.elements[2].shape.clone();
+        let out = apply_script(&mut d, "move e3 40 0").expect("script");
+        assert_eq!(d.elements[2].shape, before, "reflow would have undone it anyway");
+        assert!(out.is_empty(), "nothing changed, so nothing is saved: {out:?}");
+        assert!(
+            out.steps[0].contains("connector") && out.steps[0].contains("e1"),
+            "the step must say what to move instead: {:?}",
+            out.steps
+        );
+        // …and the MODEL has to hear it. `steps` rides the editor's event and
+        // never reaches the tool result; a summary reading "nothing changed"
+        // is what sends the same `move` again on the next turn.
+        let said = out.summary();
+        assert!(
+            said.contains("connector") && said.contains("e1") && said.contains("e3"),
+            "the tool result must carry the reason: {said}"
+        );
+        // A loose arrow — one whose ends were never attached — still moves.
+        apply_script(&mut d, "arrow 100 500 300 500 red").expect("script");
+        let out = apply_script(&mut d, "move e4 0 40").expect("script");
+        assert_eq!(out.changed, vec!["e4".to_string()]);
+    }
+
+    /// A hand-edited or imported file can carry an arrow with one point. Three
+    /// readers here index `points[1]`, so it used to panic whichever command
+    /// touched the file first — export, read, or draw.
+    #[test]
+    fn an_arrow_with_one_point_is_dropped_on_the_way_in_rather_than_panicking() {
+        let raw = r#"{"version":1,"width":1600,"height":1000,"seq":2,"elements":[
+            {"id":"e1","type":"rect","x":100,"y":100,"w":200,"h":100,"ink":"blue","label":"A"},
+            {"id":"e2","type":"line","points":[[10,10]],"ink":"red"}
+        ]}"#;
+        let d = Sketch::from_json(raw).expect("a bad element is not a bad file");
+        assert_eq!(d.elements.len(), 1, "the half-drawn line is dropped");
+        assert_eq!(d.elements[0].id, "e1");
+        // The file's own counter survives the drop — recovery only ever raises
+        // it — so a drawing whose seq was written down does not rewind.
+        assert_eq!(d.seq, 2);
+
+        // And the three readers survive a document built in memory anyway.
+        let mut broken = Sketch::default();
+        broken.elements.push(Element {
+            id: "e9".into(),
+            shape: Shape::Arrow { points: vec![[10, 10]] },
+            ink: Ink::Red,
+            fill: false,
+            label: None,
+            ..Element::plain()
+        });
+        assert!(!to_svg(&broken).is_empty());
+        assert!(!to_script(&broken).contains("arrow"), "{}", to_script(&broken));
+        let _ = layout_report(&broken);
     }
 
     /// An old file has none of these fields, and must read back as a drawing

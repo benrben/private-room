@@ -21,6 +21,7 @@ can reconstruct the exact same error strings its callers already match on.
 from __future__ import annotations
 
 from typing import Any, AsyncIterator
+from urllib.parse import urlsplit
 
 import httpx
 from fastapi.responses import JSONResponse
@@ -59,13 +60,28 @@ class LlmError(Exception):
         )
 
 
-def _classify(exc: Exception) -> LlmError:
+def _provider_host(provider: Any) -> str | None:
+    """The host a provider call was aimed at, for naming it in a failure."""
+    base = getattr(provider, "base_url", None)
+    if not base:
+        return None
+    return urlsplit(str(base)).netloc or str(base)
+
+
+def _classify(exc: Exception, *, provider_host: str | None = None) -> LlmError:
     """Map an ollama-client / transport exception to the sentinel error contract.
 
     Mirrors ollama.rs: a 404 whose body says "not found" is a model that was never
     pulled (``MODEL_MISSING``); a connect/timeout failure is a dead or unreachable
     daemon (``OLLAMA_DOWN``, same as the Rust ``map_send_err``); anything else is a
     plain engine error.
+
+    ``provider_host`` names the OpenAI-compatible host a call was aimed at, and
+    marks it as NOT having gone to ``ollama_base_url``. It matters because
+    ``OLLAMA_DOWN`` is a claim about a daemon on this Mac: the UI answers it with
+    "The local AI isn't running." and an Open Ollama button. On a room whose
+    engine is a cloud provider that is a false statement — the room never starts
+    Ollama — and it buries the real cause (offline, DNS, a stalled provider).
     """
     if isinstance(exc, LlmError):
         return exc
@@ -80,6 +96,11 @@ def _classify(exc: Exception) -> LlmError:
     # Connect refused / DNS / timeout: the daemon is down or unreachable. The old
     # Rust path mapped both is_connect() and is_timeout() to OLLAMA_DOWN.
     if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout, httpx.TimeoutException, ConnectionError)):
+        if provider_host:
+            # httpx raises several of these with an empty message; the class
+            # name is the only fact left, and it is better than a blank line.
+            detail = str(exc) or type(exc).__name__
+            return LlmError("ENGINE_ERROR", f"Could not reach {provider_host}: {detail}")
         return LlmError("OLLAMA_DOWN", str(exc))
     return LlmError("ENGINE_ERROR", str(exc))
 
@@ -154,7 +175,7 @@ async def generate(
         try:
             text = await chat.generate(messages, format=format, images=images)
         except Exception as exc:  # noqa: BLE001
-            raise _classify(exc) from exc
+            raise _classify(exc, provider_host=_provider_host(provider)) from exc
         return engaged.restore_text(text) if engaged else text
     kwargs: dict[str, Any] = {"model": model, "base_url": base_url}
     if temperature is not None:
@@ -218,7 +239,7 @@ async def generate_stream(
                         continue
                 yield delta
         except Exception as exc:  # noqa: BLE001
-            raise _classify(exc) from exc
+            raise _classify(exc, provider_host=_provider_host(provider)) from exc
         if restorer is not None:
             tail = restorer.flush()
             if tail:

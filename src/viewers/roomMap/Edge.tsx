@@ -1,6 +1,16 @@
+import { useEffect } from "react";
 import type { SimNode, SimEdge, View, Tip } from "./types";
 import { styleFor, edgeLines, edgeInk } from "./edges";
 import { nodeRadius } from "./layout";
+
+/** Which link the map's one tooltip is currently describing, or null.
+ *
+ *  The tip is a SNAPSHOT of a title and its evidence lines, and only a pointer
+ *  event ever cleared it — so a line that stopped being drawn without the mouse
+ *  moving (switching its kind off from the legend chip is the plain way to do
+ *  it: the hit line unmounts, no mouseleave fires) left the map narrating a
+ *  link it no longer shows. One slot, because there is one tooltip. */
+let tipOwner: string | null = null;
 
 interface EdgeProps {
   se: SimEdge;
@@ -44,6 +54,19 @@ export default function Edge({
   const style = styleFor(se.edge.kind);
   const title = `${a.name} ${se.edge.directed ? "→" : "↔"} ${b.name}`;
   const lines = edgeLines(se.edge);
+  // Not the array index the parent keys on: a repaint reuses the component at
+  // index i for a different link, and the tip must not survive that either.
+  const identity = `${se.edge.a}|${se.edge.b}|${se.edge.kind}`;
+
+  useEffect(
+    () => () => {
+      if (tipOwner === identity) {
+        tipOwner = null;
+        setTip(null);
+      }
+    },
+    [identity, setTip],
+  );
 
   // A directed line stops short of the target star, or its arrowhead is drawn
   // underneath the node (edges render before nodes) and reads as no arrow.
@@ -71,9 +94,18 @@ export default function Edge({
         stroke="transparent"
         strokeWidth={7 / view.k}
         style={{ cursor: "help" }}
-        onMouseEnter={(ev) => showTip(ev, title, lines)}
-        onMouseMove={(ev) => showTip(ev, title, lines)}
-        onMouseLeave={() => setTip(null)}
+        onMouseEnter={(ev) => {
+          tipOwner = identity;
+          showTip(ev, title, lines);
+        }}
+        onMouseMove={(ev) => {
+          tipOwner = identity;
+          showTip(ev, title, lines);
+        }}
+        onMouseLeave={() => {
+          if (tipOwner === identity) tipOwner = null;
+          setTip(null);
+        }}
       />
       <line
         className="room-map-edge"

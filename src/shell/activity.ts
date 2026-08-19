@@ -26,6 +26,26 @@ export function pendingApprovalCount(s: ApprovalState): number {
   );
 }
 
+/** Is the optimistic "starting…" flag still standing in for a summary job that
+ * does not exist yet?
+ *
+ * `startDeepSummary` holds the flag until after the new job is in `s.jobs`, so
+ * for at least one render both are true — and counting both counted ONE summary
+ * twice: the footer said "2 jobs running" while Activity, which applies exactly
+ * this test to its optimistic card, showed one. */
+export function summaryPending(
+  s: Pick<WorkState, "jobs" | "summaryStarting">,
+): boolean {
+  return (
+    s.summaryStarting &&
+    !s.jobs.some(
+      (j) =>
+        j.kind === "deep_summary" &&
+        (j.status === "running" || j.status === "queued"),
+    )
+  );
+}
+
 /** Background work in flight. A recording being written out counts ONCE,
  * from the moment the live recorder says "saving" until the save progress
  * clears — the two signals arrive a beat apart, and either one alone means
@@ -38,7 +58,7 @@ export function runningJobCount(s: WorkState): number {
   // reader derives from it.
   const jobs = groupActivity(s.jobs).active.length;
   const saving = s.recSave != null || s.recLive?.status === "saving";
-  return jobs + (s.summaryStarting ? 1 : 0) + (saving ? 1 : 0);
+  return jobs + (summaryPending(s) ? 1 : 0) + (saving ? 1 : 0);
 }
 
 /* ---------- Activity is two things, not one list (owner decision #12) ---------- */

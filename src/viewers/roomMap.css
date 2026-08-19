@@ -123,9 +123,11 @@
 }
 
 /* The invisible hit target. `transparent` still counts as painted, so it stays
-   hit-testable; `stroke: none` is load-bearing, because `.room-map-node` in
-   misc-moonshot.css puts a stroke on the wrapping <g> and stroke inherits —
-   without this the target would draw as a wide pink ring round every node. */
+   hit-testable; `stroke: none` is deliberately defensive rather than answering
+   a rule that exists today — stroke and fill INHERIT, so any paint later put on
+   the wrapping `.room-map-node` <g> would otherwise draw this target as a wide
+   ring round every node. It answered exactly such a rule in misc-moonshot.css
+   before the map's colour literals were removed. */
 .rm-node-hit {
   fill: transparent;
   stroke: none;
@@ -550,13 +552,9 @@
    The map declares none of its own. The settle animation is the layout finding
    its shape — not decoration — and every hover and press on this surface is
    inherited from .nb-btn / .nb-chip-btn, whose reduced-motion escapes already
-   live in paper.css.
+   live in paper.css. There is nothing left here to escape from: the node
+   groups carried a colour transition declared in misc-moonshot.css until that
+   rule was removed with the map's colour literals, and the reduced-motion
+   override that answered it went with it rather than stay as a rule matching
+   an element with no transition.
    ========================================================================== */
-
-@media (prefers-reduced-motion: reduce) {
-  /* The one exception: misc-moonshot.css puts a colour transition on every node
-     group and carries no escape of its own. */
-  .room-map .room-map-node {
-    transition: none;
-  }
-}

@@ -153,8 +153,13 @@ mod mac {
             return None;
         }
         let mut out = String::new();
+        let mut unrendered = 0usize;
         for page_number in 1..=pages {
             let Some(png) = render_pdf_page_png(&doc, page_number) else {
+                // A damaged page object or a context allocation this Mac
+                // refused. Counted, not swallowed: the pages that DID render
+                // must not be handed on as the whole document.
+                unrendered += 1;
                 continue;
             };
             if let Some(text) = ocr_image_bytes(&png) {
@@ -169,14 +174,29 @@ mod mac {
         if out.trim().is_empty() {
             return None;
         }
-        // Say so when the rest of the document was left unread, so neither the
-        // reader nor the model treats a partial scan as the whole file.
+        out.push_str(&unread_notes(total_pages, pages, unrendered));
+        Some(out)
+    }
+
+    /// What this scan's text does NOT contain, appended so neither the reader
+    /// nor the model treats a partial read as the whole file. Empty when every
+    /// page was both reached and rendered.
+    ///
+    /// `pages` is how many were attempted (the cap), `unrendered` how many of
+    /// those the rasterizer could not draw at all.
+    fn unread_notes(total_pages: usize, pages: usize, unrendered: usize) -> String {
+        let mut notes = String::new();
         if total_pages > pages {
-            out.push_str(&format!(
+            notes.push_str(&format!(
                 "\n\n[only the first {pages} of {total_pages} pages of this scan were read]"
             ));
         }
-        Some(out)
+        if unrendered > 0 {
+            notes.push_str(&format!(
+                "\n\n[{unrendered} of {pages} pages of this scan could not be rendered and were not read]"
+            ));
+        }
+        notes
     }
 
     /// Draw one PDF page onto a white RGBA bitmap and hand back PNG bytes.
@@ -331,7 +351,9 @@ mod mac {
 
     #[cfg(test)]
     mod tests {
-        use super::{page_raster_size, MAX_PAGE_EDGE, MAX_PAGE_PIXELS, PDF_RENDER_SCALE};
+        use super::{
+            page_raster_size, unread_notes, MAX_PAGE_EDGE, MAX_PAGE_PIXELS, PDF_RENDER_SCALE,
+        };
 
         #[test]
         fn a_degenerate_media_box_cannot_ask_for_a_gigabyte_bitmap() {
@@ -365,6 +387,34 @@ mod mac {
             // Nothing drawable at all.
             assert!(page_raster_size(0.0, 0.0).is_none());
             assert!(page_raster_size(f64::MAX, f64::MAX).is_none());
+        }
+
+        #[test]
+        fn pages_that_could_not_be_rendered_are_declared() {
+            // Regression: a scan whose pages mostly failed to rasterize was
+            // stored and answered from as if the few that worked were the
+            // whole document — the loop `continue`d and, with no cap in play,
+            // nothing was appended at all.
+            let note = unread_notes(12, 12, 9);
+            assert!(note.contains("9 of 12"), "{note}");
+            assert!(note.contains(concat!("could not be ", "rendered")), "{note}");
+            assert!(!note.contains("only the first"), "{note}");
+
+            // A whole document that rendered cleanly says nothing extra.
+            assert_eq!(unread_notes(12, 12, 0), "");
+            // One page short of clean still speaks up.
+            assert!(unread_notes(12, 12, 1).contains("1 of 12"));
+
+            // Capped AND partly unrenderable: both facts, cap first.
+            let both = unread_notes(900, 500, 3);
+            let cap = both.find("only the first 500 of 900").expect("cap note");
+            let skip = both.find("3 of 500").expect("skip note");
+            assert!(cap < skip, "{both}");
+
+            // Capped but every attempted page drew: only the cap note.
+            let capped = unread_notes(900, 500, 0);
+            assert!(capped.contains("only the first 500 of 900"), "{capped}");
+            assert!(!capped.contains(concat!("could not be ", "rendered")), "{capped}");
         }
     }
 }

@@ -128,7 +128,16 @@ export function reconcilePages(
   const added = live
     .filter((t) => !known.has(t.id))
     .map((t) => ({ id: t.id, title: t.title, url: t.url }));
-  return added.length === 0 && kept.length === prev.length ? prev : [...kept, ...added];
+  // Identity is how the caller learns anything happened, so `prev` may only be
+  // handed back when NOTHING did — a poll that found a navigation and no new
+  // page still has to reach the screen. Testing the set alone (nothing added,
+  // nothing dropped) called a retitled row "unchanged" and left every page
+  // listed under the title and address it was opened with.
+  const same =
+    added.length === 0 &&
+    kept.length === prev.length &&
+    kept.every((p, i) => p === prev[i]);
+  return same ? prev : [...kept, ...added];
 }
 
 /** Which page the selection should land on after a reconciliation.

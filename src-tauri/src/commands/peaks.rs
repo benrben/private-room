@@ -39,10 +39,12 @@ const MAX_BUCKETS: usize = 8000;
 /// and that flat lane is what the viewer has to explain.
 const NOISE_FLOOR: f32 = 0.01;
 
-/// Decoded envelopes, keyed by file id. Decoding shells out to the OS
-/// converters and takes real seconds on a long recording, so the answer is
-/// kept for as long as the room is open — reopening a meeting must not pay for
-/// it twice. Cleared with the room, like every other decrypted derivative.
+/// Decoded envelopes, keyed by file id, bucket count AND the stored byte
+/// length the envelope was computed from ([`cache_key`]). Decoding shells out
+/// to the OS converters and takes real seconds on a long recording, so the
+/// answer is kept for as long as the room is open — reopening a meeting must
+/// not pay for it twice. Cleared with the room, like every other decrypted
+/// derivative.
 #[derive(Default)]
 pub struct PeakCache {
     pub map: Mutex<HashMap<String, AudioPeaks>>,
@@ -54,6 +56,26 @@ const MAX_CACHED: usize = 24;
 
 pub(crate) fn clear_peaks(cache: &PeakCache) {
     cache.map.lock().unwrap().clear();
+}
+
+/// The cache key, and the reason this cache can no longer serve an envelope of
+/// audio that has since been replaced.
+///
+/// Keyed on the file id alone, and emptied only when the room closed, the
+/// waveform after "Continue recording" was the PRE-continuation one: the axis
+/// stopped at the old length, and every speaker lane, highlight band, chapter
+/// rule and click-to-seek is positioned as a fraction of the `duration` that
+/// came with it — so all of them pointed at the wrong moments. `size` closes
+/// that: every path that rewrites a file's bytes goes through
+/// `db::update_file_content`, which writes the new `size_bytes` in the same
+/// statement, so a rewritten file simply misses.
+///
+/// What it does NOT see: a rewrite to a byte length identical to the old one
+/// (restoring a version of exactly the same size). The envelope would be stale
+/// there too — but the timeline it is drawn against has not moved, which is the
+/// failure this key exists to prevent.
+fn cache_key(id: &str, buckets: usize, size: i64) -> String {
+    format!("{id}:{buckets}:{size}")
 }
 
 /// Reduce mono samples to `buckets` maxima. Uses the maximum ABSOLUTE value in
@@ -120,7 +142,15 @@ pub async fn audio_peaks(
 ) -> Result<AudioPeaks, String> {
     use tauri::Manager;
     let buckets = buckets.unwrap_or(DEFAULT_BUCKETS).clamp(64, MAX_BUCKETS);
-    let cache_key = format!("{id}:{buckets}");
+    // The stored length FIRST, and without the bytes: it is what tells a cached
+    // envelope apart from one of audio that has since been rewritten.
+    let size = {
+        let state = app.state::<AppState>();
+        let guard = state.room.lock().unwrap();
+        let room = guard.as_ref().ok_or("No room is open.")?;
+        db::get_file_meta(&room.conn, &id)?.size_bytes
+    };
+    let cache_key = cache_key(&id, buckets, size);
     {
         let cache = app.state::<PeakCache>();
         let hit = cache.map.lock().unwrap().get(&cache_key).cloned();
@@ -236,6 +266,19 @@ mod tests {
             describe_decode_error("audio decode failed: bad file".into()),
             "audio decode failed: bad file"
         );
+    }
+
+    /// The waveform after "Continue recording" was the pre-continuation one:
+    /// the key could not tell the grown file from the file it used to be, and
+    /// every mark drawn against the cached `duration` sat at the wrong moment.
+    #[test]
+    fn a_recording_that_grew_cannot_hit_its_old_envelope() {
+        let before = cache_key("rec-1", 2000, 4_000_044);
+        assert_eq!(before, cache_key("rec-1", 2000, 4_000_044), "same audio, same key");
+        assert_ne!(before, cache_key("rec-1", 2000, 9_100_044), "a continued recording");
+        // The two things the key always separated still separate.
+        assert_ne!(before, cache_key("rec-1", 4000, 4_000_044));
+        assert_ne!(before, cache_key("rec-2", 2000, 4_000_044));
     }
 
     #[test]

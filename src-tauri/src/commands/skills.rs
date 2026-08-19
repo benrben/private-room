@@ -301,6 +301,13 @@ pub(crate) fn normalize_skill_path(raw: &str) -> Result<String, String> {
     if raw.is_empty() || raw.len() > 240 {
         return Err("Use a short relative resource path.".into());
     }
+    // `references/` used to be stored verbatim: a row with no name in the folder
+    // pane, and an export that then aborted on `os error 2` naming nothing the
+    // user could act on. A resource is a FILE; a folder is only ever implied by
+    // the file inside it.
+    if raw.ends_with('/') {
+        return Err("A resource path must name a file, not a folder — remove the trailing \"/\".".into());
+    }
     let path = Path::new(&raw);
     if path.is_absolute()
         || path
@@ -310,7 +317,79 @@ pub(crate) fn normalize_skill_path(raw: &str) -> Result<String, String> {
     {
         return Err("Resource paths must stay inside the skill folder; SKILL.md is edited through the skill fields.".into());
     }
-    Ok(raw)
+    // Rebuilt from the components we just checked, so the stored path is exactly
+    // what the filesystem seams will re-create (`a//b` and `a/./b` collapse).
+    let parts: Vec<&str> = path
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(s) => s.to_str(),
+            _ => None,
+        })
+        .collect();
+    if parts.is_empty() {
+        return Err("Use a short relative resource path.".into());
+    }
+    Ok(parts.join("/"))
+}
+
+/// The one filesystem rule a skill's resource paths must obey together: no path
+/// may be a FOLDER prefix of another. `references` and `references/policy.md`
+/// can both live in the database but never on disk — and both Export folder and
+/// every script run materialize the whole tree, so one of the two writes always
+/// failed, taking the export (and the destination folder it had just made) with
+/// it. Refused at the seams that create a path, and checked before either seam
+/// starts writing, so a skill saved before this rule existed says why.
+fn check_resource_paths(paths: &[String]) -> Result<(), String> {
+    for (i, a) in paths.iter().enumerate() {
+        for b in &paths[i + 1..] {
+            let (dir, under) = if a.len() < b.len() { (a, b) } else { (b, a) };
+            // Compared as BYTES: a path may hold any UTF-8, and slicing one at
+            // the other's length can land mid-character.
+            let (d, u) = (dir.as_bytes(), under.as_bytes());
+            if u.len() > d.len()
+                && u[d.len()] == b'/'
+                // macOS folds case, so `References` and `references/x.md`
+                // collide there just as surely.
+                && u[..d.len()].eq_ignore_ascii_case(d)
+            {
+                return Err(format!(
+                    "\"{dir}\" and \"{under}\" can't both be in one skill: a file and a folder cannot share a name. Rename one of them."
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The key a DELETE matches a stored row on.
+///
+/// [`normalize_skill_path`] is the rule for CREATING a resource path, and it
+/// grew stricter: a trailing `/` is now refused outright and `a//b` collapses to
+/// `a/b`. Rows written before that keep their old spelling, so running a delete
+/// through the create rule either refused the path the folder pane is showing or
+/// looked for a key no row has — leaving a resource nothing could take out, in
+/// exactly the skill the trailing-slash rule was added to rescue. Nothing here
+/// reaches the filesystem: this is a `WHERE path=?` on one skill's rows, and a
+/// key that matches nothing is already reported as "That skill has no file at …".
+fn stored_resource_key(raw: &str) -> String {
+    raw.trim().replace('\\', "/")
+}
+
+/// [`check_resource_paths`] for ONE incoming path against what the skill already
+/// holds — the write seams (the editor's New file path, the model's
+/// `write_skill_resource`). Re-saving an existing path is not a collision.
+fn check_new_resource_path(
+    conn: &Connection,
+    skill_id: &str,
+    path: &str,
+) -> Result<(), String> {
+    let mut paths: Vec<String> = db::list_skill_resources(conn, skill_id)?
+        .into_iter()
+        .map(|r| r.path)
+        .filter(|p| p != path)
+        .collect();
+    paths.push(path.to_string());
+    check_resource_paths(&paths)
 }
 
 pub(crate) fn skill_resource_kind(path: &str) -> &'static str {
@@ -565,6 +644,7 @@ pub(crate) fn agent_write_skill_resource(
         db::find_skill(&room.conn, key)?.ok_or_else(|| format!("No skill named \"{key}\" exists."))
     })?;
     state.with_room(|room| {
+        check_new_resource_path(&room.conn, &skill.id, &path)?;
         db::upsert_skill_resource(
             &room.conn,
             &skill.id,
@@ -627,7 +707,7 @@ pub(crate) fn agent_delete_skill_resource(
     args: &serde_json::Value,
 ) -> Result<String, String> {
     let key = args["skill"].as_str().unwrap_or_default().trim();
-    let path = normalize_skill_path(args["path"].as_str().unwrap_or_default())?;
+    let path = stored_resource_key(args["path"].as_str().unwrap_or_default());
     if key.is_empty() {
         return Err("delete_skill_resource needs a skill name or id.".into());
     }
@@ -639,10 +719,55 @@ pub(crate) fn agent_delete_skill_resource(
     Ok(format!("Deleted {path} from skill \"{}\".", skill.name))
 }
 
+/// The workspaces this process is running a skill script in right now, so
+/// [`sweep_orphan_skill_runs`] can tell a leftover from a live sibling. Two
+/// chats can each be running a skill script: the room lock is not held across
+/// the await, so a sweep that took the whole folder would delete the other run's
+/// decrypted tree from under it.
+fn live_skill_runs() -> &'static std::sync::Mutex<HashSet<PathBuf>> {
+    static LIVE: std::sync::OnceLock<std::sync::Mutex<HashSet<PathBuf>>> =
+        std::sync::OnceLock::new();
+    LIVE.get_or_init(|| std::sync::Mutex::new(HashSet::new()))
+}
+
 struct SkillRunWorkspace(PathBuf);
+
+impl SkillRunWorkspace {
+    fn claim(dir: PathBuf) -> Self {
+        if let Ok(mut live) = live_skill_runs().lock() {
+            live.insert(dir.clone());
+        }
+        SkillRunWorkspace(dir)
+    }
+}
+
 impl Drop for SkillRunWorkspace {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
+        if let Ok(mut live) = live_skill_runs().lock() {
+            live.remove(&self.0);
+        }
+    }
+}
+
+/// Remove every run directory under `runs` that no live run of this process
+/// owns. A skill run materializes reference documents and source-file snapshots
+/// taken from encrypted room files IN THE CLEAR, and only `SkillRunWorkspace`'s
+/// Drop removes them — a crash, a force-quit or a SIGKILL left the decrypted
+/// copies on disk under a random name that nothing ever looked for again.
+/// Failures are ignored on purpose: a leftover we cannot delete must not stop
+/// the run the user just approved. It is swept on the next attempt.
+fn sweep_orphan_skill_runs(runs: &Path) {
+    let Ok(entries) = std::fs::read_dir(runs) else {
+        return;
+    };
+    let live = live_skill_runs().lock().ok();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if live.as_ref().is_some_and(|l| l.contains(&path)) {
+            continue;
+        }
+        let _ = std::fs::remove_dir_all(&path);
     }
 }
 
@@ -680,16 +805,28 @@ pub(crate) async fn agent_run_skill_script(
     let (runner, manifest) =
         approve_script_bytes(window, state, &display_name, &script_bytes).await?;
 
+    // Both filesystem seams materialize the same tree, so the export's rule is
+    // the run's rule — and saying so before the workspace exists beats a raw
+    // `os error 17` from the middle of the copy loop.
+    let paths: Vec<String> = resources.iter().map(|r| r.path.clone()).collect();
+    check_resource_paths(&paths)?;
+
     let cache = window
         .app_handle()
         .path()
         .app_cache_dir()
         .map_err(|e| e.to_string())?;
-    let root = cache.join("skill-runs").join(Uuid::new_v4().to_string());
-    std::fs::create_dir_all(root.join("tmp")).map_err(|e| e.to_string())?;
-    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+    let runs = cache.join("skill-runs");
+    std::fs::create_dir_all(&runs).map_err(|e| e.to_string())?;
+    sweep_orphan_skill_runs(&runs);
+    std::fs::set_permissions(&runs, std::fs::Permissions::from_mode(0o700))
         .map_err(|e| e.to_string())?;
-    let workspace = SkillRunWorkspace(root);
+    // Claimed BEFORE it exists, so a concurrent run's sweep can never mistake a
+    // directory being created for a leftover.
+    let workspace = SkillRunWorkspace::claim(runs.join(Uuid::new_v4().to_string()));
+    std::fs::create_dir_all(workspace.0.join("tmp")).map_err(|e| e.to_string())?;
+    std::fs::set_permissions(&workspace.0, std::fs::Permissions::from_mode(0o700))
+        .map_err(|e| e.to_string())?;
     for resource in resources {
         let rel = normalize_skill_path(&resource.path)?;
         let target = workspace.0.join(rel);
@@ -820,7 +957,10 @@ pub fn set_skill_enabled(
 ) -> Result<(), String> {
     if enabled {
         state.with_room(|room| {
-            let s = db::get_skill(&room.conn, &id)?;
+            // Not `db::get_skill`: for a skill deleted out from under the editor
+            // that answers with rusqlite's "Query returned no rows", while the
+            // disable half of this same command says SKILL_GONE.
+            let s = require_skill(&room.conn, &id)?;
             validate_skill_fields(&s.name, &s.description, &s.instructions)?;
             db::set_skill_enabled(&room.conn, &id, true)
         })?;
@@ -890,8 +1030,10 @@ pub fn save_skill_resource(
         return Err("That resource is too large (32 MB maximum).".into());
     }
     let kind = skill_resource_kind(&path);
-    state
-        .with_room(|room| db::upsert_skill_resource(&room.conn, &skill_id, &path, kind, &bytes))?;
+    state.with_room(|room| {
+        check_new_resource_path(&room.conn, &skill_id, &path)?;
+        db::upsert_skill_resource(&room.conn, &skill_id, &path, kind, &bytes)
+    })?;
     emit_skills_changed(&window);
     Ok(())
 }
@@ -903,7 +1045,7 @@ pub fn delete_skill_resource(
     skill_id: String,
     path: String,
 ) -> Result<(), String> {
-    let path = normalize_skill_path(&path)?;
+    let path = stored_resource_key(&path);
     state.with_room(|room| db::delete_skill_resource(&room.conn, &skill_id, &path))?;
     emit_skills_changed(&window);
     Ok(())
@@ -917,6 +1059,14 @@ fn collect_folder_files(
 ) -> Result<(), String> {
     for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())? {
         let entry = entry.map_err(|e| e.to_string())?;
+        // The normal distribution shape of an Agent Skill is a git checkout, so
+        // the folder the user picks usually carries `.git` and `.DS_Store`. They
+        // were stored as encrypted resources — re-emitted on every export — or,
+        // once history was big enough, tripped the 250-file cap and refused the
+        // whole import with a size message that named the wrong cause.
+        if entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
         let ty = entry.file_type().map_err(|e| e.to_string())?;
         if ty.is_symlink() {
             return Err("Skill folders may not contain symbolic links.".into());
@@ -934,7 +1084,11 @@ fn collect_folder_files(
             .map_err(|e| e.to_string())?
             .to_string_lossy()
             .replace('\\', "/");
-        if rel == "SKILL.md" {
+        // `normalize_skill_path` refuses SKILL.md in any case, so a folder whose
+        // own SKILL.md is spelled `skill.md` — which macOS opens and this import
+        // has already READ — used to be refused here with a message about paths
+        // escaping the skill folder.
+        if rel.eq_ignore_ascii_case("SKILL.md") {
             continue;
         }
         let rel = normalize_skill_path(&rel)?;
@@ -1010,6 +1164,11 @@ pub(crate) fn import_into(
     files: &[(String, Vec<u8>)],
     replace: bool,
 ) -> Result<String, String> {
+    // A folder carrying both `references` and `references/policy.md` imports
+    // fine and can then never be exported or run. Refuse it while the user is
+    // still looking at the folder they picked.
+    let paths: Vec<String> = files.iter().map(|(p, _)| p.clone()).collect();
+    check_resource_paths(&paths)?;
     // An UPDATE of a skill that is already here, when the caller asked for one.
     // `find_skill` matches by name case-insensitively, the same way every other
     // lookup does.
@@ -1077,6 +1236,12 @@ pub fn export_skill_folder(
     if !base.is_dir() {
         return Err("Choose an existing destination folder.".into());
     }
+    // Before anything is created: a skill saved before `check_resource_paths`
+    // existed can still hold a file and a folder of the same name, and the write
+    // loop below would abort halfway with a raw OS error and remove the
+    // destination it had just made.
+    let paths: Vec<String> = resources.iter().map(|r| r.path.clone()).collect();
+    check_resource_paths(&paths)?;
     // AUDIT 22: the export seam cleans the name it was handed, exactly like
     // `export_file`/`export_all` do. Every name that arrives through the app is
     // already `validate_skill_name`'d, but the SEC-1 threat model is a room file
@@ -1235,6 +1400,23 @@ pub async fn compose_skill(
                 .iter()
                 .map(|source| (source.path.clone(), source.content.as_bytes().to_vec())),
         );
+        // A generated pair like `references` + `references/policy.md` would
+        // store fine and then make the skill impossible to export or run, so it
+        // is a rejection the model gets to correct like any other.
+        let paths: Vec<String> = resources.iter().map(|(p, _)| p.clone()).collect();
+        if let Err(e) = check_resource_paths(&paths) {
+            last_err = e;
+            continue;
+        }
+        // A name the room already holds is the rejection this loop exists for —
+        // and the one a model repeats most readily, since it is choosing the
+        // obvious name for the job. Feeding it back lets the second attempt
+        // rename instead of throwing away a minute of generation.
+        if state.with_room(|room| Ok(db::find_skill(&room.conn, &name)?.is_some()))? {
+            last_err =
+                format!("a skill named \"{name}\" already exists — choose a different name");
+            continue;
+        }
         let id = state.with_room(|room| {
             let id = db::create_skill(
                 &room.conn,
@@ -1398,6 +1580,125 @@ mod tests {
         for bad in ["../secret", "/tmp/x", "scripts/../../x", "SKILL.md"] {
             assert!(normalize_skill_path(bad).is_err(), "{bad}");
         }
+    }
+
+    /// A path ending in `/` was stored verbatim: a nameless row in the folder
+    /// pane, and an export that then died on `os error 2` — naming nothing the
+    /// user could act on — and took the destination folder with it.
+    #[test]
+    fn a_trailing_slash_is_refused_rather_than_stored_as_a_nameless_resource() {
+        for folder in ["references/", "scripts/tools/", " assets/ "] {
+            let err = normalize_skill_path(folder)
+                .expect_err("a folder path was accepted as a resource path");
+            assert!(err.contains("not a folder"), "{folder}: {err}");
+        }
+        // The path is rebuilt from its checked components, so what is stored is
+        // exactly what the export and the script runner will re-create.
+        assert_eq!(
+            normalize_skill_path("references//policy.md").unwrap(),
+            "references/policy.md"
+        );
+        assert_eq!(
+            normalize_skill_path(" scripts/run.py ").unwrap(),
+            "scripts/run.py"
+        );
+    }
+
+    /// The trailing-slash rule refuses the spelling on the way IN, but a room
+    /// that already holds `references/` still has to be able to take it out —
+    /// and the delete seam ran the path it was given through the CREATE rule, so
+    /// the folder pane's own row was refused and the resource was stuck there.
+    #[test]
+    fn a_folder_shaped_path_stored_before_the_rule_can_still_be_deleted() {
+        let conn = crate::db::mem();
+        let id = db::create_skill(&conn, "legacy", "d", "Body", false, "import", "").unwrap();
+        // Written by an older build, which accepted this path and stored it raw.
+        db::upsert_skill_resource(&conn, &id, "references/", "reference", b"x").unwrap();
+        assert!(
+            normalize_skill_path("references/").is_err(),
+            "the create rule must still refuse it"
+        );
+
+        db::delete_skill_resource(&conn, &id, &stored_resource_key(" references/ ")).unwrap();
+        assert!(db::list_skill_resources(&conn, &id).unwrap().is_empty());
+        // A key no row has is still refused, not reported as a deletion.
+        assert!(db::delete_skill_resource(&conn, &id, &stored_resource_key("references/")).is_err());
+    }
+
+    /// A file named `references` alongside anything under `references/` can live
+    /// in the database but never on a filesystem — and BOTH the export and every
+    /// script run materialize the whole tree, so one of the two writes always
+    /// failed. Refused where the pair is created, in the app's own words.
+    #[test]
+    fn a_file_that_is_also_a_folder_name_is_refused_at_the_seam_that_creates_it() {
+        let clash = check_resource_paths(&[
+            "references".to_string(),
+            "references/policy.md".to_string(),
+        ])
+        .expect_err("the collision was accepted");
+        assert!(clash.contains("references"), "{clash}");
+        assert!(clash.contains("cannot share a name"), "{clash}");
+        // Order must not matter, and macOS folds case.
+        assert!(check_resource_paths(&[
+            "references/policy.md".to_string(),
+            "References".to_string(),
+        ])
+        .is_err());
+        // Ordinary trees, a shared PREFIX that is not a path boundary, and the
+        // empty/one-file cases all pass.
+        assert!(check_resource_paths(&[]).is_ok());
+        assert!(check_resource_paths(&["references".to_string()]).is_ok());
+        assert!(check_resource_paths(&[
+            "references/policy.md".to_string(),
+            "references/notes.md".to_string(),
+            "references-old.md".to_string(),
+            "scripts/run.py".to_string(),
+        ])
+        .is_ok());
+
+        // The import seam refuses the folder rather than storing a skill that
+        // can never be exported or run.
+        let conn = crate::db::mem();
+        let files: Vec<(String, Vec<u8>)> = vec![
+            ("references".into(), b"a file".to_vec()),
+            ("references/policy.md".into(), b"under a folder".to_vec()),
+        ];
+        assert!(import_into(&conn, "review", "d", "Body", "", &files, false).is_err());
+        assert!(
+            db::find_skill(&conn, "review").unwrap().is_none(),
+            "the refused import must leave no skill behind"
+        );
+    }
+
+    /// A cloned skill repo is the normal distribution shape, so the folder the
+    /// user picks carries `.git` and `.DS_Store`. They were stored as encrypted
+    /// resources — and re-emitted on every export — or, once history was big
+    /// enough, tripped the 250-file cap and refused the import with a size
+    /// message that named the wrong cause. `skill.md` is the skill's own file
+    /// however it is spelled.
+    #[test]
+    fn a_git_checkout_imports_without_its_dot_directories() {
+        let root = std::env::temp_dir().join(format!("pr-skill-import-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(root.join(".git/objects/ab")).unwrap();
+        std::fs::create_dir_all(root.join("references")).unwrap();
+        std::fs::write(root.join(".git/objects/ab/cdef"), b"loose object").unwrap();
+        std::fs::write(root.join(".git/config"), b"[core]").unwrap();
+        std::fs::write(root.join(".DS_Store"), b"finder").unwrap();
+        // Lowercase: macOS opens it, and this import has already READ it.
+        std::fs::write(root.join("skill.md"), b"---\nname: x\n---\n\nBody\n").unwrap();
+        std::fs::write(root.join("references/policy.md"), b"policy").unwrap();
+
+        let mut files = Vec::new();
+        let mut total = 0usize;
+        collect_folder_files(&root, &root, &mut files, &mut total).unwrap();
+        let paths: Vec<&str> = files.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["references/policy.md"],
+            "only the skill's own material is imported"
+        );
+        assert_eq!(total, b"policy".len(), "hidden files never count toward the caps");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

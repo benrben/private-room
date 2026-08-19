@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import type { KeyboardEvent as ReactKeyboardEvent } from "react";
 import { ENGINE_LABELS } from "./api";
 import { AlertIcon, CloseIcon, DownloadIcon, EyeIcon, TrashIcon } from "./icons";
 import "./settingsA11y.css";
@@ -23,6 +24,8 @@ import AboutSection from "./settings/AboutSection";
 import AppearanceSection from "./settings/AppearanceSection";
 import InterfaceSection from "./settings/InterfaceSection";
 import AiProvidersSection from "./settings/AiProvidersSection";
+import { bestLocalModel } from "./workspace/localModel";
+import { RECOMMENDED_MODELS } from "./workspace/constants";
 import { useFocusTrap } from "./settings/useFocusTrap";
 import { useModelManagement } from "./settings/useModelManagement";
 import { useBehaviorSettings } from "./settings/useBehaviorSettings";
@@ -110,14 +113,40 @@ export default function Settings({
   // set up before the section hooks that know whether anything is dirty exist.
   const unsavedRef = useRef(false);
   const [confirmClose, setConfirmClose] = useState(false);
+  const keepEditingRef = useRef<HTMLButtonElement>(null);
   function requestClose() {
     if (unsavedRef.current) {
+      // Escape RAISED the question, so Escape has to be able to answer it: the
+      // repeat press only re-set the same flag, so the second and third press
+      // did nothing at all and the modal read as frozen.
+      if (confirmClose) {
+        keepEditing();
+        return;
+      }
       setConfirmClose(true);
       return;
     }
     onClose();
   }
-  const { modalRef, onModalKeyDown } = useFocusTrap(requestClose);
+  // Dropping the strip leaves focus on a button that no longer exists, i.e. on
+  // <body>, outside the trap — the same hole `refocusModal` covers for the
+  // backdrop click.
+  function keepEditing() {
+    setConfirmClose(false);
+    refocusModal();
+  }
+  const { modalRef, onModalKeyDown, refocusModal } = useFocusTrap(requestClose);
+  // The strip is announced (role="alert") but focus stayed where it was, several
+  // Tab stops before either answer, in DOM order behind the page index.
+  useEffect(() => {
+    if (confirmClose) keepEditingRef.current?.focus();
+  }, [confirmClose]);
+  // A backdrop click with unsaved work leaves the modal open and focus on
+  // <body>, outside the trap — see `refocusModal`.
+  function backdropClick() {
+    requestClose();
+    if (unsavedRef.current) refocusModal();
+  }
   // The one scrolling container all six pages share (they're all mounted at
   // once and only toggled via `hidden` — see the module comment). Needed so
   // a tab switch can reset scroll position; see the effect below.
@@ -128,6 +157,23 @@ export default function Settings({
   const [activeGroup, setActiveGroup] = useState<string>(
     (initialSection && GROUP_OF_SECTION[initialSection]) || SETTINGS_GROUPS[0].key,
   );
+  const tabRefs = useRef<(HTMLButtonElement | null)[]>([]);
+  // A tablist is driven by the arrows, and the selection follows them — the
+  // index is six buttons that all do the same kind of thing, so moving through
+  // it is the whole interaction.
+  function onNavKeyDown(e: ReactKeyboardEvent<HTMLElement>) {
+    const last = SETTINGS_GROUPS.length - 1;
+    const at = SETTINGS_GROUPS.findIndex((g) => g.key === activeGroup);
+    let next = -1;
+    if (e.key === "ArrowDown") next = at >= last ? 0 : at + 1;
+    else if (e.key === "ArrowUp") next = at <= 0 ? last : at - 1;
+    else if (e.key === "Home") next = 0;
+    else if (e.key === "End") next = last;
+    if (next < 0) return;
+    e.preventDefault();
+    setActiveGroup(SETTINGS_GROUPS[next].key);
+    tabRefs.current[next]?.focus();
+  }
 
   // Deep-link (e.g. the status-bar trust chip → Cloud privacy): switch to the
   // owning page, then once it has painted jump to the section and flag it.
@@ -139,6 +185,11 @@ export default function Settings({
       const el = document.getElementById(initialSection);
       if (!el) return;
       el.scrollIntoView({ block: "start" });
+      // The trap put focus on Close while the viewport showed a section three
+      // pages down: a keyboard user arriving from the trust chip had to tab
+      // back to what they were sent to look at.
+      el.tabIndex = -1;
+      el.focus({ preventScroll: true });
       el.classList.add("settings-section-flash");
       window.setTimeout(() => el.classList.remove("settings-section-flash"), 1400);
     }, 40);
@@ -342,7 +393,7 @@ export default function Settings({
   return (
     // ADD-25: consent surface — the agent UI driver must never see or operate
     // Settings (web/cloud/advisor/room-server switches, password, Touch ID).
-    <div className="settings-backdrop" data-agent-blocked onClick={requestClose}>
+    <div className="settings-backdrop" data-agent-blocked onClick={backdropClick}>
       {/* `settings-sheet` is the real Settings modal, as opposed to the two
           smaller sheets in workspace/SettingsModals.tsx that reuse the same
           `.settings*` chrome. Everything that would be wrong at 460px — the
@@ -377,7 +428,7 @@ export default function Settings({
               Some changes on this page haven't been saved yet — closing now
               would discard them.
             </span>
-            <button className="subtle" onClick={() => setConfirmClose(false)}>
+            <button className="subtle" ref={keepEditingRef} onClick={keepEditing}>
               Keep editing
             </button>
             <button className="subtle danger" onClick={onClose}>
@@ -388,13 +439,28 @@ export default function Settings({
         <div className="settings-main">
           {/* One focused page at a time. The rail selects the page; the section
               anchors below (and deep-links) still resolve within the open page. */}
-          <nav className="settings-nav" aria-label="Settings pages">
-            {SETTINGS_GROUPS.map((g) => (
+          <nav
+            className="settings-nav"
+            role="tablist"
+            aria-orientation="vertical"
+            aria-label="Settings pages"
+            onKeyDown={onNavKeyDown}
+          >
+            {SETTINGS_GROUPS.map((g, i) => (
               <button
                 key={g.key}
                 type="button"
+                role="tab"
+                id={`settings-tab-${g.key}`}
+                aria-controls={`settings-page-${g.key}`}
+                aria-selected={activeGroup === g.key}
+                // One tab stop for the whole index instead of six before the
+                // first control; the arrows move within it.
+                tabIndex={activeGroup === g.key ? 0 : -1}
+                ref={(el) => {
+                  tabRefs.current[i] = el;
+                }}
                 className={`settings-nav-item${activeGroup === g.key ? " is-active" : ""}`}
-                aria-current={activeGroup === g.key ? "page" : undefined}
                 onClick={() => setActiveGroup(g.key)}
               >
                 <span className="settings-nav-label">{g.label}</span>
@@ -411,7 +477,12 @@ export default function Settings({
             ))}
           </nav>
           <div className="settings-body" ref={bodyRef}>
-            <div className="settings-page" hidden={activeGroup !== "ai"}>
+            <div
+              className="settings-page"
+              id="settings-page-ai"
+              role="tabpanel"
+              aria-labelledby="settings-tab-ai"
+              hidden={activeGroup !== "ai"}>
               <ModelSection
                 ai={ai}
                 model={model}
@@ -444,6 +515,17 @@ export default function Settings({
                 TrashIcon={TrashIcon}
                 DownloadIcon={DownloadIcon}
               />
+              {/* Model errors (a failed or cancelled download, a removal that
+                  would not go through) used to render at the bottom of the
+                  shared scroller, so they appeared under whichever page was
+                  open — a pull that failed here printed its reason on Voice,
+                  attached to nothing. They belong on the page that produced
+                  them. */}
+              {error && (
+                <div className="gate-error" role="alert">
+                  {error}
+                </div>
+              )}
               <BehaviorSection
                 temperature={temperature}
                 setTemperature={setTemperature}
@@ -496,13 +578,23 @@ export default function Settings({
               />
             </div>
 
-            <div className="settings-page" hidden={activeGroup !== "voice"}>
+            <div
+              className="settings-page"
+              id="settings-page-voice"
+              role="tabpanel"
+              aria-labelledby="settings-tab-voice"
+              hidden={activeGroup !== "voice"}>
               <VoiceSection {...voiceSettings} />
               <MicSection />
               <SavedVoicesSection />
             </div>
 
-            <div className="settings-page" hidden={activeGroup !== "privacy"}>
+            <div
+              className="settings-page"
+              id="settings-page-privacy"
+              role="tabpanel"
+              aria-labelledby="settings-tab-privacy"
+              hidden={activeGroup !== "privacy"}>
               <CloudPrivacySection />
               <PrivacySection
                 autolock={autolock}
@@ -561,13 +653,25 @@ export default function Settings({
               />
             </div>
 
-            <div className="settings-page" hidden={activeGroup !== "connections"}>
+            <div
+              className="settings-page"
+              id="settings-page-connections"
+              role="tabpanel"
+              aria-labelledby="settings-tab-connections"
+              hidden={activeGroup !== "connections"}>
               <AiProvidersSection
                 model={model}
+                // What a room falls back to when its OpenRouter model is
+                // disconnected. The first entry of Ollama's raw /api/tags order
+                // can be nomic-embed-text (installed for semantic search, and
+                // 400s on /api/chat), and `ai.defaultModel` echoes the room's
+                // saved model — in a cloud room that IS the model being
+                // disconnected. Ask in the host's own preference order instead.
                 fallbackModel={
-                  ai?.models.find((candidate) => !candidate.endsWith(":cloud")) ??
-                  ai?.defaultModel ??
-                  "qwen3.5:4b"
+                  bestLocalModel(
+                    ai?.models ?? [],
+                    RECOMMENDED_MODELS.map((m) => m.name),
+                  ) ?? RECOMMENDED_MODELS[0].name
                 }
                 onModelChange={onModelChange}
                 onChanged={onModelsChanged}
@@ -616,17 +720,25 @@ export default function Settings({
               />
             </div>
 
-            <div className="settings-page" hidden={activeGroup !== "history"}>
+            <div
+              className="settings-page"
+              id="settings-page-history"
+              role="tabpanel"
+              aria-labelledby="settings-tab-history"
+              hidden={activeGroup !== "history"}>
               <CheckpointsSection {...checkpoints} busy={busy} />
             </div>
 
-            <div className="settings-page" hidden={activeGroup !== "app"}>
+            <div
+              className="settings-page"
+              id="settings-page-app"
+              role="tabpanel"
+              aria-labelledby="settings-tab-app"
+              hidden={activeGroup !== "app"}>
               <AppearanceSection />
               <InterfaceSection onApplyPreset={onApplyPreset} />
               <AboutSection />
             </div>
-
-            {error && <div className="gate-error">{error}</div>}
           </div>
         </div>
       </div>

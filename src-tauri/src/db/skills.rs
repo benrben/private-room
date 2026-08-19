@@ -255,13 +255,38 @@ pub fn get_skill_resource(
     skill_id: &str,
     path: &str,
 ) -> Result<SkillResource, String> {
-    query_one(
+    query_opt(
         conn,
         "SELECT id, skill_id, path, kind, content, created_at, updated_at \
          FROM skill_resources WHERE skill_id=?1 AND path=?2",
         params![skill_id, path],
         resource_row,
-    )
+    )?
+    .ok_or_else(|| missing_resource(conn, skill_id, path))
+}
+
+/// A skill that has no file at this path, in words.
+///
+/// `query_one` answered SQLite's own "Query returned no rows", and that string
+/// went out unchanged: to the model as the whole result of
+/// `read_skill_resource` — for a SKILL.md naming a file nobody bundled, which
+/// is the ordinary way this happens — and to the editor as a red toast when a
+/// row that had been deleted underneath it was clicked. The paths the skill
+/// DOES have are the half that answers the question.
+fn missing_resource(conn: &Connection, skill_id: &str, path: &str) -> String {
+    let who = get_skill(conn, skill_id)
+        .map(|s| format!("\"{}\"", s.name))
+        .unwrap_or_else(|_| "That skill".to_string());
+    let has: Vec<String> = list_skill_resources(conn, skill_id)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| r.path)
+        .collect();
+    if has.is_empty() {
+        format!("{who} has no file at {path} — no files travel with it at all.")
+    } else {
+        format!("{who} has no file at {path}. It carries: {}.", has.join(", "))
+    }
 }
 
 pub fn upsert_skill_resource(
@@ -286,10 +311,16 @@ pub fn upsert_skill_resource(
 }
 
 pub fn delete_skill_resource(conn: &Connection, skill_id: &str, path: &str) -> Result<(), String> {
-    execute_one(
+    // A DELETE that matched nothing used to answer Ok, and the tool above it
+    // reported "Deleted references/policy.md from skill \"review\"." for a file
+    // the skill never had — a cleanup the model then believed and passed on.
+    // Unlike `delete_skill`, absence here is not the intent satisfied: the
+    // caller named a particular file.
+    execute_existing(
         conn,
         "DELETE FROM skill_resources WHERE skill_id=?1 AND path=?2",
         params![skill_id, path],
+        &format!("That skill has no file at {path}."),
     )?;
     execute_one(
         conn,
@@ -370,5 +401,49 @@ mod tests {
         update_skill(&conn, &live, "here", "d", "Edited text.", "").unwrap();
         set_skill_enabled(&conn, &live, true).unwrap();
         assert!(get_skill(&conn, &live).unwrap().enabled);
+    }
+
+    /// The same defect one level down: a resource DELETE that matched no row
+    /// reported success, and the tool above it told the model it had removed a
+    /// file the skill never had.
+    #[test]
+    fn deleting_a_resource_that_was_never_there_is_refused_not_reported_as_done() {
+        let conn = crate::db::mem();
+        let id = create_skill(&conn, "review", "d", "Do the work.", true, "user", "").unwrap();
+        upsert_skill_resource(&conn, &id, "references/policy.md", "reference", b"policy").unwrap();
+
+        let err = delete_skill_resource(&conn, &id, "references/old-policy.md")
+            .expect_err("deleting a path the skill never had reported success");
+        assert!(err.contains("no file at references/old-policy.md"), "{err}");
+        // The file that IS there still goes, and only once.
+        delete_skill_resource(&conn, &id, "references/policy.md").unwrap();
+        assert!(delete_skill_resource(&conn, &id, "references/policy.md").is_err());
+        assert!(list_skill_resources(&conn, &id).unwrap().is_empty());
+    }
+
+    /// A skill whose SKILL.md names a file nobody bundled: the model was handed
+    /// SQLite's "Query returned no rows" as the whole answer.
+    #[test]
+    fn a_missing_resource_is_explained_in_words_and_lists_what_is_there() {
+        let conn = crate::db::mem();
+        let id = create_skill(&conn, "review", "d", "Do the work.", true, "user", "").unwrap();
+        upsert_skill_resource(&conn, &id, "references/policy.md", "reference", b"policy").unwrap();
+
+        let err = get_skill_resource(&conn, &id, "references/risk-policy.md")
+            .expect_err("a missing resource read as a row");
+        assert!(!err.contains("Query returned no rows"), "{err}");
+        assert!(err.contains("\"review\" has no file at references/risk-policy.md"), "{err}");
+        assert!(err.contains("references/policy.md"), "what it does carry is missing: {err}");
+
+        // A skill that bundles nothing says that rather than listing an empty set.
+        let bare = create_skill(&conn, "bare", "d", "Do the work.", true, "user", "").unwrap();
+        let err = get_skill_resource(&conn, &bare, "notes.md").unwrap_err();
+        assert!(err.contains("no files travel with it"), "{err}");
+
+        // And a resource that IS there is still returned.
+        assert_eq!(
+            get_skill_resource(&conn, &id, "references/policy.md").unwrap().content,
+            b"policy"
+        );
     }
 }

@@ -13,6 +13,12 @@
 
 use super::*;
 
+/// The window event that asks the question. Named here rather than spelled out
+/// at each end: the menu raises it, `Workspace.tsx` answers it, and a typo in
+/// either would be a guard that silently never fires — which is the exact
+/// failure this module exists to have fixed once.
+pub const QUIT_REQUESTED: &str = "quit-requested";
+
 /// Does the open editor have edits that quitting would throw away? Pushed from
 /// the frontend, which is the only place that knows (the buffer lives in
 /// Monaco, not in Rust).
@@ -35,6 +41,20 @@ pub fn set_unsaved_edits(on: bool) {
         // Nothing left to ask about — re-arm, so a LATER edit is guarded too.
         QUIT_HELD.store(false, Ordering::SeqCst);
     }
+}
+
+/// The window answered the quit question with "no". Re-arm the door.
+///
+/// The latch exists so a door that cannot be ANSWERED never traps the user: a
+/// wedged window means the second ⌘Q quits regardless. Answering "Cancel" is
+/// the opposite situation — the window is plainly alive and the user said they
+/// want to stay — but it left the latch set, so the next ⌘Q minutes later quit
+/// with no dialog and took the buffer with it. Clearing it here keeps the
+/// fail-open property (nothing clears the latch unless the window replied)
+/// while making Cancel mean "not this time" instead of "never again".
+#[tauri::command]
+pub fn quit_guard_rearm() {
+    QUIT_HELD.store(false, Ordering::SeqCst);
 }
 
 /// Should this exit be held so the window can ask about unsaved edits?
@@ -106,6 +126,26 @@ mod tests {
         set_unsaved_edits(false);
         set_unsaved_edits(true);
         assert!(hold_quit_for_unsaved(None), "a fresh edit is guarded again");
+        reset();
+    }
+
+    /// Cancel means "not this time", not "never again for this buffer".
+    #[test]
+    fn cancelling_the_dialog_re_arms_the_door_for_the_same_buffer() {
+        let _guard = state_lock();
+        reset();
+        set_unsaved_edits(true);
+        assert!(hold_quit_for_unsaved(None), "first ⌘Q asks");
+        // The window asked, the user said Cancel, and the buffer is STILL dirty
+        // — so `set_unsaved_edits(false)` is exactly what must not happen here.
+        quit_guard_rearm();
+        assert!(
+            hold_quit_for_unsaved(None),
+            "a later ⌘Q must ask again, not quit and discard the buffer"
+        );
+        // The fail-open property survives: an UNANSWERED hold still lets the
+        // next press through, because nothing re-armed it.
+        assert!(!hold_quit_for_unsaved(None));
         reset();
     }
 }

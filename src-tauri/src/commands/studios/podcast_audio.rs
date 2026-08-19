@@ -36,8 +36,9 @@ const MAX_PODCAST_TURNS: usize = 400;
 
 /// Render `file_id`'s script to audio and save it in the room.
 ///
-/// Returns the new audio file's metadata. `progress` is called with
-/// (done, total) so the job card can name which turn is being recorded.
+/// Returns the new audio file's metadata. There is no per-turn progress: the
+/// whole episode is one POST, so the only honest report while it runs is the
+/// step emitted below.
 pub(crate) async fn render_podcast_audio(
     window: &tauri::Window,
     state: &State<'_, AppState>,
@@ -102,12 +103,19 @@ pub(crate) async fn render_podcast_audio(
     // Phase 2 (unlocked): the long one. Minutes of network work, so the room
     // lock must not be held — a job that pinned the room for ten minutes would
     // freeze every other operation in the app.
-    let resp = crate::sidecar::sidecar_json(
+    // Stop has to reach the card while the episode is still being read, not
+    // when the finished WAV lands minutes later. `Ok(None)` is the stopped step,
+    // the same contract the studios and the file pass use.
+    let Some(resp) = crate::sidecar::sidecar_json_cancellable(
         "/tts/podcast",
         &serde_json::json!({ "turns": outbound, "gap_ms": 420 }),
+        &cancel,
     )
     .await
-    .map_err(|e| e.error)?;
+    .map_err(|e| e.error)?
+    else {
+        return Err("Stopped — the podcast recording was not saved.".to_string());
+    };
     let wav_b64 = resp
         .get("audio_b64")
         .and_then(|v| v.as_str())
@@ -318,27 +326,59 @@ pub fn set_podcast_cast(
         if cast.iter().any(|h| h.name.trim().is_empty()) {
             return Err("Every host needs a name.".into());
         }
-        let mut turns = current.turns.clone();
-        // Re-fold BY POSITION: the panel edits the cast in place, so host N's
-        // new name belongs to whoever host N used to be. Matching by name would
-        // make renaming impossible — the old name no longer appears anywhere.
-        let mut renamed = turns.clone();
-        for (i, host) in cast.iter().enumerate() {
-            if let Some(old) = current.cast.get(i) {
-                for t in renamed.iter_mut() {
-                    if t.speaker.eq_ignore_ascii_case(old.name.trim()) {
-                        t.speaker = host.name.trim().to_string();
-                    }
-                }
+        // Two hosts under one name cannot both be reached: a line is joined to a
+        // voice by name (`render_podcast_audio`'s first match), so the second
+        // host would never read a word and the episode would be a one-voice
+        // reading of a two-voice script.
+        for (i, h) in cast.iter().enumerate() {
+            if cast[..i]
+                .iter()
+                .any(|e| e.name.trim().eq_ignore_ascii_case(h.name.trim()))
+            {
+                return Err("Two hosts can't share a name — the lines are matched by name.".into());
             }
         }
-        turns = renamed;
+        let turns = refold_speakers(&current.cast, &cast, &current.turns);
         db::save_podcast(&room.conn, &file_id, &current.title, &turns, &cast)?;
         if let Some(audio) = current.audio_file_id.as_deref() {
             db::set_podcast_audio(&room.conn, &file_id, audio)?;
         }
         db::get_podcast(&room.conn, &file_id).ok_or_else(|| "the script vanished".to_string())
     })
+}
+
+/// Carry every turn onto the new spelling of its host's name.
+///
+/// BY POSITION, because the panel edits the cast in place: host N's new name
+/// belongs to whoever host N used to be, and matching by name would make
+/// renaming impossible (the old name no longer appears anywhere).
+///
+/// The mapping is built in full BEFORE any turn is touched, and each turn is
+/// rewritten once, against the name it originally carried. Rewriting the turns
+/// once per host instead let a later host's rule fire on a name an earlier host
+/// had just written: swapping two hosts' names collapsed every line onto one
+/// speaker, and the next recording read the whole episode in one voice.
+fn refold_speakers(
+    old_cast: &[db::PodcastHost],
+    new_cast: &[db::PodcastHost],
+    turns: &[db::PodcastTurn],
+) -> Vec<db::PodcastTurn> {
+    let renames: Vec<(&str, String)> = new_cast
+        .iter()
+        .enumerate()
+        .filter_map(|(i, host)| Some((old_cast.get(i)?.name.trim(), host.name.trim().to_string())))
+        .collect();
+    turns
+        .iter()
+        .map(|t| {
+            let speaker = renames
+                .iter()
+                .find(|(old, _)| t.speaker.eq_ignore_ascii_case(old))
+                .map(|(_, new)| new.clone())
+                .unwrap_or_else(|| t.speaker.clone());
+            db::PodcastTurn { speaker, line: t.line.clone() }
+        })
+        .collect()
 }
 
 /// Speak one host's line as a preview, in that host's own voice.
@@ -429,6 +469,58 @@ mod tests {
         let out = timed_transcript("Ep", &turns(), &spoken, &[0], 0);
         assert!(out.contains("[0:00] Ada:"));
         assert!(out.contains("\nBo: Glad to be here."), "unstamped, not stamped 0:00");
+    }
+
+    fn host(name: &str) -> db::PodcastHost {
+        db::PodcastHost {
+            name: name.into(),
+            voice: String::new(),
+            rate: String::new(),
+            pitch: String::new(),
+        }
+    }
+
+    #[test]
+    fn swapping_two_hosts_names_keeps_both_speakers() {
+        // Rewriting the turns once per host let host 1's rule fire on the name
+        // host 0 had just written: every line ended up on one speaker, and the
+        // next recording read the whole episode in that host's voice.
+        let old = vec![host("Ada"), host("Bo")];
+        let new = vec![host("Bo"), host("Ada")];
+        let turns = vec![
+            db::PodcastTurn { speaker: "Ada".into(), line: "One.".into() },
+            db::PodcastTurn { speaker: "Bo".into(), line: "Two.".into() },
+            db::PodcastTurn { speaker: "Ada".into(), line: "Three.".into() },
+        ];
+        let out = refold_speakers(&old, &new, &turns);
+        let who: Vec<&str> = out.iter().map(|t| t.speaker.as_str()).collect();
+        assert_eq!(who, vec!["Bo", "Ada", "Bo"]);
+    }
+
+    #[test]
+    fn a_plain_rename_still_carries_every_line() {
+        let old = vec![host("Ada"), host("Bo")];
+        let new = vec![host("Ada Lovelace"), host("Bo")];
+        let turns = vec![
+            db::PodcastTurn { speaker: "ada".into(), line: "One.".into() },
+            db::PodcastTurn { speaker: "Cy".into(), line: "Two.".into() },
+        ];
+        let out = refold_speakers(&old, &new, &turns);
+        // Case-insensitive as before, and a speaker who is in no cast row keeps
+        // the name the script gave them rather than being folded onto host 0.
+        assert_eq!(out[0].speaker, "Ada Lovelace");
+        assert_eq!(out[1].speaker, "Cy");
+        assert_eq!(out[1].line, "Two.");
+    }
+
+    #[test]
+    fn a_host_added_beyond_the_old_cast_renames_nobody() {
+        let old = vec![host("Ada")];
+        let new = vec![host("Ada"), host("Bo")];
+        let turns = vec![db::PodcastTurn { speaker: "Bo".into(), line: "Hi.".into() }];
+        let out = refold_speakers(&old, &new, &turns);
+        assert_eq!(out[0].speaker, "Bo");
+        assert!(refold_speakers(&old, &new, &[]).is_empty());
     }
 
     #[test]

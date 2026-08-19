@@ -2,7 +2,6 @@ import { formatSize, isRecordingFile, type FileMeta, type RoomInfo } from "../ap
 import { displayName, formatWhen } from "./composer";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
-import { useAdaptiveText } from "./adaptiveText";
 import "../styles/recordingsPage.css";
 
 /** The Recordings OVERVIEW — the workspace half of the Recordings destination.
@@ -27,11 +26,16 @@ import "../styles/recordingsPage.css";
  * container, which nothing on this page does. A total in minutes would have to
  * be guessed from byte counts, and a plausible default is indistinguishable
  * from a fact once it is on screen (the rule mediaMeta.ts is written around).
- * Bytes ARE in the file list, so bytes are what the tally states. */
+ * Bytes ARE in the file list, so bytes are what the tally states.
+ *
+ * `info` is still accepted (the pane passes it) but deliberately unread: the
+ * only thing that ever wanted it was a model-written subtitle, and writing one
+ * meant sending the newest recording's FILE NAME to whatever engine this room
+ * is set to — off the machine, in a cloud room, to decorate the one page whose
+ * whole subject is private capture. */
 export default function RecordingsPage({
   s,
   a,
-  info,
 }: {
   s: WSState;
   a: WSActions;
@@ -60,31 +64,6 @@ export default function RecordingsPage({
   const newestDrawnElsewhere =
     newest !== null && newestAlreadyOnPage(newest.id, now, waitingShown);
 
-  // A1 "living dek": the static subtitle below is always the fallback (RULE
-  // 1/3/8) — this only ever REPLACES it visually when a fresh sentence is
-  // ready. Facts are exactly what this page itself states: how many tapes, how
-  // many are written up, and the newest one's name — never anything fetched
-  // fresh for this purpose (RULE 4/10). Gated on having at least one
-  // recording — an empty shelf has nothing true to say beyond the static line.
-  const recDekFacts = newest
-    ? {
-        count: tally.count,
-        transcribedCount: tally.transcribed,
-        newestName: displayName(newest.name),
-        recordingNow: now?.phase === "recording",
-      }
-    : null;
-  const recDek = useAdaptiveText({
-    roomId: info.path,
-    kind: "dek",
-    prompt: recDekFacts
-      ? `Write one plain sentence, max 20 words, for the header of this room's Recordings shelf. Use ONLY these facts: ${JSON.stringify(recDekFacts)}. Match this voice: short, concrete, no hype (existing example: "Captured here, transcribed here"). No preamble, just the sentence.`
-      : "",
-    facts: recDekFacts,
-    maxWords: 20,
-    enabled: recDekFacts !== null,
-  });
-
   return (
     <div className="rec-home">
       <header className="rec-home-head">
@@ -98,7 +77,7 @@ export default function RecordingsPage({
           </span>
         )}
         <p className="nb-subtitle rec-home-sub">
-          {recDek ?? "Captured here, transcribed here"}
+          Captured here, transcribed here
         </p>
       </header>
 
@@ -338,7 +317,9 @@ export const ATTENTION_COPY: Record<AttentionReason, string> = {
     "Install a speech model in Settings and this will transcribe itself.",
   failed: "Converting the file to a common format usually fixes this.",
   "no-speech": "The audio was read all the way through and held no speech.",
-  "not-yet": "Nothing has read it yet. Open it to write it up.",
+  // "read" is the AI findings pass inside the recording; speech→text is
+  // "transcribe" on every screen, so this line may not borrow either word.
+  "not-yet": "Nothing has transcribed it yet. Open it to transcribe it.",
 };
 
 /** The backend sends `failed: <why>`; the why is the half worth showing. */
@@ -463,13 +444,17 @@ export function countLabel(count: number): string {
 }
 
 /** The label under the transcribed figure. It states the RATIO, because "9"
- * under "written up" beside "12" under "recordings" makes a reader do the
- * subtraction — and the interesting number is the three that are not. */
+ * under "transcribed" beside "12" under "recordings" makes a reader do the
+ * subtraction — and the interesting number is the three that are not.
+ *
+ * The word matches the chip on a finished recording ("Transcribed") and the
+ * verb inside the recording itself; the shelf used to say "written up" here and
+ * "Transcribed" a few pixels away, about the same files. */
 export function transcribedPhrase(t: ShelfTally): string {
-  if (t.count === 0) return "written up";
-  if (t.transcribed === t.count) return "written up — all of them";
-  if (t.transcribed === 0) return `written up — none of ${t.count} yet`;
-  return `written up of ${t.count}`;
+  if (t.count === 0) return "transcribed";
+  if (t.transcribed === t.count) return "transcribed — all of them";
+  if (t.transcribed === 0) return `transcribed — none of ${t.count} yet`;
+  return `transcribed of ${t.count}`;
 }
 
 /* ---------- pieces ---------- */

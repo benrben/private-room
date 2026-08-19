@@ -78,6 +78,23 @@ interface GridCell {
 
 const EMPTY_CELL: GridCell = { text: "", edit: "", formula: false, span: 1, covered: false };
 
+/** Why a workbook would not open, in words the reader can act on.
+ *
+ * An ENCRYPTED workbook is not an unparseable one: the file is fine, it is
+ * locked, and there is nothing here to type a password into. Reporting it as
+ * "could not parse this spreadsheet" hid both the reason and the one thing
+ * that fixes it, on screen and in search. */
+function parseFailure(e: unknown): string {
+  const message = e instanceof Error ? e.message : String(e);
+  if (/password|encrypt/i.test(message)) {
+    return (
+      "This spreadsheet is protected with a password, so it can't be opened here. " +
+      "Remove the password in Excel and import it again."
+    );
+  }
+  return "Could not parse this spreadsheet.";
+}
+
 /** `#RRGGBB` from SheetJS's colour shapes, or undefined when it can't be read.
  * The community build fills these in only sometimes, so every read is
  * defensive: a missing colour means "inherit the theme", never a crash. */
@@ -152,7 +169,7 @@ export default function SheetView({
     text != null ? null : dataB64,
   );
 
-  const workbook = useMemo(() => {
+  const parsed = useMemo<{ wb: XLSX.WorkBook | null; failure: string | null }>(() => {
     try {
       if (text != null) {
         const wb = XLSX.read(text, { type: "string" });
@@ -160,17 +177,21 @@ export default function SheetView({
         // `"=SUM(A1:A2)"` — literal text by RFC 4180 — arrives marked as a
         // formula. Put the source's own quoting back over the result.
         for (const n of wb.SheetNames) stripQuotedCsvFormulas(wb.Sheets[n], text);
-        return wb;
+        return { wb, failure: null };
       }
-      if (!bytes) return null;
+      if (!bytes) return { wb: null, failure: null };
       // `cellStyles` is what makes column widths, merges and cell formatting
       // reach the grid at all; SheetJS parses them but does not populate them
       // unless asked. `cellDates` stops a date column rendering as 45678.
-      return XLSX.read(bytes, { type: "array", cellStyles: true, cellDates: true });
-    } catch {
-      return null;
+      return {
+        wb: XLSX.read(bytes, { type: "array", cellStyles: true, cellDates: true }),
+        failure: null,
+      };
+    } catch (e) {
+      return { wb: null, failure: parseFailure(e) };
     }
   }, [bytes, text]);
+  const workbook = parsed.wb;
 
   const [sheetIdx, setSheetIdx] = useState(0);
   /** `seed` is what the cell held when the editor opened, so a commit can tell
@@ -411,16 +432,19 @@ export default function SheetView({
     });
   }
 
-  /** Put the most recent changed cell back, in the file and on screen. */
+  /** Put the most recent changed cell back, in the file and on screen.
+   *
+   * The write happens HERE, not inside the `setEdits` updater: React may run an
+   * updater more than once for one call (it does so on every render in dev),
+   * and an updater that writes to the file turned one ⌘Z into two writes and
+   * two "You edited" entries in the file's history. */
   const undoLastEdit = useCallback(() => {
-    setEdits((prev) => {
-      const last = prev[prev.length - 1];
-      if (!last) return prev;
-      onEditCell?.(last.sheet, last.ref, last.before);
-      setNotice(`${last.ref} put back to "${last.before || "(empty)"}".`);
-      return prev.slice(0, -1);
-    });
-  }, [onEditCell]);
+    const last = edits[edits.length - 1];
+    if (!last) return;
+    onEditCell?.(last.sheet, last.ref, last.before);
+    setNotice(`${last.ref} put back to "${last.before || "(empty)"}".`);
+    setEdits((prev) => prev.slice(0, -1));
+  }, [edits, onEditCell]);
 
   // ⌘Z, where it is expected. Live QA pressed it and nothing happened, because
   // the grid never had an undo of its own and Monaco's was nowhere near.
@@ -474,7 +498,7 @@ export default function SheetView({
   if (loading) return <div className="empty-hint">Opening spreadsheet…</div>;
   if (readError) return <div className="empty-hint">{readError}</div>;
   if (!workbook || workbook.SheetNames.length === 0) {
-    return <div className="empty-hint">Could not parse this spreadsheet.</div>;
+    return <div className="empty-hint">{parsed.failure ?? "Could not parse this spreadsheet."}</div>;
   }
 
   const { totalRows, totalCols, widths } = sheet;

@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { api, AppDiag } from "../api";
 import { SparklesIcon } from "../icons";
+import { useFocusTrap } from "../settings/useFocusTrap";
 import { WSState } from "./state";
 
 /** How long a prefilled new-issue link may be. GitHub answers 414 well before
@@ -49,7 +50,7 @@ export default function FeedbackModal({ s }: { s: WSState }) {
     : "";
   const errorBlock =
     includeErrors && recentErrors.length > 0
-      ? `\n\n### Error messages seen this session\n\n${recentErrors
+      ? `\n\n### Error messages shown as pop-ups this session\n\n${recentErrors
           .map((e) => `- \`${e.at}\` ${e.text}`)
           .join("\n")}`
       : "";
@@ -62,6 +63,27 @@ export default function FeedbackModal({ s }: { s: WSState }) {
   function close() {
     if (!drafting) s.setShowFeedback(false);
   }
+
+  /* Escape, capture-phase, the way every sibling sheet does it (CompareModal,
+   * StudioModal). Without it the key reached the app-level listener instead:
+   * its typing guard meant Escape did nothing at all while a field had focus,
+   * and closed the FILE BEHIND this dialog once focus had left the fields.
+   * No dependency array — the handler reads `drafting` through `close`, and a
+   * listener registered once would keep answering with the value it captured. */
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (e.key !== "Escape") return;
+      e.stopPropagation();
+      close();
+    }
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  });
+
+  // Tab containment, so `aria-modal` describes something the component does.
+  // Its own Escape path is bubble-phase and does not stop propagation, which
+  // is why the capture listener above is still the one that closes this.
+  const { modalRef, onModalKeyDown } = useFocusTrap(close);
 
   async function draftWithAi() {
     if (drafting || !raw.trim()) return;
@@ -120,6 +142,9 @@ export default function FeedbackModal({ s }: { s: WSState }) {
       <div
         className="studio-prompt feedback-modal"
         data-testid="feedback-modal"
+        ref={modalRef}
+        tabIndex={-1}
+        onKeyDown={onModalKeyDown}
         // Named and announced as a dialog, the way every other sheet in the
         // app already is (AiActionModal, CompareModal, the consent cards). It
         // was the one modal that arrived as an anonymous div, so a screen
@@ -146,7 +171,10 @@ export default function FeedbackModal({ s }: { s: WSState }) {
             dir="auto"
             value={raw}
             disabled={drafting}
-            autoFocus
+            // No `autoFocus`: React applies it during commit, BEFORE the trap's
+            // effect reads `document.activeElement`, so the trap remembered
+            // this textarea as the trigger and had nothing to hand focus back
+            // to on close. The trap focuses the first control — this one.
             onChange={(e) => setRaw(e.target.value)}
           />
           <button
@@ -194,8 +222,12 @@ export default function FeedbackModal({ s }: { s: WSState }) {
                 checked={includeErrors}
                 onChange={(e) => setIncludeErrors(e.target.checked)}
               />
+              {/* "shown as pop-ups" is the whole truth: the list is fed by
+                  `pushToast` alone, so a pane that crashed outright is not in
+                  it — the error boundary draws a card and raises no toast. */}
               Append the {recentErrors.length} error message
-              {recentErrors.length === 1 ? "" : "s"} shown this session
+              {recentErrors.length === 1 ? "" : "s"} shown as pop-ups this
+              session
             </label>
             <p className="studio-prompt-hint">
               Read them first — an error can name one of your files, and this

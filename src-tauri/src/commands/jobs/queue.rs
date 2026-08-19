@@ -434,6 +434,32 @@ fn start_workflow_row(
 mod tests {
     use super::*;
 
+    /// `finish_and_pump` says it is "called from EVERY job's terminal epilogue",
+    /// and the single slot depends on it: `start_job_from_row` reports
+    /// `Started::Runner` for these kinds, which obliges the runner — not the
+    /// caller — to free the slot. `rec_read` shipped without the call, so the
+    /// first recording read (which happens automatically on Stop) wedged every
+    /// later background job for the session.
+    ///
+    /// Each module below owns the spawned task that ends its job, so the call
+    /// has to be in that file. Reading a DIFFERENT file than this one matters:
+    /// a source scan of its own text would contain the needle in the assertion
+    /// and could never fail.
+    #[test]
+    fn every_runner_that_owns_its_epilogue_frees_the_slot() {
+        for (name, src) in [
+            ("rec_read.rs", include_str!("rec_read.rs")),
+            ("download.rs", include_str!("download.rs")),
+            ("workflow.rs", include_str!("workflow.rs")),
+            ("create.rs", include_str!("create.rs")),
+        ] {
+            assert!(
+                src.contains("finish_and_pump"),
+                "{name} spawns a runner but never frees the single job slot"
+            );
+        }
+    }
+
     #[test]
     fn reserve_is_single_slot() {
         let state = AppState::default();

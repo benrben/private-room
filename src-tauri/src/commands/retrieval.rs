@@ -57,6 +57,27 @@ pub(crate) fn question_terms(question: &str) -> Vec<String> {
     terms
 }
 
+/// How close a chunk's vector has to be to the question's before it counts as
+/// a match at all.
+///
+/// Measured on the embed model this app actually runs (nomic-embed-text with
+/// the `search_query:` / `search_document:` prefixes, 2026-08-16): a question
+/// nothing in the room answers ("asdf qwerty", "kzzzt vorplex") scores
+/// 0.32–0.49 against EVERY chunk, while a real paraphrase of a chunk scores
+/// 0.64–0.83. Any positive cosine used to pool a chunk, so once the backfill
+/// had run no question could ever be reported as unanswered: the six chunks
+/// with the highest cosine came back under a header calling them context from
+/// the room, when all that distinguished them was being least-unrelated.
+pub(crate) const MIN_CHUNK_SIMILARITY: f32 = 0.55;
+
+/// How many vector candidates one question may carry into hydration.
+///
+/// `chunks_by_rowids` binds one SQL variable per rowid and SQLite binds at most
+/// 32,766 of them, so an unlimited request (`limit: None`) over a room with
+/// more embedded chunks than that failed the whole query rather than answering
+/// it. Far above anything a caller displays, and far below the bind limit.
+const MAX_VECTOR_CANDIDATES: usize = 2_000;
+
 pub(crate) struct ScoredChunk {
     pub(crate) rowid: i64,
     pub(crate) file_name: String,
@@ -133,7 +154,10 @@ pub(crate) fn retrieve_context_limited(
     // negative LIMIT as no limit, which `i64::MAX` matches in practice).
     let candidates = match limit {
         Some(n) => n.saturating_mul(4).max(RETRIEVE_CANDIDATES),
-        None => i64::MAX as usize,
+        // Not `i64::MAX`: hydration binds one SQL variable per rowid and SQLite
+        // binds at most 32,766, so "no limit" over a big room failed the whole
+        // query instead of answering it.
+        None => MAX_VECTOR_CANDIDATES,
     };
     struct Cand {
         file_name: String,
@@ -169,7 +193,11 @@ pub(crate) fn retrieve_context_limited(
         let mut scored: Vec<(i64, f32)> = Vec::new();
         db::for_each_chunk_embedding(conn, |rowid, blob| {
             let cos = db::cosine_similarity_blob(q, blob);
-            if cos > 0.0 {
+            // A floor, not "any positive cosine": every chunk scores somewhat
+            // above zero against any question, so pooling on `> 0.0` meant a
+            // question the room cannot answer still came back with its six
+            // least-unrelated chunks, presented as context from the room.
+            if cos >= MIN_CHUNK_SIMILARITY {
                 scored.push((rowid, cos));
             }
         })?;
@@ -281,7 +309,21 @@ pub(crate) fn make_snippet(haystack: &str, needle: &str, radius: usize) -> Strin
         }
     };
     // No match to center on: return a clipped preview from the start.
-    let Some(byte) = find(needle).or_else(|| needle.split_whitespace().find_map(find)) else {
+    //
+    // The whole phrase first; failing that, the most SELECTIVE word in it. Word
+    // order used to decide, so "the deposit" previewed the region around "the" —
+    // in a lease that opens "The tenant shall…", the reader saw the first
+    // sentence with "the" marked and never saw the word that made the file
+    // match. `question_terms` is the same stopword filter the search itself
+    // ranks with; longest term first is the cheap stand-in for selectivity.
+    // Raw word order still backstops it, so a query that is ALL stopwords
+    // ("the it") centres exactly where it used to.
+    let mut selective = question_terms(needle);
+    selective.sort_by_key(|t| std::cmp::Reverse(t.chars().count()));
+    let Some(byte) = find(needle)
+        .or_else(|| selective.iter().find_map(|t| find(t)))
+        .or_else(|| needle.split_whitespace().find_map(find))
+    else {
         let mut out: String = chars.iter().take(radius * 2).collect();
         if chars.len() > radius * 2 {
             out.push('…');
@@ -308,8 +350,9 @@ pub(crate) fn make_snippet(haystack: &str, needle: &str, radius: usize) -> Strin
 /// oldest-first. We walk newest-first, keeping whole turns until the budget is
 /// spent (recency-weighted), and drop older turns entirely instead of cutting
 /// each to a fixed head. A turn that alone exceeds the budget is cut at the
-/// last paragraph boundary before the limit with an explicit omitted-marker,
-/// so the model never sees a silently unterminated prior turn. Char-safe.
+/// last paragraph boundary NEAR the limit — or at the limit itself when the
+/// nearest one is far behind it — with an explicit omitted-marker, so the model
+/// never sees a silently unterminated prior turn. Char-safe.
 pub(crate) fn compact_history(history: Vec<(String, String)>, budget: usize) -> Vec<(String, String)> {
     let mut kept: Vec<(String, String)> = Vec::new();
     let mut remaining = budget;
@@ -330,7 +373,16 @@ pub(crate) fn compact_history(history: Vec<(String, String)>, budget: usize) -> 
             break;
         }
         let cut = floor_boundary(&content, remaining.saturating_sub(40));
-        let end = content[..cut].rfind("\n\n").unwrap_or(cut);
+        // A paragraph boundary is worth having only if it is NEAR the cut. One
+        // blank line early in a long turn — "Here's the summary:\n\n" above a
+        // list written with single newlines — is the last "\n\n" before a cut
+        // 40 KB later, so this kept 19 characters and threw the other 40 KB of
+        // allowance away. Past that distance, cut where the budget says.
+        let floor = cut - cut / 5;
+        let end = match content[..cut].rfind("\n\n") {
+            Some(at) if at >= floor => at,
+            _ => cut,
+        };
         let mut piece = content[..end].to_string();
         piece.push_str("\n… [rest of this message omitted]");
         kept.push((role, piece));
@@ -452,6 +504,58 @@ mod tests {
         // No match → a preview from the start, never a panic.
         let none = make_snippet("just some words here", "zzzzz", 5);
         assert!(none.starts_with("just"));
+    }
+
+    #[test]
+    fn snippet_centres_on_the_selective_word_not_the_first_one() {
+        // The two words of the query are 900 characters apart, so there is no
+        // phrase match to centre on. The preview must show the word that made
+        // the file match, not the article the query happened to open with.
+        let lease = format!(
+            "The tenant shall keep the premises in good repair. {} Any deposit is held in trust.",
+            "Filler about quiet enjoyment. ".repeat(30)
+        );
+        let snip = make_snippet(&lease, "the deposit", 40);
+        assert!(snip.contains("deposit"), "got {snip:?}");
+        assert!(!snip.contains("tenant shall"), "still centred on the stopword: {snip:?}");
+        // Longest-first among the selective terms.
+        let both = make_snippet(&lease, "repair deposit", 40);
+        assert!(both.contains("deposit"), "got {both:?}");
+        // A query with nothing selective in it keeps the old behaviour: the
+        // first of its words that occurs at all.
+        let all_stop = make_snippet(&lease, "the it", 20);
+        assert!(all_stop.contains("tenant"), "got {all_stop:?}");
+        // And a single word is still centred on itself.
+        let one = make_snippet(&lease, "deposit", 20);
+        assert!(one.contains("deposit"), "got {one:?}");
+    }
+
+    #[test]
+    fn one_early_blank_line_does_not_shrink_a_long_turn_to_nothing() {
+        // "Here's the summary:" over a list written with single newlines: the
+        // only "\n\n" in 70 KB sits at character 19. Cutting there kept 19
+        // characters of a 20,000-character allowance and spent the rest on
+        // nothing.
+        let mut long = String::from("Here's the summary:\n\n");
+        for i in 0..2_000 {
+            long.push_str(&format!("- item {i} explained at some length\n"));
+        }
+        let budget = 20_000;
+        let kept = compact_history(vec![("assistant".into(), long)], budget);
+        assert_eq!(kept.len(), 1);
+        let piece = &kept[0].1;
+        assert!(
+            piece.len() > budget * 3 / 4,
+            "kept {} characters of a {budget} budget",
+            piece.len()
+        );
+        assert!(piece.ends_with("… [rest of this message omitted]"));
+
+        // A paragraph boundary NEAR the cut is still preferred over it.
+        let para = format!("{}\n\n{}", "a".repeat(19_000), "b".repeat(19_000));
+        let kept = compact_history(vec![("assistant".into(), para)], budget);
+        assert!(!kept[0].1.contains('b'), "cut past the nearby paragraph break");
+        assert!(kept[0].1.starts_with("aaa"));
     }
 
     #[test]
@@ -594,6 +698,113 @@ mod tests {
         assert!(generic_fallback);
     }
 
+    /// Give every chunk in the room the vector at the same index, in order.
+    fn embed_chunks_in_order(conn: &Connection, vectors: &[[f32; 3]]) {
+        let missing = db::chunks_missing_embedding(conn, 1000).unwrap();
+        assert_eq!(missing.len(), vectors.len(), "fixture: one vector per chunk");
+        for ((id, _, _), v) in missing.iter().zip(vectors) {
+            db::set_chunk_embedding(conn, id, &db::embedding_to_blob(v)).unwrap();
+        }
+    }
+
+    /// An embedded room must still be able to say "nothing here matches that".
+    ///
+    /// Every positive cosine used to pool a chunk, and every chunk in a room
+    /// has a positive cosine with almost every question — so once the backfill
+    /// finished, `fallback` was unreachable and a nonsense question came back
+    /// with the six least-unrelated chunks presented as the room's answer.
+    #[test]
+    fn a_question_the_room_cannot_answer_is_still_a_no_match_once_it_is_embedded() {
+        let conn = db::open_in_memory_schema();
+        db::insert_file(
+            &conn,
+            "hr.txt",
+            "text/plain",
+            b"x",
+            Some("Our vacation schedule lists everyone's paid time away."),
+            "upload",
+        )
+        .unwrap();
+        db::insert_file(
+            &conn,
+            "lease.pdf",
+            "application/pdf",
+            b"x",
+            Some("The tenant shall not keep pets on the premises."),
+            "upload",
+        )
+        .unwrap();
+        embed_chunks_in_order(&conn, &[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]);
+
+        // Cosine 0.4 with both chunks — the band nomic-embed-text puts an
+        // unanswerable question in (measured 0.32–0.49). No keyword overlap
+        // either, so nothing at all in this room matches.
+        let nothing = [0.4f32, 0.4, 0.824_621_1];
+        let (chunks, fallback) =
+            retrieve_context(&conn, "asdf qwerty", Some(&nothing)).unwrap();
+        assert!(
+            fallback,
+            "an unanswerable question must not be dressed up as a match: got {} chunks",
+            chunks.len()
+        );
+
+        // …and the floor must not be so high that a real match falls under it:
+        // cosine 0.66 with hr.txt is what a genuine paraphrase scores.
+        let real = [0.66f32, 0.4, 0.635_924_5];
+        let (chunks, fallback) =
+            retrieve_context(&conn, "how much unpaid absence", Some(&real)).unwrap();
+        assert!(!fallback, "a genuine vector match is still a match");
+        assert_eq!(chunks[0].file_name, "hr.txt");
+    }
+
+    /// #find asks for every match (`limit: None`). The vector pass hydrates its
+    /// candidates with one SQL variable per rowid, and SQLite binds at most
+    /// 32,766 — so past that many embedded chunks the command did not return a
+    /// long list, it returned "too many SQL variables".
+    #[test]
+    fn an_unlimited_search_of_a_huge_embedded_room_answers_instead_of_erroring() {
+        let conn = db::open_in_memory_schema();
+        db::insert_file(&conn, "big.txt", "text/plain", b"x", Some("seed chunk"), "upload")
+            .unwrap();
+        let file_id: String = conn
+            .query_row("SELECT id FROM files LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        let blob = db::embedding_to_blob(&[1.0f32, 0.0, 0.0]);
+        // One more than SQLite's variable limit, which is where it broke.
+        const ROWS: usize = 32_800;
+        conn.execute("BEGIN", []).unwrap();
+        {
+            let mut stmt = conn
+                .prepare("INSERT INTO chunks (id, file_id, seq, text, embedding) VALUES (?1, ?2, ?3, ?4, ?5)")
+                .unwrap();
+            for i in 0..ROWS {
+                stmt.execute(rusqlite::params![
+                    format!("c{i}"),
+                    &file_id,
+                    i as i64,
+                    format!("paragraph {i}"),
+                    &blob
+                ])
+                .unwrap();
+            }
+        }
+        conn.execute("COMMIT", []).unwrap();
+
+        // No keyword hit (so every candidate has to be hydrated by the vector
+        // pass), and a vector every chunk answers.
+        let q = [1.0f32, 0.0, 0.0];
+        let (chunks, fallback) =
+            retrieve_context_limited(&conn, "asdf qwerty", Some(&q), &HashSet::new(), None)
+                .unwrap();
+        assert!(!fallback);
+        assert!(!chunks.is_empty());
+        assert!(
+            chunks.len() <= MAX_VECTOR_CANDIDATES,
+            "an unlimited search still has to fit one query: {} chunks",
+            chunks.len()
+        );
+    }
+
     // ------------------------------------------------- the history hand-off
     //
     // What the model is given to work with. Measured 2026-07-28 on a
@@ -688,4 +899,6 @@ mod tests {
         assert!(!kept.is_empty());
     }
 }
+
+
 

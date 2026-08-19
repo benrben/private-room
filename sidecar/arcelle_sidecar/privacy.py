@@ -28,13 +28,23 @@ from typing import Any
 from .external_llm import is_external_model
 from .messages import Message
 
-#: Ollama's remote-relay tag (mirror external.rs ``is_cloud_model``).
+#: Ollama's remote-relay tag (mirror ``capabilities.rs::engine_id_of``).
 _CLOUD_SUFFIX = ("cloud",)
 
 
 def is_cloud_model(model: str) -> bool:
-    """True for an Ollama model whose tag relays to ollama.com (``name:cloud``)."""
-    return model.rsplit(":", 1)[-1] in _CLOUD_SUFFIX and ":" in model
+    """True for an Ollama model whose tag relays to ollama.com.
+
+    Ollama writes the marker BOTH ways — ``minimax-m3:cloud`` and, for its
+    sized entries, inside the tag as ``gpt-oss:120b-cloud``. An exact ``:cloud``
+    test sees only the first and calls the second local, and the cost of that
+    error is the user's content leaving the Mac under a promise that it would
+    not. ``engine_id_of`` on the Rust side accepts both; so does this.
+    """
+    if ":" not in model:
+        return False
+    tag = model.rsplit(":", 1)[-1]
+    return tag in _CLOUD_SUFFIX or tag.endswith("-cloud")
 
 
 def is_nonlocal_model(model: str) -> bool:
@@ -85,6 +95,11 @@ class PrivacyPolicy:
     #: User-defined concept rules ("my health") — consumed by the live guard
     #: (:mod:`.privacy_scan`), carried here so routes have one policy object.
     concepts: list[str] = field(default_factory=list)
+    #: Rust's verdict that this request's transport leaves the Mac even though
+    #: the model NAME says local — the Closet (``set_ollama_url``) pointing an
+    #: ordinary ``qwen3.5:4b`` at another computer. Only the host can know this,
+    #: so it is told to us rather than guessed from the name here.
+    relayed: bool = False
     report: PrivacyReport = field(default_factory=PrivacyReport)
 
     _redact_re: re.Pattern[str] | None = None
@@ -264,6 +279,7 @@ def policy_from_payload(payload: dict[str, Any] | None) -> PrivacyPolicy | None:
         active=bool(payload.get("active", False)),
         rules=rules,
         concepts=[str(c) for c in payload.get("concepts", []) if str(c).strip()],
+        relayed=bool(payload.get("relayed", False)),
     )
 
 
@@ -279,7 +295,12 @@ def guard_outbound(
     ``None`` when the door stays open (local model, or policy off/absent), the
     redacted copy and ``images=None`` when it engages.
     """
-    if policy is None or not policy.active or not is_nonlocal_model(model):
+    if policy is None or not policy.active:
+        return messages, images, None
+    # Two ways out, and the name only knows one of them: a relayed tag, and a
+    # transport the host pointed off this Mac. Asking the name alone let the
+    # Closet carry whole documents away with the door reading "on".
+    if not (is_nonlocal_model(model) or policy.relayed):
         return messages, images, None
     redacted = policy.redact_messages(messages)
     policy.block_images(images)

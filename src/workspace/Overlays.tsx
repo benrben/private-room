@@ -24,6 +24,8 @@ import { languageForFile } from "../viewers/languages";
 import { LayoutApi } from "../shell/useLayout";
 import { toggleTheme } from "../theme";
 import { SCRIPT_POWERS, SCRIPT_WORKSPACE_NOTE } from "./scriptTrust";
+import { newItemLabel, newItemOf } from "./destinations";
+import type { WorkArea } from "./types";
 import {
   applyFindFilters,
   DEFAULT_FILTERS,
@@ -270,6 +272,16 @@ function buildPaletteActions(
     { id: "go-skills", label: "Open Skills", hint: "Reusable instructions the AI can load", run: () => { leaveAreas(); s.setArea("skills"); } },
     { id: "go-connectors", label: "Open Connectors", hint: "MCP tools this room may use", run: () => { leaveAreas(); s.setArea("connectors"); } },
     { id: "go-memory", label: "Open Memory & scratch pad", hint: "Durable context, visible and editable", run: () => a.revealMemory() },
+    // ----- surfaces that live inside a pane, not at an area -----
+    //
+    // Same argument as the destinations above, one level down: these three are
+    // tabs of the library and assistant columns, so with that column collapsed
+    // there was no keyboard route to them at all and none `uiSnapshot()` could
+    // see. Each one shows its pane first, because a tab selected inside a
+    // hidden column is a click that appears to do nothing.
+    { id: "pane-trash", label: "Open the Trash", hint: "Files deleted from this room — restorable", run: () => { leaveAreas(); s.setArea("home"); s.setLibraryTab("trash"); layout?.showPane("library"); } },
+    { id: "pane-studio", label: "Open Studio", hint: "Things the assistant can make from this room", run: () => { s.setAiTab("studio"); layout?.showPane("ai"); } },
+    { id: "pane-activity", label: "Open Activity", hint: "Background jobs, approvals, and the run log", run: () => { s.setAiTab("activity"); layout?.showPane("ai"); } },
     // ----- the window's arrangement (same handlers the Layout menu uses) -----
     { id: "toggle-library", label: "Show or hide the sidebar", hint: "The left pane (⌘1)", run: () => layout?.togglePane("library") },
     { id: "toggle-assistant", label: "Show or hide the Assistant", hint: "Chat, Studio, and Activity (⌘2)", run: () => layout?.togglePane("ai") },
@@ -290,19 +302,25 @@ function buildPaletteActions(
   // call into one is dropped rather than offered as a no-op. Matched on a
   // prefix set instead of by name so a preset added above cannot be forgotten
   // here and silently become a row that does nothing.
-  const LAYOUT_ROWS = /^(toggle-library|toggle-assistant|focus-editor|preset-|reset-layout)/;
+  const LAYOUT_ROWS = /^(toggle-library|toggle-assistant|focus-editor|preset-|reset-layout|pane-)/;
   if (!layout) return acts.filter((x) => !LAYOUT_ROWS.test(x.id));
   return acts;
 }
+
+/** The group ⌘T's row is spliced into. Named once so the splice below cannot
+ * quietly stop matching if this heading is ever reworded. */
+const AROUND_THE_ROOM = "Around the room";
 
 /** Every keyboard shortcut this app answers, grouped the way the user meets
  * them. The app had over a dozen and no way to learn one except hovering the
  * right button; this sheet is the list. Keep it in step with the real handlers:
  * effects.ts (app), Workspace.tsx (tabs), useLayout.ts (panes), chatActions.ts
- * (composer), CodeEditor.tsx (save), PdfView.tsx (zoom). */
+ * (composer), CodeEditor.tsx (save), PdfView.tsx and SketchView.tsx (zoom),
+ * SketchView.tsx (drawing), BookView.tsx / SheetView.tsx / RecordingView.tsx
+ * (reading), Sidebar.tsx and BrowserSearch.tsx (the library and the browser). */
 const SHORTCUTS: { group: string; rows: [string, string][] }[] = [
   {
-    group: "Around the room",
+    group: AROUND_THE_ROOM,
     rows: [
       ["⌘K  /  ⌘F", "Search this room, or run a command"],
       ["⌘N", "New chat"],
@@ -316,7 +334,10 @@ const SHORTCUTS: { group: string; rows: [string, string][] }[] = [
   {
     group: "Tabs",
     rows: [
-      ["⌘W", "Close the current tab"],
+      // In `closeItemHere`'s own order (Workspace.tsx). Naming only the tab
+      // described a key that closes the WINDOW — in Memory, Skills, Connectors
+      // or an empty Sketch, that is all it can close — as a harmless one.
+      ["⌘W", "Close the page, document or tab you are in — the window when there is none"],
       ["⇧⌘T", "Reopen the last file tab you closed"],
       ["⌘⇧]  /  ⌘⇧[", "Next / previous tab"],
       ["⌥⌘1 – ⌥⌘9", "Jump to a tab by position (⌥⌘9 = last)"],
@@ -346,14 +367,69 @@ const SHORTCUTS: { group: string; rows: [string, string][] }[] = [
     ],
   },
   {
-    group: "Reading a PDF",
-    rows: [["⌘+ / ⌘- / ⌘0", "Zoom in, out, or fit the width"]],
+    group: "Reading",
+    rows: [
+      // ⌘+/⌘-/⌘0 was filed under the PDF alone, which read as a promise that
+      // the drawing did not answer it. SketchView.tsx:1315-1329 does.
+      ["⌘+ / ⌘- / ⌘0", "Zoom in, out, or fit — in a PDF or a drawing"],
+      ["← / →,  PageUp / PageDown", "Previous or next page of a book"],
+      // SheetView binds these on the cell only when `editable` — a spreadsheet
+      // opened to read has tabIndex -1 cells and answers no key at all.
+      ["Arrows", "Move between cells, in a spreadsheet opened for editing"],
+      ["Enter  /  F2", "Edit the cell you are on"],
+      ["← / →,  Home / End", "Move between a recording's tabs"],
+    ],
+  },
+  {
+    group: "Drawing",
+    rows: [
+      ["V P R O A T E", "Pick a tool: select, pen, rectangle, ellipse, arrow, text, eraser"],
+      ["Arrows  /  ⇧Arrows", "Nudge the selection by a point, or by a grid square"],
+      ["⌘Z  /  ⇧⌘Z", "Undo or redo the drawing"],
+      ["⌘A  /  ⌘D", "Select everything, or duplicate the selection"],
+      ["⌘]  /  ⌘[", "Bring forward or send back (⇧ sends it all the way)"],
+      ["⌫", "Delete the selection"],
+    ],
+  },
+  {
+    group: "The Library and the browser",
+    rows: [
+      ["⌘A", "Select every file — while the sidebar has the pointer or focus"],
+      ["Esc", "Clear the file selection"],
+      ["⌫", "Close the browser page row you are on"],
+      ["J  /  K", "Next or previous result on a browser search page"],
+    ],
   },
 ];
 
 /** The keyboard-shortcuts sheet. Reuses the settings modal's frame so it is
  * dismissed exactly like every other sheet in the app. */
-function ShortcutsSheet({ onClose }: { onClose: () => void }) {
+function ShortcutsSheet({
+  area,
+  webOn,
+  onClose,
+}: {
+  area: WorkArea;
+  webOn: boolean;
+  onClose: () => void;
+}) {
+  // ⌘T is the only key whose MEANING depends on where you are — new page, new
+  // sketch, new creation — which is why it was left out of a static table and
+  // so out of the list the app calls complete, while its ⇧⌘T counterpart was
+  // listed. In the Browser it is the primary verb, and a reader of this sheet
+  // concluded it did nothing. Omitted, still, where it really does nothing —
+  // including the offline room, whose ⌘T declines to open a page it cannot
+  // have (the same condition `newItemHere` in Workspace.tsx returns on).
+  const groups = useMemo(() => {
+    const newLabel =
+      newItemOf(area) === "page" && !webOn ? null : newItemLabel(area);
+    if (!newLabel) return SHORTCUTS;
+    return SHORTCUTS.map((sec) =>
+      sec.group === AROUND_THE_ROOM
+        ? { ...sec, rows: [["⌘T", newLabel] as [string, string], ...sec.rows] }
+        : sec,
+    );
+  }, [area, webOn]);
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Escape") return;
@@ -383,7 +459,7 @@ function ShortcutsSheet({ onClose }: { onClose: () => void }) {
           </button>
         </div>
         <div className="settings-body">
-          {SHORTCUTS.map((sec) => (
+          {groups.map((sec) => (
             <section key={sec.group}>
               <div className="group-heading">{sec.group}</div>
               {sec.rows.map(([keys, what]) => (
@@ -544,7 +620,11 @@ export default function Overlays({
     <>
       <CaptureDock s={s} />
       {s.showShortcuts && (
-        <ShortcutsSheet onClose={() => s.setShowShortcuts(false)} />
+        <ShortcutsSheet
+          area={s.area}
+          webOn={s.webOn}
+          onClose={() => s.setShowShortcuts(false)}
+        />
       )}
       {pendingScript && (
         // Wave 5 (Idea 13): the script-run consent card. Same data-agent-blocked
@@ -787,6 +867,20 @@ export default function Overlays({
               )}
               ?
             </div>
+            {/* Only the head of the queue is drawn — two cards would overlap in
+                this fixed layer — so a second request (a background job editing
+                while a chat turn also edits) was invisible here. The deadline is
+                named because it is real and it is NOT reset by reaching the
+                front: edit_gate.rs gives every request 180s from the moment it
+                was raised and declines it on the way out. */}
+            {s.editApprovals.length > 1 && (
+              <p className="approve-body">
+                {s.editApprovals.length - 1} more change
+                {s.editApprovals.length > 2 ? "s are" : " is"} waiting behind
+                this one. Each is asked in turn, and declines itself three
+                minutes after it was raised.
+              </p>
+            )}
             <div className="approve-diffs">
               {pendingEdit.files.slice(0, 5).map((f, i) => (
                 <div className="approve-diff-file" key={`${f.name}-${i}`}>

@@ -1,4 +1,10 @@
-import { useEffect, useRef, useState } from "react";
+import {
+  useEffect,
+  useRef,
+  useState,
+  type Dispatch,
+  type SetStateAction,
+} from "react";
 import { FileContent, RoomInfo, formatSize } from "../api";
 import {
   BookOpenIcon,
@@ -45,6 +51,7 @@ import {
   type SearchableDocument,
   withQuote,
 } from "./quoteSelection";
+import { isCloudRoute, isModelReady, trustState } from "./markup";
 import ConnectorsView from "./ConnectorsView";
 import { BrowserView } from "./BrowserView";
 import { WSState } from "./state";
@@ -65,7 +72,15 @@ import type { ViewerKind } from "../api";
  * This used to be spelled inline as `kind === "code" || kind === "html"`, which
  * was complete when those were the only two. Every viewer added since has a
  * bar across the top and a scroll region under it, and one that misses this
- * set collapses to content height with its toolbar floating above nothing. */
+ * set collapses to content height with its toolbar floating above nothing.
+ *
+ * `fill` also drops `.viewer-body`'s page margin to zero, so a viewer only
+ * belongs here if it draws its OWN padding — `.sk-tools` and `.rec-transport`
+ * do. `.audio-view` and `.image-view` do not: adding them pins their controls
+ * at the cost of running the player, the transcript and the OCR block flush
+ * into the pane edges, and `.image-view`'s siblings would be clipped rather
+ * than scrolled under `overflow: hidden`. Those two need padding in
+ * composer.css/viewer-formats.css before they can join. */
 const FILL_HEIGHT_KINDS = new Set<ViewerKind>([
   "archive",
   "book",
@@ -73,13 +88,38 @@ const FILL_HEIGHT_KINDS = new Set<ViewerKind>([
   "html",
   "json",
   "log",
+  "recording",
   "sheet",
   "csv",
+  "sketch",
   "slides",
   "subtitle",
   "svg",
   "worddoc",
 ]);
+
+/** Escape dismisses the popover, not the document behind it.
+ *
+ * Capture phase, because the shell's Escape handler (effects.ts) listens on
+ * `window` in the BUBBLE phase and closes the open file: a menu that stopped
+ * propagation only from its own subtree still lost the document underneath
+ * it, leaving the popover drawn over whatever replaced it. Same dismissal
+ * grammar as the top bar's shared menu slot. */
+function useDismissOnEscape(
+  open: boolean,
+  close: Dispatch<SetStateAction<boolean>>,
+) {
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      e.stopPropagation();
+      close(false);
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [open, close]);
+}
 
 /** True when a file name is a runnable script (.py/.js). */
 function isScriptName(name: string): boolean {
@@ -149,6 +189,8 @@ function LibraryChip({
     setOpen(false);
     setAsking(false);
   }, [fileId]);
+  useDismissOnEscape(asking, setAsking);
+  useDismissOnEscape(open, setOpen);
   const file = s.files.find((f) => f.id === fileId);
   const status = file ? libraryStatus(file) : null;
   if (!file || !status) return null;
@@ -181,7 +223,9 @@ function LibraryChip({
                 </span>
               </p>
               <div className="library-chip-actions">
-                <button className="subtle" onClick={() => setAsking(false)}>
+                {/* The safe choice takes focus, so a dialog announced to a
+                    screen reader does not then have to be hunted for by tab. */}
+                <button className="subtle" autoFocus onClick={() => setAsking(false)}>
                   Cancel
                 </button>
                 <button
@@ -324,6 +368,12 @@ export default function ViewerPane({
   // this popover's lifetime, not to the file, and must not survive a switch.
   const [overflowOpen, setOverflowOpen] = useState(false);
   useEffect(() => setOverflowOpen(false), [openFile?.id]);
+  useDismissOnEscape(overflowOpen, setOverflowOpen);
+  // The History popover outlives the menu that opened it (`openHistory` closes
+  // the menu), so it is a third surface Escape used to shoot through — and the
+  // one where doing so also took away the only route back to an earlier
+  // version. Closed the same way its own toggle closes it.
+  useDismissOnEscape(s.showHistory, s.setShowHistory);
   // "Preview cloud payload" only means something for a file that HAS text a
   // cloud model would be handed. Asking the kind was a proxy for that and went
   // stale every time a kind was added; ask the file itself.
@@ -350,12 +400,16 @@ export default function ViewerPane({
         setQuote(null);
         return;
       }
-      // Both ends, not just the anchor: a drag that starts in the document and
-      // ends outside it is not a quote of the document.
+      // Both ends, not just the anchor — for the exclusion too. A drag that
+      // started in the text and ended in the reader's own chrome was offered as
+      // a quote, so a book's contents list or a mode button's label reached the
+      // composer under the document's name; dragging the other way was refused,
+      // which made the answer depend on the direction of the drag.
       if (
         !inQuotableDocument(sel.anchorNode) ||
         !inQuotableDocument(sel.focusNode) ||
-        inExcludedSurface(sel.anchorNode)
+        inExcludedSurface(sel.anchorNode) ||
+        inExcludedSurface(sel.focusNode)
       ) {
         setQuote(null);
         return;
@@ -402,6 +456,15 @@ export default function ViewerPane({
   // A file swap leaves a stale button pinned over the new document.
   useEffect(() => setQuote(null), [openFile?.id]);
 
+  // P1-4: lifted out of ViewerRouter, which used to own this hook entirely,
+  // so the header's overflow menu can draw the same picker — see
+  // TextEncoding.tsx. `enc` (not `encoding`) on purpose: ViewerRouter passes
+  // it straight through to the editors' save banners under that exact name,
+  // and `encoding.test.mjs` reads the literal `enc.decoded` text out of the
+  // source to make sure every in-place editor still warns about a legacy
+  // encoding being converted on save.
+  const enc = useTextEncoding(openFile?.id ?? "", openFile?.content ?? NO_FILE);
+
   /* THE SAME GESTURE, FROM INSIDE A SANDBOXED FRAME.
      A saved page renders in an opaque `roomdoc://` frame, so the selection
      above cannot see it: `selectionchange` never fires on this document and
@@ -415,13 +478,30 @@ export default function ViewerPane({
      The last check costs a page that BUILDS its text with script: the app has
      no copy of what that page generated, so it cannot vouch for it and does
      not offer it. Refusing to quote what cannot be verified is the point. */
-  /* Parsed on FIRST REPORT and cached per file, never on open.
+  /* Parsed on FIRST REPORT and cached, never on open.
      Taking the document's text is a full parse of the page, and the reader it
      was lifted from is explicit that most pages are never read that way — so
      doing it eagerly here would charge every HTML file the cost of a feature
      it may never use. The cache is a ref rather than state because producing
-     it must not re-render anything. */
-  const searchable = useRef<{ id: string; doc: SearchableDocument } | null>(null);
+     it must not re-render anything.
+
+     Keyed on the TEXT as well as the file id, the way `useTextEncoding` keys on
+     `{ id, payload }`. A page rewritten while it stays open (the editor, an
+     agent write, a version restore) keeps its id, and a cache keyed on the id
+     alone then verified every selection against the pre-edit page: a newly
+     added sentence could not be quoted, and a deleted one still could, both
+     without a word on screen. */
+  const searchable = useRef<{
+    id: string;
+    text: string;
+    doc: SearchableDocument;
+  } | null>(null);
+  /* The frame shows what the ENCODING PICKER produced, not what
+     `get_file_content` decoded (ViewerRouter hands HtmlView `enc.text`). Once a
+     detected charset is overruled, verifying against the original decode failed
+     every selection holding a non-ASCII character — and never healed. */
+  const shownFor = openFile?.id ?? null;
+  const shownText = enc.text;
   useEffect(() => {
     const onMessage = (e: MessageEvent) => {
       const report = frameSelectionOf(e.data);
@@ -435,10 +515,13 @@ export default function ViewerPane({
       // switches, and a stale selection inside an invisible page would put the
       // button over whatever is on screen instead.
       if (!frame || frame.hidden || !inQuotableDocument(frame)) return;
-      if (searchable.current?.id !== file.id) {
+      const source =
+        (shownFor === file.id ? shownText : null) ?? file.content.text ?? "";
+      if (searchable.current?.id !== file.id || searchable.current.text !== source) {
         searchable.current = {
           id: file.id,
-          doc: searchableDocument(textOf(file.content.text ?? "")),
+          text: source,
+          doc: searchableDocument(textOf(source)),
         };
       }
       const text = verifiedFrameQuote(
@@ -461,15 +544,7 @@ export default function ViewerPane({
     };
     window.addEventListener("message", onMessage);
     return () => window.removeEventListener("message", onMessage);
-  }, [s.editMode]);
-  // P1-4: lifted out of ViewerRouter, which used to own this hook entirely,
-  // so the header's overflow menu can draw the same picker — see
-  // TextEncoding.tsx. `enc` (not `encoding`) on purpose: ViewerRouter passes
-  // it straight through to the editors' save banners under that exact name,
-  // and `encoding.test.mjs` reads the literal `enc.decoded` text out of the
-  // source to make sure every in-place editor still warns about a legacy
-  // encoding being converted on save.
-  const enc = useTextEncoding(openFile?.id ?? "", openFile?.content ?? NO_FILE);
+  }, [s.editMode, shownText, shownFor]);
   // §14, the research reader: a source card at the head of the column and a
   // reading-progress stroke over it. Reading formats only — see READER_KINDS —
   // and never over the cloud-payload preview, which is a diagnostic of what
@@ -481,6 +556,26 @@ export default function ViewerPane({
     READER_KINDS.has(openFile.content.kind);
   // Keyed by file id, so opening the next document starts its own read.
   const reading = useReadingProgress(openFile?.id ?? "");
+  // ProseView and PdfView already draw a progress stroke of their own
+  // (`.rdr-progress`), so these two painted two strokes at the head of the
+  // column — measured differently, and a PDF's page-count reading disagrees
+  // with a scroll-offset one on a tall final page.
+  const viewerDrawsProgress =
+    openFile?.content.kind === "prose" || openFile?.content.kind === "pdf";
+  // The privacy line on the empty room used to be a literal that read no
+  // state. Same source as the status-bar chip under it, so the two can never
+  // describe the same room differently.
+  const trust = trustState(isCloudRoute(s.model, s.ai), s.privacyOn);
+  // `trustState` answers from the engine route and the privacy door alone, so
+  // its LOCAL sentence ends "nothing leaves the device" — false while online
+  // search or a connector is on. The chip carries them (StatusBar), and this
+  // line sits directly above it, so it has to carry them too.
+  const alsoSendsOut = s.webOn || s.mcpTools.length > 0;
+  // "Ask the room" cannot work before a model exists, and on a fresh Mac that
+  // is a multi-gigabyte download nothing in the centre pane mentions. `s.ai`
+  // still null means the probe hasn't answered yet, so this stays quiet then —
+  // the same condition ChatPane's own setup banners wait on.
+  const aiReady = s.ai == null || isModelReady(s.ai, s.model);
   const frontPageView =
     s.fp && (s.fp.fileCount > 0 || s.fp.chatCount > 0 || s.fp.memories.length > 0)
       ? s.fp
@@ -721,10 +816,23 @@ export default function ViewerPane({
                 (() => {
                   const sc = s.scripts.find((x) => x.fileId === openFile.id);
                   const running = !!(sc?.lastRun?.jobId && s.jobProgress[sc.lastRun.jobId]);
+                  // The same rule the Scripts page's row follows: pressing this
+                  // on an unapproved script CANNOT run it — `run_script_inner`
+                  // refuses content whose hash is not approved on this Mac and
+                  // raises the consent card instead. A button labelled "Run"
+                  // promised execution that could not happen, which is what made
+                  // the review gate read as broken. Unknown here (the script is
+                  // not in `s.scripts` yet) is treated as unapproved: the label
+                  // must never over-promise.
+                  const approved = !!sc?.approved;
                   return (
                     <button
                       className="btn-ic viewer-primary"
-                      title="Run this script — outputs are saved into the room"
+                      title={
+                        approved
+                          ? "Run this script — outputs are saved into the room"
+                          : "This version has not been approved — opens the review card; nothing runs until you approve it"
+                      }
                       disabled={running}
                       onClick={() => {
                         if (s.editMode && s.editorDirtyRef.current) {
@@ -734,7 +842,7 @@ export default function ViewerPane({
                         void a.runScript(openFile.id);
                       }}
                     >
-                      <PlayIcon size={14} /> Run
+                      <PlayIcon size={14} /> {approved ? "Run" : "Review script"}
                     </button>
                   );
                 })()}
@@ -1169,7 +1277,9 @@ export default function ViewerPane({
           {/* §14: how far down the document the reader has come, drawn as a
               marker stroke across the head of the column. Outside the scroller
               so it stays put while the page moves under it. */}
-          {readerShell && <ReadingProgress value={reading.progress} />}
+          {readerShell && !viewerDrawsProgress && (
+            <ReadingProgress value={reading.progress} />
+          )}
           <div
             // `fill` = this viewer manages its own scrolling and wants the
             // full height. Naming the two kinds that did was fine when there
@@ -1177,6 +1287,10 @@ export default function ViewerPane({
             // needs it, and one that doesn't get it collapses to content
             // height with its toolbar floating above nothing.
             className={`viewer-body ${
+              // The cloud-payload preview asks for the full height itself
+              // (`.cloudview`), and it is not the file's kind that decides
+              // that — it is not showing the file.
+              cloudView ||
               FILL_HEIGHT_KINDS.has(openFile.content.kind) ||
               (s.editMode && a.editModeOf(openFile.content) !== "grid")
                 ? "fill"
@@ -1240,7 +1354,17 @@ export default function ViewerPane({
           // the page's text is in the very next turn rather than only findable
           // by a later search.
           onAttach={(file) => a.toggleAttach(file)}
-          onAsk={(query) => s.setQuestion(query)}
+          onAsk={(query) => {
+            // Appended, never overwritten: the app already decided a
+            // half-written draft is not a quote button's to throw away
+            // (`withQuote`), and this is the same gesture from the results
+            // page. And shown, because the Assistant is hidden in two of the
+            // layout presets — a question landing in a box nobody can see is
+            // the same as no question at all.
+            const draft = s.question.trim();
+            s.setQuestion(draft ? `${draft}\n\n${query}` : query);
+            layout.showPane("ai");
+          }}
         />
       ) : area === "connectors" ? (
         <ConnectorsView />
@@ -1268,38 +1392,57 @@ export default function ViewerPane({
           <h1 className="viewer-empty-title">Your room is sealed</h1>
           <p className="viewer-empty-sub">
             Everything you add stays inside{" "}
-            <strong>{info.path.split("/").pop()}</strong>. Add a file, open a
-            note, or ask the room a question about everything inside.
+            <strong>{info.path.split("/").pop()}</strong>.{" "}
+            {aiReady
+              ? "Add a file, open a note, or ask the room a question about everything inside."
+              : "Add a file to get started — asking the room a question needs a model, and this room's AI isn't set up yet."}
           </p>
           <div className="viewer-empty-actions">
             <button className="qa-btn primary" onClick={a.importFiles}>
               <PlusIcon size={14} /> Add a file
             </button>
-            <button
-              className="qa-btn"
-              disabled={
-                s.files.length === 0 ||
-                s.summaryStarting ||
-                s.jobs.some(
-                  (j) => j.status === "running" || j.status === "queued",
-                )
-              }
-              onClick={() => void a.startDeepSummary()}
-            >
-              <SparkIcon size={14} /> Summarize room
-            </button>
-            <button
-              className="qa-btn"
-              onClick={() => a.focusComposer(layout)}
-            >
-              <SendIcon size={14} /> Ask the room
-            </button>
+            {aiReady ? (
+              <>
+                {/* Not drawn on an empty room. It was permanently greyed on
+                    the first screen a person ever sees, with the reason
+                    sealed inside a title a disabled button cannot show. */}
+                {s.files.length > 0 && (
+                  <button
+                    className="qa-btn"
+                    disabled={
+                      s.summaryStarting ||
+                      s.jobs.some(
+                        (j) => j.status === "running" || j.status === "queued",
+                      )
+                    }
+                    onClick={() => void a.startDeepSummary()}
+                  >
+                    <SparkIcon size={14} /> Summarize room
+                  </button>
+                )}
+                <button
+                  className="qa-btn"
+                  onClick={() => a.focusComposer(layout)}
+                >
+                  <SendIcon size={14} /> Ask the room
+                </button>
+              </>
+            ) : (
+              <button
+                className="qa-btn"
+                onClick={() => a.focusComposer(layout)}
+              >
+                <SparkIcon size={14} /> Set up the AI
+              </button>
+            )}
           </div>
           <div className="viewer-empty-note">
             <LockIcon size={16} />
             <div>
-              <strong>Encrypted on your Mac.</strong> Your data is encrypted
-              and never leaves this file unless you choose a cloud model.
+              <strong>This room is an encrypted file on this Mac.</strong>{" "}
+              {trust.tone === "good" && alsoSendsOut
+                ? "The AI runs on this Mac — but online search or a connected tool sends what it asks for off the device."
+                : trust.title}
             </div>
           </div>
         </div>

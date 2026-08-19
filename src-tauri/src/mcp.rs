@@ -335,6 +335,29 @@ fn flatten_call_result(result: &serde_json::Value) -> Result<ToolOutput, String>
                     images.push(data.to_string());
                 }
             }
+            // An embedded resource CARRIES its payload: `text` for a text
+            // resource, base64 `blob` for a binary one. Flattening it to
+            // "[resource content omitted]" threw away the very answer — the
+            // reference `server-everything` and several docs/git servers reply
+            // this way, and the model was told the connector returned nothing.
+            Some("resource") => {
+                let resource = &block["resource"];
+                let uri = resource["uri"].as_str().unwrap_or("");
+                let named = if uri.is_empty() { "resource" } else { uri };
+                if let Some(text) = resource["text"].as_str() {
+                    parts.push(text.to_string());
+                } else if resource["blob"].is_string() {
+                    let mime = resource["mimeType"].as_str().unwrap_or("unknown type");
+                    parts.push(format!("[binary resource omitted: {named} ({mime})]"));
+                } else {
+                    parts.push(format!("[resource omitted: {named} carried no content]"));
+                }
+            }
+            // A link has no payload of its own; its uri IS the content.
+            Some("resource_link") => match block["uri"].as_str() {
+                Some(uri) if !uri.is_empty() => parts.push(format!("[resource link: {uri}]")),
+                _ => parts.push("[resource link omitted: no uri]".to_string()),
+            },
             Some(other) => parts.push(format!("[{other} content omitted]")),
             None => {}
         }
@@ -969,6 +992,29 @@ mod tests {
         assert_eq!(flatten_call_result(&empty).unwrap().text, "(no output)");
         let structured = serde_json::json!({"content": [], "structuredContent": {"n": 1}});
         assert_eq!(flatten_call_result(&structured).unwrap().text, r#"{"n":1}"#);
+        // An embedded resource's own text is the answer, not something to note
+        // as omitted; a blob and a link are named, since neither is readable.
+        let embedded = serde_json::json!({"content": [
+            {"type": "resource", "resource": {"uri": "file:///x.md",
+                "mimeType": "text/plain", "text": "the answer"}}]});
+        assert_eq!(flatten_call_result(&embedded).unwrap().text, "the answer");
+        let blob = serde_json::json!({"content": [
+            {"type": "resource", "resource": {"uri": "file:///x.bin",
+                "mimeType": "application/octet-stream", "blob": "AAAA"}}]});
+        let out = flatten_call_result(&blob).unwrap().text;
+        assert!(out.contains("file:///x.bin"), "{out}");
+        assert!(out.contains("application/octet-stream"), "{out}");
+        let link = serde_json::json!({"content": [
+            {"type": "resource_link", "uri": "file:///y.md", "name": "y"}]});
+        assert!(
+            flatten_call_result(&link).unwrap().text.contains("file:///y.md"),
+            "a link's uri is all it carries"
+        );
+        // Neither text nor blob: say so rather than claim a binary payload.
+        let hollow = serde_json::json!({"content": [
+            {"type": "resource", "resource": {"uri": "file:///z"}}]});
+        let out = flatten_call_result(&hollow).unwrap().text;
+        assert!(out.contains("carried no content"), "{out}");
     }
 
     #[test]

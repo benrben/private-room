@@ -1,5 +1,6 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { api, type RoomPicture } from "../../api";
+import { useFocusTrap } from "../../settings/useFocusTrap";
 
 /** Choose a picture that is already in this room.
  *
@@ -50,8 +51,8 @@ export function PicturePicker({
   );
 
   return (
-    <div className="cr-pick-scrim" role="dialog" aria-modal="true" aria-label={title}>
-      <div className="nb-panel cr-pick">
+    <PickerSheet label={title} onClose={onClose}>
+      <div className="nb-panel cr-pick" onClick={(e) => e.stopPropagation()}>
         <header className="cr-pick-head">
           <h3>{title}</h3>
           <input
@@ -97,6 +98,41 @@ export function PicturePicker({
           </div>
         )}
       </div>
+    </PickerSheet>
+  );
+}
+
+/** The scrim, and the keyboard contract `aria-modal` was already promising.
+ *
+ * Its own component because `useFocusTrap` moves focus in on mount and hands it
+ * back on unmount, and the picker itself stays mounted with `open` false. Until
+ * this existed Escape did nothing here — or worse, reached the app-level
+ * handler and closed the FILE behind a sheet that stayed on screen. */
+function PickerSheet({
+  label,
+  onClose,
+  children,
+}: {
+  label: string;
+  onClose: () => void;
+  children: ReactNode;
+}) {
+  const { modalRef, onModalKeyDown } = useFocusTrap(onClose);
+  return (
+    <div
+      ref={modalRef}
+      tabIndex={-1}
+      onKeyDown={(e) => {
+        if (e.key === "Escape") e.stopPropagation();
+        onModalKeyDown(e);
+      }}
+      onClick={onClose}
+      className="cr-pick-scrim"
+      role="dialog"
+      aria-modal="true"
+      aria-label={label}
+    >
+      {children}
     </div>
   );
 }

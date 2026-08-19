@@ -659,7 +659,24 @@ export function useWorkspaceEffects(
       );
       if (stage === "done") void api.listFiles().then(s.setFiles);
     });
+    // The crash-recovery failure is delivered TWICE on purpose: parked for
+    // whoever mounts next, and emitted for a workspace that is already up. The
+    // host no longer lets the emit consume the park (a mount a moment later
+    // found it empty and said nothing), so whichever copy arrives second has to
+    // be recognised as the same news. Recovery messages carry no fileId — an
+    // ordinary `rec-error` names the recording it belongs to and is never
+    // folded in here.
+    const shownRecovery = new Set<string>();
+    const recoveryOnce = (message: string) => {
+      if (shownRecovery.has(message)) return;
+      shownRecovery.add(message);
+      s.pushToast("error", message);
+    };
     const unlistenRecError = api.onRecError((p) => {
+      if (!p.fileId) {
+        recoveryOnce(p.message);
+        return;
+      }
       s.pushToast("error", p.message);
     });
     // The unlock's crash-recovery pass runs before this listener exists, so a
@@ -668,7 +685,7 @@ export function useWorkspaceEffects(
     void api
       .takeRecRecoveryError()
       .then((message) => {
-        if (message) s.pushToast("error", message);
+        if (message) recoveryOnce(message);
       })
       .catch(() => {});
     // A capture lane dying must reach the user even when the recording's
@@ -693,6 +710,14 @@ export function useWorkspaceEffects(
       voice.cancelAll();
       voice.setTurnAudioDoneListener(null);
       voice.setVoiceProblemListener(null);
+      // The same rule for the microphone: nothing here stopped the tap, so its
+      // lifetime hung on a terminal `rec-state` arriving BEFORE this listener
+      // was removed. Lose that race (⌘L closes the room and navigates in one
+      // tick) and the stream, the AudioContext and the macOS mic indicator all
+      // outlive the sealed room, with the worklet still pushing frames at a
+      // recording that no longer exists. Idempotent, so the ordinary path where
+      // the event already stopped it costs nothing.
+      stopMicTap();
       if (s.armTimerRef.current !== null) {
         window.clearTimeout(s.armTimerRef.current);
         s.armTimerRef.current = null;
@@ -833,7 +858,14 @@ export function useWorkspaceEffects(
         // Silence speech at the call site as well as in handleLock/unmount:
         // this timer calls onLock() directly, bypassing both.
         voice.cancelAll();
-        onLock();
+        // A lock that FAILS tore down the seal overlay and left the workspace
+        // on screen with the room still open, saying nothing — the user walked
+        // away believing it had sealed itself. The manual lock already says so
+        // (chatActions' "Couldn't lock the room…"); the automatic one is the
+        // half nobody is present for, so it owes the same message.
+        void Promise.resolve(onLock()).catch(() =>
+          s.pushToast("error", "Auto-lock failed — this room is still open."),
+        );
       }
     }, 30_000);
     return () => {
@@ -875,11 +907,30 @@ export function useWorkspaceEffects(
           return;
         }
         const t = e.target as HTMLElement | null;
+        // A field's Escape belongs to the field — the chat composer, a rename
+        // box, a search input. The NOTE EDITOR is not one of those, however
+        // much it looks like one from here: Monaco paints its text and keeps
+        // the caret in a hidden <textarea class="inputarea">, so the tag test
+        // alone read the one surface with a buffer to lose as "the user is
+        // typing" and Escape stopped doing anything at all there — no close,
+        // and so no unsaved-edits dialog either.
+        //
+        // Nothing is taken from Monaco by this. Its keybinding service calls
+        // stopPropagation() on every key it handles, so this listener (on
+        // `window`, bubble phase) hears Escape only once the editor has decided
+        // it has nothing to dismiss — no suggestion popup, no find widget, no
+        // extra cursors.
+        const inNoteEditor = t?.closest(".monaco-editor") != null;
         const typing =
-          t != null && (t.tagName === "INPUT" || t.tagName === "TEXTAREA");
+          t != null &&
+          !inNoteEditor &&
+          (t.tagName === "INPUT" || t.tagName === "TEXTAREA");
         if (!typing && s.openFileRef.current) {
           e.preventDefault();
-          s.setOpenFile(null);
+          // The same door ⌘W and the viewer's Close button use. Escape unmounts
+          // Monaco like they do, and it was the one exit that took an unsaved
+          // buffer with it — no dialog, no undo.
+          a.guardLeave("Closing this file", () => s.setOpenFile(null));
         }
         return;
       }

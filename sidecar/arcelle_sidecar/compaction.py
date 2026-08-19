@@ -57,10 +57,10 @@ Fresh, it cost the 2B ~100 s; amortised over a 20-turn session, ~5 s/turn.
 from __future__ import annotations
 
 import hashlib
-from typing import Protocol
+from typing import Any, Protocol
 
 from .budget import msg_len
-from .messages import Message, user_message
+from .messages import Message, compact_json, user_message
 
 #: How much of the available context a payload may fill before compaction
 #: engages. High on purpose: **compaction is a safety valve, not a policy.**
@@ -183,6 +183,49 @@ def _cache_put(key: str, digest: str) -> None:
         _CACHE.pop(next(iter(_CACHE)))
 
 
+def _calls_text(tool_calls: list[dict[str, Any]]) -> str:
+    """``name(args)`` for each call in a provider-shaped ``tool_calls`` array.
+
+    Shape-tolerant on purpose: the array is echoed back from whichever provider
+    produced it, and a call whose shape we do not recognise still has to render
+    as SOMETHING — a digest that silently drops a call is the failure this
+    function exists to remove.
+    """
+    out: list[str] = []
+    for call in tool_calls:
+        call = call if isinstance(call, dict) else {}
+        fn = call.get("function")
+        fn = fn if isinstance(fn, dict) else {}
+        name = fn.get("name") or call.get("name") or "tool"
+        args = fn.get("arguments", call.get("arguments"))
+        if args is None or args == {} or args == "":
+            out.append(f"{name}()")
+        else:
+            out.append(f"{name}({args if isinstance(args, str) else compact_json(args)})")
+    return ", ".join(out)
+
+
+def _render(m: Message) -> str:
+    """One message as the digest model reads it.
+
+    The MACHINERY is part of the record. An assistant turn that only asked for a
+    tool used to render as the bare line ``assistant: `` and its answer as
+    ``tool: <content>``, so the digest kept a page of fetched text with nothing
+    saying which tool fetched it, with what arguments, or from which URL —
+    while :data:`DIGEST_PROMPT` asks for every value "with what it refers to".
+    """
+    role = m.get("role") or ""
+    content = m.get("content") or ""
+    if role == "tool":
+        name = m.get("tool_name")
+        return f"tool {name}: {content}" if name else f"tool: {content}"
+    calls = m.get("tool_calls")
+    if calls:
+        called = f"called {_calls_text(calls)}"
+        return f"{role}: {content}\n{role}: {called}" if content else f"{role}: {called}"
+    return f"{role}: {content}"
+
+
 def _key(messages: list[Message]) -> str:
     h = hashlib.sha256()
     for m in messages:
@@ -190,6 +233,13 @@ def _key(messages: list[Message]) -> str:
         h.update(b"\x00")
         h.update((m.get("content") or "").encode())
         h.update(b"\x01")
+        # The calls and the tool that answered them are IN the digested text, so
+        # two chunks differing only there are different digests — a cache keyed
+        # on content alone would hand back the wrong one.
+        h.update(compact_json(m.get("tool_calls") or []).encode())
+        h.update(b"\x02")
+        h.update((m.get("tool_name") or "").encode())
+        h.update(b"\x03")
     return h.hexdigest()
 
 
@@ -252,6 +302,22 @@ def digest_chunk_bytes(window_tokens: int | None, *, cloud: bool) -> int:
     )
 
 
+def _exchange_start(messages: list[Message], cut: int) -> int:
+    """``cut``, moved back off the middle of a tool exchange.
+
+    An assistant ``tool_calls`` turn and the ``role: "tool"`` messages answering
+    it are ONE unit. Every boundary here is measured in bytes and lands wherever
+    the arithmetic says, so it can fall between the call and its results —
+    digesting the call and leaving results that now answer nothing. Ollama and
+    the cloud providers reject that shape outright. Stepping back to the call
+    keeps them together on the verbatim side, which costs the recent tail one
+    small assistant turn.
+    """
+    while 0 < cut < len(messages) and messages[cut].get("role") == "tool":
+        cut -= 1
+    return cut
+
+
 def _split(messages: list[Message], recent_bytes: int) -> tuple[list[Message], list[Message]]:
     """(older, recent). Index 0 (system) always stays out of the digest."""
     head = messages[:1]
@@ -265,8 +331,8 @@ def _split(messages: list[Message], recent_bytes: int) -> tuple[list[Message], l
         used += n
         recent.append(m)
     recent.reverse()
-    older = rest[: len(rest) - len(recent)]
-    return head + older, recent
+    cut = _exchange_start(rest, len(rest) - len(recent))
+    return head + rest[:cut], rest[cut:]
 
 
 def _chunks(messages: list[Message], limit: int) -> list[list[Message]]:
@@ -275,7 +341,11 @@ def _chunks(messages: list[Message], limit: int) -> list[list[Message]]:
     cur_b = 0
     for m in messages:
         n = msg_len(m)
-        if cur and cur_b + n > limit:
+        # A tool result never starts a chunk: the last chunk is handed back
+        # VERBATIM (see `compact_to_budget`), so a break here would digest the
+        # call and keep its results. Letting the group run over `limit` costs
+        # one oversized digest pass; breaking it costs a rejected request.
+        if cur and cur_b + n > limit and m.get("role") != "tool":
             out.append(cur)
             cur, cur_b = [], 0
         cur.append(m)
@@ -299,10 +369,13 @@ async def compact_to_budget(
     rather than editing them in place.
 
     Leaves the system message first and the recent tail verbatim; everything
-    between becomes one ``user`` message of extracted facts. Role pairing is not
-    a concern because whole messages are replaced, never individually dropped:
-    an assistant ``tool_calls`` turn and its results either both survive in the
-    tail or both fold into the digest.
+    between becomes one ``user`` message of extracted facts. Whole messages are
+    replaced, never individually dropped, and every boundary between the digest
+    and the verbatim part is moved off the middle of a tool exchange
+    (:func:`_exchange_start`, :func:`_chunks`), so an assistant ``tool_calls``
+    turn and its results either both survive in the tail or both fold into the
+    digest — a result whose call has been digested is a request the provider
+    rejects.
 
     Digesting alone cannot always reach the budget, so every exit runs through
     :func:`budget.fit_oversized_results`: the recent tail is kept VERBATIM and
@@ -347,9 +420,7 @@ async def compact_to_budget(
         key = _key(chunk)
         cached = _cache_get(key)
         if cached is None:
-            text = "\n".join(
-                f"{m.get('role')}: {m.get('content') or ''}" for m in chunk
-            )
+            text = "\n".join(_render(m) for m in chunk)
             try:
                 cached = (await digest(text)).strip()
             except Exception:  # noqa: BLE001 - a failed digest must not fail the turn

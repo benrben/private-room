@@ -133,21 +133,26 @@ export default function MarkdownEditor({
         </button>
       </div>
       <div className="mde-panes">
-        {layout !== "preview" && (
-          <div className="mde-source">
-            <CodeEditor
-              value={value}
-              language="markdown"
-              onSave={onSave}
-              onChange={setLive}
-              registerSave={registerSave}
-              registerFormat={registerFormat}
-              onDirtyChange={onDirtyChange}
-              find={find}
-              banner={banner}
-            />
-          </div>
-        )}
+        {/* Hidden in Preview, never unmounted: the buffer IS the editor, and
+            unmounting it threw away the only editable copy of unsaved text
+            while the preview went on painting that text from `live`. It also
+            disarmed both doors — CodeEditor hands back `registerSave(null)` and
+            `onDirtyChange(false)` on the way out, so ⌘S and the unsaved-edits
+            prompt went quiet on a note that had unsaved work. Monaco is on
+            `automaticLayout`, so it re-measures when the pane comes back. */}
+        <div className="mde-source">
+          <CodeEditor
+            value={value}
+            language="markdown"
+            onSave={onSave}
+            onChange={setLive}
+            registerSave={registerSave}
+            registerFormat={registerFormat}
+            onDirtyChange={onDirtyChange}
+            find={find}
+            banner={banner}
+          />
+        </div>
         {layout !== "source" && (
           <div className="mde-preview">
             {/* Same renderer as the reader — a preview that could disagree

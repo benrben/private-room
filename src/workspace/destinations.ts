@@ -106,7 +106,12 @@ export function showsDocumentTabs(area: WorkArea): boolean {
 }
 
 /** The one-line label for ⌘T in this destination, for the shortcuts sheet and
- * the sidebar header's tooltip. Null where ⌘T does nothing. */
+ * the sidebar header's tooltip. Null where ⌘T does nothing.
+ *
+ * Home's is "New note", not "New page": ⌘T there makes a blank Markdown note in
+ * the library, while ⌘T in the browser opens a web page. Both were called "New
+ * page", so the shortcut sheet promised the same object in two destinations and
+ * delivered two different ones. */
 export function newItemLabel(area: WorkArea): string | null {
   switch (newItemOf(area)) {
     case "page":
@@ -116,7 +121,7 @@ export function newItemLabel(area: WorkArea): string | null {
     case "creation":
       return "New creation";
     case "note":
-      return "New page";
+      return "New note";
     default:
       return null;
   }

@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { unzip } from "fflate";
+import { unzip, unzipSync } from "fflate";
 import { api } from "../api";
 import { Book, chapterHtml, parseEpub } from "./epub";
+import { findEntry } from "./zipdoc";
 import { frameIsDark, useFrameTheme } from "./frameTheme";
 import { textOf } from "./htmlText";
 import { useFileBytes } from "./useFileBytes";
@@ -55,12 +56,8 @@ export default function BookView({
     let alive = true;
     setError("");
     setBook(null);
-    unzip(bytes, (err, files) => {
+    const open = (files: Record<string, Uint8Array>) => {
       if (!alive) return;
-      if (err) {
-        setError(`This book could not be read: ${err.message}`);
-        return;
-      }
       filesRef.current = files;
       try {
         const parsed = parseEpub(files);
@@ -73,7 +70,30 @@ export default function BookView({
       } catch (e) {
         setError(`This book could not be read: ${String(e)}`);
       }
-    });
+    };
+    try {
+      unzip(bytes, (err, files) => {
+        if (!alive) return;
+        if (err) {
+          setError(`This book could not be read: ${err.message}`);
+          return;
+        }
+        open(files);
+      });
+    } catch {
+      // fflate hands any entry over 512 KB that also compresses well to a
+      // Worker built from a `blob:` URL — which this app's CSP refuses, so the
+      // constructor throws straight out of `unzip`, past the (err, files)
+      // callback and out of this effect. A book with one long chapter took the
+      // whole centre pane down to the chunk boundary. Inflate it here instead:
+      // slower on the main thread, but it opens, and the callback cannot have
+      // fired (fflate only calls it once every entry has landed).
+      try {
+        open(unzipSync(bytes));
+      } catch (e) {
+        setError(`This book could not be read: ${String(e)}`);
+      }
+    }
     return () => {
       alive = false;
     };
@@ -108,7 +128,12 @@ export default function BookView({
     const files = filesRef.current;
     const chapter = book?.chapters[at];
     if (mode !== "text" || !files || !chapter) return "";
-    const raw = files[chapter.path];
+    // The tolerant lookup every other reader of a chapter path uses: an OPF
+    // href that differs from the zip entry only in case or a leading slash
+    // renders fine in Page mode, and an exact-key miss here claimed the
+    // chapter was a plate — a false statement about the book, and the only
+    // route to quoting from it.
+    const raw = findEntry(files, chapter.path);
     if (!raw) return "";
     try {
       return textOf(new TextDecoder().decode(raw));

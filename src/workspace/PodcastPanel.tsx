@@ -42,13 +42,26 @@ export default function PodcastPanel({
 }) {
   const [script, setScript] = useState<Podcast | null>(null);
   const [loading, setLoading] = useState(true);
+  // Held apart from `script`, because a failed READ and a page that genuinely
+  // carries no script both arrive as null — and the explanation below tells the
+  // user to regenerate the episode, which is minutes of model time and a
+  // duplicate for a script that was never lost.
+  const [readError, setReadError] = useState("");
   const [voices, setVoices] = useState<NeuralVoiceInfo[]>([]);
   const [voicesError, setVoicesError] = useState(false);
   const [cast, setCast] = useState<PodcastHost[]>([]);
   const [autoCastDone, setAutoCastDone] = useState(false);
   const [saved, setSaved] = useState(false);
-  const [previewing, setPreviewing] = useState<string | null>(null);
+  // Keyed by the host's POSITION in the cast, never by its name: two hosts may
+  // share a name, and the Stop button then lit on the wrong row while the
+  // click handler addressed a host nobody had pressed.
+  const [previewing, setPreviewing] = useState<number | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  const previewUrl = useRef<string | null>(null);
+  // Every preview takes the next number; anything that comes back holding an
+  // older one has been superseded (a second Preview, Stop, or this panel
+  // unmounting) and must not touch the element, the state or the speakers.
+  const previewEpoch = useRef(0);
 
   // The script and the catalog are independent: a room that is offline still
   // shows the cast and the lines, just without a list of voices to change them
@@ -56,14 +69,17 @@ export default function PodcastPanel({
   useEffect(() => {
     let alive = true;
     setLoading(true);
+    setReadError("");
     void (async () => {
       try {
         const p = await api.getPodcast(fileId);
         if (!alive) return;
         setScript(p);
         setCast(p?.cast ?? []);
-      } catch {
-        if (alive) setScript(null);
+      } catch (e) {
+        if (!alive) return;
+        setScript(null);
+        setReadError(String(e));
       } finally {
         if (alive) setLoading(false);
       }
@@ -101,8 +117,15 @@ export default function PodcastPanel({
   }, [voices, cast, autoCastDone]);
 
   function stopPreview() {
+    previewEpoch.current += 1;
     audioRef.current?.pause();
     audioRef.current = null;
+    if (previewUrl.current) {
+      // A blob URL holds the whole WAV alive for as long as the document does,
+      // so auditioning a dozen voices used to leave a dozen clips resident.
+      URL.revokeObjectURL(previewUrl.current);
+      previewUrl.current = null;
+    }
     setPreviewing(null);
   }
 
@@ -113,7 +136,14 @@ export default function PodcastPanel({
 
   async function saveCast() {
     try {
-      const next = await api.setPodcastCast(fileId, cast);
+      // Trimmed ON THE WAY IN. The turns are re-folded onto the trimmed
+      // spelling by `set_podcast_cast`, while the cast kept whatever was typed
+      // — so a host saved as "Ada " matched none of their own lines and the
+      // whole episode read them in the default voice, discovered only after a
+      // multi-minute cloud render. Not trimmed in `editHost`: that would eat
+      // the space between "Ada" and a surname as it is typed.
+      const named = cast.map((h) => ({ ...h, name: h.name.trim() }));
+      const next = await api.setPodcastCast(fileId, named);
       setScript(next);
       setCast(next.cast);
       setSaved(true);
@@ -122,20 +152,25 @@ export default function PodcastPanel({
     }
   }
 
-  /** Speak one of this host's ACTUAL lines, not a generic sample. Hearing the
+  /** Speak one of this host's ACTUAL lines where there is one. Hearing the
    * words the episode will contain is what tells you whether the voice suits
-   * the script; "The quick brown fox" tells you nothing about either. */
-  async function preview(host: PodcastHost) {
-    if (previewing === host.name) {
+   * the script; "The quick brown fox" tells you nothing about either. A host
+   * whose name matches no speaker — freshly renamed, or cast before the script
+   * was written — has no line to hear, so a greeting stands in. The button's
+   * title promises only that something is sent and spoken, because that is the
+   * half that is true on both branches. */
+  async function preview(i: number, host: PodcastHost) {
+    if (previewing === i) {
       stopPreview();
       return;
     }
     stopPreview();
+    const epoch = previewEpoch.current;
     const line =
       script?.turns.find(
         (t) => t.speaker.toLowerCase() === host.name.trim().toLowerCase(),
       )?.line ?? `Hello, I'm ${host.name}.`;
-    setPreviewing(host.name);
+    setPreviewing(i);
     try {
       const b64 = await api.previewPodcastVoice(
         line.slice(0, 300),
@@ -143,13 +178,24 @@ export default function PodcastPanel({
         host.rate,
         host.pitch,
       );
-      const blob = new Blob([base64ToBytes(b64)], { type: "audio/wav" });
-      const el = new Audio(URL.createObjectURL(blob));
+      // Synthesis is a cloud round trip, so a second Preview — or leaving the
+      // panel — can land first. Answering it would start a second clip over
+      // the top of the first and orphan whichever element `audioRef` no longer
+      // holds, leaving one voice talking with nothing that could stop it.
+      if (epoch !== previewEpoch.current) return;
+      const url = URL.createObjectURL(
+        new Blob([base64ToBytes(b64)], { type: "audio/wav" }),
+      );
+      const el = new Audio(url);
       audioRef.current = el;
-      el.onended = () => setPreviewing(null);
+      previewUrl.current = url;
+      el.onended = () => {
+        if (epoch === previewEpoch.current) stopPreview();
+      };
       await el.play();
     } catch (e) {
-      setPreviewing(null);
+      if (epoch !== previewEpoch.current) return;
+      stopPreview();
       // A failed preview must not look like a voice that sounds like nothing.
       s.pushToast("error", `Could not play that voice: ${String(e)}`);
     }
@@ -175,6 +221,17 @@ export default function PodcastPanel({
   }
 
   if (loading) return <div className="pod-panel">Loading the script…</div>;
+
+  if (readError) {
+    return (
+      <div className="pod-panel">
+        <p className="set-note set-note--flag nb-sem-urgent" role="alert">
+          This script couldn't be read just now ({readError}). Nothing was
+          changed — reopen the page to try again.
+        </p>
+      </div>
+    );
+  }
 
   // A podcast PAGE with no row: generated before scripts were stored as data.
   // Say exactly that, and say the way forward, rather than showing a Record
@@ -213,16 +270,17 @@ export default function PodcastPanel({
         <span className="nb-tape set-note-tag">Recording uses a cloud voice</span>{" "}
         — every line of this script is sent to Microsoft's Edge TTS service to
         be spoken. Nothing else goes with it, and nothing is sent until you
-        press Record.
+        press Preview or Record.
       </div>
 
       {/* THE TRAP, named before the button and not after it. */}
       {s.privacyOn && (
         <p className="set-note set-note--flag nb-sem-pending" role="note">
           This room's privacy door is on, so names in the script are replaced
-          before they are spoken — the recording will say “Person A” where the
-          script says a real name. Turn the door off in Settings → Cloud
-          privacy first if you want the real names read aloud.
+          before they are spoken — a preview and the finished recording will
+          both say “Person A” where the script says a real name. Turn the door
+          off in Settings → Cloud privacy first if you want the real names read
+          aloud.
         </p>
       )}
       {!s.webOn && (
@@ -246,11 +304,11 @@ export default function PodcastPanel({
               />
               <button
                 className="chip-btn"
-                title={`Hear ${host.name || "this host"} read one of their lines`}
+                title={`Send a short line to the voice service and hear it in ${host.name || "this host"}'s voice`}
                 aria-label={`Preview ${host.name}`}
-                onClick={() => void preview(host)}
+                onClick={() => void preview(i, host)}
               >
-                {previewing === host.name ? (
+                {previewing === i ? (
                   <StopIcon size={12} />
                 ) : (
                   <PlayIcon size={12} />

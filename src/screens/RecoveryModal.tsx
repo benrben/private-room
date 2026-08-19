@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { confirm as askConfirm } from "@tauri-apps/plugin-dialog";
 import { RecoveryKeyIcon } from "./RecoveryKeyIcon";
 import { CircleCheckIcon } from "../icons";
@@ -18,9 +19,11 @@ export function RecoveryModal({
   /** "Skip for now" used to be byte-for-byte "I saved it": one click and the
    * only way back into this room without the password was gone, with nothing
    * said. The code is shown ONCE — there is no reset and no second reveal — so
-   * leaving without it has to be a deliberate second answer. Copying (or
-   * printing) counts as saving it, so the guard only stands in the way of the
-   * user who genuinely has nothing written down. */
+   * leaving without it has to be a deliberate second answer. A CONFIRMED copy
+   * counts as saving it, so the guard only stands in the way of the user who
+   * genuinely has nothing written down. Printing does not count: the Tauri
+   * webview's window.print() can be a no-op (see RecoverySection), and a sheet
+   * that may never have left the machine must not disarm the warning. */
   async function skip() {
     if (recoveryCopied) {
       onDismiss();
@@ -39,6 +42,7 @@ export function RecoveryModal({
   // a one-time reveal outright. The trap also keeps Tab inside the panel — it
   // renders over the start screen, whose buttons were reachable behind it.
   const { modalRef, onModalKeyDown } = useFocusTrap(() => void skip());
+  const [copyFailed, setCopyFailed] = useState(false);
 
   return (
     /* The one genuinely floating surface on the gate, so the one thing that
@@ -64,8 +68,10 @@ export function RecoveryModal({
           <div className="recovery-code">{recoveryCode}</div>
           <p className="recovery-sheet-note">
             Keep this somewhere safe. It's the only way back in if you forget
-            your password. We can't recover it for you — it never leaves this
-            Mac.
+            your password. It opens the room through a small companion file
+            saved beside it, whose name ends in .recovery — copy or move the
+            room on its own and this code has nothing to open. We can't recover
+            it for you, and it never leaves this Mac.
           </p>
           <div className="recovery-sheet-actions">
             <button
@@ -73,22 +79,34 @@ export function RecoveryModal({
               className={recoveryCopied ? "primary btn-ic" : undefined}
               onClick={() => {
                 if (!recoveryCode) return;
-                setRecoveryCopied(true);
-                try {
-                  void navigator.clipboard.writeText(recoveryCode);
-                } catch {
-                  /* clipboard unavailable — the code is still on screen */
-                }
+                setCopyFailed(false);
+                // "Copied" said itself BEFORE the write, and a rejected
+                // clipboard promise (denied permission, no clipboard in the
+                // webview) was swallowed by `void` — so the app claimed the one
+                // string it can never show again was safe, and `recoveryCopied`
+                // is the same flag that waives the skip guard. Claim it only
+                // once the write has actually landed.
+                void Promise.resolve()
+                  .then(() => navigator.clipboard.writeText(recoveryCode))
+                  .then(() => setRecoveryCopied(true))
+                  .catch(() => setCopyFailed(true));
               }}
             >
               {recoveryCopied ? (<><CircleCheckIcon size={14} /> Copied</>) : "Copy code"}
             </button>
             <button type="button" onClick={() => window.print()}>
-              Print
+              Print / Save as PDF…
             </button>
             <button type="button" className="primary" onClick={onDismiss}>
               I saved it
             </button>
+            {/* Inside the actions row so it wraps onto its own line and never
+                reaches the printed sheet, which hides the row. */}
+            {copyFailed && (
+              <div className="gate-error" role="alert">
+                Couldn't copy — write the code down from the screen.
+              </div>
+            )}
           </div>
           <button type="button" className="subtle" onClick={() => void skip()}>
             Skip for now

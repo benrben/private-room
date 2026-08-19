@@ -41,6 +41,13 @@ pub fn check_public_http_url(url: &str) -> Result<reqwest::Url, String> {
         .host_str()
         .ok_or_else(|| "Invalid URL: no host.".to_string())?
         .to_lowercase();
+    // A trailing dot is the DNS ROOT LABEL: "localhost." and "printer.local."
+    // resolve exactly like the names without it, and every service on this Mac
+    // answers them — but a literal comparison does not see that, so
+    // `http://localhost.:11434/` walked straight through this check. Normalised
+    // once, before every test below. (IP literals need no help: `url` already
+    // rewrites "127.0.0.1." back to "127.0.0.1".)
+    let host = host.trim_end_matches('.');
     // host_str() keeps the brackets on IPv6 literals ("[::1]"); strip them or
     // the IpAddr parse below never fires for V6 and the literal check is moot.
     let local = host == "localhost"
@@ -133,6 +140,28 @@ mod tests {
         for url in ["http://100.63.1.1/", "http://100.128.1.1/", "http://198.17.0.1/"] {
             assert!(check_public_http_url(url).is_ok(), "should allow {url}");
         }
+    }
+
+    /// A hostname's trailing dot is the root label — it names the SAME service
+    /// and resolves to the same address, so the guard has to read it the same
+    /// way. `http://localhost.:11434/api/tags` used to pass this check, and in
+    /// `download_allowed` the literal check is the only layer there is.
+    #[test]
+    fn a_trailing_dot_does_not_smuggle_a_local_name_past_the_guard() {
+        for url in [
+            "http://localhost.:11434/api/tags",
+            "http://localhost./",
+            "https://LocalHost.:443/",
+            "http://printer.local./",
+            "http://printer.local.:631/",
+            "http://localhost..:11434/",
+        ] {
+            assert!(check_public_http_url(url).is_err(), "should block {url}");
+        }
+        // A real name that merely ends in a dot is still fetchable, and a name
+        // that only CONTAINS one of these labels was never local to begin with.
+        assert!(check_public_http_url("https://example.com./page").is_ok());
+        assert!(check_public_http_url("https://my-localhost.example.com/").is_ok());
     }
 
     /// What the removed `hop_host_is_public` used to assert, now asserted of

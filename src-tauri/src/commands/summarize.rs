@@ -243,6 +243,14 @@ pub(crate) async fn write_room_summary(
     // place (ADD-2 keeps the previous versions) or create it the first time.
     let guard = state.room.lock().unwrap();
     let room = pinned_room(&guard, pin)?;
+    // `existing_id` was read BEFORE the reduce, which awaits the model for
+    // minutes — long enough for the user to delete the old summary in the
+    // Library. `store_file_bytes` writes by id and would happily fill the
+    // trashed row, and the metadata read that follows is trash-aware and would
+    // then fail: an error on screen over a file that was silently rewritten
+    // where nobody can see it. Ask again, the same trash-aware way, and write a
+    // new summary when the old one is gone.
+    let existing_id = existing_id.filter(|id| db::get_file_name(&room.conn, id).is_ok());
     let meta = match existing_id {
         Some(id) => {
             store_file_bytes(&room.conn, &id, content.as_bytes(), Some(&content), "Summarized")?;
@@ -274,6 +282,34 @@ pub(crate) async fn write_room_summary(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The re-check before the write rests on two db facts, and neither is
+    /// visible from `write_room_summary` itself: the trash-aware read is what
+    /// notices a summary deleted during the reduce, and the content write it
+    /// guards is perfectly willing to fill a trashed row. If `get_file_name`
+    /// ever stopped hiding the trash the guard would go quiet without
+    /// anything failing.
+    #[test]
+    fn a_summary_trashed_during_the_reduce_is_no_longer_findable_by_id() {
+        let conn = crate::db::mem();
+        let meta = db::insert_file(
+            &conn,
+            SUMMARY_FILE_NAME,
+            "text/html",
+            b"<p>old</p>",
+            Some("old"),
+            "generated",
+        )
+        .unwrap();
+        assert!(db::get_file_name(&conn, &meta.id).is_ok());
+        db::trash_file(&conn, &meta.id, db::TrashActor::User).unwrap();
+        assert!(
+            db::get_file_name(&conn, &meta.id).is_err(),
+            "the question the guard asks stopped hiding the trash",
+        );
+        db::update_file_content(&conn, &meta.id, b"<p>new</p>", Some("new"))
+            .expect("a by-id write still lands in a trashed row — which is why the guard exists");
+    }
 
     #[test]
     fn summary_file_excludes_only_the_generated_one() {

@@ -74,6 +74,44 @@ function copyText(step: Step): string {
   return step.result;
 }
 
+/** How many further indices to ask for once a batch came back full. */
+const STEP_PROBE = 4;
+/** A run cannot have more steps than this. A stored artifact index is a step
+ * id in the plan, and a plan that long is a bug elsewhere — bound the walk
+ * rather than let one keep asking. */
+const MAX_RUN_STEPS = 200;
+
+/** Every step artifact a finished run recorded.
+ *
+ * `hint` is the workflow's node count as the EDITOR has it now, which is not
+ * this run's size: a run of the 6-step version, listed after two steps were
+ * deleted (saved or not), showed four and said nothing about the rest. So the
+ * hint only sizes the first batch, and the walk continues while artifacts keep
+ * coming — the run's own length decides where it stops.
+ */
+async function fetchRunSteps(jobId: string, hint: number): Promise<(string | null)[]> {
+  const steps: (string | null)[] = [];
+  let want = Math.max(hint, 1);
+  while (steps.length < MAX_RUN_STEPS) {
+    const from = steps.length;
+    const batch = await Promise.all(
+      Array.from({ length: Math.min(want, MAX_RUN_STEPS - from) }, (_, i) =>
+        api.getJobStepArtifact(jobId, from + i).catch(() => null),
+      ),
+    );
+    steps.push(...batch);
+    // A batch with nothing in it is past the end of what this run wrote — a
+    // run that failed at step 2 recorded no step 3, and neither did a run of
+    // exactly this many steps.
+    if (batch.every((a) => a == null)) break;
+    want = STEP_PROBE;
+  }
+  // Drop the empty tail the probe asked for, so "no step artifacts recorded"
+  // still describes the run rather than the probe.
+  while (steps.length > 0 && steps[steps.length - 1] == null) steps.pop();
+  return steps;
+}
+
 function StepBody({ step }: { step: Step }) {
   const report = asScriptReport(step.result);
   if (report) {
@@ -169,9 +207,7 @@ export function RunHistory({ runs, nodeCount, nodes }: Props) {
       setArtifacts((a) => ({ ...a, [run.id]: [] }));
       return;
     }
-    const steps = await Promise.all(
-      Array.from({ length: Math.max(nodeCount, 1) }, (_, i) => api.getJobStepArtifact(jobId, i).catch(() => null)),
-    );
+    const steps = await fetchRunSteps(jobId, nodeCount);
     setArtifacts((a) => ({ ...a, [run.id]: steps }));
   }
 

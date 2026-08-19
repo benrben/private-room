@@ -1170,7 +1170,9 @@ export type Capability =
   | "tool_calling"
   | "vision"
   | "structured_output"
-  | "chat";
+  | "chat"
+  | "image_generation"
+  | "video_generation";
 
 /** The engine's DECLARED capability record (src-tauri/src/commands/
  *  capabilities.rs). One record per provider, refined per-model where the live
@@ -1185,6 +1187,12 @@ export interface EngineCapabilities {
   vision: Support;
   structuredOutput: Support;
   chat: Support;
+  /** Can it hand back PIXELS / a CLIP — the mirror of `vision`, and separate
+   *  questions from each other: a model that draws a still need not move it.
+   *  `"unknown"` on every engine that publishes no modality list, which the
+   *  Create page treats as "do not offer this". */
+  imageGeneration: Support;
+  videoGeneration: Support;
   contextWindow: number | null;
   tier: string;
   /** Would pixels actually ARRIVE? The privacy door strips images out of every

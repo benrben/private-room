@@ -27,7 +27,6 @@ export function useModelManagement(
   const [error, setError] = useState("");
   // ADD-3: two-step confirm for deleting a model.
   const [confirmModel, setConfirmModel] = useState<string | null>(null);
-  const confirmTimer = useRef<number | null>(null);
   // ADD-18: built-in dictation/transcription model (Whisper).
   const [stt, setStt] = useState<SttStatus | null>(null);
   const [sttPercent, setSttPercent] = useState<number | null>(null);
@@ -200,16 +199,17 @@ export function useModelManagement(
     }
   }
 
-  // ADD-3: first click arms the confirm; ✓ deletes, ✕ or a 3s timeout reverts.
+  /** ADD-3: first click arms the confirm; ✓ deletes, ✕ takes it back down.
+   *
+   * It WAITS for an answer. It used to disarm itself after three seconds, so
+   * anyone who paused to read the question clicked ✓ on a button that had
+   * already turned back into the bin — which merely re-asked, and read as a
+   * broken control. Same removal `miscActions.askConfirm` already carries. */
   function askRemoveModel(name: string) {
-    if (confirmTimer.current) window.clearTimeout(confirmTimer.current);
     setConfirmModel(name);
-    confirmTimer.current = window.setTimeout(() => setConfirmModel(null), 3000);
   }
 
   function cancelRemoveModel() {
-    if (confirmTimer.current) window.clearTimeout(confirmTimer.current);
-    confirmTimer.current = null;
     setConfirmModel(null);
   }
 

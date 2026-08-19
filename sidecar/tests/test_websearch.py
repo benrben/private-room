@@ -430,6 +430,54 @@ def test_all_engines_dead_returns_empty_not_an_error() -> None:
     assert w.search("page", engines=[engine("e1"), engine("e2")]) == []
 
 
+def test_a_rotted_duckduckgo_selector_cannot_sink_the_other_engines(monkeypatch: Any) -> None:
+    """duckduckgo was the one engine with no `_fails_soft`, so the AttributeError of
+    a rotted selector — the exact case that decorator's docstring names — escaped
+    fusion and answered 502 for a search six engines had answered."""
+
+    def rotted(*a: Any, **k: Any) -> list[dict[str, Any]]:
+        raise AttributeError("'NoneType' object has no attribute 'text'")
+
+    monkeypatch.setattr(w, "_ddg_attempt", rotted)
+    payload = w.timed_search("page", engines=[w.duckduckgo, engine("e2", "https://a.com/p")])
+    assert [h["url"] for h in payload["hits"]] == ["https://a.com/p"]
+    assert payload["failed"] == ["duckduckgo"]
+
+
+def test_the_polite_sequential_path_survives_it_too(monkeypatch: Any) -> None:
+    """`delay > 0` runs the engines in this thread, where the same exception would
+    have come straight back out of _ranked."""
+
+    def rotted(*a: Any, **k: Any) -> list[dict[str, Any]]:
+        raise AttributeError("'NoneType' object has no attribute 'text'")
+
+    monkeypatch.setattr(w, "_ddg_attempt", rotted)
+    hits, _collected, failed = w._ranked(
+        "q", 5, engines=[w.duckduckgo, engine("e2", "https://a.com/p")], delay=0.01
+    )
+    assert [h["url"] for h in hits] == ["https://a.com/p"]
+    assert failed == ["duckduckgo"]
+
+
+def test_an_engine_that_raises_past_its_guard_is_named_not_fatal(caplog: Any) -> None:
+    """The fan-out's own belt: an engine added without the decorator is a bug to fix,
+    not a reason to throw away the engines that answered."""
+
+    def undecorated(query: str, **kwargs: Any) -> list[dict[str, Any]]:
+        raise RuntimeError("no guard")
+
+    undecorated.__name__ = "undecorated"
+    with caplog.at_level(logging.WARNING, logger="arcelle_sidecar.websearch"):
+        payload = w.timed_search(
+            "secret words", engines=[undecorated, engine("e2", "https://a.com/p")]
+        )
+    assert [h["url"] for h in payload["hits"]] == ["https://a.com/p"]
+    assert payload["failed"] == ["undecorated"]
+    logged = " ".join(r.getMessage() for r in caplog.records)
+    assert "undecorated" in logged and "RuntimeError" in logged
+    assert "secret words" not in logged  # SPEC §6: never the query
+
+
 # ── failed vs. found nothing ────────────────────────────────────────────────────
 
 

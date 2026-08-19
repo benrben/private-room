@@ -556,9 +556,10 @@
   margin: 0 auto;
 }
 
-/* Same zoom pill as the PDF viewer, sat in the image toolbar row. */
+/* Same zoom pill as the PDF viewer, sat in the image toolbar row — and it
+   keeps `.pdf-zoombar`'s sticky, because zooming a scan to 400% to read a
+   stamp is the exact moment the control must not scroll away. */
 .img-zoombar {
-  position: static;
   margin-bottom: 0;
 }
 
@@ -612,7 +613,7 @@
 }
 .img-ocr > summary {
   cursor: pointer;
-  font-size: 13px;
+  font-size: var(--fs-meta);
   color: var(--text-dim);
 }
 .img-ocr-count {
@@ -621,16 +622,22 @@
 }
 .img-ocr-note {
   margin: 8px 0 4px;
-  font-size: 12px;
+  font-size: var(--fs-micro);
   color: var(--text-dim);
 }
-.img-ocr-text {
+/* OCR output is a document's prose — a scanned letter, a receipt, a Hebrew
+   page — so it is drawn in the interface face, not the one reserved for wire
+   formats. TWO classes on purpose: this is a <pre>, and `.viewer-body pre`
+   (styles/viewer.css) is (0,1,1), so a single class loses and both the face
+   and the size silently stay whatever that rule says. */
+.image-view .img-ocr-text {
   margin: 0;
   max-height: 40vh;
   overflow: auto;
   white-space: pre-wrap;
   word-break: break-word;
-  font-size: 13px;
-  line-height: 1.5;
+  font-family: var(--sans);
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
   user-select: text;
 }

@@ -1,7 +1,7 @@
 /* =====================================================================
    THE SEAL — Arcelle's signature ritual
    One deliberate, calm motion in BOTH directions, on the app's palette:
-   the sheet itself (--bg) and the pink pen (--accent / --accent-fill) as a
+   the sheet itself (--bg) and the berry pen (--accent / --accent-fill) as a
    keyhole/seal motif. No sound, nothing garish. The pen is pigment spreading
    on paper here, never a glow — the notebook has no lit surfaces in it.
 
@@ -19,9 +19,14 @@
    precedence over the placeholder seal styles there.
    ===================================================================== */
 
-/* Shared easing/timing so both directions feel like one gesture. */
+/* Shared easing/timing so both directions feel like one gesture. The curve is
+   the app's own --ease-pen rather than a second one, so the signature ritual
+   moves like the panels and menus around it. Kept as a named alias because
+   gate.css reads it too, and the gate's exit and the seal's bloom are one
+   gesture. The durations are the deliberate exception to the 160-260ms band
+   in tokens.css; the JS timeouts named above live in rooms/constants.ts. */
 :root {
-  --seal-ease: cubic-bezier(0.4, 0, 0.2, 1);
+  --seal-ease: var(--ease-pen);
   --seal-unlock-dur: 0.52s;
   --seal-lock-dur: 0.46s;
 }

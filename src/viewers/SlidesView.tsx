@@ -58,7 +58,12 @@ export default function SlidesView({
     unzip(bytes, (err, files) => {
       if (!alive) return;
       if (err) {
-        setParseError(`This presentation could not be read: ${err.message}`);
+        // A zip-parse failure is a verdict on the OUTLINE, not on the deck: a
+        // legacy .ppt is not a zip at all, and macOS draws it perfectly well.
+        // Announcing it as unreadable said so for the whole render, and for
+        // ever on a Mac where the render fails — hiding the accurate message
+        // written for exactly that case.
+        setParseError(err.message);
         return;
       }
       try {
@@ -126,26 +131,36 @@ export default function SlidesView({
     if (!deck || !quote) return;
     const needle = quote.toLowerCase().replace(/\s+/g, " ").trim();
     if (!needle) return;
-    const idx = deck.slides.findIndex((s) =>
+    const hit = deck.slides.find((s) =>
       s.text.toLowerCase().replace(/\s+/g, " ").includes(needle),
     );
-    if (idx >= 0) setAt(idx);
+    // Its own number, not where it sits in the array — a dropped slide part
+    // ahead of it would land the citation one slide short.
+    if (hit) setAt(Math.max(0, hit.number - 1));
   }, [deck, quote]);
 
+  // Keyed by the slide's OWN number, never by its position in the array. A
+  // slide part that fails to parse is dropped, and reading the rest by index
+  // then showed slide 8's title and speaker notes beside the picture of slide
+  // 7, all the way to the end of the deck. A gap now stays a gap.
+  const byNumber = useMemo(
+    () => new Map((deck?.slides ?? []).map((s) => [s.number, s])),
+    [deck],
+  );
   const outline = useMemo(
     () =>
       Array.from({ length: slideCount }, (_, i) => ({
         number: i + 1,
         title:
-          deck?.slides[i]?.text.split("\n").find((l) => l.trim()) ?? `Slide ${i + 1}`,
+          byNumber.get(i + 1)?.text.split("\n").find((l) => l.trim()) ??
+          `Slide ${i + 1}`,
       })),
-    [deck, slideCount],
+    [byNumber, slideCount],
   );
-  const notes = deck?.slides[at]?.notes ?? "";
+  const notes = byNumber.get(at + 1)?.notes ?? "";
 
   if (loading) return <div className="empty-hint">Opening presentation…</div>;
   if (readError) return <div className="empty-hint">{readError}</div>;
-  if (parseError && !slideCount) return <div className="empty-hint">{parseError}</div>;
   if (!slideCount && renderError) {
     return (
       <div className="empty-hint">
@@ -155,7 +170,21 @@ export default function SlidesView({
       </div>
     );
   }
-  if (!slideCount) return <div className="empty-hint">Reading slides…</div>;
+  // The terminal branch: the read, the parse and the render have all been
+  // ruled out and there is still no slide. It used to say "Reading slides…"
+  // whether or not anything was running, so a deck that resolves to zero
+  // slides looked permanently busy instead of permanently unreadable —
+  // and the reader waited rather than reaching for Export.
+  if (!slideCount)
+    return rendering ? (
+      <div className="empty-hint">Opening presentation…</div>
+    ) : (
+      <div className="empty-hint">
+        No slides were found in this presentation. Its text is still stored and
+        searchable, and <strong>Export</strong> saves the original out
+        unchanged.
+      </div>
+    );
 
   const last = slideCount - 1;
   const current = images[at];
@@ -188,6 +217,14 @@ export default function SlidesView({
             {showNotes ? "Hide notes" : "Speaker notes"}
           </button>
         )}
+        {/* Said where the missing thing is missing from, not over the deck:
+            the slides are drawn either way, but their titles and notes are not
+            available to read. */}
+        {parseError && (
+          <span className="viewer-status">
+            No slide titles or notes ({parseError})
+          </span>
+        )}
       </div>
       <div className="sl-stage">
         {current ? (
@@ -197,9 +234,12 @@ export default function SlidesView({
             alt={outline[at]?.title ?? `Slide ${at + 1}`}
           />
         ) : (
-          <div className="empty-hint">
-            {renderError || (rendering ? "Drawing slide…" : "Drawing slide…")}
-          </div>
+          /* This had a ternary with the same string in both branches, so it
+             looked like it told two states apart and did not. There is only
+             one to tell: a slide with no picture and no error always has a
+             render in flight, or one the effect issues in this same tick —
+             every other outcome sets `renderError`. */
+          <div className="empty-hint">{renderError || "Drawing slide…"}</div>
         )}
       </div>
       {showNotes && notes && (
@@ -207,12 +247,14 @@ export default function SlidesView({
           {notes}
         </div>
       )}
-      <div className="sl-rail" role="tablist" aria-label="Slides">
+      {/* A plain nav with aria-current, not a tablist: a tablist promises
+          arrow-key roving and a tabpanel, and this rail has neither. Same
+          choice, for the same reason, as the sheet tabs in SheetView. */}
+      <nav className="sl-rail" aria-label="Slides">
         {outline.map((o, i) => (
           <button
             key={o.number}
-            role="tab"
-            aria-selected={i === at}
+            aria-current={i === at ? "true" : undefined}
             className={`sl-thumb${i === at ? " active" : ""}`}
             onClick={() => setAt(i)}
             title={o.title}
@@ -221,7 +263,7 @@ export default function SlidesView({
             <span className="sl-thumb-t">{o.title}</span>
           </button>
         ))}
-      </div>
+      </nav>
     </div>
   );
 }

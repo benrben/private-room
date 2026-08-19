@@ -388,12 +388,18 @@ pub fn list_scripts(app: tauri::AppHandle, state: State<'_, AppState>) -> Result
                     Some(_) => break,
                 }
             }
+            // The room files this script would actually decrypt into its
+            // workspace — declared inputs PLUS the auto-materialized ones the
+            // run adds — so the row and the consent card describe one run.
+            // Listing only the header's `room-inputs` showed nothing for a
+            // script that reads twenty room files by name.
+            let inputs = readable_room_files(&room.conn, &manifest.inputs, &text);
             out.push(ScriptInfo {
                 file_id: f.id,
                 name: f.name,
                 lang: lang_str(lang),
                 deps: manifest.deps,
-                inputs: manifest.inputs,
+                inputs,
                 outputs: manifest.outputs,
                 shortcut: shortcut_str(manifest.shortcut),
                 approved: is_approved,

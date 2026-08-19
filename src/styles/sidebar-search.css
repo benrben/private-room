@@ -211,10 +211,14 @@
    ========================================================================== */
 
 /* The "this list is empty, and here is why that is fine" line. Never set
-   small: it is the only thing on screen and it is usually an instruction. */
+   small: it is the only thing on screen and it is usually an instruction —
+   which is why it is NOT on --fs-meta, the metadata floor. The rule said this
+   and then set --fs-meta anyway, so the ~38 empty, waiting and failure states
+   across the viewers (several of them multi-sentence advice) were all drawn at
+   the size reserved for a file's byte count. */
 .empty-hint {
   color: var(--muted);
-  font-size: var(--fs-meta);
+  font-size: var(--fs-body);
   line-height: var(--lh-body);
   padding: 12px;
 }

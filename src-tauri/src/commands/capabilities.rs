@@ -534,7 +534,12 @@ pub enum BlockCode {
 /// locate that in this image": a false statement about the user's photograph,
 /// caused by a switch three screens away. Naming the switch is the fix.
 pub(crate) fn vision_door_block(caps: &EngineCapabilities) -> Option<String> {
-    if caps.image_reaches || caps.vision == Support::No {
+    // Only a CONFIRMED yes earns this sentence. With the catalog unreadable the
+    // record says `Unknown`, and answering that with "it can look at images"
+    // asserts a capability of an engine we could not reach — the one thing this
+    // module exists to stop. `preflight` then falls through to the Unknown arm,
+    // which says what is actually true.
+    if caps.image_reaches || caps.vision != Support::Yes {
         return None;
     }
     Some(format!(
@@ -644,10 +649,13 @@ pub struct SupportMatrix {
     /// Every agent, id + label, straight from the sidecar registry.
     pub agents: Vec<AgentRow>,
     pub providers: Vec<ProviderRow>,
-    /// False when the sidecar could not be reached: the capability half of the
-    /// matrix is still true (it is declared here), the agent half is simply
-    /// not known, and the UI says so rather than drawing an empty grid that
-    /// reads as "no agent works anywhere".
+    /// False when the sidecar could not be reached, or answered in a shape
+    /// this version cannot read: the capability half of the matrix is still
+    /// true (it is declared here), the agent half is simply not known, and the
+    /// UI says so rather than drawing an empty grid that reads as "no agent
+    /// works anywhere". A sidecar that answered with no agents at all is
+    /// KNOWN — that is a real answer, and `agents_error` says why when it is
+    /// not.
     pub agents_known: bool,
     /// Why the agent half is missing, when it is.
     pub agents_error: Option<String>,
@@ -686,22 +694,24 @@ pub async fn engine_support_matrix(state: State<'_, AppState>) -> Result<Support
         }
     }
     let body = serde_json::json!({ "tiers": tiers, "web_enabled": true });
-    let (agents, per_tier, agents_error) =
+    // `agents_known` is "did the sidecar answer", NOT "did it name any agent".
+    // Read off the list, an answer of `[]` — or one this version could not
+    // decode — was reported as "the sidecar could not be reached", with no
+    // reason beside it: a shape bug presented as a network problem.
+    let (agents, per_tier, agents_known, agents_error) =
         match crate::sidecar::sidecar_json("/agent_support", &body).await {
             Ok(v) => {
-                let agents: Vec<AgentRow> =
-                    serde_json::from_value(v["agents"].clone()).unwrap_or_default();
                 let per_tier: HashMap<String, Vec<String>> =
                     serde_json::from_value(v["tiers"].clone()).unwrap_or_default();
-                (agents, per_tier, None)
+                let (agents, decode_error) = agent_rows(&v);
+                (agents, per_tier, decode_error.is_none(), decode_error)
             }
             // `.error` and not `.sentinel(..)`: this string is shown next to a
             // half-drawn table, so it has to read as "why the agent columns are
             // missing", not as an `OLLAMA_DOWN` token the matrix UI has no
             // reason to know how to translate.
-            Err(e) => (Vec::new(), HashMap::new(), Some(e.error)),
+            Err(e) => (Vec::new(), HashMap::new(), false, Some(e.error)),
         };
-    let agents_known = !agents.is_empty();
 
     let providers = DECLARED
         .iter()
@@ -722,6 +732,24 @@ pub async fn engine_support_matrix(state: State<'_, AppState>) -> Result<Support
         agents_known,
         agents_error,
     })
+}
+
+/// The agent list out of a `/agent_support` answer, and — when the answer
+/// carried a shape this version cannot read — the sentence that says so.
+///
+/// Decoding into an empty vec loses the distinction the matrix rests on: a
+/// sidecar that answered `{"agents": {…}}` is REACHABLE, and telling the user
+/// it could not be reached sends them looking at the network for a bug in here.
+fn agent_rows(answer: &serde_json::Value) -> (Vec<AgentRow>, Option<String>) {
+    match serde_json::from_value::<Vec<AgentRow>>(answer["agents"].clone()) {
+        Ok(agents) => (agents, None),
+        Err(e) => (
+            Vec::new(),
+            Some(format!(
+                "The AI engine answered in a shape this version does not understand ({e})."
+            )),
+        ),
+    }
 }
 
 /// Is this engine usable on this Mac right now? Read from real state only —
@@ -927,6 +955,42 @@ mod tests {
         // Door open → the declared capability answers, unblocked.
         caps.image_reaches = true;
         assert_eq!(preflight(&caps, Capability::Vision), Verdict::Ready);
+    }
+
+    /// UNKNOWN IS NOT A YES. The door sentence asserts the engine can see; with
+    /// the provider catalog unreadable nothing established that, and claiming
+    /// it about an engine we could not reach is precisely what this module
+    /// exists to prevent.
+    #[test]
+    fn an_unconfirmed_vision_model_behind_the_door_is_not_told_it_can_see() {
+        let mut caps = EngineCapabilities::from_decl("openrouter::vendor/anything", &OPENROUTER);
+        caps.vision = Support::Unknown;
+        caps.image_reaches = false;
+        assert!(vision_door_block(&caps).is_none());
+        match preflight(&caps, Capability::Vision) {
+            Verdict::Unknown { reason } => assert!(reason.contains("unreachable"), "{reason}"),
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+    }
+
+    /// A sidecar that answered is REACHABLE, whatever it said. Reading
+    /// "reached" off the length of the list made an empty answer — and an
+    /// answer in a shape this version cannot decode — read as a network
+    /// failure, with no reason shown beside the half-drawn table.
+    #[test]
+    fn an_undecodable_agent_list_is_a_shape_problem_not_a_silence() {
+        let (rows, err) = agent_rows(&serde_json::json!({
+            "agents": [{ "id": "web", "label": "Web" }]
+        }));
+        assert_eq!(rows.len(), 1);
+        assert!(err.is_none());
+        // No agents at all is still an answer, and must not be reported as one.
+        assert!(agent_rows(&serde_json::json!({ "agents": [] })).1.is_none());
+        let (rows, err) = agent_rows(&serde_json::json!({ "agents": { "a": "b" } }));
+        assert!(rows.is_empty());
+        assert!(err.unwrap_or_default().contains("does not understand"));
+        // A missing field is the same failure, not a crash.
+        assert!(agent_rows(&serde_json::json!({})).1.is_some());
     }
 
     /// A provider row is only "available" when this Mac really has it. The

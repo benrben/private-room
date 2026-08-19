@@ -53,7 +53,15 @@ export default function DocxView({ mediaToken, dataB64, target }: Props) {
   return (
     <div className="docx-view">
       {loading && <div className="viewer-status">Opening document…</div>}
-      {(error || readError) && <div className="viewer-status">{error || readError}</div>}
+      {/* A render that threw and a document still opening used to be the same
+          dim grey line, so the honest response to a dead viewer was to keep
+          waiting. `.gate-error` is the app's error banner (styles/gate.css) —
+          the same one HtmlView, AudioView and SubtitleView already use. */}
+      {(error || readError) && (
+        <div className="gate-error" role="alert">
+          {error || readError}
+        </div>
+      )}
       <div ref={containerRef} />
     </div>
   );

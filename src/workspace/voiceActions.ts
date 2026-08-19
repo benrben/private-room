@@ -16,11 +16,13 @@ export function makeVoiceActions(s: WSState) {
     // The click IS the gesture — unlock before any audio is scheduled.
     voice.ensureUnlocked();
     const text = m.effects ? m.content : splitMarkupBlocks(m.content).text;
-    s.setSpeakingMsgId(m.id);
+    // Which message is speaking is decided BY the pipeline, not before it.
+    // Setting it up front lost the race with `speakText`: taking the pipeline
+    // fires the OUTGOING message's onState(false) first, which cleared the id
+    // just written — so playing a second answer over a first left nothing
+    // marked as speaking and its button stuck on Play.
     voice.speakText(text, {
-      onState: (playing) => {
-        if (!playing) s.setSpeakingMsgId(null);
-      },
+      onState: (playing) => s.setSpeakingMsgId(playing ? m.id : null),
     });
   }
 

@@ -196,6 +196,28 @@ async def synthesize_wav(
 PODCAST_SAMPLE_RATE = 24_000
 
 
+#: Mid-clause break characters, the same set the frontend chunker uses
+#: (``SOFT_BREAKS`` in workspace/voice.ts). The ideographic and fullwidth forms
+#: are what make the last resort work at all in Chinese and Japanese, which
+#: write no spaces: cutting on ASCII whitespace alone handed a whole CJK turn
+#: back as one over-limit piece.
+SOFT_BREAKS = ",;: 、，；："
+
+#: Sentence ends. The ASCII ones are followed by whitespace; the CJK ones are
+#: not, so they are matched on their own.
+_SENTENCE_END = re.compile(r"(?<=[.!?…])\s+|(?<=[。！？])")
+
+
+def _break_at(window: str) -> int:
+    """Where to cut ``window``: just past its last break character, or its whole
+    length when it holds none. Never 0 for a NON-EMPTY window, which is what
+    lets :func:`split_for_tts` loop on it — its window is ``chunk[:limit]``
+    taken only while ``len(chunk) > limit``, so it is empty only for a
+    non-positive ``limit``, which no caller passes."""
+    at = max((window.rfind(ch) for ch in SOFT_BREAKS), default=-1)
+    return at + 1 if at > 0 else len(window)
+
+
 def split_for_tts(text: str, limit: int = MAX_TTS_CHARS) -> list[str]:
     """Break one turn into pieces the service will accept, on sentence ends.
 
@@ -204,9 +226,11 @@ def split_for_tts(text: str, limit: int = MAX_TTS_CHARS) -> list[str]:
     :data:`MAX_TTS_CHARS`. Splitting on sentence boundaries keeps the prosody
     right — a cut mid-clause is audible, a cut between sentences is not.
 
-    A single sentence longer than the limit is cut on whitespace as a last
-    resort; there is no way to say it in one call, and dropping it would lose
-    the line silently.
+    A single sentence longer than the limit is cut on a break character as a
+    last resort, and on the character count when it holds none; there is no way
+    to say it in one call, and dropping it would lose the line silently. EVERY
+    piece is at most ``limit`` — a turn written in Chinese or Japanese has no
+    ASCII space to cut on, and used to come back whole and over the limit.
     """
     text = " ".join(text.split())
     if not text:
@@ -216,22 +240,25 @@ def split_for_tts(text: str, limit: int = MAX_TTS_CHARS) -> list[str]:
     pieces: list[str] = []
     current = ""
     # Keep the terminator with its sentence — "Yes." must not become "Yes" "."
-    for chunk in re.split(r"(?<=[.!?…])\s+", text):
+    for chunk in _SENTENCE_END.split(text):
+        # The CJK terminator is matched with no width, so the space after
+        # "。 " stays on the front of the next sentence and would be doubled by
+        # the join below.
+        chunk = chunk.strip()
         if not chunk:
             continue
         if len(chunk) > limit:
             if current:
                 pieces.append(current)
                 current = ""
-            words, buf = chunk.split(" "), ""
-            for w in words:
-                if buf and len(buf) + 1 + len(w) > limit:
-                    pieces.append(buf)
-                    buf = w
-                else:
-                    buf = f"{buf} {w}".strip()
-            if buf:
-                current = buf
+            while len(chunk) > limit:
+                cut = _break_at(chunk[:limit])
+                head = chunk[:cut].strip()
+                if head:
+                    pieces.append(head)
+                chunk = chunk[cut:].lstrip()
+            if chunk:
+                current = chunk
             continue
         if current and len(current) + 1 + len(chunk) > limit:
             pieces.append(current)

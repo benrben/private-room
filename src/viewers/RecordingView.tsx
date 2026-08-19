@@ -37,6 +37,26 @@ const LOOK_BACK_CS = 600;
 const SCREEN_CAPTURE_SETTINGS_URL =
   "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture";
 
+/** Have the words moved since the room read them?
+ *
+ * `readOf` is the stamp Rust wrote when the reading pass ran (`ReadStamp::of`):
+ * the number of phrases, and the transcript's length in **UTF-8 bytes** —
+ * `String::len`. JavaScript's `String.length` counts UTF-16 code units, so the
+ * two sides only ever agreed on pure ASCII: a Hebrew, Russian or emoji
+ * transcript never matched its own stamp, and every note, highlight and chapter
+ * was labelled "about a transcript that no longer exists" for ever. The unit is
+ * converted here, at the seam, rather than compared across it.
+ */
+export function readingIsStale(
+  readOf: { turns: number; chars: number } | undefined,
+  segments: readonly { text: string }[],
+): boolean {
+  if (!readOf) return false;
+  const utf8 = new TextEncoder();
+  const chars = segments.reduce((n, s) => n + utf8.encode(s.text).length, 0);
+  return readOf.turns !== segments.length || readOf.chars !== chars;
+}
+
 /**
  * ADD-27: the Recording file — record live (mic + the Mac's own audio, so a
  * Google Meet/Zoom/Teams call is heard), watch the transcript appear WHILE
@@ -55,7 +75,7 @@ const SCREEN_CAPTURE_SETTINGS_URL =
  *
  * The audio is the subject, so the page opens with it: ONE transport cluster,
  * then the wave at full size with its tick scale and a lane per voice. Reading
- * comes below that, split into tabs, with the clips beside it — and everything
+ * comes below that, split into tabs, at the full width of the pane — and everything
  * technical (translate, re-transcribe, the three exports) lives in a closed
  * drawer at the foot, because those are things you do to a recording ONCE and
  * the toolbar they used to share was seven controls wide over every reading.
@@ -107,17 +127,12 @@ const LANGS = [
   "Українська (Ukrainian)", "Nederlands (Dutch)", "Polski (Polish)", "Türkçe (Turkish)",
 ];
 
-/** The reading tabs. Transcript is the only one this app has data for today;
- * the other three say so in their own words rather than being hidden, because
- * "where would my notes go" is a question the page should answer.
- *
- * `empty` is what keeps that from being a lie told by the tab ROW. A
- * role="tablist" is a promise of four panels of content, and three of these
- * can never hold any — there is no per-recording note, highlight or chapter
- * table in the schema and no command that could write one. So the tab itself
- * carries the state, visibly (a dashed edge) and in its accessible name, and
- * the reader learns it before spending a click rather than after. Delete the
- * flag, not the tab, on the day the data exists. */
+/** The reading tabs. All four read one `RecMeta`: Transcript draws its
+ * segments, and the other three are one `ReadPanel` over the notes, highlights
+ * and chapters the `rec_read` job writes. Each tab states its own count, so
+ * "is there anything in Notes" is answered before a click rather than after —
+ * which is what the old `empty` flag was for, back when three of the four
+ * could never hold anything. */
 const TABS = [
   { id: "transcript", label: "Transcript" },
   { id: "notes", label: "Notes" },
@@ -130,9 +145,9 @@ type TabId = (typeof TABS)[number]["id"];
  * Stable marker class per speaker.
  *
  * Keyed on the machine LABEL, never on the name, so renaming "Speaker 2" to
- * "Dana" cannot change her colour — and so the chip in the transcript, the row
- * in the clips panel and the lane under the wave are guaranteed to agree,
- * because all three ask this one function.
+ * "Dana" cannot change her colour — and so the chip in the transcript and the
+ * lane under the wave are guaranteed to agree, because both ask this one
+ * function.
  *
  * "You" gets the pen (the app-wide accent) because it is not one voice among
  * several, it is the person reading the page. The rest walk the four-hue
@@ -187,7 +202,7 @@ function SpeakerChip({
         dir="auto"
         maxLength={60}
         value={draft}
-        aria-label={`Name for ${label}`}
+        aria-label={`Name for ${label} — also taught to this room`}
         data-testid="speaker-input"
         placeholder={label}
         onChange={(e) => setDraft(e.target.value)}
@@ -223,7 +238,10 @@ function SpeakerChip({
           ? `Recognised from a voice you named before — click if this isn't ${name}. The engine calls this voice ${label}.`
           : named
             ? `Rename — the engine calls this voice ${label}`
-            : "Name this speaker — renames every line they said"
+            : // Said BEFORE the act, not only in the toast afterwards: this
+              // writes into the room's voice memory, so a name typed onto the
+              // wrong voice reaches recordings that have not been made yet.
+              "Name this speaker — renames every line they said here, and this room will recognise the voice in later recordings"
       }
       onClick={() => {
         setDraft(named ? name : "");
@@ -268,6 +286,7 @@ function ReadPanel({
   meta,
   quotes,
   reading,
+  hasTranscript,
   onRead,
   onSeek,
   onJump,
@@ -284,6 +303,10 @@ function ReadPanel({
    * sentence: with no overlapping phrase it says so instead. */
   quotes: readonly Quote[];
   reading: boolean;
+  /** `start_rec_read` refuses a recording with no turns outright, so offering
+   * the read button here would be a primary action whose only answer is the
+   * engine's error string. */
+  hasTranscript: boolean;
   onRead: () => void;
   onSeek: (cs: number) => void;
   /** Show this moment in the transcript WITHOUT starting playback — the other
@@ -348,10 +371,7 @@ function ReadPanel({
   // The words moved under the reading — a re-transcribe, or corrections. The
   // findings are about a transcript that no longer exists, so say so rather
   // than let them read as current.
-  const stale =
-    everRead &&
-    (meta!.readOf!.turns !== (meta?.segments.length ?? 0) ||
-      meta!.readOf!.chars !== (meta?.segments ?? []).reduce((n, s) => n + s.text.length, 0));
+  const stale = readingIsStale(meta?.readOf, meta?.segments ?? []);
 
   const readButton = (label: string, primary: boolean) => (
     <button
@@ -359,7 +379,10 @@ function ReadPanel({
       disabled={reading}
       data-testid="rec-read-btn"
       onClick={onRead}
-      title="The room reads the transcript and writes what happened in it"
+      // Where the reading happens, said in the same breath as what it does —
+      // the live-translate box beside it already has to say this, and this
+      // pass sends the WHOLE transcript, not one phrase.
+      title="The room reads the transcript and writes what happened in it — on the room's AI model. In a cloud room the transcript is sent to the provider."
     >
       {reading ? "Reading…" : label}
     </button>
@@ -378,13 +401,28 @@ function ReadPanel({
   if (count === 0) {
     return (
       <div className="rec-blank" data-testid="rec-read-empty">
-        <h3 className="rec-blank-title">{everRead ? empty : "Not read yet"}</h3>
+        <h3 className="rec-blank-title">
+          {!hasTranscript ? "Nothing to read yet" : everRead ? empty : "Not read yet"}
+        </h3>
         <p className="rec-blank-aside nb-note">
-          {everRead ? "the room read it and found none" : "nobody has read this one"}
+          {!hasTranscript
+            ? "this recording has no transcript"
+            : everRead
+              ? "the room read it and found none"
+              : "nobody has read this one"}
         </p>
         <p className="rec-blank-body">{blank}</p>
+        {/* The button would fail by design here: the engine reads WORDS, and
+            this recording has none. Say that instead of offering a primary
+            action that answers with an error. */}
+        {!hasTranscript && (
+          <p className="rec-blank-body">
+            Nothing has been transcribed yet — there is nothing here to read.
+            Transcribe it on the Transcript tab and this fills in.
+          </p>
+        )}
         <div className="rec-read-actions">
-          {readButton("Read this recording", true)}
+          {hasTranscript && readButton("Read this recording", true)}
           {addChapter}
         </div>
       </div>
@@ -530,9 +568,9 @@ function ReadPanel({
 /** One phrase inside a turn. `visible` is the words to draw ("Show deleted"
  * already applied); null means the segment has no word timings — draw its
  * plain text. `text` is that same phrase as a plain string — computed once
- * here because the search, the clips panel and the highlight quotes all need
- * it, and three places deriving "what this phrase says" is three places that
- * can disagree about a deleted word. */
+ * here because the search and the highlight quotes both need it, and two
+ * places deriving "what this phrase says" is two places that can disagree
+ * about a deleted word. */
 interface TurnSeg {
   seg: RecSegment;
   visible: RecWord[] | null;
@@ -558,6 +596,15 @@ function strongDir(text: string): "rtl" | "ltr" | null {
   if (!m) return null;
   return /[\u0591-\u08FF\uFB1D-\uFDFD\uFE70-\uFEFC]/.test(m[0]) ? "rtl" : "ltr";
 }
+
+/** Playback volume and speed for the SESSION, not for the mount.
+ *
+ * The viewer host remounts this component per file, so reviewing a stack of
+ * meetings at 1.5\u00D7 meant setting the speed again on every one of them. Same
+ * reason the mic mute lives in `liveRec` module state: the preference outlives
+ * the component. Nothing is written to disk. */
+let lastVolume = 1;
+let lastRate = 1;
 
 export default function RecordingView({
   fileId,
@@ -594,7 +641,12 @@ export default function RecordingView({
   // the first render — a state read there would be permanently `false`.
   const correctingRef = useRef(false);
   correctingRef.current = correcting;
-  const [translating, setTranslating] = useState<{ done: number; total: number } | null>(null);
+  /** Whole-file translation. "starting" is the state between the press and the
+   * engine's first progress event: how many parts there are is not known yet,
+   * and seeding a denominator of 1 put a number nobody had counted on screen. */
+  const [translating, setTranslating] = useState<
+    { done: number; total: number } | "starting" | null
+  >(null);
   const [retrans, setRetrans] = useState<{ doneCs: number; totalCs: number } | null>(null);
   const [confirmRetrans, setConfirmRetrans] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -622,8 +674,18 @@ export default function RecordingView({
   // mirrors of the element, exactly like `playing`: the control asks the
   // element and the element's own event writes these back, so a slider can
   // never claim a level the audio is not at.
-  const [volume, setVolume] = useState(1);
-  const [rate, setRate] = useState(1);
+  // The session memory is written through the SAME setters, so it can only ever
+  // hold a level the element reported.
+  const [volume, setVolumeNow] = useState(lastVolume);
+  const [rate, setRateNow] = useState(lastRate);
+  const setVolume = (v: number) => {
+    lastVolume = v;
+    setVolumeNow(v);
+  };
+  const setRate = (v: number) => {
+    lastRate = v;
+    setRateNow(v);
+  };
   /** The capture choices, while a finished recording is being CONTINUED. Off
    * until the user presses Continue, because until then they are choices about
    * a session that does not exist. */
@@ -640,6 +702,12 @@ export default function RecordingView({
   const mediaRef = useRef<HTMLAudioElement | null>(null);
   const listRef = useRef<HTMLDivElement | null>(null);
   const listEndRef = useRef<HTMLDivElement | null>(null);
+  const panelRef = useRef<HTMLDivElement | null>(null);
+  /** Does the transcript still belong to the playhead? A wheel or a drag
+   * inside the panel means the reader took it over — following them back to
+   * the playhead every few seconds would make the page unreadable. Seeking,
+   * scrubbing or asking for a phrase hands it back. */
+  const followRef = useRef(true);
   const tabRefs = useRef<(HTMLButtonElement | null)[]>([]);
 
   const mine = live?.fileId === fileId ? live : null;
@@ -659,6 +727,24 @@ export default function RecordingView({
         }
       })
       .catch((e) => pushToast("error", String(e)));
+    // A read may already be under way when this view mounts — the room starts
+    // one by itself on Stop and in the background sweep, and the button's
+    // optimistic flag only exists in the session that pressed it. Without this
+    // the tabs offer "Read this recording" for a read that is already running,
+    // and pressing it is refused ("already being read").
+    void api
+      .listJobs()
+      .then((jobs) => {
+        if (dead) return;
+        const mineNow = jobs.some(
+          (j) =>
+            j.kind === "rec_read" &&
+            (j.status === "queued" || j.status === "running") &&
+            (j.plan as { file_id?: string } | null)?.file_id === fileId,
+        );
+        if (mineNow) setReading(true);
+      })
+      .catch(() => {});
     // A source may have died BEFORE this view mounted; the engine keeps the
     // latest health durable exactly for this read.
     void api
@@ -713,10 +799,18 @@ export default function RecordingView({
             : m,
         );
       }),
-      // The room finished reading — pull the meta so the three tabs fill in
+      // The room stopped reading — pull the meta so the three tabs fill in
       // without the user clicking anything. This is also how a reading the
       // room started BY ITSELF (on Stop, or the background sweep) reaches a
       // recording that is already open.
+      //
+      // It fires on EVERY ending now, not only a successful one: a read that
+      // failed or was stopped left the three tabs saying "Reading this
+      // recording…" and the button disabled until the file was closed and
+      // reopened. The REASON is not toasted here — the runner emits the
+      // standard terminal `job-progress`, whose failure toast is the one place
+      // a stopped background job explains itself, and saying it twice would be
+      // worse than saying it once.
       api.onRecReadDone((p) => {
         if (p.fileId !== fileId) return;
         setReading(false);
@@ -860,27 +954,6 @@ export default function RecordingView({
     [turns, meta?.speakerNames],
   );
 
-  /** Every turn as a playable clip: who, when, how long, and what was said.
-   *
-   * Derived from the same turns the transcript draws, so a clip's length is
-   * the real distance between the first and last word timing the engine
-   * produced — nothing here is rounded up to look tidier. */
-  const clips = useMemo(
-    () =>
-      turns.map((t) => {
-        const last = t.segs[t.segs.length - 1].seg;
-        return {
-          key: t.key,
-          speaker: t.speaker,
-          t0: t.t0,
-          t1: Math.max(last.t1 ?? t.t0, t.t0),
-          dir: t.dir,
-          text: t.segs.map((s) => s.text).join(" ").trim(),
-        };
-      }),
-    [turns],
-  );
-
   /** The transcript, filtered to the phrases the search box asked for. Empty
    * box = the whole transcript, and the same array, so nothing re-renders for
    * a search nobody is running. */
@@ -964,6 +1037,37 @@ export default function RecordingView({
       });
   }, [findSeg, tab]);
 
+  // The transcript follows the playhead. Without this the phrase the player is
+  // in lights up, walks off the bottom of a long meeting within seconds and
+  // never comes back — which is the whole of what playback/transcript sync is
+  // for. Reduced motion gets the jump, not the travel.
+  useEffect(() => {
+    if (!playing || !activeSeg || tab !== "transcript" || !followRef.current) return;
+    listRef.current
+      ?.querySelector<HTMLElement>(`[data-seg="${CSS.escape(activeSeg)}"]`)
+      ?.scrollIntoView({
+        block: "center",
+        behavior: prefersReducedMotion() ? "auto" : "smooth",
+      });
+  }, [playing, activeSeg, tab]);
+
+  // Wheel and touch, not `scroll`: the smooth scroll above fires `scroll`
+  // itself, so listening for that would switch following off the instant it
+  // was used.
+  useEffect(() => {
+    const el = panelRef.current;
+    if (!el) return;
+    const stop = () => {
+      followRef.current = false;
+    };
+    el.addEventListener("wheel", stop, { passive: true });
+    el.addEventListener("touchmove", stop, { passive: true });
+    return () => {
+      el.removeEventListener("wheel", stop);
+      el.removeEventListener("touchmove", stop);
+    };
+  }, []);
+
   function onTime() {
     const el = mediaRef.current;
     if (!el) return;
@@ -987,6 +1091,7 @@ export default function RecordingView({
   function seek(cs: number) {
     const el = mediaRef.current;
     if (!el) return;
+    followRef.current = true;
     el.currentTime = cs / 100;
     void el.play().catch(() => {});
   }
@@ -997,6 +1102,7 @@ export default function RecordingView({
   function scrubTo(cs: number) {
     const el = mediaRef.current;
     if (!el) return;
+    followRef.current = true;
     el.currentTime = cs / 100;
     // timeupdate does not fire while paused, so the clock and the active
     // phrase would sit on the old moment until playback resumed.
@@ -1008,6 +1114,10 @@ export default function RecordingView({
    * phrase, and no playback. Any search in force is dropped first — a jump
    * into a phrase the current filter hides would land on nothing. */
   function showInTranscript(cs: number) {
+    // The playhead did NOT move — this is the reader looking somewhere else.
+    // Following it back would drag the phrase they asked for off screen at the
+    // next word boundary.
+    followRef.current = false;
     setQuery("");
     setTab("transcript");
     setFindSeg(segmentAt(segments, cs));
@@ -1292,7 +1402,7 @@ export default function RecordingView({
   async function runTranslate() {
     if (!translateTo.trim() || busy) return;
     setBusy(true);
-    setTranslating({ done: 0, total: 1 });
+    setTranslating("starting");
     try {
       const f = await api.recTranslate(fileId, translateTo.trim());
       pushToast("success", `Translated into ${translateTo.trim()} — saved "${f.name}".`);
@@ -1378,6 +1488,12 @@ export default function RecordingView({
         kind === "srt" && cuts.length > 0
           ? `Saved "${f.name}" into this room — timed for the edited copy, not the original.`
           : `Saved "${f.name}" into this room.`,
+        // The audio these cues line up with is a button the user may never
+        // have pressed; offer the missing half rather than leaving subtitles
+        // for a file that does not exist.
+        kind === "srt" && cuts.length > 0
+          ? { label: "Export the edited copy", run: () => void exportClean() }
+          : undefined,
       );
     } catch (e) {
       pushToast("error", String(e));
@@ -1435,7 +1551,12 @@ export default function RecordingView({
       setMeta(updated);
       setDurationCs(updated.durationCs);
       setLiveTranslations({});
-      pushToast("success", "Transcript rebuilt from the audio — the old one is in this file's History.");
+      pushToast(
+        "success",
+        segments.length > 0
+          ? "Transcript rebuilt from the audio — the old one is in this file's History."
+          : "Transcript written from the audio.",
+      );
     } catch (e) {
       pushToast("error", String(e));
     } finally {
@@ -1482,6 +1603,11 @@ export default function RecordingView({
   // overwrite the edit on its next flush.
   const canEdit = !isLive;
   const hasWords = segments.some((s) => s.words.length > 0);
+  // Anything actually cut. `hasWords` is true of every word-timed transcript,
+  // edited or not, so gating "Show deleted" on it put a permanent checkbox
+  // with nothing to reveal beside the search box. One predicate, so the
+  // checkbox and "Export edited copy" can never disagree about it.
+  const hasDeleted = segments.some((s) => s.words.some((w) => w.del));
   // Audio already in the file — a recording with sound but no transcript lines
   // (live transcription off, or a silent stretch) is still CONTINUED, never
   // started over, and the button must not suggest otherwise. Length is the only
@@ -1493,7 +1619,17 @@ export default function RecordingView({
   // mediaToken too: a corrupted (unparseable) meta reads as durationCs 0,
   // and re-transcribe is the rescue tool for exactly that file.
   const canRetranscribe = !isLive && (durationCs > 0 || !!mediaToken);
+  /** The empty transcript panel offers the rebuild itself, but only on the
+   * `finished` reading of the file — which needs a duration. A file whose meta
+   * lost its duration reads as `fresh`, so the drawer stays its one route to
+   * the tool that rescues it. */
+  const rebuildOnlyInDrawer = canRetranscribe && !hasAudio;
   const canPlay = !!src && durationCs > 0;
+  /** The re-transcribe figure the engine actually reported, written once so
+   * the three places that show it cannot round it differently. */
+  const retransPct = retrans
+    ? Math.min(100, Math.round((retrans.doneCs / Math.max(1, retrans.totalCs)) * 100))
+    : null;
   const voices = new Set(segments.map((s) => s.speaker)).size;
   // Anything already in this file: audio, or — for a file whose meta lost its
   // duration — transcribed words. The button's label and the capture stage
@@ -1519,13 +1655,21 @@ export default function RecordingView({
   // One "still speaking…" ghost per lane. A ghost whose speaker matches the
   // last turn renders inside it (the same voice, mid-sentence); the rest —
   // including everything when there are no finals yet — stand alone.
-  // `speaker` is the machine LABEL, exactly as on a finished turn, so the ghost
-  // is drawn through speakerName() too — otherwise renaming "You" left the
-  // line being spoken right now under the old name, the same person appearing
-  // twice in one transcript.
+  //
+  // The MIC lane's `speaker` is the machine LABEL, exactly as on a finished
+  // turn, so its ghost is drawn through speakerName() too — otherwise renaming
+  // "You" left the line being spoken right now under the old name, the same
+  // person appearing twice in one transcript.
+  //
+  // The Mac's audio lane has no label to give: its finals arrive as "Speaker N"
+  // once the engine has clustered the voice. "Meeting" was drawn as if it were
+  // one — Speaker 1's colour, a name no rename could ever reach — and a moment
+  // later the same words reappeared as a differently-coloured "Speaker 3". It
+  // is provisional, so it is presented as provisional and claims no speaker.
   const ghosts = (["mic", "sys"] as const).flatMap((lane) => {
     const text = partials[lane];
-    return text ? [{ lane, speaker: lane === "mic" ? "You" : "Meeting", text }] : [];
+    if (!text) return [];
+    return [{ lane, speaker: lane === "mic" ? "You" : null, text }];
   });
   const lastTurn = turns[turns.length - 1];
   const attachedGhosts = lastTurn ? ghosts.filter((g) => g.speaker === lastTurn.speaker) : [];
@@ -1977,12 +2121,6 @@ export default function RecordingView({
               <b className="nb-num">{voices}</b>
             </span>
           )}
-          {clips.length > 0 && (
-            <span className="rec-fact">
-              <i>Clips</i>
-              <b className="nb-num">{clips.length}</b>
-            </span>
-          )}
           {cuts.length > 0 && (
             <span className="rec-fact">
               <i>Removed</i>
@@ -2034,7 +2172,13 @@ export default function RecordingView({
         </div>
       </div>
 
-      {/* ---- reading: tabs + the clips beside them ---- */}
+      {/* ---- reading ----
+          There used to be a permanent 268px "Clips" rail here, drawing every
+          speaker turn — the same list, in the same order, in the same words as
+          the transcript beside it, which already carries the speaker chip and
+          gives every phrase its own stamp. It bought one fact the transcript
+          did not have (each turn's length) at the cost of narrowing the thing
+          people actually read, so the transcript has the width now. */}
       <div className="rec-tabbar">
         <div className="rec-tabs" role="tablist" aria-label="Recording views">
           {TABS.map((t, i) => (
@@ -2088,7 +2232,7 @@ export default function RecordingView({
               )}
             </span>
           )}
-          {hasWords && tab === "transcript" && (
+          {hasDeleted && tab === "transcript" && (
             <label className="rec-opt">
               <input
                 type="checkbox"
@@ -2104,6 +2248,7 @@ export default function RecordingView({
       <div className="rec-body">
         <div
           className="rec-panel"
+          ref={panelRef}
           role="tabpanel"
           id={`rec-panel-${tab}`}
           aria-labelledby={`rec-tab-${tab}`}
@@ -2118,33 +2263,79 @@ export default function RecordingView({
               className="rec-transcript"
               ref={listRef}
               tabIndex={0}
-              aria-label="Transcript — select words here to correct them, or to delete them from the recording"
+              // The editing invitation follows the same rule as the visible
+              // hint at the foot of the list: the backend refuses an edit
+              // while the file has a live session, so telling a screen reader
+              // to select words mid-meeting describes an act that produces no
+              // selection bar at all.
+              aria-label={
+                isLive
+                  ? "Transcript — appearing as people speak"
+                  : "Transcript — select words here to correct them, or to delete them from the recording"
+              }
               onMouseUp={captureSelection}
             >
               {segments.length === 0 && !partials.mic && !partials.sys && (
                 <div className="rec-empty">
-                  {status === "idle" ? (
+                  {/* On `stage`, never on `status`: a paused or saving session
+                      has a closed microphone, and a FINISHED recording holding
+                      an hour of audio and no words was told the answer was to
+                      record more into it — with the control that actually
+                      rescues it shut inside a drawer named after exports. */}
+                  {stage === "fresh" ? (
                     <>
                       <p className="rec-empty-lead">
                         <strong>This file records and understands speech — live.</strong>
                       </p>
                       <p>
-                        {/* Not "the checkbox": on a recording that has already
-                            been made, the Mac's-audio choice is inside the
-                            preflight that button opens, and there is no
-                            checkbox on screen to leave anything on. */}
-                        Press <em>{everRecorded ? "Continue recording" : "Start recording"}</em>:
-                        your words (and, with the Mac’s-audio option on,
-                        whatever the Mac plays — a Google Meet, Zoom, Teams or Slack call) appear here
-                        as text while people are still speaking, with speakers told apart.
+                        Press <em>Start recording</em>: your words (and, with the Mac’s-audio
+                        option on, whatever the Mac plays — a Google Meet, Zoom, Teams or Slack
+                        call) appear here as text while people are still speaking, with speakers
+                        told apart.
                       </p>
                       <p>
                         Afterwards, edit the audio by editing the text (select words → delete), run any
                         AI action on it, or translate the whole thing. Speech is recognised on this Mac;
-                        AI actions and translation use the room's model — the trust chip in the status
-                        bar says whether that one is local or in the cloud.
+                        AI actions, translation, and the room's own reading of a finished recording —
+                        which starts by itself when you press Stop — use the room's model, and the
+                        trust chip in the status bar says whether that one is local or in the cloud.
                       </p>
                     </>
+                  ) : stage === "finished" ? (
+                    <>
+                      <p className="rec-empty-lead">
+                        <strong>
+                          This recording has audio, but no transcript — nothing has written it
+                          up yet.
+                        </strong>
+                      </p>
+                      <p>
+                        Live transcription may have been off while it was made, or the speech
+                        model missing at the time. Writing it up rebuilds the words from the
+                        audio this file already holds — on this Mac, and the audio is untouched.
+                      </p>
+                      {canRetranscribe && (
+                        <button
+                          className="nb-btn"
+                          disabled={busy}
+                          data-testid="rec-transcribe-empty"
+                          title="Write up this recording from the audio it already holds — speech is recognised on this Mac"
+                          onClick={() => void runRetranscribe()}
+                        >
+                          {retransPct !== null
+                            ? `Transcribing ${retransPct}%…`
+                            : "Write it up"}
+                        </button>
+                      )}
+                    </>
+                  ) : stage === "paused" ? (
+                    <p className="rec-empty-lead">
+                      Paused — nothing is being recorded. Resume above to keep going.
+                    </p>
+                  ) : stage === "saving" ? (
+                    <p className="rec-empty-lead">
+                      Saving — the audio is already safe; the transcript is finishing.
+                    </p>
                   ) : (
                     <p className="rec-empty-lead">Listening… speak, or bring the meeting on.</p>
                   )}
@@ -2189,34 +2380,70 @@ export default function RecordingView({
                             found.hits.has(seg.id) ? " is-hit" : ""
                           }${findSeg === seg.id ? " is-found" : ""}`}
                         >
-                          <button
-                            className="rec-stamp nb-num"
-                            title="Play from here"
-                            aria-label={`Play from ${formatTimestamp(seg.t0)}`}
-                            onClick={() => seek(seg.t0)}
-                          >
-                            {formatTimestamp(seg.t0)}
-                          </button>
+                          {/* Only a control when there is something to play.
+                              While a recording is being captured there is no
+                              element at all, so a button announcing "Play from
+                              2:14" — to the eye and to a screen reader — did
+                              nothing on every line of a live meeting. */}
+                          {canPlay ? (
+                            <button
+                              className="rec-stamp nb-num"
+                              title="Play from here"
+                              aria-label={`Play from ${formatTimestamp(seg.t0)}`}
+                              onClick={() => seek(seg.t0)}
+                            >
+                              {formatTimestamp(seg.t0)}
+                            </button>
+                          ) : (
+                            <span className="rec-stamp nb-num">{formatTimestamp(seg.t0)}</span>
+                          )}
                           <div className="rec-line-text" dir={turn.dir}>
                             <span
                               className={`rec-seg ${activeSeg === seg.id ? "active" : ""}`}
                               dir="auto"
                             >
                               {visible
-                                ? visible.map((w, i) => (
-                                    <span
-                                      key={i}
-                                      data-t0={w.t0}
-                                      data-t1={w.t1}
-                                      className={w.del ? "rec-word deleted" : "rec-word"}
-                                      onClick={() => {
-                                        // A drag is a delete-selection, not a seek.
-                                        if (window.getSelection()?.isCollapsed) seek(w.t0);
-                                      }}
-                                    >
-                                      {w.w}{" "}
-                                    </span>
-                                  ))
+                                ? visible.map((w, i) => {
+                                    // Moves the playhead; it does not start the
+                                    // room talking. This surface is also where
+                                    // words are selected to correct or delete
+                                    // them, and one area that answers a click
+                                    // with audio and a drag with an edit bar is
+                                    // two areas. The stamp stays the one control
+                                    // that plays, exactly as its title says.
+                                    const place = canPlay
+                                      ? () => {
+                                          // A drag is a delete-selection, not a seek.
+                                          if (window.getSelection()?.isCollapsed) scrubTo(w.t0);
+                                        }
+                                      : undefined;
+                                    // <del>, not a struck-through <span>: the
+                                    // line-through is CSS and reaches no
+                                    // accessibility API, so with "Show deleted"
+                                    // on, a word already cut from the recording
+                                    // was read out exactly like a kept one.
+                                    return w.del ? (
+                                      <del
+                                        key={i}
+                                        data-t0={w.t0}
+                                        data-t1={w.t1}
+                                        className="rec-word deleted"
+                                        onClick={place}
+                                      >
+                                        {w.w}{" "}
+                                      </del>
+                                    ) : (
+                                      <span
+                                        key={i}
+                                        data-t0={w.t0}
+                                        data-t1={w.t1}
+                                        className="rec-word"
+                                        onClick={place}
+                                      >
+                                        {w.w}{" "}
+                                      </span>
+                                    );
+                                  })
                                 : text}
                               {translation && (
                                 <span className="rec-translation" dir="auto">
@@ -2246,9 +2473,16 @@ export default function RecordingView({
               {standaloneGhosts.map((g) => (
                 <div key={g.lane} className="rec-turn ghost">
                   <div className="rec-turn-head">
-                    <span className={`rec-speaker ${speakerTone(g.speaker)}`} dir="auto">
-                      {speakerName(g.speaker)}
-                    </span>
+                    {g.speaker ? (
+                      <span className={`rec-speaker ${speakerTone(g.speaker)}`} dir="auto">
+                        {speakerName(g.speaker)}
+                      </span>
+                    ) : (
+                      /* A tape label, not a speaker chip: nobody has been
+                         identified yet, and a chip is a claim that somebody
+                         has. */
+                      <span className="nb-tape nb-sem-pending">the Mac’s audio</span>
+                    )}
                   </div>
                   <div className="rec-line">
                     <span className="rec-stamp nb-num" aria-hidden="true">
@@ -2264,8 +2498,10 @@ export default function RecordingView({
               ))}
               {!isLive && segments.length > 0 && (
                 <p className="rec-read-note">
-                  Select words above to correct them, or to delete them from the
-                  recording.
+                  {/* Naming a voice was the one edit nothing on screen named:
+                      the chip's whole affordance was a tooltip. */}
+                  Click a speaker’s name to say who they were. Select words
+                  above to correct them, or to delete them from the recording.
                 </p>
               )}
               <div ref={listEndRef} />
@@ -2278,6 +2514,7 @@ export default function RecordingView({
               meta={meta}
               quotes={quotes}
               reading={reading}
+              hasTranscript={segments.length > 0}
               onRead={() => void startReading()}
               onSeek={seek}
               onJump={showInTranscript}
@@ -2293,6 +2530,7 @@ export default function RecordingView({
               meta={meta}
               quotes={quotes}
               reading={reading}
+              hasTranscript={segments.length > 0}
               onRead={() => void startReading()}
               onSeek={seek}
               onJump={showInTranscript}
@@ -2308,6 +2546,7 @@ export default function RecordingView({
               meta={meta}
               quotes={quotes}
               reading={reading}
+              hasTranscript={segments.length > 0}
               onRead={() => void startReading()}
               onSeek={seek}
               onJump={showInTranscript}
@@ -2318,85 +2557,6 @@ export default function RecordingView({
             />
           )}
         </div>
-
-        {/* ---- clips ----
-            Not a new data model: one clip IS one speaker turn, which is what
-            diarization already produced and what the transcript is grouped by.
-            Duration is the distance between the first and last word timing in
-            the turn, so it is measured, not estimated. */}
-        <aside className="rec-clips" aria-label="Clips in this recording">
-          <div className="rec-clips-head">
-            <h3>Clips</h3>
-            <span className="rec-clips-note">
-              {clips.length === 0
-                ? "none yet"
-                : `${clips.length} turn${clips.length === 1 ? "" : "s"}`}
-            </span>
-          </div>
-          {clips.length === 0 ? (
-            <p className="rec-clips-empty">
-              A clip appears for every turn a voice takes. Record or import
-              audio and they fill in as the transcript does.
-            </p>
-          ) : (
-            <ul className="rec-clip-list">
-              {clips.map((c) => (
-                <li key={c.key}>
-                  <button
-                    className="rec-clip"
-                    disabled={!canPlay}
-                    title={c.text || "Play from here"}
-                    onClick={() => seek(c.t0)}
-                  >
-                    <span className="rec-clip-line">
-                      <span
-                        className={`rec-clip-who ${speakerTone(c.speaker)}`}
-                        dir="auto"
-                      >
-                        {speakerName(c.speaker)}
-                      </span>
-                      <span className="rec-clip-at nb-num">{formatTimestamp(c.t0)}</span>
-                      <span className="rec-clip-len nb-num">
-                        {formatTimestamp(Math.max(0, c.t1 - c.t0))}
-                      </span>
-                    </span>
-                    {c.text && (
-                      <span className="rec-clip-text" dir={c.dir}>
-                        {c.text}
-                      </span>
-                    )}
-                  </button>
-                </li>
-              ))}
-            </ul>
-          )}
-
-          {/* Spans the transcript edits removed. Read-only on purpose: playback
-              skips them, so a row that seeked into one would do nothing. */}
-          {cuts.length > 0 && (
-            <div className="rec-cuts">
-              <hr className="nb-rule-dash" />
-              <h4>Removed spans</h4>
-              <ul>
-                {cuts.map((c, i) => (
-                  <li key={i} className="rec-cut">
-                    <span className="nb-tape nb-sem-urgent rec-cut-tag">Cut</span>
-                    <span className="nb-num rec-cut-at">
-                      {formatTimestamp(c.t0)}–{formatTimestamp(c.t1)}
-                    </span>
-                    <span className="nb-num rec-cut-len">
-                      {formatTimestamp(Math.max(0, c.t1 - c.t0))}
-                    </span>
-                  </li>
-                ))}
-              </ul>
-              <p className="rec-cuts-note">
-                Still in the file — playback skips them. “Export edited copy”
-                writes a version with them really removed.
-              </p>
-            </div>
-          )}
-        </aside>
       </div>
 
       {/* selection action bar */}
@@ -2533,8 +2693,16 @@ export default function RecordingView({
           default: these are things done to a recording once, and as a
           seven-control toolbar they sat across the bottom of every reading of
           it. Anything actually RUNNING is reported on the summary line, which
-          is always visible, so closing the drawer can never hide progress. */}
-      {(segments.length > 0 || canRetranscribe) && (
+          is always visible, so closing the drawer can never hide progress.
+
+          It needs a transcript. On a recording that has none the only control
+          left in here was Re-transcribe, shut behind a title promising
+          exports it could not do — and the file that most needs it is the one
+          that reads as a dead end. That button is stated plainly in the empty
+          transcript panel instead — but only where the panel can SEE the
+          audio, so a file whose meta lost its duration keeps the drawer as its
+          one route to the rescue tool. */}
+      {(segments.length > 0 || rebuildOnlyInDrawer) && (
         <details className="rec-drawer">
           <summary className="rec-drawer-head">
             <span className="rec-drawer-caret" aria-hidden="true" />
@@ -2544,10 +2712,15 @@ export default function RecordingView({
             </span>
             {(translating || retrans || exporting) && (
               <span className="nb-tape nb-sem-linked rec-drawer-run">
+                {/* No figures until the engine has counted the parts — a
+                    denominator of 1 on a 40-minute transcript was a number
+                    nobody had measured. */}
                 {translating
-                  ? `Translating ${translating.done}/${translating.total}…`
-                  : retrans
-                    ? `Re-transcribing ${Math.min(100, Math.round((retrans.doneCs / Math.max(1, retrans.totalCs)) * 100))}%…`
+                  ? translating === "starting"
+                    ? "Translating…"
+                    : `Translating ${translating.done}/${translating.total}…`
+                  : retransPct !== null
+                    ? `Re-transcribing ${retransPct}%…`
                     : "Exporting edited copy…"}
               </span>
             )}
@@ -2571,7 +2744,11 @@ export default function RecordingView({
                   disabled={busy || !translateTo.trim()}
                   onClick={() => void runTranslate()}
                 >
-                  {translating ? `Translating ${translating.done}/${translating.total}…` : "Translate"}
+                  {!translating
+                    ? "Translate"
+                    : translating === "starting"
+                      ? "Translating…"
+                      : `Translating ${translating.done}/${translating.total}…`}
                 </button>
               </span>
             )}
@@ -2608,9 +2785,7 @@ export default function RecordingView({
                   title="Rebuild the transcript from the audio with the current pipeline — fixes recordings saved with garbled words, the wrong language, or old speaker labels"
                   onClick={() => setConfirmRetrans(true)}
                 >
-                  {retrans
-                    ? `Re-transcribing ${Math.min(100, Math.round((retrans.doneCs / Math.max(1, retrans.totalCs)) * 100))}%…`
-                    : "Re-transcribe"}
+                  {retransPct !== null ? `Re-transcribing ${retransPct}%…` : "Re-transcribe"}
                 </button>
               ))}
             {segments.length > 0 && !isLive && (
@@ -2640,7 +2815,7 @@ export default function RecordingView({
             {hasWords && (
               <button
                 className="nb-btn"
-                disabled={busy || (!cuts.length && !segments.some((s) => s.words.some((w) => w.del)))}
+                disabled={busy || (!cuts.length && !hasDeleted)}
                 title="Save a copy with the deleted words really cut out of the audio"
                 onClick={() => void exportClean()}
               >
@@ -2648,6 +2823,34 @@ export default function RecordingView({
               </button>
             )}
           </div>
+
+          {/* Spans the transcript edits removed. Read-only on purpose: playback
+              skips them, so a row that seeked into one would do nothing. It
+              lives beside the button it is about — "Export edited copy" is what
+              turns these into a real cut. */}
+          {cuts.length > 0 && (
+            <div className="rec-cuts">
+              <hr className="nb-rule-dash" />
+              <h4>Removed spans</h4>
+              <ul>
+                {cuts.map((c, i) => (
+                  <li key={i} className="rec-cut">
+                    <span className="nb-tape nb-sem-urgent rec-cut-tag">Cut</span>
+                    <span className="nb-num rec-cut-at">
+                      {formatTimestamp(c.t0)}–{formatTimestamp(c.t1)}
+                    </span>
+                    <span className="nb-num rec-cut-len">
+                      {formatTimestamp(Math.max(0, c.t1 - c.t0))}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+              <p className="rec-cuts-note">
+                Still in the file — playback skips them. “Export edited copy”
+                writes a version with them really removed.
+              </p>
+            </div>
+          )}
         </details>
       )}
     </div>

@@ -447,6 +447,12 @@ def merge_cast(found: list[dict[str, str]]) -> list[dict[str, str]]:
     return merged
 
 
+def _is_fatal(code: str) -> bool:
+    """A hard engine failure is about the ENGINE, never the document (the same
+    test as file_pass.py / rec_read.py)."""
+    return code == "OLLAMA_DOWN" or code.startswith("MODEL_MISSING")
+
+
 async def extract_cast(
     model: str,
     base_url: str,
@@ -464,6 +470,10 @@ async def extract_cast(
     characters and losing them to one bad reply would be the worse trade. A
     document where NO window could be read raises, so "the model could not read
     this" never arrives disguised as "this file has no characters in it".
+
+    A FATAL engine failure (OLLAMA_DOWN / MODEL_MISSING) is not a window that
+    could not be read — it raises unchanged on the first window, keeping the
+    code the Rust gateway and the UI branch on.
     """
     windows = cast_windows(document)
     if not windows:
@@ -487,7 +497,18 @@ async def extract_cast(
                 provider=provider,
             )
             parsed = json.loads(reply.strip())
-        except (ValueError, TypeError, llm.LlmError):
+        except llm.LlmError as exc:
+            # A dead daemon or an unpulled model is not this document's fault,
+            # and it will be every window's answer — counting it as a window
+            # that "was not usable" ends in a message blaming the file, with
+            # the sentinel the Rust gateway rebuilds OLLAMA_DOWN /
+            # MODEL_MISSING:<model> from (and the UI's "start Ollama" offer)
+            # thrown away.
+            if _is_fatal(exc.code):
+                raise
+            failures += 1
+            continue
+        except (ValueError, TypeError):
             failures += 1
             continue
         people = parsed.get("cast") if isinstance(parsed, dict) else None

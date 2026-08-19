@@ -45,15 +45,17 @@ export default function OnlineSection({
       <h3>Online features</h3>
             <p className="settings-hint">
               This room's master internet switch. Off by default: while off, no
-              online tool is even offered to the AI, and the browser's address
-              bar refuses to load anything. Turn it on and you can then choose,
+              online tool is even offered to the AI, the browser's address bar
+              refuses to load anything, and spoken answers stay silent (the
+              voice is an online service). Turn it on and you can then choose,
               below, which of the two online abilities the AI actually gets.
             </p>
             {/* The consequence of the master switch, drawn as a marked note
                 above the switch itself. */}
             <p className="set-note set-note--flag set-note--lead nb-sem-urgent">
-              <AlertIcon size={16} className="warn-ic" /> When on, search queries and fetched pages leave this Mac.
-              Your files never do.
+              <AlertIcon size={16} className="warn-ic" /> When on, search queries and fetched pages leave this Mac —
+              and, while an answer is being read aloud, the sentence being
+              spoken. Your files never do.
             </p>
             <label className="settings-label">
               <input
@@ -157,7 +159,10 @@ export default function OnlineSection({
                 disabled={webTesting}
                 onClick={testWebSearch}
               >
-                {webTesting ? "Testing…" : "Test search"}
+                {/* It saves first, so that what is tested is what is active
+                    (useOnlineSearch.testWebSearch) — a button labelled just
+                    "Test" was hiding a commit on the internet switch. */}
+                {webTesting ? "Testing…" : "Save & test search"}
               </button>
               <button
                 className="primary btn-ic"

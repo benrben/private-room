@@ -168,7 +168,17 @@ export const NO_FILTER: EdgeFilter = { hidden: [], minWeight: 0 };
  *  never claims a connection it is not showing. */
 export function filterEdges(edges: GraphEdge[], filter: EdgeFilter): GraphEdge[] {
   return edges.filter(
-    (e) => !filter.hidden.includes(e.kind) && e.weight >= filter.minWeight,
+    // FACTS ARE NOT WEAK LINKS. The backend gives each recorded kind a constant
+    // weight (same_site 0.45, a memory's match 0.6, `mentions` 0.8) while an
+    // inferred `similar` is scored against this room's own range and can sit
+    // near 1 — so one comparison across every kind took the proven relations
+    // off the map first and left the guesses drawn. `rankEdges` spends its
+    // render budget on facts first for the same reason; there it still has a
+    // budget to run out of, whereas here nothing is being rationed, so a fact
+    // is simply never hidden for being weak.
+    (e) =>
+      !filter.hidden.includes(e.kind) &&
+      (styleFor(e.kind).fact || e.weight >= filter.minWeight),
   );
 }
 
@@ -184,7 +194,23 @@ export function countByKind(edges: GraphEdge[]): Record<string, number> {
  *  actually has for it. Never a bare percentage — after the sparsification the
  *  weight is a position in this room's own range, not a "% similar". */
 export function edgeLines(edge: GraphEdge): string[] {
-  return [styleFor(edge.kind).lead, ...edge.shared.slice(0, 3)];
+  return [leadFor(edge), ...edge.shared.slice(0, 3)];
+}
+
+/** What THIS link claims.
+ *
+ *  A memory's link is not the file-to-file relation its kind is named after:
+ *  the backend found the memory's two rarest words somewhere in the file's
+ *  text, where `mentions` between files is a match on the file's own NAME. So
+ *  the borrowed lead — "this one names the other by name" — stated a match
+ *  nobody made, under evidence ("zermatt") that plainly isn't a name. Said
+ *  here rather than as a sixth kind because the kind is the backend's word;
+ *  what a line CLAIMS to the reader is this file's. */
+function leadFor(edge: GraphEdge): string {
+  if (edge.kind === "mentions" && edge.a.startsWith("mem:")) {
+    return "This memory's distinctive words appear in this file";
+  }
+  return styleFor(edge.kind).lead;
 }
 
 /* ----- how much ink a link gets -----

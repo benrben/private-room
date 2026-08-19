@@ -12,7 +12,7 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 // The "[m:ss]" transcript stamp — ONE implementation for the whole app. The
 // player, search and the AI all parse this exact shape, so a live recording's
@@ -79,6 +79,9 @@ pub fn decode_to_pcm(input: &Path, kind: MediaKind) -> Result<Vec<f32>, String> 
                 String::from_utf8_lossy(&out.stderr).chars().take(200).collect::<String>()
             ));
         }
+        // The converter made this file under the umask; it holds the room's
+        // decrypted audio for the length of the decode.
+        make_private(&m4a);
         m4a.clone()
     } else {
         input.to_path_buf()
@@ -99,6 +102,7 @@ pub fn decode_to_pcm(input: &Path, kind: MediaKind) -> Result<Vec<f32>, String> 
         ));
     }
 
+    make_private(&wav);
     let pcm = parse_wav_to_mono_f32(&wav);
     let _ = std::fs::remove_file(&wav);
     pcm
@@ -110,11 +114,48 @@ pub fn decode_to_pcm(input: &Path, kind: MediaKind) -> Result<Vec<f32>, String> 
 pub fn decode_bytes_to_pcm(bytes: &[u8], ext: &str, kind: MediaKind) -> Result<Vec<f32>, String> {
     let safe_ext = if ext.is_empty() { "bin" } else { ext };
     let src = std::env::temp_dir().join(format!("pr-stt-src-{}.{safe_ext}", uuid::Uuid::new_v4()));
-    std::fs::write(&src, bytes).map_err(|e| e.to_string())?;
+    if let Err(e) = write_private(&src, bytes) {
+        // A PARTIAL write (disk full mid-file) has already created the file,
+        // and it holds the room's decrypted audio. Removed here as
+        // `media_probe::probe_bytes` does; removing a file that was never
+        // created is a no-op.
+        let _ = std::fs::remove_file(&src);
+        return Err(e.to_string());
+    }
     let result = decode_to_pcm(&src, kind);
     let _ = std::fs::remove_file(&src);
     result
 }
+
+/// Owner-only from the moment it exists, rather than created world-readable
+/// and tightened afterwards: between those two steps another local process can
+/// already have opened it. (Same reasoning as `quicklook::write_private` — and
+/// the same shape, because what these files hold is the room's decrypted audio
+/// and TMPDIR is not always per-user.)
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)?.write_all(bytes)
+}
+
+/// Tighten a converter's OUTPUT to owner-only. `afconvert`/`avconvert` create
+/// their file themselves (0644 under the process umask), and it holds the same
+/// decrypted audio the source copy does. Best-effort: a failure here is not a
+/// reason to fail the transcription, and the file is removed either way.
+#[cfg(unix)]
+fn make_private(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+}
+
+#[cfg(not(unix))]
+fn make_private(_path: &Path) {}
 
 /// Read exactly what afconvert emits (PCM 16-bit LE, 16 kHz, any channel
 /// count) into mono f32. The RIFF walk itself lives in
@@ -134,7 +175,29 @@ fn parse_wav_to_mono_f32(path: &Path) -> Result<Vec<f32>, String> {
 /// One warm Whisper context, keyed by model path. whisper.cpp mmaps the
 /// weights, so keeping it loaded costs address space, not resident RAM the OS
 /// can't reclaim — and saves the multi-second reload on every dictation.
-static CTX: Mutex<Option<(String, whisper_rs::WhisperContext)>> = Mutex::new(None);
+///
+/// Behind an `Arc` so the lock covers the LOOKUP only, never the decode. Held
+/// across `full()`, this one mutex serialised every speech job in the app: a
+/// 45-minute video dropped into a room mid-meeting stopped the live transcript
+/// for the whole import — no partials, no new lines — because the recorder's
+/// decoder thread was parked here. The weights are read-only and whisper.cpp
+/// gives each decode its own `WhisperState`, so the parallel decodes this
+/// allows are what the library is built for.
+static CTX: Mutex<Option<(String, Arc<whisper_rs::WhisperContext>)>> = Mutex::new(None);
+
+/// The warm context for `model_path`, loading it if this is a different model.
+/// The returned `Arc` outlives the lock deliberately — see [`CTX`].
+fn warm_context(model_path: &Path) -> Result<Arc<whisper_rs::WhisperContext>, String> {
+    use whisper_rs::{WhisperContext, WhisperContextParameters};
+    let key = model_path.to_string_lossy().into_owned();
+    let mut guard = CTX.lock().map_err(|_| "stt context poisoned")?;
+    if guard.as_ref().map(|(k, _)| k.as_str()) != Some(key.as_str()) {
+        let ctx = WhisperContext::new_with_params(&key, WhisperContextParameters::default())
+            .map_err(|e| format!("model load failed: {e}"))?;
+        *guard = Some((key, Arc::new(ctx)));
+    }
+    Ok(guard.as_ref().expect("just set").1.clone())
+}
 
 /// Drop the warm context on app exit. With Metal, ggml ASSERTS during process
 /// teardown when GPU buffers are still resident (`rsets->data count == 0` in
@@ -160,9 +223,19 @@ pub fn unload_ctx() {
 /// gone, or the warm context belongs to another model and must stay.
 pub fn unload_model(path: &Path) -> bool {
     let Ok(mut guard) = CTX.try_lock() else { return false };
-    if guard.as_ref().is_some_and(|(key, _)| Path::new(key) == path) {
-        *guard = None;
+    let Some((key, ctx)) = guard.as_ref() else { return true };
+    if Path::new(key) != path {
+        return true;
     }
+    // A decode in flight holds its own clone of this context now that the lock
+    // is released for the decode itself, and unlinking an mmapped file frees
+    // nothing while that mapping is open. Leave the entry in place and answer
+    // "come back later", exactly as a busy lock used to. Nothing can take a new
+    // clone while this lock is held, so the count cannot go stale under us.
+    if Arc::strong_count(ctx) > 1 {
+        return false;
+    }
+    *guard = None;
     true
 }
 
@@ -183,19 +256,14 @@ pub fn unload_model(path: &Path) -> bool {
 /// near-source text when asked (alfred's `_whisper_can_translate` finding).
 /// Translation runs in the dictation-shaping LLM stage instead (commands.rs).
 pub fn transcribe(model_path: &Path, pcm: &[f32], timestamps: bool) -> Result<String, String> {
-    use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
+    use whisper_rs::{FullParams, SamplingStrategy};
 
     if pcm.len() < 1600 {
         return Ok(String::new()); // < 0.1s of audio: nothing to hear
     }
-    let key = model_path.to_string_lossy().into_owned();
-    let mut guard = CTX.lock().map_err(|_| "stt context poisoned")?;
-    if guard.as_ref().map(|(k, _)| k.as_str()) != Some(key.as_str()) {
-        let ctx = WhisperContext::new_with_params(&key, WhisperContextParameters::default())
-            .map_err(|e| format!("model load failed: {e}"))?;
-        *guard = Some((key, ctx));
-    }
-    let (_, ctx) = guard.as_ref().expect("just set");
+    // The lock ends with this line: a whole-file import must not park the live
+    // recording's decoder thread for the length of the file (see [`CTX`]).
+    let ctx = warm_context(model_path)?;
 
     let mut state = ctx.create_state().map_err(|e| e.to_string())?;
     let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
@@ -431,19 +499,12 @@ pub fn transcribe_segments(
     offset_cs: i64,
     mode: LangMode<'_>,
 ) -> Result<PhraseOut, String> {
-    use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
+    use whisper_rs::{FullParams, SamplingStrategy};
 
     if pcm.len() < 3200 {
         return Ok(PhraseOut::default()); // < 0.2 s: nothing decodable
     }
-    let key = model_path.to_string_lossy().into_owned();
-    let mut guard = CTX.lock().map_err(|_| "stt context poisoned")?;
-    if guard.as_ref().map(|(k, _)| k.as_str()) != Some(key.as_str()) {
-        let ctx = WhisperContext::new_with_params(&key, WhisperContextParameters::default())
-            .map_err(|e| format!("model load failed: {e}"))?;
-        *guard = Some((key, ctx));
-    }
-    let (_, ctx) = guard.as_ref().expect("just set");
+    let ctx = warm_context(model_path)?;
 
     let forced = match mode {
         LangMode::Auto | LangMode::Sniff => None,

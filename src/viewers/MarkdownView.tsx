@@ -72,7 +72,15 @@ export default function MarkdownView({ text, target }: Props) {
         if (lang === "mermaid") {
           return <Mermaid source={String(children ?? "")} />;
         }
-        return <code className={className}>{children}</code>;
+        // Code is left-to-right whatever the prose around it is: inside a
+        // Hebrew note the container below resolves to rtl, and the bidi
+        // algorithm then reorders a line's brackets, slashes and operators
+        // into something that is no longer the code that was written.
+        return (
+          <code className={className} dir="ltr">
+            {children}
+          </code>
+        );
       },
       // A wide table scrolls inside its own box rather than widening the
       // document (or the chat bubble) around it. Presentational only — the
@@ -89,8 +97,14 @@ export default function MarkdownView({ text, target }: Props) {
     [],
   );
 
+  // `dir="auto"` for the same reason every other reader in the family carries it
+  // (ProseView, TextView, EmailView, the Text readings of html/book/worddoc): a
+  // Hebrew or Arabic note laid out left-to-right puts its final punctuation at
+  // the wrong end and its bullets on the wrong side. This renderer draws both
+  // .md files and every AI answer, so it was the one place the app got it wrong
+  // most often.
   return (
-    <div className="md-body" ref={ref} onClick={onClick}>
+    <div className="md-body" dir="auto" ref={ref} onClick={onClick}>
       <ReactMarkdown
         remarkPlugins={[remarkGfm, ...(rich?.remarkPlugins ?? [])]}
         rehypePlugins={rich?.rehypePlugins ?? []}

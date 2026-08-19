@@ -161,10 +161,25 @@ pub(crate) fn schedule_auto_index(app: &tauri::AppHandle, room_path: String) {
                     (unread.first(), crate::main_window(&app))
                 {
                     let state = app.state::<AppState>();
-                    // Best-effort: a room at job capacity, or a recording
-                    // already being read, simply waits for the next tick.
-                    let _ = start_rec_read(&window, state.inner(), &room_path, file_id).await;
-                    return;
+                    // Only a read that actually STARTED has spent this tick's
+                    // model lane and earned the early exit. One that could not
+                    // start — room at job capacity, this recording already
+                    // queued, no transcript yet — spends nothing, and returning
+                    // on it starved the summary sweep below for as long as the
+                    // recording stayed unread: every import after it went
+                    // undescribed, on this tick and on every later one.
+                    if start_rec_read(&window, state.inner(), &room_path, file_id)
+                        .await
+                        .is_ok()
+                    {
+                        return;
+                    }
+                    // That attempt awaited (it resolves the pass engine before
+                    // it can refuse for a full queue), so the same rule as the
+                    // model probe applies to the sweep it now falls through to.
+                    if !mine(&app) {
+                        return;
+                    }
                 }
             }
             match auto_index_decision(setting_on, missing, job_running, asking, models_available) {

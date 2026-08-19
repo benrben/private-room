@@ -194,6 +194,8 @@
   display: flex;
   flex: 1;
   min-height: 0;
+  /* The anchor the hidden source pane stretches to in Preview — see below. */
+  position: relative;
 }
 
 .mde-source {
@@ -246,6 +248,27 @@
 /* In preview-only mode there is no source pane to divide from. */
 .mde[data-layout="preview"] .mde-preview {
   background-image: none;
+}
+
+/* Preview hides the source; it does not unmount it, and it does not take its
+   SIZE away either.
+
+   Unmounting lost the work: the buffer holds the only editable copy of unsaved
+   text, and CodeEditor gives back the save handler and the dirty flag on its
+   way out, so ⌘S and the unsaved-edits prompt went quiet with it.
+
+   `display: none` then cost the second half. Monaco is on `automaticLayout`,
+   which watches the container — and a container with no size lays the buffer
+   out with no size, so coming back to Source painted every line on top of
+   every other until the next save. Out of flow (the preview takes the whole
+   width) but stretched to the pane it left, so what it measures while hidden
+   is what it will be shown at. `visibility: hidden` is what actually hides it:
+   not painted, not clickable, not a tab stop, not read aloud. */
+.mde[data-layout="preview"] .mde-source {
+  position: absolute;
+  inset: 0;
+  visibility: hidden;
+  pointer-events: none;
 }
 
 /* ----- focused writing -----

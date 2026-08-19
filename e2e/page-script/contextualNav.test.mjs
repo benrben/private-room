@@ -515,7 +515,9 @@ test("a second attempt replaces the first failure rather than stacking on it", (
 
 test("opening a file names it, offers the way back, and clears on success", () => {
   const src = read("src/workspace/fileActions.ts");
-  const fn = src.slice(src.indexOf("async function viewFile("));
+  // `viewFile` is the door (it asks about an unsaved edit first — see
+  // unsavedGuard.test.mjs); `openFile` is the read this test is about.
+  const fn = src.slice(src.indexOf("async function openFile("));
   const body = fn.slice(0, fn.indexOf("\n  }"));
   // Unanswerable in a room of two hundred: the click that failed is over, and
   // the message outlives the selection that would have said which file it was.

@@ -256,6 +256,15 @@ pub fn cancel_job(state: State<'_, AppState>, id: String) -> Result<(), String> 
             let job = db::get_job(&room.conn, &id)?;
             if job.status == "queued" {
                 db::set_job_status(&room.conn, &id, "paused", None)?;
+                // A workflow that was removed from the queue never reached the
+                // runner, and the runner's epilogue is the only thing that ever
+                // closed its run row — so without this the row stayed 'running'
+                // with a NULL finished_at forever: a green "Running" badge on
+                // the library card, a live line in Run history, and the job
+                // WorkflowDetail picks as the current one. `park_running_jobs`
+                // does the same for the running case; harmless for the other
+                // kinds, which have no run row.
+                let _ = db::set_workflow_run_status_by_job(&room.conn, &id, "paused");
             }
             Ok(())
         });
@@ -356,6 +365,12 @@ pub(crate) fn quiesce_stale_jobs(conn: &Connection) {
     // NEXT open. Sweeping again here costs one scan of a handful of rows and is
     // a no-op on a room that is already clean.
     let _ = db::dedupe_parked_jobs(conn);
+    // And roll the finished history off the back. Nothing else ever removed a
+    // 'done' job, its artifacts or a closed run row, so an interval-scheduled
+    // workflow grew the encrypted room file without bound and every Activity
+    // refresh re-parsed every historical plan. Room open is the one moment the
+    // connection is held with no runner attached to any row.
+    let _ = db::prune_job_history(conn);
 }
 
 // ------------------------------------------------ a terminal state on EVERY exit
@@ -1189,6 +1204,18 @@ pub async fn resume_job(
     if job.parent_job_id.is_some() {
         return Err("This job runs as part of a workflow — resume the workflow instead.".into());
     }
+    // A recording keeps NO checkpoint: `render_podcast_audio` always starts at
+    // the first turn, so "Resume" would read the whole script to Microsoft's
+    // voice service a second time — a cloud seam the panel only warns about
+    // next to Record, and the one control here cannot relabel. Until a per-turn
+    // checkpoint exists, this says so and sends the user back to the surface
+    // that does warn, rather than crossing that seam behind the word Resume.
+    if job.kind == "podcast_audio" {
+        return Err("A recording can't be picked up part-way: every line would be read \
+                    out to the voice service again. Record the episode again from the \
+                    script when you're ready to send it."
+            .into());
+    }
     if !matches!(
         job.kind.as_str(),
         "deep_summary"
@@ -1196,7 +1223,6 @@ pub async fn resume_job(
             | "workflow"
             | "studio"
             | "download"
-            | "podcast_audio"
             // Resuming a generation re-runs it from scratch, which costs money
             // — but so does the alternative of a card the user cannot retry
             // after a crash, and the button says "Resume" not "Free".
@@ -1878,9 +1904,15 @@ mod tests {
         // pass started". Pin the composition and the digest shape.
         let raw = "Header\nHeader\n\n\n  body line  \n\nHeader\n";
         let filtered = extraction::smart_filter(raw);
-        // Dedupe of CONSECUTIVE repeated lines, blank-run collapse, and
-        // trailing-space trim (leading space is KEPT) are all inside the hash.
-        assert_eq!(filtered, "Header\n\n  body line\n\nHeader\n");
+        // Blank-run collapse and trailing-space trim (leading space is KEPT)
+        // are inside the hash. Consecutive duplicates are NOT collapsed any
+        // more: a short run of identical lines is a ledger's rows, not
+        // boilerplate, and only a run longer than `MAX_IDENTICAL_RUN` is cut
+        // (with a note saying how many lines it stood for). That change moved
+        // this durable format once, on purpose — a pass paused across that
+        // upgrade re-filters differently and is refused with "The file changed
+        // since this pass started", which costs a restart and no data.
+        assert_eq!(filtered, "Header\nHeader\n\n  body line\n\nHeader\n");
         assert_ne!(filtered.len(), raw.len(), "the gate compares FILTERED lengths");
         let d = text_digest(&filtered);
         assert_eq!(d.len(), 64);

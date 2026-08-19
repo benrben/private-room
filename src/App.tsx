@@ -302,7 +302,7 @@ export default function App() {
     if (typeof path === "string") goTo({ kind: "unlock", path });
   }
 
-  // "Try a demo room": jump straight into the create flow with the bundled
+  // "Create a demo room": jump straight into the create flow with the bundled
   // demo template pre-selected, so the user only sets a password. goTo resets
   // the picker to blank; the setters below run in the same batch and win.
   function chooseDemo() {
@@ -421,6 +421,18 @@ export default function App() {
       } catch (e) {
         console.error("Could not create a recovery code", e);
         if (navEpochRef.current !== epoch) return; // stale: gate moved on
+        // The create screen has just promised, unconditionally, that a
+        // one-time code on the next screen is the only way back into a room
+        // whose password is forgotten. Entering quietly would leave that
+        // promise broken with nothing but a console line to show for it.
+        await message(
+          "The room was created, but its recovery code could not be written. " +
+            "As it stands, this room can only ever be opened with its " +
+            "password. You can make a recovery key in Settings → " +
+            "Privacy & recovery.",
+          { title: "No recovery code was made", kind: "warning" },
+        ).catch(() => {});
+        if (navEpochRef.current !== epoch) return; // stale: gate moved on
         enterRoom(info);
       }
     } catch (e) {
@@ -469,8 +481,18 @@ export default function App() {
       const info = await openRoomWithRecovery(path, code);
       if (navEpochRef.current !== epoch) return; // stale: the gate moved on
       enterRoom(info);
-    } catch {
-      setError("That recovery code didn't work. Check it and try again.");
+    } catch (e) {
+      const msg = String(e);
+      console.error("recovery unlock failed:", msg);
+      // A recovery unlock recovers the password and then runs the FULL open,
+      // so a disconnected drive or a damaged file arrives in this catch too.
+      // Only a verdict on the code itself may blame the code — the one
+      // credential this user has left.
+      setError(
+        /recovery code/i.test(msg)
+          ? "That recovery code didn't work. Check it and try again."
+          : unlockMessage(msg),
+      );
     } finally {
       setBusy(false);
     }
@@ -570,7 +592,13 @@ export default function App() {
             onCreate={chooseCreate}
             onOpen={chooseOpen}
             onDemo={chooseDemo}
-            onOpenRecent={(path) => goTo({ kind: "unlock", path })}
+            onOpenRecent={(path) => {
+              // The row already knows the file is gone, so asking for its
+              // password authenticates against nothing. The picker is the
+              // thing that can be told where the room moved to.
+              if (recent.find((r) => r.path === path)?.missing) void chooseOpen();
+              else goTo({ kind: "unlock", path });
+            }}
             onRemoveRecent={removeRecent}
             onClearRecent={clearRecent}
           />

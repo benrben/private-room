@@ -57,6 +57,10 @@ export function QuickActionsMenu({
   pill,
 }: Props) {
   const menuRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  // Whether the menu was open on the previous render, so closing can hand
+  // focus back WITHOUT the first render stealing it from whatever has it.
+  const wasOpen = useRef(false);
   const [focusIdx, setFocusIdx] = useState(0);
 
   const inline = actions.slice(0, inlineMax ?? 0);
@@ -64,8 +68,25 @@ export function QuickActionsMenu({
   const menuItems: QuickAction[] = overflow;
   const showTrigger = menuItems.length > 0 || footer != null || (inlineMax == null && actions.length > 0);
 
+  // The menu takes focus on open (below), so it owes it back on close: it
+  // unmounts while a menu item holds focus, which drops focus on <body> and
+  // restarts the next Tab at the top of the document. Escape, a chosen item
+  // and the backdrop all end here.
   useEffect(() => {
-    if (open) setFocusIdx(0);
+    if (open) {
+      setFocusIdx(0);
+      wasOpen.current = true;
+      return;
+    }
+    if (wasOpen.current) {
+      wasOpen.current = false;
+      // Only reclaim what the menu DROPPED. A chosen item can open a dialog or
+      // a page that focuses something itself, and that focus commits before
+      // this effect runs — pulling it back to the trigger would be the same
+      // defect pointed the other way.
+      const active = document.activeElement;
+      if (!active || active === document.body) triggerRef.current?.focus();
+    }
   }, [open]);
 
   useEffect(() => {
@@ -117,16 +138,22 @@ export function QuickActionsMenu({
           className="qa-pill"
           title={a.hint ?? a.label}
           // An icon-only button's name came from `title` alone, which is a
-          // hint and not a label. Same words, said properly.
-          aria-label={a.hint ?? a.label}
-          disabled={a.disabled}
-          onClick={a.onRun}
+          // hint and not a label — and then from the HINT, so a control with a
+          // short name announced as a sentence. The name is the label; the
+          // hint stays the hint.
+          aria-label={a.label}
+          // aria-disabled, never the attribute (see AreaChip in FrontPage): a
+          // disabled button fires no pointer events, so the title explaining
+          // why it cannot be used can never open.
+          aria-disabled={a.disabled || undefined}
+          onClick={a.disabled ? undefined : a.onRun}
         >
           {a.icon ?? "•"}
         </button>
       ))}
       {showTrigger && (
         <button
+          ref={triggerRef}
           className={pill ? "qa-pill" : "subtle btn-ic"}
           title={buttonLabel}
           // Only in the pill form: the text form already says the words, and

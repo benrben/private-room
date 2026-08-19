@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { useFrameTheme } from "./frameTheme";
 
 /** One id per diagram on the page — mermaid needs a unique DOM id per render
  * and reusing one makes the second diagram overwrite the first. */
@@ -10,25 +11,28 @@ let nextId = 0;
  * dozen diagrams loads it once. */
 let mermaidPromise: Promise<typeof import("mermaid").default> | null = null;
 function loadMermaid() {
-  if (!mermaidPromise) {
-    mermaidPromise = import("mermaid").then((m) => {
-      m.default.initialize({
-        startOnLoad: false,
-        // The app has a light and a dark theme; "base" plus CSS variables
-        // would need a full theme map, so follow the OS setting, which is
-        // what the app's own theme follows by default.
-        theme: window.matchMedia?.("(prefers-color-scheme: dark)").matches
-          ? "dark"
-          : "default",
-        // A diagram in a note is untrusted input like any other file content:
-        // strict blocks click handlers and raw HTML labels.
-        securityLevel: "strict",
-        fontFamily: "inherit",
-      });
-      return m.default;
-    });
-  }
+  if (!mermaidPromise) mermaidPromise = import("mermaid").then((m) => m.default);
   return mermaidPromise;
+}
+
+/** mermaid keeps ONE global configuration for the whole module, so the palette
+ * is set immediately before each render rather than once when the module
+ * arrives. Configuring at import time meant every diagram of the session was
+ * drawn in whichever palette the FIRST fence happened to load under, and no
+ * theme change afterwards could reach it. */
+function configure(mermaid: Awaited<ReturnType<typeof loadMermaid>>, dark: boolean) {
+  mermaid.initialize({
+    startOnLoad: false,
+    // "base" plus CSS variables would need a full theme map; mermaid's own two
+    // palettes track the APP's light/dark setting, which is what the diagram
+    // sits on — the Mac's setting is not it, and pinning the app opposite to
+    // the Mac used to give dark node fills on ivory paper.
+    theme: dark ? "dark" : "default",
+    // A diagram in a note is untrusted input like any other file content:
+    // strict blocks click handlers and raw HTML labels.
+    securityLevel: "strict",
+    fontFamily: "inherit",
+  });
 }
 
 /** A ```mermaid code fence, drawn as a diagram.
@@ -40,6 +44,7 @@ export default function Mermaid({ source }: { source: string }) {
   const [svg, setSvg] = useState("");
   const [error, setError] = useState("");
   const idRef = useRef(`mmd-${nextId++}`);
+  const theme = useFrameTheme();
 
   useEffect(() => {
     let alive = true;
@@ -52,6 +57,7 @@ export default function Mermaid({ source }: { source: string }) {
     (async () => {
       try {
         const mermaid = await loadMermaid();
+        configure(mermaid, theme === "dark");
         // `parse` throws on a syntax error before anything is injected, which
         // keeps a broken diagram from leaving mermaid's error graphic behind.
         await mermaid.parse(body);
@@ -70,7 +76,9 @@ export default function Mermaid({ source }: { source: string }) {
     return () => {
       alive = false;
     };
-  }, [source]);
+    // `theme` is a dependency, not a read: a diagram already on screen has to
+    // be drawn again when the room changes theme, or it keeps the old palette.
+  }, [source, theme]);
 
   if (error) {
     return (

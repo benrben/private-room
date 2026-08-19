@@ -175,6 +175,23 @@ mod tests {
             .unwrap_or(0)
     }
 
+    /// Count leftover temp copies with NO extension — the shape
+    /// `temp_path_for` produces for an extension-less name. Every other test
+    /// here owns an extension, so a dot rules a file out of this count and the
+    /// parallel-thread race the extension filter above avoids stays avoided.
+    fn extensionless_leftovers() -> usize {
+        std::fs::read_dir(std::env::temp_dir())
+            .map(|d| {
+                d.filter_map(Result::ok)
+                    .filter(|e| {
+                        let n = e.file_name().to_string_lossy().into_owned();
+                        n.starts_with("arcelle-ql-") && !n.contains('.')
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
     #[test]
     fn empty_bytes_are_not_written_to_disk_at_all() {
         assert!(preview_png("thing.key", &[]).is_none());
@@ -204,10 +221,13 @@ mod tests {
         // thumbnail for it is the environment's business and not what this test
         // is about — what matters is that the call cannot leave a decrypted
         // copy behind, which the assertion below is the one that states.
-        // (This was `assert!(… .is_none() || true)`, which asserts nothing:
-        // `|| true` is true whatever the call returns.)
+        assert_eq!(extensionless_leftovers(), 0, "a previous run leaked");
         let _ = preview_png("noext", b"hello");
-        assert_eq!(leftovers("-noextprobe"), 0);
+        assert_eq!(
+            extensionless_leftovers(),
+            0,
+            "a decrypted preview copy of an extension-less file was left behind"
+        );
     }
 
     #[cfg(unix)]

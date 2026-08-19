@@ -1,7 +1,8 @@
 import ToolBadgeIcon from "./ToolBadgeIcon";
 import type { AiStatus, IconComponent, ModelCaps, SttStatus } from "./types";
-import { CheckIcon, CloseIcon, CircleCheckIcon } from "../icons";
+import { CircleCheckIcon } from "../icons";
 import EngineModelPicker from "../workspace/EngineModelPicker";
+import DeleteControl from "../workspace/DeleteControl";
 
 interface Props {
   ai: AiStatus | null;
@@ -71,11 +72,26 @@ export default function ModelSection({
   return (
     <section id="set-model">
       <h3>Model</h3>
-            <p className="settings-hint">
-              The AI that lives in this room. Models run locally through
-              Ollama — except <b>:cloud</b> models, which run on Ollama's
-              servers: your prompts and file context leave this Mac.
-            </p>
+            {/* Where the model runs is not readable from its name once a
+                remote Ollama is saved: every tag below then runs on THAT
+                machine, and this is the one screen where the model is chosen.
+                The status-bar trust chip already ORs `remoteRelay` in
+                (workspace/markup.isCloudRoute); this sentence has to agree
+                with it. */}
+            {ai?.remoteRelay ? (
+              <p className="settings-hint">
+                The AI that lives in this room. This room's Ollama is another
+                machine on your network (Settings → Remote AI), so every model
+                listed below runs there, not on this Mac — your prompts and file
+                context travel to it.
+              </p>
+            ) : (
+              <p className="settings-hint">
+                The AI that lives in this room. Models run locally through
+                Ollama — except <b>:cloud</b> models, which run on Ollama's
+                servers: your prompts and file context leave this Mac.
+              </p>
+            )}
             {ai && (
               <>
                 <EngineModelPicker
@@ -116,35 +132,32 @@ export default function ModelSection({
                           </span>
                         );
                       })()}
-                      {confirmModel === m ? (
-                        <span className="model-confirm">
-                          <span className="settings-hint">Delete?</span>
-                          <button
-                            className="subtle btn-ic confirm-yes"
-                            title="Confirm delete"
-                            aria-label="Confirm delete"
-                            onClick={() => confirmRemoveModel(m)}
-                          >
-                            <CheckIcon size={14} />
-                          </button>
-                          <button
-                            className="subtle btn-ic confirm-no"
-                            title="Keep model"
-                            aria-label="Keep model"
-                            onClick={cancelRemoveModel}
-                          >
-                            <CloseIcon size={14} />
-                          </button>
-                        </span>
-                      ) : (
+                      {/* The shared control, not a second copy of it: arming
+                          this unmounted the button that was pressed, so the ✓
+                          it replaced it with was unreachable from the keyboard
+                          and the question was never announced. DeleteControl
+                          moves the focus, carries role="alert", and blocks the
+                          agent driver from clicking ✓ on a multi-gigabyte
+                          delete it did not earn. */}
+                      {m === model ? (
                         <button
-                          className="subtle btn-ic"
-                          title={m === model ? "Can't delete the active model" : "Delete model from disk"}
-                          disabled={m === model}
-                          onClick={() => askRemoveModel(m)}
+                          className="chip-btn"
+                          title="Can't delete the active model"
+                          aria-label="Can't delete the active model"
+                          disabled
                         >
                           <TrashIcon size={14} />
                         </button>
+                      ) : (
+                        <DeleteControl
+                          k={m}
+                          trigger={<TrashIcon size={14} />}
+                          title={`Delete ${m} from disk`}
+                          confirmDelete={confirmModel}
+                          askConfirm={askRemoveModel}
+                          cancelConfirm={cancelRemoveModel}
+                          onConfirm={() => confirmRemoveModel(m)}
+                        />
                       )}
                     </>
                   )}
@@ -172,17 +185,29 @@ export default function ModelSection({
                      sentence is a core promise, so it runs at lead size. */
                   <p className="set-note set-note--flag set-note--lead nb-sem-urgent">
                     <AlertIcon size={16} className="warn-ic" /> Cloud engines send your questions and room context to your
-                    connected AI provider or account — content leaves this Mac. Images stay
-                    local (vision and image marking always use the local model).
+                    connected AI provider or account — content leaves this Mac. Images
+                    stay on this Mac only while Cloud privacy is on for this room:
+                    with the door off, a cloud model that can see images is handed
+                    them for vision and image marking.
                   </p>
                 )}
               </>
             )}
             <div className="pull-row">
+              {/* This field holds a registry identifier, not prose. macOS's
+                  "capitalize words automatically" applies to WebKit text
+                  fields, and Ollama files a pulled model under whatever string
+                  it was handed — so one silent capital produced a model that
+                  appeared installed and 404'd on every request. The Rust side
+                  normalises it too (`registry_name`); this stops the surprise
+                  where the user can still see it. */}
               <input
                 placeholder="Download a model… e.g. qwen3.5:9b, gemma3:4b"
                 value={pullName}
                 disabled={pulling}
+                autoCapitalize="off"
+                autoCorrect="off"
+                spellCheck={false}
                 onChange={(e) => setPullName(e.target.value)}
                 onKeyDown={(e) => e.key === "Enter" && pull()}
               />
@@ -198,7 +223,11 @@ export default function ModelSection({
                 </button>
               )}
             </div>
-            {(pullStatus || pullPercent != null) && (
+            {/* Only the download THIS section started. The AI-helpers buttons
+                write to the same pullStatus/pullPercent pair without setting
+                `pulling`, so an ungated block painted a second, unlabelled and
+                uncancellable bar under an input the user never touched. */}
+            {pulling && (pullStatus || pullPercent != null) && (
               <div className="pull-progress">
                 {pullPercent != null && (
                   <div className="pull-bar">

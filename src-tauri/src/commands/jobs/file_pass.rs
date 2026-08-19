@@ -509,6 +509,52 @@ pub(crate) async fn execute_pass_step<R: tauri::Runtime>(
     }
 }
 
+/// The child row a re-entered file_pass node should carry on with, and where it
+/// left off — `None` when this node has never run, or ran against a different
+/// file/instruction/mode.
+///
+/// Identity is the PLAN, for `db::work_identity`'s reason: the plan is the whole
+/// definition of what a resume would do, and it already carries the file's
+/// digest, so a file edited between the two runs produces a different plan and
+/// correctly starts a fresh child rather than resuming over text that moved.
+/// Compared as re-serialized JSON, never as stored text.
+///
+/// Only unfinished children are eligible: a 'done' child is this node's finished
+/// work (or an identical sibling node's), and re-driving it would seed every
+/// step as done and publish nothing.
+fn resumable_child(
+    conn: &Connection,
+    parent_job_id: &str,
+    plan_json: &serde_json::Value,
+) -> Result<Option<(String, i64)>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, plan, cursor FROM jobs \
+             WHERE parent_job_id = ?1 AND kind = 'file_pass' \
+               AND status IN ('queued','paused','error','running') \
+             ORDER BY created_at DESC, rowid DESC",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([parent_job_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    for (id, plan, cursor) in rows {
+        // An unreadable plan is not evidence of sameness — skip it rather than
+        // resume a row whose windows we cannot confirm are these windows.
+        let Ok(stored) = serde_json::from_str::<serde_json::Value>(&plan) else {
+            continue;
+        };
+        if &stored == plan_json {
+            return Ok(Some((id, cursor.max(0))));
+        }
+    }
+    Ok(None)
+}
+
 /// Wave 4a: drive a whole-file pass INLINE as a workflow node's child job.
 /// Generic over the runtime so the workflow executor (and its mock e2e harness)
 /// can drive it. Creates a CHILD job row (parent-tagged, so pump/resume/quiesce
@@ -565,14 +611,25 @@ pub(crate) async fn drive_file_pass<R: tauri::Runtime>(
     };
     let plan_json = serde_json::to_value(&plan).map_err(|e| e.to_string())?;
     let title = format!("Full pass — {file_name}");
-    let child_id = {
+    // A parent that was stopped re-drives this node from the top, so without
+    // this lookup every pause/resume minted a SECOND child row and re-read the
+    // whole file from window 0 — the checkpoint and the window artifacts of the
+    // first attempt left behind as an orphan nothing lists. Carrying on with
+    // the same row is what `start_file_pass_row` does for a top-level pass.
+    let (child_id, start_cursor) = {
         let guard = state.room.lock().unwrap();
         let room = guard
             .as_ref()
             .filter(|r| r.path == room_path)
             .ok_or("The room this job belongs to is no longer open.")?;
-        db::create_child_job(&room.conn, "file_pass", &title, &plan_json,
-            steps.len() as i64, parent_job_id)?
+        match resumable_child(&room.conn, parent_job_id, &plan_json)? {
+            Some((id, cursor)) => (id, usize::try_from(cursor).unwrap_or(0).min(steps.len())),
+            None => (
+                db::create_child_job(&room.conn, "file_pass", &title, &plan_json,
+                    steps.len() as i64, parent_job_id)?,
+                0,
+            ),
+        }
     };
     {
         let guard = state.room.lock().unwrap();
@@ -584,7 +641,7 @@ pub(crate) async fn drive_file_pass<R: tauri::Runtime>(
     let published: std::sync::Mutex<Option<FileMeta>> = std::sync::Mutex::new(None);
     let outcome = run_plan(
         &steps,
-        std::collections::HashSet::new(),
+        (0..start_cursor).collect(),
         cancel.clone(),
         |s| {
             let app = app.clone();
@@ -808,6 +865,66 @@ mod tests {
 
     fn art(result: &str, skipped: bool) -> PassArtifact {
         PassArtifact { result: result.into(), thread: String::new(), skipped, file_id: None }
+    }
+
+    /// A workflow's file_pass node is re-driven from the top on every resume,
+    /// so the child row it finds (or fails to find) decides whether 20 windows
+    /// are re-read through the model and billed a second time — and whether the
+    /// room keeps a second child row plus a second set of artifacts for one
+    /// node.
+    #[test]
+    fn a_re_driven_node_carries_on_with_its_own_parked_child() {
+        let conn = db::open_in_memory_schema();
+        let parent =
+            db::create_job(&conn, "workflow", "Morning digest", &serde_json::json!({}), 2).unwrap();
+        let plan = serde_json::to_value(plan_for("merge", vec![(0, 32_000), (31_600, 60_000)], 60_000))
+            .unwrap();
+        let child = db::create_child_job(&conn, "file_pass", "Full pass — book.txt", &plan, 5, &parent)
+            .unwrap();
+        db::checkpoint_job(&conn, &child, 20, &serde_json::json!({})).unwrap();
+        db::set_job_status(&conn, &child, "paused", None).unwrap();
+
+        assert_eq!(
+            resumable_child(&conn, &parent, &plan).unwrap(),
+            Some((child.clone(), 20)),
+            "the stopped child is where this node left off"
+        );
+
+        // A different file (or instruction, or mode) is different work: its
+        // artifacts do not align with these step ids.
+        let elsewhere = serde_json::to_value(PassPlan {
+            file_id: "file-2".into(),
+            ..plan_for("merge", vec![(0, 32_000), (31_600, 60_000)], 60_000)
+        })
+        .unwrap();
+        assert_eq!(resumable_child(&conn, &parent, &elsewhere).unwrap(), None);
+
+        // Another workflow's child is not ours, however identical the plan.
+        let stranger =
+            db::create_job(&conn, "workflow", "Weekly digest", &serde_json::json!({}), 2).unwrap();
+        assert_eq!(resumable_child(&conn, &stranger, &plan).unwrap(), None);
+
+        // A finished child is this node's completed work: re-driving it would
+        // seed every step as done and publish nothing.
+        db::set_job_status(&conn, &child, "done", None).unwrap();
+        assert_eq!(resumable_child(&conn, &parent, &plan).unwrap(), None);
+    }
+
+    #[test]
+    fn a_child_whose_plan_will_not_parse_is_never_resumed_over() {
+        // Sameness has to be PROVEN. An unreadable plan is not proof, and
+        // resuming over it would seed `0..cursor` as done across windows
+        // nothing can confirm are these windows.
+        let conn = db::open_in_memory_schema();
+        let parent =
+            db::create_job(&conn, "workflow", "Digest", &serde_json::json!({}), 1).unwrap();
+        let plan = serde_json::to_value(plan_for("stitch", vec![(0, 10)], 10)).unwrap();
+        let child =
+            db::create_child_job(&conn, "file_pass", "Full pass — book.txt", &plan, 2, &parent)
+                .unwrap();
+        conn.execute("UPDATE jobs SET plan = 'not json' WHERE id = ?1", [child.as_str()])
+            .unwrap();
+        assert_eq!(resumable_child(&conn, &parent, &plan).unwrap(), None);
     }
 
     /// Drive one step against the mock room, returning its result and whatever

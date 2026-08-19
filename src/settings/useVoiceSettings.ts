@@ -40,6 +40,33 @@ export function useVoiceSettings(visible: boolean) {
     voiceFingerprint("", "off", { ...ARCHETYPE_DEFAULTS.off }),
   );
 
+  // Whether the sample this hook started is still playing. A ref, because the
+  // unmount cleanup below runs after the last render and would read a stale
+  // `previewing` out of that render's closure.
+  const previewingRef = useRef(false);
+
+  // Closing Settings mid-sample used to leave the room talking with nothing on
+  // screen able to stop it — the "Stop preview" button unmounts with the modal,
+  // and the sentence went on in the UNSAVED voice the user was auditioning.
+  // Only when this hook still owns the pipeline: an unconditional cancelAll
+  // here would also cut off an answer being read aloud behind the modal.
+  //
+  // Ownership is only as good as what voice.ts reports. cancelAll and the
+  // end-of-audio path both call back with `false`, but `beginTurn` takes the
+  // pipeline WITHOUT clearing the manual-state callback — so a hands-free
+  // auto-send during a preview leaves this flag reading true for the length of
+  // the answer, and closing Settings then cuts that answer off. Closing it for
+  // real means clearing onManualState in beginTurn, in voice.ts.
+  useEffect(
+    () => () => {
+      if (previewingRef.current) {
+        previewingRef.current = false;
+        voice.cancelAll();
+      }
+    },
+    [],
+  );
+
   // Once, and only after the Voice page is on screen. The ref (not `voices
   // .length`) is the guard because an empty catalog is a legitimate answer —
   // retrying on it would put the app back to one request per render.
@@ -122,17 +149,22 @@ export function useVoiceSettings(visible: boolean) {
   function preview() {
     if (previewing) {
       voice.cancelAll();
+      previewingRef.current = false;
       setPreviewing(false);
       return;
     }
     voice.ensureUnlocked();
+    previewingRef.current = true;
     setPreviewing(true);
     voice.speakText("I have read every page you keep in this room.", {
       archetype,
       params,
       neuralVoiceId: neuralVoiceId || null,
       onState: (playing) => {
-        if (!playing) setPreviewing(false);
+        if (!playing) {
+          previewingRef.current = false;
+          setPreviewing(false);
+        }
       },
     });
   }

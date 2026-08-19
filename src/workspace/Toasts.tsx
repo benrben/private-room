@@ -34,13 +34,17 @@ const TOAST_MARK: Record<Toast["kind"], string> = {
  * owns the toast list and its lifecycle.
  *
  * These are the app's only report that something failed, so they are ANNOUNCED:
- * the stack is a live region, and an error is an `alert` (interrupting) while
- * successes and notices are polite `status` messages. Without this a blind user
- * was told nothing at all when an action failed. */
+ * each toast is its OWN live region — an error is an `alert` (interrupting)
+ * while successes and notices are polite `status` messages. Without this a
+ * blind user was told nothing at all when an action failed.
+ *
+ * The stack itself must not be a live region too: an insertion inside one is
+ * announced at the container's politeness, so a polite wrapper quietly demoted
+ * every error to the same "wait your turn" as a success. */
 export default function Toasts({ toasts, dismissToast }: ToastsProps) {
   if (toasts.length === 0) return null;
   return (
-    <div className="toast-stack" aria-live="polite" aria-relevant="additions">
+    <div className="toast-stack">
       {toasts.map((t) => (
         <div
           key={t.id}

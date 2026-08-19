@@ -33,7 +33,6 @@ import { displayName } from "./composer";
 import ChatPane from "./ChatPane";
 import StudioShelf from "./StudioShelf";
 import PodcastPanel from "./PodcastPanel";
-import { useAdaptiveText } from "./adaptiveText";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
 import { WorkArea } from "./types";
@@ -44,6 +43,23 @@ import {
   pendingApprovalCount,
   runningJobCount,
 } from "../shell/activity";
+
+/** Not a scope. The last option in the scope select opens the sources list
+ * rather than changing what the turn reads — see the strip below for why it
+ * lives inside the same control. */
+const PICK_FILES = "__pick_files";
+
+/** The tab order the strip renders, and the order the arrow keys walk. */
+const AI_TABS = ["chat", "studio", "activity"] as const;
+
+/** Job kinds that narrate themselves through `studio-step` rather than through
+ * `job-progress`. Both emit one progress event ("Starting…") and then go quiet
+ * for minutes; the podcast recorder is on the list because its steps include
+ * the one saying every line is sent to a cloud voice service, which is a
+ * privacy consequence and must not go unsaid because the row that carried it
+ * was folded into the job's own. Emitters: commands/studios.rs and
+ * commands/studios/podcast_audio.rs. */
+const STEP_KINDS: readonly string[] = ["studio", "podcast_audio"];
 
 /** Pane 3: persistent Chat / Studio / Activity tabs. Chat keeps the entire
  * existing conversation surface; Studio hosts the room's transformations;
@@ -99,17 +115,43 @@ export default function AiPane({
     setTurnScope(view);
     return () => setTurnScope(ROOM_ONLY);
   }, [view]);
+  // A `role="tablist"` owes Left/Right and Home/End, and ONE Tab stop rather
+  // than one per tab — the same contract shell/TabStrip.tsx keeps. This strip
+  // announced the pattern and answered none of it, on the pane a person meets
+  // every session. The header also holds the pane's own icon buttons, so the
+  // handler acts only when a tab has the focus.
+  const onTabKey = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    const from = AI_TABS.indexOf(s.aiTab);
+    if (from < 0 || !(e.target as HTMLElement).closest(".assistant-tab")) return;
+    const to =
+      e.key === "ArrowLeft"
+        ? (from + AI_TABS.length - 1) % AI_TABS.length
+        : e.key === "ArrowRight"
+          ? (from + 1) % AI_TABS.length
+          : e.key === "Home"
+            ? 0
+            : e.key === "End"
+              ? AI_TABS.length - 1
+              : -1;
+    if (to < 0) return;
+    e.preventDefault();
+    s.setAiTab(AI_TABS[to]);
+    document.getElementById(`ai-tab-${AI_TABS[to]}`)?.focus();
+  };
   return (
     <>
       <div
         className="assistant-header"
         role="tablist"
         aria-label="AI tools"
+        onKeyDown={onTabKey}
       >
         <button
+          id="ai-tab-chat"
           className="assistant-tab"
           role="tab"
           aria-selected={s.aiTab === "chat"}
+          tabIndex={s.aiTab === "chat" ? 0 : -1}
           aria-label="Chat"
           data-tip="Chat"
           onClick={() => s.setAiTab("chat")}
@@ -118,9 +160,11 @@ export default function AiPane({
           <span>Chat</span>
         </button>
         <button
+          id="ai-tab-studio"
           className="assistant-tab"
           role="tab"
           aria-selected={s.aiTab === "studio"}
+          tabIndex={s.aiTab === "studio" ? 0 : -1}
           aria-label="Studio"
           data-tip="Studio"
           onClick={() => s.setAiTab("studio")}
@@ -129,9 +173,11 @@ export default function AiPane({
           <span>Studio</span>
         </button>
         <button
+          id="ai-tab-activity"
           className="assistant-tab"
           role="tab"
           aria-selected={s.aiTab === "activity"}
+          tabIndex={s.aiTab === "activity" ? 0 : -1}
           aria-label={
             pendingApprovals > 0
               ? "Activity — something needs your approval"
@@ -190,40 +236,39 @@ export default function AiPane({
           <div className="context-strip">
             <span className="context-label">
               <span className="context-label-prefix">Answering from </span>
-              {/* With a page on screen the scope is a CHOICE, so it is a real
-                  control rather than a shortcut to the sources list. Nothing
-                  may float over the native web page — but this is the sibling
-                  pane, so a plain select is exactly what it looks like. */}
-              {view.available.length > 1 ? (
-                <select
-                  className="context-scope"
-                  aria-label="What this chat answers from"
-                  title="Change what this chat answers from"
-                  value={view.scope}
-                  onChange={(e) => setChosen(e.target.value as BrowserScope)}
-                >
-                  {view.available.map((k) => (
-                    <option key={k} value={k}>
-                      {scopeLabel(k, subject)}
-                    </option>
-                  ))}
-                </select>
-              ) : (
-                <button
-                  className="context-count"
-                  title={
-                    s.attachments.length > 0
-                      ? "Change which files are attached"
-                      : "Pick specific files for the AI to answer from"
-                  }
-                  onClick={() => {
+              {/* One control, always. This slot used to be a select when a page
+                  was on screen and a button that navigated away when one was
+                  not — the same appearance for two different acts, and no route
+                  to the sources list at all while the select was showing. The
+                  files option stays last and is not a scope; it opens the list
+                  and leaves the chosen scope alone. Nothing may float over the
+                  native web page — but this is the sibling pane, so a plain
+                  select is exactly what it looks like. */}
+              <select
+                className="context-scope"
+                aria-label="What this chat answers from"
+                title="Change what this chat answers from"
+                value={view.scope}
+                onChange={(e) => {
+                  if (e.target.value === PICK_FILES) {
                     s.setLibraryTab("sources");
                     layout.showPane("library");
-                  }}
-                >
-                  {view.label}
-                </button>
-              )}
+                    return;
+                  }
+                  setChosen(e.target.value as BrowserScope);
+                }}
+              >
+                {view.available.map((k) => (
+                  <option key={k} value={k}>
+                    {scopeLabel(k, subject)}
+                  </option>
+                ))}
+                <option value={PICK_FILES}>
+                  {s.attachments.length > 0
+                    ? "Change which files are attached…"
+                    : "Choose files…"}
+                </option>
+              </select>
             </span>
             {/* The consequence of the scope, in the words the composer's own
                 cloud strip uses for the same fact. Only when it is true: on a
@@ -249,9 +294,7 @@ export default function AiPane({
 
       {s.aiTab === "studio" && <StudioView s={s} a={a} area={area} />}
 
-      {s.aiTab === "activity" && (
-        <ActivityPanel s={s} a={a} roomId={info.path} />
-      )}
+      {s.aiTab === "activity" && <ActivityPanel s={s} a={a} />}
     </>
   );
 }
@@ -309,10 +352,16 @@ function StudioView({
 }) {
   void area;
   const scope = s.openFile?.id;
-  const jobRunning = s.jobs.some(
-    (j) => j.status === "running" || j.status === "queued",
+  // The row may only report on the work it starts. Read across every job kind,
+  // this greyed itself out and said "Working…" about a film run or a flashcard
+  // deck — a false reading on the one row whose state a person waits on. The
+  // kind is the same one `startDeepSummary` tests before deciding anything.
+  const summaryRunning = s.jobs.some(
+    (j) =>
+      j.kind === "deep_summary" &&
+      (j.status === "running" || j.status === "queued"),
   );
-  const working = s.summaryStarting || jobRunning;
+  const working = s.summaryStarting || summaryRunning;
   // A podcast script's own panel takes over the top of this tab. It is the one
   // thing you can make FROM this particular file, and burying it under the
   // three generic "make something new" cards would put the least discoverable
@@ -417,15 +466,7 @@ function StateTape({ word, mark }: { word: string; mark: string }) {
   return <span className={`nb-tape ${mark} activity-flag`}>{word}</span>;
 }
 
-function ActivityPanel({
-  s,
-  a,
-  roomId,
-}: {
-  s: WSState;
-  a: WSActions;
-  roomId: string;
-}) {
+function ActivityPanel({ s, a }: { s: WSState; a: WSActions }) {
   // A once-a-second tick so running cards' elapsed time advances. Armed only
   // while something is actually running.
   const jobActive = runningJobCount(s) > 0;
@@ -541,12 +582,14 @@ function ActivityPanel({
       )}
 
       {/* The LIVE half: work in flight and work waiting to be picked back up.
-          Everything in here is actionable — Stop, Remove, Resume, Retry. */}
+          Jobs here can be stopped and resumed; the rows that are not jobs — the
+          OCR pass, an import, the recording drain and the optimistic card that
+          answers the summary button before the backend does — carry no control,
+          because there is nothing to interrupt. */}
       <section className="activity-live" aria-label="Work happening now">
         {(running.length > 0 ||
           s.summaryStarting ||
           s.importProgress ||
-          s.studioStep.text ||
           s.ocrFiles.length > 0 ||
           savingRec) && (
           <div className="activity-group-title">Running now</div>
@@ -572,31 +615,10 @@ function ActivityPanel({
           </div>
         )}
 
-        {/* AUDIT 262: what the Studio is doing right now. Rust named each step
-            from the start and nothing displayed it, so a flashcard deck or a
-            mind map sat on "Starting…" for the whole run — minutes, on a local
-            model — and the step that says "your cloud AI is writing (content
-            leaves this Mac)" never reached the person it is about. */}
-        {s.studioStep.text && (
-          <div className="activity-row" role="status">
-            <div className="activity-row-head">
-              <span className="activity-row-title">Studio</span>
-              <StateTape word="Running" mark="nb-sem-linked" />
-            </div>
-            <div
-              className={
-                s.studioStep.local
-                  ? "activity-copy ap-note"
-                  : "activity-copy studio-running-cloud"
-              }
-            >
-              {s.studioStep.text}
-            </div>
-            <div className="activity-progress">
-              <span className="indeterminate" />
-            </div>
-          </div>
-        )}
+        {/* AUDIT 262's Studio step had its own card here, beside the JobRow for
+            the same run: one card carried the words and no Stop, the other
+            carried Stop and the stale "Starting…" the backend emits once. The
+            step is on that JobRow now — one card per run. */}
 
         {s.importProgress && (
           <div className="activity-row" role="status">
@@ -621,7 +643,11 @@ function ActivityPanel({
             model; this optimistic card shows the instant the button is pressed,
             so a click is never silent. */}
         {s.summaryStarting &&
-          !s.jobs.some((j) => j.status === "running" || j.status === "queued") && (
+          !s.jobs.some(
+            (j) =>
+              j.kind === "deep_summary" &&
+              (j.status === "running" || j.status === "queued"),
+          ) && (
             <div className="activity-row" role="status">
               <div className="activity-row-head">
                 <span className="activity-row-title">Room summary</span>
@@ -738,7 +764,7 @@ function ActivityPanel({
               between, breaks the run and renders exactly as it always did. */}
           {groupHistoryRuns(shownHistory).map((group) =>
             group.length > 1 ? (
-              <HistoryGroupRow key={group[0].id} jobs={group} roomId={roomId} />
+              <HistoryGroupRow key={group[0].id} jobs={group} />
             ) : (
               <HistoryRow key={group[0].id} j={group[0]} />
             ),
@@ -838,13 +864,11 @@ function dayLabelOf(iso: string): string {
 }
 
 /** One collapsed group of 2+ same-day, same-name finished runs. The header
- * line is built entirely in code from the runs' own fields (never blank, and
- * never waits on a model); the harness only ever supplies the second line —
- * a plain "N runs, all finished" sentence renders until/unless it does (rule
- * 3: null is common, not an error). Individual runs are collapsed by default
- * behind "Show runs" — nothing is deleted, `HistoryRow` still renders each
- * one unchanged once expanded. */
-function HistoryGroupRow({ jobs, roomId }: { jobs: HistoryJob[]; roomId: string }) {
+ * line and the summary under it are both built in code from the runs' own
+ * fields, so neither is ever blank and neither waits on anything. Individual
+ * runs are collapsed by default behind "Show runs" — nothing is deleted,
+ * `HistoryRow` still renders each one unchanged once expanded. */
+function HistoryGroupRow({ jobs }: { jobs: HistoryJob[] }) {
   const [expanded, setExpanded] = useState(false);
   const latest = jobs[0]; // most recent first, per `groupHistoryRuns`'s contract
   const name = latest.title;
@@ -858,27 +882,13 @@ function HistoryGroupRow({ jobs, roomId }: { jobs: HistoryJob[]; roomId: string 
   );
   const when = Date.parse(latest.updatedAt);
 
-  const facts = { name, runCount, allSucceeded };
-  const prompt =
-    `Write one line (max 20 words), in the same plain, short style as dashboard ` +
-    `copy like "Finished — 1 of 1 steps": summarize what happened across ` +
-    `${runCount} runs of "${name}". Say whether they went the same way each ` +
-    `time or something changed. Use ONLY the facts given — never state a ` +
-    `number, name, or detail that isn't one of them.`;
-  const generated = useAdaptiveText({
-    roomId,
-    kind: "activity_history_group_summary",
-    prompt,
-    facts,
-    maxWords: 20,
-    enabled: true,
-  });
-  // Rule 1/3: the static line renders first and always exists; a generated
-  // one only ever swaps in on top of it, never instead of a blank.
-  const staticFallback = allSucceeded
+  // Written in code, not generated. The only inputs a model had here were the
+  // name, the count and whether every run finished — all three already stated
+  // exactly in the header line above, so the call could only paraphrase its own
+  // evidence less precisely, and paid for the privilege on every visit.
+  const summary = allSucceeded
     ? `${runCount} runs, all finished.`
     : `${runCount} runs — not every one finished all its steps.`;
-  const summary = generated ?? staticFallback;
 
   const runsId = `history-group-runs-${latest.id}`;
   return (
@@ -947,6 +957,13 @@ function JobRow({
   // not being interrupted by anything, and the backend clears the column the
   // moment it moves off 'paused'.
   const parkedReason = !running ? (j.parkedReason ?? null) : null;
+  // A Studio run emits `job-progress` exactly once, at the start, so `live`
+  // holds "Starting…" for the whole of a run that can take minutes. Its real
+  // phases arrive on a separate event, and that is the line worth reading —
+  // including the one saying the content is leaving this Mac. Cleared by the
+  // terminal job event, so it can never outlive the run it describes.
+  const studioStep =
+    STEP_KINDS.includes(j.kind) && s.studioStep.text ? s.studioStep.text : null;
   const friendlyError =
     j.error === "OLLAMA_DOWN"
       ? "The local AI isn't running."
@@ -1024,13 +1041,21 @@ function JobRow({
         )}
       </div>
       <div className="activity-row-foot">
+        {/* A cloud stage says room content is leaving this Mac, and it keeps the
+            caution treatment here that it had on the card this row replaced —
+            the same one chat.css gives .chat-route-cloud for the same fact. The
+            flag comes from the event, never from reading the sentence. */}
         <span
-          className={`activity-copy${j.status === "error" ? "" : " ap-note"}`}
+          className={
+            studioStep && running && !queued && !s.studioStep.local
+              ? "activity-copy studio-running-cloud"
+              : `activity-copy${j.status === "error" ? "" : " ap-note"}`
+          }
         >
           {queued
             ? `Waiting — ${queuePos}${queuePos === 1 ? "st" : queuePos === 2 ? "nd" : queuePos === 3 ? "rd" : "th"} in line`
             : running
-              ? (live?.label ?? "Working…")
+              ? (studioStep ?? live?.label ?? "Working…")
               : j.status === "error"
                 ? (friendlyError ?? "Stopped.")
                 : // A job the APP stopped must not read like one the user

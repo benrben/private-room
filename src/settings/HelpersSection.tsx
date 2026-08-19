@@ -48,9 +48,13 @@ export default function HelpersSection({
               Two small local models that unlock extra features. Each downloads
               once and runs entirely on this Mac.
             </p>
-            {ai?.running ? (
-              <>
-                <label className="settings-label">Vision helper</label>
+            {/* The Ollama gate sits on the DOWNLOAD offers, not on the whole
+                section. Whether this room can already see is answered without
+                Ollama (`groundingModelForRoom` is asked unconditionally), so a
+                room on a cloud vision engine with Ollama stopped must still be
+                told the name of the model that looks at its images rather than
+                being sent to start a daemon it does not need. */}
+            <label className="settings-label">Vision helper</label>
                 {/* "Installed" now means SOMETHING can mark an image for this
                     room — which includes the room's own model. It used to mean
                     "a local model whose name we recognise is present", so a room
@@ -84,15 +88,22 @@ export default function HelpersSection({
                       this — including a cloud one — or download a local helper
                       {recommended ? ` (${recommended.vision})` : ""}.
                     </p>
-                    <button
-                      className="btn-ic"
-                      disabled={!!pullingSpecial || pulling}
-                      onClick={() =>
-                        recommended && pullSpecial(recommended.vision)
-                      }
-                    >
-                      <DownloadIcon size={14} /> Download a local vision helper
-                    </button>
+                    {ai?.running ? (
+                      <button
+                        className="btn-ic"
+                        disabled={!!pullingSpecial || pulling}
+                        onClick={() =>
+                          recommended && pullSpecial(recommended.vision)
+                        }
+                      >
+                        <DownloadIcon size={14} /> Download a local vision helper
+                      </button>
+                    ) : (
+                      <p className="settings-hint">
+                        Ollama is not running — start it to download a local
+                        helper.
+                      </p>
+                    )}
                   </>
                 )}
 
@@ -110,13 +121,21 @@ export default function HelpersSection({
                       {recommended ? ` (${recommended.embed})` : ""}. Turning it
                       on indexes what's already here.
                     </p>
-                    <button
-                      className="btn-ic"
-                      disabled={!!pullingSpecial || pulling}
-                      onClick={() => pullSpecial(recommended?.embed ?? "", true)}
-                    >
-                      <DownloadIcon size={14} /> Turn on semantic search
-                    </button>
+                    {/* This one really is a local pull — there is no cloud
+                        route to it, so the gate belongs here. */}
+                    {ai?.running ? (
+                      <button
+                        className="btn-ic"
+                        disabled={!!pullingSpecial || pulling}
+                        onClick={() => pullSpecial(recommended?.embed ?? "", true)}
+                      >
+                        <DownloadIcon size={14} /> Turn on semantic search
+                      </button>
+                    ) : (
+                      <p className="settings-hint">
+                        Ollama is not running — start it to turn this on.
+                      </p>
+                    )}
                   </>
                 )}
 
@@ -146,12 +165,6 @@ export default function HelpersSection({
                     </button>
                   </div>
                 )}
-              </>
-            ) : (
-              <p className="settings-hint">
-                Ollama is not running — start it to add these helpers.
-              </p>
-            )}
     </section>
   );
 }

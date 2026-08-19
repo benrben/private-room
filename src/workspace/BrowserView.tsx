@@ -22,6 +22,7 @@ import {
 } from "./browserChrome";
 import {
   EPHEMERAL_VS_ROOM,
+  NOT_ANONYMOUS,
   privacyClaim,
   protectionAlert,
   startScreenCopy,
@@ -121,6 +122,9 @@ export function BrowserView({
   const verifiedForRef = useRef<string | null>(null);
   const [journalOpen, setJournalOpen] = useState(false);
   const [journal, setJournal] = useState<BrowseJournalRow[]>([]);
+  // Why the last read of the record failed, if it did. `null` is "the rows
+  // below are what the room holds"; anything else means they are not.
+  const [journalError, setJournalError] = useState<string | null>(null);
   // The journal is the ONLY record of what the assistant did in this browser
   // and Clear erases it with no undo. It used to fire on the first click.
   const [confirmClear, setConfirmClear] = useState(false);
@@ -140,12 +144,31 @@ export function BrowserView({
   const [saving, setSaving] = useState(false);
   // A block list being re-compiled at the user's request (`retryProtection`).
   const [retrying, setRetrying] = useState(false);
-  const [notice, setNotice] = useState<string | null>(null);
+  const [notice, setNoticeText] = useState<string | null>(null);
+  // ONE notice, ONE timer. Every transient notice used to arm its own
+  // `setTimeout` against the same state, so an earlier notice's timer went on
+  // running after a later one replaced it: open a result in a new tab (4 s),
+  // save the page three seconds later, and the "Saved …" confirmation was
+  // wiped a second after it appeared by a banner that had already gone.
+  const noticeTimer = useRef(0);
+  const setNotice = useCallback((message: string | null, ms = 0) => {
+    window.clearTimeout(noticeTimer.current);
+    noticeTimer.current = ms > 0 ? window.setTimeout(() => setNoticeText(null), ms) : 0;
+    setNoticeText(message);
+  }, []);
+  useEffect(() => () => window.clearTimeout(noticeTimer.current), []);
   // BROWSE-3: the results page. Held in memory only — a stored list of
   // queries is a search history, which is the one thing this browser promises
   // not to keep (same doctrine as tabs.ts `isDurable`).
   const [search, setSearch] = useState<BrowserSearchResult | null>(null);
   const [searchOpen, setSearchOpen] = useState(false);
+  // The poll has to know whether the results list is in front of the page, and
+  // cannot take it as a dependency: `refresh` is also what the four native
+  // event subscriptions below hang off, so rebuilding it on every results
+  // toggle would tear down and re-register them mid-search. Mirrored the way
+  // browserPages.ts mirrors its own two — written on the way past.
+  const searchOpenRef = useRef(false);
+  searchOpenRef.current = searchOpen;
   const [searching, setSearching] = useState(false);
   // The query in flight, echoed by the skeleton so the wait is legible.
   const [pending, setPending] = useState("");
@@ -206,6 +229,24 @@ export function BrowserView({
   // page, because a blank page runs no page script to ask.
   const blank = info.blank === true;
 
+  // A NAVIGATION IS UNDER WAY. `busy` covers only the three this chrome starts
+  // itself — a typed address, an opened result, a new tab. The commonest
+  // navigation there is, a link clicked INSIDE the page, reaches this window
+  // through no event at all, so the page's own readiness is the only witness to
+  // it; the live region has been reading it all along ("Loading …") while the
+  // button beside it still offered Reload. `info.error` is excluded on purpose:
+  // a page that has stopped answering reports no readiness, and without that
+  // term the button would sit on Stop for good beside the stalled banner.
+  const loading =
+    busy ||
+    (info.open === true && !blank && !info.error && info.ready !== "complete");
+
+  // The results list is in front of the page from the moment the query is sent,
+  // not from the moment it is answered: the skeleton carries the same `bsearch`
+  // class the stylesheet collapses the stage for, so a search started from a
+  // page that is already open showed nothing at all until the results landed.
+  const resultsInFront = searchOpen || searching;
+
   // WHAT IS IN FRONT OF THE PAGE, decided once and read by everything that
   // needs to know. The bounds pusher, the ability list and the signal the chat
   // scope reads used to answer this separately, and the reading view — a
@@ -214,13 +255,13 @@ export function BrowserView({
     () => ({
       parked,
       blank,
-      searchOpen,
+      searchOpen: resultsInFront,
       // An extraction is the one moment the page is handed its viewport back,
       // so it is not parked then even though the reader is showing.
       readerHasTheFloor:
         readerOpen && !comparing && extracting === 0 && !priming,
     }),
-    [parked, blank, searchOpen, readerOpen, comparing, extracting, priming],
+    [parked, blank, resultsInFront, readerOpen, comparing, extracting, priming],
   );
 
   // --- bounds: keep the native view glued to the placeholder ---------------
@@ -355,7 +396,7 @@ export function BrowserView({
     setBusy(CLOSED_VIEW.busy);
     setEphemeral(CLOSED_VIEW.ephemeral);
     verifiedForRef.current = null;
-  }, []);
+  }, [setNotice]);
 
   const refresh = useCallback(async () => {
     let next: BrowserInfo;
@@ -397,7 +438,12 @@ export function BrowserView({
         "Keyboard returned to the browser toolbar. The address box has focus.",
       );
     }
-    if (!editing && next.url) setAddress(next.url);
+    // NOT while the results list is up. The page behind it is parked at 1×1
+    // and nobody is looking at it, so writing its URL here renamed the box a
+    // second after a search — the query the user is reading replaced by an
+    // address for a page not on screen, beside a magnifier that says this is a
+    // search box, and Enter then navigating there instead of searching again.
+    if (!editing && !searchOpenRef.current && next.url) setAddress(next.url);
     // Verified against the LIVE webview, not inferred from a flag: the
     // failure mode is silent, so the shield must report a real check — and
     // it must be a check of the page it is sitting next to. Re-asked on every
@@ -405,7 +451,12 @@ export function BrowserView({
     const shieldFor = next.url ?? "";
     if (next.open && verifiedForRef.current !== shieldFor) {
       verifiedForRef.current = shieldFor;
-      setEphemeral(await api.browserVerifyPrivate().catch(() => null));
+      const answer = await api.browserVerifyPrivate().catch(() => null);
+      // A check that did not come back has claimed nothing, so it must not
+      // hold the claim: leaving the page marked as checked latched the shield
+      // on "Checking" for the rest of that page's life, never retried.
+      if (answer === null) verifiedForRef.current = null;
+      setEphemeral(answer);
     }
     if (!next.open) {
       setEphemeral(null);
@@ -451,12 +502,43 @@ export function BrowserView({
   useEffect(() => () => publishBrowserPage(null), []);
 
   const loadJournal = useCallback(async () => {
-    setJournal(await api.browserJournal(300).catch(() => []));
+    try {
+      setJournal(await api.browserJournal(300));
+      setJournalError(null);
+    } catch (e) {
+      // A record that could not be READ is not an empty record. Swallowing the
+      // failure and standing the rows down to `[]` printed "Nothing yet." for a
+      // room whose journal nobody had managed to read — on the one panel in
+      // this app whose whole job is to be checkable. Say it failed, keep
+      // whatever was last read on screen, and offer the re-read.
+      setJournalError(String(e));
+    }
+  }, []);
+
+  /** What a Clear would actually destroy: the record AND the room's web cache.
+   *  `null` is "the room would not say", which the warning and the gate both
+   *  read as "do not claim a number". */
+  const loadClearScope = useCallback(async () => {
+    setClearScope(await api.browserClearScope().catch(() => null));
   }, []);
 
   useEffect(() => {
-    if (journalOpen) void loadJournal();
-  }, [journalOpen, loadJournal]);
+    if (!journalOpen) {
+      // A destructive confirmation belongs to the visit that armed it.
+      // Reopening the panel used to land straight on "Erase / Keep", beside
+      // counts fetched during the previous visit.
+      setConfirmClear(false);
+      setClearScope(null);
+      return;
+    }
+    void loadJournal();
+    // What a Clear would erase, asked as the panel opens rather than only at
+    // the moment of confirming — the button below is gated on it. The web
+    // cache is filled by the assistant's own chat-side web_search as well,
+    // which writes no journal row, so an empty record is no evidence that
+    // there is nothing to erase.
+    void loadClearScope();
+  }, [journalOpen, loadJournal, loadClearScope]);
 
   // Live journal + navigation events, so the record updates as the agent works.
   useEffect(() => {
@@ -560,6 +642,11 @@ export function BrowserView({
    * would turn the reader into an error message. */
   const openReader = useCallback(() => {
     setSearchOpen(false);
+    // ONE PANEL IN THE BODY AT A TIME. The journal and the reader are flex
+    // siblings, and the document is the one that yields — journal plus reader
+    // plus Compare put three columns in a centre pane the Assistant has already
+    // narrowed, and the article was the item squeezed out.
+    setJournalOpen(false);
     setReaderOpen(true);
     // Every opening starts as a replacement. `comparing` is a choice the user
     // makes per reading, not a preference that follows them into the next one.
@@ -572,14 +659,24 @@ export function BrowserView({
     setPriming(true);
   }, []);
 
-  /** Leave the reading view. Focus must land somewhere the user chose, not
-   *  nowhere — the page underneath is a native layer the DOM cannot focus. */
-  const closeReader = useCallback(() => {
+  /** Put the reading view away without touching focus.
+   *
+   * For the callers that are not the reader's own toggle: pressing the shield
+   * is a press on the SHIELD, and a control that answers by moving the
+   * keyboard into the address bar has taken the user somewhere they did not
+   * ask to go — the one thing `closeReader`'s focus line exists to prevent. */
+  const standDownReader = useCallback(() => {
     setReaderOpen(false);
     setComparing(false);
     setPriming(false);
-    addressRef.current?.focus();
   }, []);
+
+  /** Leave the reading view. Focus must land somewhere the user chose, not
+   *  nowhere — the page underneath is a native layer the DOM cannot focus. */
+  const closeReader = useCallback(() => {
+    standDownReader();
+    addressRef.current?.focus();
+  }, [standDownReader]);
 
   /** Open a result. The results page stays in memory behind the page, so
    *  coming back is free and costs no navigation. */
@@ -588,18 +685,29 @@ export function BrowserView({
       setSearchOpen(false);
       setBusy(true);
       setError(null);
+      // The banner's recovery button belongs to the message above it. Left
+      // standing, a new failure was shown over "Search the web for …" naming
+      // something the user typed minutes ago — and pressing it broadcast that
+      // earlier internal hostname to seven engines.
+      setFailedInput(null);
       try {
         const settled = await api.browserNavigate(url);
         setAddress(settled);
         await refresh();
       } catch (e) {
         setError(String(e));
-        setSearchOpen(true);
+        // Only back to a list that EXISTS, and only when the results are
+        // where the click came from. This handler also serves links clicked in
+        // the reading view: putting a results layer up there parked the page
+        // behind a list that was empty (or that the user never opened), and
+        // the pane went blank with every page-scoped control dead and nothing
+        // on screen able to undo it.
+        if (search && !readerOpen) setSearchOpen(true);
       } finally {
         setBusy(false);
       }
     },
-    [refresh],
+    [refresh, search, readerOpen],
   );
 
   /** Open a result in a NEW tab.
@@ -615,12 +723,13 @@ export function BrowserView({
     async (url: string) => {
       setBusy(true);
       setError(null);
+      // The banner's recovery button goes with the message it belongs to.
+      setFailedInput(null);
       setNotice("Opening in a new tab…");
       try {
         await api.browserNewTab(url);
         setSearchOpen(false);
-        setNotice("Opened in a new tab.");
-        window.setTimeout(() => setNotice(null), 4000);
+        setNotice("Opened in a new tab.", 4000);
         await refresh();
       } catch (e) {
         setNotice(null);
@@ -633,6 +742,14 @@ export function BrowserView({
   );
 
   async function nav(action: "back" | "forward" | "reload" | "stop") {
+    // Back, with the results in front, means "leave the results" — that is the
+    // step the user actually took. Driving the page instead moved a webview
+    // parked at 1×1 that nobody is looking at, and left the list with no exit
+    // but navigating away from the page it was meant to help with.
+    if (action === "back" && searchOpen) {
+      setSearchOpen(false);
+      return;
+    }
     try {
       await api.browserGo(action);
       window.setTimeout(() => void refresh(), 400);
@@ -672,8 +789,7 @@ export function BrowserView({
     setError(null);
     try {
       const message = await action();
-      setNotice(message);
-      window.setTimeout(() => setNotice(null), 6000);
+      setNotice(message, 6000);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -724,6 +840,19 @@ export function BrowserView({
   // with no browser open.
   const can = chromeAbilities(info, chromeView);
 
+  // IS THERE ANYTHING TO ERASE? Not "is the journal empty": this button is the
+  // only control in the app that empties the room's web cache — the queries,
+  // the readable text of result pages, the preview images — and the
+  // assistant's chat-side web_search fills that cache without writing a
+  // journal row. Gated on the journal alone it sat greyed out, labelled
+  // "Nothing recorded yet", over a room full of cached searches. A scope that
+  // has not come back (or would not read) leaves the old gate in place rather
+  // than promising either answer.
+  const cached = clearScope
+    ? clearScope.journal + clearScope.searches + clearScope.pages + clearScope.images
+    : 0;
+  const nothingToErase = journal.length === 0 && cached === 0;
+
   // THE RECORD, AS SITTINGS. Rows arrive newest-first, so the first group is
   // the sitting that is live (or, with the browser closed, the one that just
   // ended) and every other group is history the user has to ask for.
@@ -740,8 +869,8 @@ export function BrowserView({
   // page nobody is looking at.
   // The page stopped answering the poll. Silent while the results page is up:
   // the native view is parked then, and nobody is looking at the page.
-  const stalled = searchOpen ? null : stalledBanner(info);
-  const scheme = schemeOf(searchOpen || blank ? null : info.url);
+  const stalled = resultsInFront ? null : stalledBanner(info);
+  const scheme = schemeOf(resultsInFront || blank ? null : info.url);
   const secure = scheme === "https:";
   const insecure = scheme === "http:";
   const schemeLabel = secure
@@ -776,6 +905,7 @@ export function BrowserView({
         <button
           className="browser-skip"
           type="button"
+          title="The page is a separate native layer this app cannot put into the reading order. This shows its text here, where a screen reader and the keyboard can reach it."
           disabled={!can.read && !readerOpen}
           aria-pressed={readerOpen}
           onClick={() => (readerOpen ? closeReader() : openReader())}
@@ -805,11 +935,11 @@ export function BrowserView({
           </button>
           <button
             className="browser-btn browser-btn-ico"
-            aria-label={busy ? "Stop loading" : "Reload the page"}
+            aria-label={loading ? "Stop loading" : "Reload the page"}
             disabled={!can.navigate}
-            onClick={() => void nav(busy ? "stop" : "reload")}
+            onClick={() => void nav(loading ? "stop" : "reload")}
           >
-            <span className={`bico ${busy ? "bico-stop" : "bico-reload"}`} aria-hidden />
+            <span className={`bico ${loading ? "bico-stop" : "bico-reload"}`} aria-hidden />
           </button>
         </div>
 
@@ -847,7 +977,13 @@ export function BrowserView({
               setAddress(e.target.value);
               setEditing(true);
             }}
-            onBlur={() => setEditing(false)}
+            /* Leaving the box does not mean abandoning what is in it. The
+               native page is a SIBLING view, so glancing at it — or pressing
+               Save, or the shield — really does blur this input, and the 1.2s
+               poll then replaced a half-typed address with the current page's
+               URL inside a beat. Text that differs from the live page is still
+               being written; text that matches it is released as before. */
+            onBlur={() => setEditing(address !== (info.url ?? ""))}
             spellCheck={false}
           />
         </form>
@@ -865,7 +1001,13 @@ export function BrowserView({
           aria-label={shieldLabel}
           title={shieldLabel}
           aria-pressed={journalOpen}
-          onClick={() => setJournalOpen((v) => !v)}
+          onClick={() => {
+            // The body holds the stage plus at most one panel: opening the
+            // record puts the reading view away rather than splitting the pane
+            // three ways. Without moving focus — this press was on the shield.
+            if (!journalOpen && readerOpen) standDownReader();
+            setJournalOpen((v) => !v);
+          }}
         >
           <ShieldIcon size={14} />
           <span>{claim.chip}</span>
@@ -875,6 +1017,11 @@ export function BrowserView({
           className={`browser-takeover${info.takeover ? " on" : ""}`}
           type="button"
           disabled={!can.takeover}
+          title={
+            info.takeover
+              ? "You have the wheel — the agent's browsing tools are paused until you hand it back."
+              : "Drive this page yourself. The agent's browsing tools pause until you hand it back."
+          }
           aria-pressed={info.takeover === true}
           onClick={() => void toggleTakeover()}
         >
@@ -899,27 +1046,19 @@ export function BrowserView({
         </button>
 
         {/* Item #18: the one control that gives a screen reader the page's
-            actual content. Named for what it DOES first — the reason it has to
-            exist is in the title, not in the accessible name. */}
+            actual content — and a genuinely better article view for everyone
+            else, which is what its title now says. The platform confession
+            about the reading order belongs to the skip link above, whose whole
+            reason to exist it is. */}
         <button
           className="browser-btn"
           type="button"
           disabled={!can.read && !readerOpen}
           aria-pressed={readerOpen}
-          title="The page is a separate native layer this app cannot put into the reading order. This shows its text here, where a screen reader and the keyboard can reach it."
+          title="The page as clean article text — selectable, copyable and reachable by keyboard, without the page's own layout."
           onClick={() => (readerOpen ? closeReader() : openReader())}
         >
           Read as text
-        </button>
-
-        <button
-          className="browser-btn"
-          type="button"
-          aria-label="Show what the agent did in this browser"
-          aria-pressed={journalOpen}
-          onClick={() => setJournalOpen((v) => !v)}
-        >
-          Journal
         </button>
       </div>
 
@@ -948,9 +1087,14 @@ export function BrowserView({
           >
             Save page
           </button>
+          {/* One question more than its neighbours, and the app already had the
+              answer: `hasSelection` rides on the same 1.2s poll that offers the
+              chat its "selected passage" scope. Offered with nothing
+              highlighted, this failed down in the page script with "Nothing is
+              selected on the page." — a refusal the chrome could see coming. */}
           <button
             className="browser-btn"
-            disabled={saving || !can.save}
+            disabled={saving || !can.save || info.hasSelection !== true}
             onClick={() => void saveSelection()}
           >
             Save selection
@@ -992,7 +1136,18 @@ export function BrowserView({
           true — a control the user cannot un-press. */}
       {search && !searchOpen && !readerOpen && (
         <div className="browser-banner browser-results-row" role="status">
-          <button className="browser-btn" onClick={() => setSearchOpen(true)}>
+          <button
+            className="browser-btn"
+            onClick={() => {
+              setSearchOpen(true);
+              // The box has to name what is on screen. Coming back to the
+              // results without this left it showing the URL of the page hidden
+              // behind them, so Enter navigated there instead of searching
+              // again — the same two lines `runSearch` uses.
+              setAddress(search.query);
+              setEditing(false);
+            }}
+          >
             ◂ Results
           </button>
           <span>
@@ -1000,11 +1155,17 @@ export function BrowserView({
           </span>
         </div>
       )}
-
-      {info.takeover && (
-        <div className="browser-banner" role="status">
-          You have the wheel — the agent's browsing tools are paused until you
-          hand it back.
+      {/* The same row in the state it was missing from. Without it the results
+          were a one-way door: nothing closed them but navigating, which loses
+          the page the search was meant to help with. */}
+      {searchOpen && info.open && !blank && (
+        <div className="browser-banner browser-results-row" role="status">
+          <button className="browser-btn" onClick={() => setSearchOpen(false)}>
+            Page ▸
+          </button>
+          <span>
+            back to <b dir="auto">{info.title?.trim() || info.url}</b>
+          </span>
         </div>
       )}
       {/* THE PROTECTION ENGINE FAILED AND THE CHIP USED TO SAY NOTHING.
@@ -1089,7 +1250,7 @@ export function BrowserView({
         <div className="browser-stage" ref={stageRef} aria-hidden />
         {/* BROWSE-3: the results page. Shown over the parked webview, so it
             takes precedence over the start screen. */}
-        {searchOpen && search && (
+        {!searching && searchOpen && search && (
           <BrowserSearch
             result={search}
             onOpen={(url) => void openResult(url)}
@@ -1099,7 +1260,12 @@ export function BrowserView({
           />
         )}
 
-        {searching && !searchOpen && <BrowserSearchSkeleton query={pending} />}
+        {/* A SECOND search, started from the results page, used to leave the
+            previous query's eight results on screen — its timing, its engine
+            dial and all — presented as the answer to a question nobody was
+            asking any more. The skeleton echoes the query in flight and counts
+            the wait, which is the whole reason it exists. */}
+        {searching && <BrowserSearchSkeleton query={pending} />}
 
         {!searchOpen && !searching && (!info.open || blank) && (
           /* A ruled start page, not a centred globe. It is a real React
@@ -1145,7 +1311,27 @@ export function BrowserView({
                     className="browser-btn browser-btn-danger"
                     onClick={() => {
                       setConfirmClear(false);
-                      void api.browserClearJournal().then(loadJournal);
+                      // Re-read either way, and the failure is SAID. An
+                      // unhandled rejection left the entries standing with no
+                      // banner, so "nothing was deleted", "everything was" and
+                      // a partial erase — the record gone, the cached queries
+                      // and page text still there — all looked identical. What
+                      // the panel shows afterwards is what actually survived.
+                      void api
+                        .browserClearJournal()
+                        .catch((e) => {
+                          setError(String(e));
+                          // The banner is shared, and its recovery button is
+                          // not: leaving an address the user failed to reach
+                          // behind offers "Search the web for …" under a
+                          // message about the journal.
+                          setFailedInput(null);
+                          setConfirmClear(true);
+                        })
+                        .finally(() => {
+                          void loadJournal();
+                          void loadClearScope();
+                        });
                     }}
                   >
                     Erase
@@ -1157,9 +1343,9 @@ export function BrowserView({
               ) : (
                 <button
                   className="browser-btn"
-                  disabled={journal.length === 0}
+                  disabled={nothingToErase}
                   title={
-                    journal.length === 0
+                    nothingToErase
                       ? "Nothing recorded yet"
                       : "Erase this record and the room's web cache — it cannot be brought back"
                   }
@@ -1170,17 +1356,21 @@ export function BrowserView({
                     // trip, and a confirmation that exists to state the true
                     // magnitude of a deletion must not state a stale one.
                     setClearScope(null);
-                    void api
-                      .browserClearScope()
-                      .then(setClearScope)
-                      .catch(() => setClearScope(null));
+                    void loadClearScope();
                   }}
                 >
                   Clear
                 </button>
               )}
             </header>
-            <p className="browser-journal-note">{EPHEMERAL_VS_ROOM}</p>
+            {/* The sentence this browser owes the user harder than Safari or
+                Firefox do had no readable home once a page was open: it rode
+                in the shield's tooltip and on a start screen you have left.
+                The panel a user opens to CHECK what this browser does is where
+                it belongs. */}
+            <p className="browser-journal-note">
+              {`${EPHEMERAL_VS_ROOM} ${NOT_ANONYMOUS}`}
+            </p>
             {/* SIX FILTERS OVER TWELVE KINDS. None pressed is "everything" —
                 the state you reach by turning them all off has to be the state
                 you started in, or the panel goes blank for no reason the user
@@ -1209,8 +1399,25 @@ export function BrowserView({
                 );
               })}
             </div>
+            {/* A FAILED READ IS NOT AN EMPTY RECORD. Whatever was last read
+                stays below it — a panel that exists to be checked must not
+                answer a question it could not ask. */}
+            {journalError && (
+              <p className="browser-banner error" role="alert">
+                The record could not be read — {journalError}
+                <button
+                  className="browser-btn"
+                  type="button"
+                  onClick={() => void loadJournal()}
+                >
+                  Retry
+                </button>
+              </p>
+            )}
             {sessions.length === 0 ? (
-              <p className="browser-journal-empty">Nothing yet.</p>
+              journalError ? null : (
+                <p className="browser-journal-empty">Nothing yet.</p>
+              )
             ) : (
               sessions.map((session, at) => (
                 <section

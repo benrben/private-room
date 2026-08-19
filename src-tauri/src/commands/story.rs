@@ -289,6 +289,22 @@ pub fn story_add_shot(
     state.with_room(|room| db::add_shot(&room.conn, &list_id, &action))
 }
 
+/// The cast a shot may be saved with — or the sentence to show instead.
+///
+/// This used to `take(MAX_SHOT_CAST)` silently. The row does not know it was
+/// cut: the fifth chip stays pressed, the review sheet lists four, and that
+/// person's portrait and name are never sent — the shot on screen and the shot
+/// in the room are two different shots. A refusal the caller can show is the
+/// only version of this the user can act on.
+fn fit_shot_cast(cast_ids: Vec<String>) -> Result<Vec<String>, String> {
+    if cast_ids.len() > MAX_SHOT_CAST {
+        return Err(format!(
+            "A shot carries {MAX_SHOT_CAST} people at most — take someone out of this one first."
+        ));
+    }
+    Ok(cast_ids)
+}
+
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub fn story_update_shot(
@@ -300,9 +316,7 @@ pub fn story_update_shot(
     image_model: String,
     video_model: String,
 ) -> Result<(), String> {
-    // Truncated rather than refused: the user dragged a fifth face onto a shot,
-    // which is a preference, not an error worth stopping their work for.
-    let cast_ids: Vec<String> = cast_ids.into_iter().take(MAX_SHOT_CAST).collect();
+    let cast_ids = fit_shot_cast(cast_ids)?;
     state.with_room(|room| {
         db::update_shot(
             &room.conn,
@@ -846,6 +860,19 @@ mod tests {
         let assigned = assign_cast(&shots, &cast);
         assert!(assigned[0].is_empty(), "Noah and 'no answer' are not Noa");
         assert!(assigned[1].is_empty(), "nor is 'announce'");
+    }
+
+    #[test]
+    fn a_fifth_person_on_one_shot_is_refused_rather_than_dropped() {
+        // The silent `take(4)` this replaces: the row kept the fifth chip
+        // pressed while the room stored four, so the shot on screen and the
+        // shot that gets drawn were two different shots.
+        let four: Vec<String> = ["a", "b", "c", "d"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(fit_shot_cast(four.clone()).unwrap(), four);
+        assert!(fit_shot_cast(Vec::new()).unwrap().is_empty());
+        let five: Vec<String> = ["a", "b", "c", "d", "e"].iter().map(|s| s.to_string()).collect();
+        let refused = fit_shot_cast(five).expect_err("a fifth person is refused");
+        assert!(refused.contains("at most"), "the message has to say why: {refused}");
     }
 
     #[test]

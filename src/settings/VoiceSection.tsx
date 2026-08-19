@@ -103,7 +103,9 @@ export default function VoiceSection({
         </span>{" "}
         — the text of each spoken sentence leaves this Mac, sent to Microsoft's
         Edge TTS service. Only the sentence being spoken is sent, and only
-        while speaking is on.
+        while speaking is on. So it needs the room's internet switch on
+        (Settings → Online features): with that off, answers stay silent —
+        including ▶ Preview — and no sentence is sent.
       </div>
       <label className="settings-label">
         Voice{voices.length > 0 ? ` (${voices.length} available)` : ""}

@@ -1,4 +1,4 @@
-import { useEffect, useState, type CSSProperties } from "react";
+import { useEffect, useState } from "react";
 import { RefreshIcon, SparklesIcon } from "../icons";
 import MarkdownView from "../viewers/MarkdownView";
 import { WSState } from "./state";
@@ -45,11 +45,27 @@ const THRESHOLD_WORD: Record<"ok" | "warn" | "danger", string> = {
   danger: "At limit",
 };
 
+/** The newest usage snapshot the transcript itself carries.
+ *
+ * `s.tokenUsage` only holds what THIS session's live `ask-token-usage` event
+ * delivered, so a conversation reopened after a restart had no reading at all
+ * — the meter went missing precisely when the window was fullest. The same
+ * snapshot is persisted on the assistant row (`effects.usage`, written by
+ * agent.rs), so the loaded messages restore it without another round trip. */
+function persistedUsage(messages: Message[]): AskTokenUsage | null {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const u = messages[i].effects?.usage;
+    if (u) return u;
+  }
+  return null;
+}
+
 /** The chat's live token-budget bar: a segmented fill (colored by category)
  * showing how much of the model's context window this turn used, plus a
- * click-to-expand exact breakdown. Renders nothing until the first turn's
- * usage snapshot arrives, and the meter itself stays out of the row below
- * TOKEN_METER_VISIBLE_PCT — Hand off still renders regardless. */
+ * click-to-expand exact breakdown. Renders nothing on an empty conversation,
+ * and the meter itself stays out of the row below TOKEN_METER_VISIBLE_PCT —
+ * Hand off still renders regardless, including on a chat whose only usage
+ * snapshot is the persisted one. */
 export default function TokenBudgetBar({ s, a }: { s: WSState; a: WSActions }) {
   const [open, setOpen] = useState(false);
   useEffect(() => {
@@ -63,37 +79,27 @@ export default function TokenBudgetBar({ s, a }: { s: WSState; a: WSActions }) {
     return () => window.removeEventListener("keydown", onKey, true);
   }, [open]);
 
-  const usage: AskTokenUsage | null = s.tokenUsage;
-  if (!usage) return null;
+  const usage: AskTokenUsage | null = s.tokenUsage ?? persistedUsage(s.messages);
+  // An empty conversation has nothing to meter and nothing to hand off.
+  if (!usage && s.messages.length === 0) return null;
 
-  const total = Math.max(usage.total_tokens, 0);
-  const max = Math.max(usage.max_context, 1);
+  const total = usage ? Math.max(usage.total_tokens, 0) : 0;
+  const max = usage ? Math.max(usage.max_context, 1) : 1;
   const fillPct = Math.min(100, (total / max) * 100);
   const cls = thresholdClass(fillPct);
   const showMeter = fillPct >= TOKEN_METER_VISIBLE_PCT;
 
   return (
     <div className="token-bar-row">
-      {showMeter && (
+      {usage && showMeter && (
         <div className="token-bar-wrap">
           <button
             type="button"
             className={`token-bar ${cls}`}
-            aria-haspopup="dialog"
             aria-expanded={open}
             onClick={() => setOpen((o) => !o)}
-            title={`${formatTokenCount(total)} / ${formatTokenCount(max)} tokens used this turn — click for a breakdown`}
+            title={`${formatTokenCount(total)} / ${formatTokenCount(max)} tokens in the last answer — click for a breakdown`}
           >
-            {/* The one-number view of the same ratio, as a partially filled
-                circle: the conic sweep is exactly `fillPct` of the disc, no
-                easing and no minimum visible sliver, so it cannot overstate a
-                small value. Decorative in the strict sense — the exact figures
-                are written out beside it — hence aria-hidden. */}
-            <span
-              className="nb-dial token-bar-dial"
-              style={{ "--nb-val": `${fillPct}%` } as CSSProperties}
-              aria-hidden
-            />
             <span className="token-bar-track">
               <span className="token-bar-fill" style={{ width: `${fillPct}%` }}>
                 {CATEGORY_ORDER.map(({ key, label }) => {
@@ -132,7 +138,11 @@ export default function TokenBudgetBar({ s, a }: { s: WSState; a: WSActions }) {
           {open && (
             <>
               <div className="menu-backdrop" onMouseDown={() => setOpen(false)} />
-              <div className="pop-menu token-breakdown-pop" role="dialog">
+              {/* A disclosure, not a dialog: static rows with nothing focusable
+                  in them. `role="dialog"` announced it as one, unnamed and with
+                  no way out — `aria-expanded` on the button that owns it is the
+                  whole of the semantics it needs. */}
+              <div className="pop-menu token-breakdown-pop">
                 {CATEGORY_ORDER.map(({ key, label }) => {
                   const cat = usage.breakdown[key];
                   const catTokens = cat?.tokens ?? 0;

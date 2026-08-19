@@ -346,6 +346,29 @@ async fn consent_for_typing(
     }
 }
 
+/// The text a `type` action would put in the field, whatever JSON shape the
+/// model wrote it in. `page.js` coerces with `String(a.type.text)`, so a bare
+/// JSON number types just as literally as a quoted one — and a door that only
+/// recognised strings let an account number through with no card and no
+/// journal line. An ARRAY is the same hole one shape further out: `String()`
+/// joins it with commas, so `[9725, 1234]` reaches the field as digits too.
+/// An object and `null` stay out because they carry no room content to the
+/// page — they arrive as the constant `[object Object]` and as nothing at all.
+fn typed_text_of(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Number(_) | serde_json::Value::Bool(_) => Some(v.to_string()),
+        serde_json::Value::Array(items) => Some(
+            items
+                .iter()
+                .map(|i| typed_text_of(i).unwrap_or_default())
+                .collect::<Vec<_>>()
+                .join(","),
+        ),
+        _ => None,
+    }
+}
+
 /// Every `type` action's text in a batch, paired with its ref. Used to run the
 /// outbound door BEFORE any action in the batch executes — a batch must not be
 /// half-applied while the user is being asked about step three.
@@ -354,7 +377,7 @@ fn typed_texts(actions: &[serde_json::Value]) -> Vec<(String, String)> {
         .iter()
         .filter_map(|a| {
             let t = a.get("type")?;
-            let text = t.get("text")?.as_str()?.to_string();
+            let text = typed_text_of(t.get("text")?)?;
             let field = t
                 .get("ref")
                 .and_then(|r| r.as_str())
@@ -689,11 +712,14 @@ async fn exec_browse_inner(
             // just to ask for eyes.
             if v.get("ok").and_then(|o| o.as_bool()) != Some(true) {
                 match look_png(&app).await {
-                    Ok(b64) => {
-                        effects.pending_images.push(b64);
-                        out.push_str(
-                            "\nAn action failed, so a picture of the page (with the element numbers drawn on it) is attached.\n",
-                        );
+                    Ok(shot) => {
+                        let scale_note = shot.scale_note(effects.vision_chat);
+                        match perceive_image(effects, shot.b64, FAILED_ACTION_CAPTION).await {
+                            Ok(seen) => out.push_str(&format!("\n{seen}{scale_note}\n")),
+                            Err(e) => out.push_str(&format!(
+                                "\n(An action failed; nothing could look at the page: {e})\n"
+                            )),
+                        }
                     }
                     Err(e) => out.push_str(&format!(
                         "\n(An action failed; the page picture could not be taken: {e})\n"
@@ -704,14 +730,30 @@ async fn exec_browse_inner(
         }
 
         "browse_look" => {
-            let b64 = look_png(&app).await?;
-            effects.pending_images.push(b64);
+            let shot = look_png(&app).await?;
             let info = browser::call(&app, "info", serde_json::json!({})).await?;
             let url = info.get("url").and_then(|u| u.as_str()).unwrap_or("");
             browser::journal(&app, "look", url, "Looked at the page");
+            let title = info
+                .get("title")
+                .and_then(|t| t.as_str())
+                .filter(|t| !t.is_empty())
+                .unwrap_or(url);
+            let scale_note = shot.scale_note(effects.vision_chat);
+            // Through `perceive_image`, so a text-only chat model gets a LOCAL
+            // vision model's description instead of pixels it cannot read plus
+            // a sentence claiming it is looking at the page.
+            let seen = perceive_image(
+                effects,
+                shot.b64,
+                &format!(
+                    "a picture of the web page \"{title}\", with every interactive element \
+                     numbered with the same ref browse_snapshot uses"
+                ),
+            )
+            .await?;
             Ok(format!(
-                "Looking at {} — every interactive element is numbered with the same ref browse_snapshot uses.{}",
-                info.get("title").and_then(|t| t.as_str()).filter(|t| !t.is_empty()).unwrap_or(url),
+                "{seen}{scale_note}{}",
                 uncapturable_media_note(&info).unwrap_or_default(),
             ))
         }
@@ -766,7 +808,47 @@ fn png_too_small_to_see(png: &[u8]) -> Option<(u32, u32)> {
     (w < 64 || h < 64).then_some((w, h))
 }
 
-async fn look_png(app: &tauri::AppHandle) -> Result<String, String> {
+/// A captured page picture, with the mapping back to the coordinates the page
+/// actually takes.
+///
+/// `click_at` is specified in CSS pixels, but the picture the model reads them
+/// off is the webview's BACKING store (2× on a Retina Mac) shrunk again to
+/// [`LOOK_MAX_W`]. Nothing said so, so a control the model saw at x=640 in the
+/// picture was clicked at CSS 640 — a different element, or off the page.
+struct LookShot {
+    b64: String,
+    /// Picture pixels per CSS pixel, when both widths were measured and their
+    /// ratio is a plausible backing scale. `None` = say nothing rather than
+    /// state a factor we cannot stand behind.
+    picture_per_css: Option<f64>,
+}
+
+impl LookShot {
+    /// The sentence that carries the mapping, for a model that got the pixels.
+    /// Empty when the picture is 1:1 with the page, when the ratio could not be
+    /// measured, or when the model was handed a description instead of pixels —
+    /// there are no picture coordinates to convert in any of those.
+    fn scale_note(&self, sees_pixels: bool) -> String {
+        match self.picture_per_css {
+            Some(f) if sees_pixels && (f - 1.0).abs() > 0.01 => format!(
+                " The picture is {f:.2}× the page's own scale, so DIVIDE any x/y you read off \
+                 it by {f:.2} before passing it to click_at, which takes CSS pixels."
+            ),
+            _ => String::new(),
+        }
+    }
+}
+
+/// The widest picture a `browse_look` hands the model (see `downscale_png_b64`).
+const LOOK_MAX_W: u32 = 1280;
+
+/// What the picture attached to a FAILED action is, in the words
+/// `perceive_image` wraps ("Captured …" / "a local vision model looked at …").
+const FAILED_ACTION_CAPTION: &str =
+    "a picture of the web page an action just failed on, with every interactive element \
+     numbered with the same ref browse_snapshot uses";
+
+async fn look_png(app: &tauri::AppHandle) -> Result<LookShot, String> {
     browser::call_async(
         app,
         "annotate",
@@ -791,7 +873,7 @@ async fn look_png(app: &tauri::AppHandle) -> Result<String, String> {
 
 /// The screenshot half of [`look_png`], split out so its caller can un-paint
 /// the badges on every path.
-async fn capture_look_png(app: &tauri::AppHandle) -> Result<String, String> {
+async fn capture_look_png(app: &tauri::AppHandle) -> Result<LookShot, String> {
     let wv = browser::webview(app).ok_or("The browser isn't open.")?;
     // capture_png must not run on the main thread (it would deadlock on the
     // snapshot completion handler), so it goes to a blocking worker.
@@ -806,7 +888,38 @@ async fn capture_look_png(app: &tauri::AppHandle) -> Result<String, String> {
              card) and ask again."
         ));
     }
-    downscale_png_b64(&png, 1280)
+    let picture_per_css = picture_per_css(png_width(&png), browser::bounds(app).width);
+    let b64 = downscale_png_b64(&png, LOOK_MAX_W)?;
+    Ok(LookShot { b64, picture_per_css })
+}
+
+/// The pixel width in a PNG's IHDR. `None` when the header is not one we can
+/// read — the same "never guess" rule [`png_too_small_to_see`] follows.
+fn png_width(png: &[u8]) -> Option<u32> {
+    if png.len() < 20 || &png[12..16] != b"IHDR" {
+        return None;
+    }
+    Some(u32::from_be_bytes(png[16..20].try_into().ok()?))
+}
+
+/// Picture pixels per CSS pixel, from the capture's own width and the width the
+/// browser area last reported (`browser::bounds` is logical, i.e. CSS, px).
+///
+/// Answers `None` unless the capture is a plausible backing-store copy of that
+/// rect — between 1× and 4×. A stale or parked rect would otherwise turn into a
+/// confident conversion factor that is simply wrong, which is worse for the
+/// model than the silence it had before.
+fn picture_per_css(capture_w: Option<u32>, css_w: f64) -> Option<f64> {
+    let capture_w = f64::from(capture_w?);
+    if css_w < 1.0 || capture_w < 1.0 {
+        return None;
+    }
+    let backing = capture_w / css_w;
+    if !(0.95..=4.05).contains(&backing) {
+        return None;
+    }
+    let shown_w = capture_w.min(f64::from(LOOK_MAX_W));
+    Some(shown_w / css_w)
 }
 
 /// What a screenshot of this page CANNOT show, in the tool result itself.
@@ -1362,6 +1475,62 @@ mod tests {
             vec![
                 ("e3".to_string(), "hello".to_string()),
                 ("e5".to_string(), "world".to_string())
+            ]
+        );
+    }
+
+    /// `click_at` takes CSS pixels, but the picture is the backing store (2× on
+    /// a Retina Mac) shrunk again to 1280. A model reading x=640 off that
+    /// picture used to click 190 CSS px away from what it aimed at.
+    #[test]
+    fn the_picture_carries_its_own_conversion_back_to_css_pixels() {
+        // 900 CSS px on a 2× display → an 1800 px capture, shown at 1280.
+        let f = picture_per_css(Some(1800), 900.0).expect("a 2× capture is measurable");
+        assert!((f - 1280.0 / 900.0).abs() < 1e-9);
+        // 640 in the picture is 450 on the page — the repro's own numbers.
+        assert!((640.0 / f - 450.0).abs() < 0.5);
+        let shot = LookShot { b64: String::new(), picture_per_css: Some(f) };
+        assert!(shot.scale_note(true).contains("1.42"));
+        // A model that was handed a DESCRIPTION has no picture coordinates to
+        // convert, and a 1:1 picture needs no conversion at all.
+        assert_eq!(shot.scale_note(false), "");
+        assert_eq!(
+            LookShot { b64: String::new(), picture_per_css: Some(1.0) }.scale_note(true),
+            ""
+        );
+        // 1× and under the cap: nothing to say.
+        assert_eq!(picture_per_css(Some(900), 900.0), Some(1.0));
+        // Nothing measurable, or a rect that cannot be this capture's: silence
+        // beats a confident wrong factor.
+        assert_eq!(picture_per_css(None, 900.0), None);
+        assert_eq!(picture_per_css(Some(1800), 0.0), None);
+        assert_eq!(picture_per_css(Some(1800), 100.0), None);
+        assert_eq!(picture_per_css(Some(2), 900.0), None);
+    }
+
+    /// The outbound door used to read `text` as a JSON string ONLY, so an
+    /// account number emitted as a bare number was typed into the page with no
+    /// consent card and no journal line — while the same digits in quotes
+    /// raised one. `page.js` types both identically (`String(t.text)`), arrays
+    /// included: it joins them with commas, so digits in a list reach the field
+    /// exactly as digits and must raise the same card.
+    #[test]
+    fn typed_texts_sees_a_number_or_a_bool_the_page_would_type_literally() {
+        let actions = vec![
+            serde_json::json!({"type": {"ref": "e3", "text": 972501234567i64}}),
+            serde_json::json!({"type": {"ref": "e4", "text": true}}),
+            serde_json::json!({"type": {"ref": "e7", "text": [9725, "0123", null]}}),
+            // Not text the page would meaningfully type: no consent to ask for.
+            serde_json::json!({"type": {"ref": "e5", "text": {"a": 1}}}),
+            serde_json::json!({"type": {"ref": "e6", "text": null}}),
+            serde_json::json!({"type": {"ref": "e8", "text": []}}),
+        ];
+        assert_eq!(
+            typed_texts(&actions),
+            vec![
+                ("e3".to_string(), "972501234567".to_string()),
+                ("e4".to_string(), "true".to_string()),
+                ("e7".to_string(), "9725,0123,".to_string()),
             ]
         );
     }

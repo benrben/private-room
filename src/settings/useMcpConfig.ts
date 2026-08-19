@@ -2,16 +2,36 @@ import { useEffect, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { api, ConnectorPowers, McpServerStatus } from "../api";
 
+/** Each server whose `Authorization` header exists in `stored` (what the room
+ *  holds now) and is missing from `posted` (what the page is about to write).
+ *  Unparseable JSON on either side names nothing: this answers one question,
+ *  and "I could not tell" is not "yes". */
+export function signInsDroppedBy(stored: string, posted: string): string[] {
+  type Entry = { headers?: Record<string, string> };
+  const servers = (json: string): Record<string, Entry> => {
+    try {
+      const root = JSON.parse(json) as { mcpServers?: Record<string, Entry> } | null;
+      return root?.mcpServers ?? {};
+    } catch {
+      return {};
+    }
+  };
+  const before = servers(stored);
+  const after = servers(posted);
+  return Object.keys(before).filter(
+    (name) =>
+      before[name]?.headers?.Authorization &&
+      name in after &&
+      !after[name]?.headers?.Authorization,
+  );
+}
+
 /** Connections section: the mcpServers JSON config, live per-server status, and
- * the guided connector form that merges into that JSON. */
+ * the connector powers that config runs under. */
 export function useMcpConfig() {
   const [mcpConfig, setMcpConfig] = useState("");
   const [mcpStatuses, setMcpStatuses] = useState<McpServerStatus[]>([]);
   const [mcpError, setMcpError] = useState("");
-  // Guided connector form — a friendlier path than hand-editing JSON.
-  const [connName, setConnName] = useState("");
-  const [connCmd, setConnCmd] = useState("");
-  const [connArgs, setConnArgs] = useState("");
   // The two independent connector powers (owner's split, 2026-08-03):
   // `autoApprove` = run connector tools without a consent card; `outboundUnmask`
   // = let a remote connector receive the room's real values instead of the
@@ -45,6 +65,21 @@ export function useMcpConfig() {
   async function applyMcp() {
     setMcpError("");
     try {
+      const dropped = signInsDroppedBy(await api.mcpGetConfig(), mcpConfig);
+      if (dropped.length) {
+        // The editor holds a copy taken when the page opened. Signing a
+        // connector in writes its bearer into the room's config behind that
+        // copy, so re-posting it silently signs the connector back OUT — it
+        // reconnects with no token, every call 401s, and the drawer still says
+        // "Signed in". Refused rather than merged: a token nobody can see is
+        // not something to guess about on the user's behalf.
+        setMcpError(
+          `This box was loaded before ${dropped.join(", ")} signed in, so saving it now would ` +
+            `drop that sign-in. Reopen Connections to pick up the current config, then re-apply ` +
+            `your change (or use Sign out if you meant to remove it).`,
+        );
+        return;
+      }
       setMcpStatuses(await api.mcpApplyConfig(mcpConfig));
     } catch (e) {
       setMcpError(String(e));
@@ -60,10 +95,15 @@ export function useMcpConfig() {
     name: string,
     entry: Record<string, unknown>,
   ): Promise<McpServerStatus[]> {
+    // Merge into what the ROOM holds right now, never into the copy this page
+    // loaded. A connector signed in since then has had its bearer written into
+    // the config behind us, and re-posting the older snapshot dropped it — the
+    // connector reconnected unauthenticated while the drawer read "Signed in".
+    const current = await api.mcpGetConfig();
     let root: { mcpServers?: Record<string, unknown> } = {};
-    if (mcpConfig.trim()) {
+    if (current.trim()) {
       try {
-        root = JSON.parse(mcpConfig);
+        root = JSON.parse(current);
       } catch {
         throw new Error(
           "The current config isn't valid JSON — fix or clear it under Advanced before installing.",
@@ -141,51 +181,12 @@ export function useMcpConfig() {
     }
   }
 
-  // Merge the guided form's fields into the mcpServers JSON so non-technical
-  // users never have to hand-write it. The raw editor below stays available
-  // for anyone pasting a config from elsewhere.
-  function addConnector() {
-    setMcpError("");
-    const name = connName.trim();
-    const command = connCmd.trim();
-    if (!name || !command) {
-      setMcpError("Give the connector a name and a command.");
-      return;
-    }
-    let root: { mcpServers?: Record<string, unknown> } = {};
-    if (mcpConfig.trim()) {
-      try {
-        root = JSON.parse(mcpConfig);
-      } catch {
-        setMcpError(
-          "The current config isn't valid JSON — fix or clear the box below before adding.",
-        );
-        return;
-      }
-    }
-    const servers = (root.mcpServers ?? {}) as Record<string, unknown>;
-    const args = connArgs.trim() ? connArgs.trim().split(/\s+/) : [];
-    servers[name] = args.length ? { command, args } : { command };
-    root.mcpServers = servers;
-    setMcpConfig(JSON.stringify(root, null, 2));
-    setConnName("");
-    setConnCmd("");
-    setConnArgs("");
-  }
-
   return {
     mcpConfig,
     setMcpConfig,
     mcpStatuses,
     mcpError,
-    connName,
-    setConnName,
-    connCmd,
-    setConnCmd,
-    connArgs,
-    setConnArgs,
     applyMcp,
-    addConnector,
     installServer,
     setServerEnabled,
     removeServer,

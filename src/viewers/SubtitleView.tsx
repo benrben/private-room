@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Cue, parseCues, shortStamp, toSrt, toVtt } from "./subtitles";
 import "./subtitle.css";
 
@@ -24,9 +24,24 @@ export default function SubtitleView({ text, name, onSave }: Props) {
   const [cues, setCues] = useState<Cue[]>(parsed);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
+  // The exact bytes this panel last wrote. "Saved" is then a claim about the
+  // file in front of you rather than a label the button wears on open — and it
+  // lapses on its own when the file changes underneath us, because a write by
+  // the agent or a restore is not a save this panel performed.
+  const written = useRef<string | null>(null);
 
-  // A save elsewhere (the agent, a restore) replaces the file under us.
-  useEffect(() => setCues(parsed), [parsed]);
+  // A save elsewhere (the agent, a restore) replaces the file under us — and
+  // takes the edits a failed save was still holding, so its banner ("your
+  // edits are still here") stops being true the moment that happens.
+  useEffect(() => {
+    setCues(parsed);
+    setError("");
+  }, [parsed]);
+
+  // The LATEST end time, not the last cue's. SRT does not require ascending
+  // timecodes, and machine-merged or bilingual files routinely break that
+  // order — reading the final block understated the length by minutes.
+  const endMs = useMemo(() => cues.reduce((m, c) => Math.max(m, c.endMs), 0), [cues]);
 
   const dirty = useMemo(
     () => cues.length !== parsed.length || cues.some((c, i) => c.text !== parsed[i]?.text),
@@ -40,7 +55,16 @@ export default function SubtitleView({ text, name, onSave }: Props) {
     try {
       // Written back in the dialect it arrived in — silently converting a
       // .vtt to SRT would break whatever player it belongs to.
-      await onSave(/\.vtt$/i.test(name) ? toVtt(cues) : toSrt(cues));
+      const body = /\.vtt$/i.test(name) ? toVtt(cues) : toSrt(cues);
+      const ok = await onSave(body);
+      // A refused write resolves false rather than throwing, and the toast it
+      // raises can be missed or dismissed — the panel the edits are sitting in
+      // has to say so too, next to the Save button that still reads "Save".
+      if (ok) {
+        written.current = body;
+      } else {
+        setError("Could not save this subtitle file — your edits are still here.");
+      }
     } catch (e) {
       setError(String(e));
     } finally {
@@ -62,15 +86,19 @@ export default function SubtitleView({ text, name, onSave }: Props) {
       <div className="srt-bar">
         <span className="viewer-status">
           {cues.length.toLocaleString()} {cues.length === 1 ? "cue" : "cues"} ·{" "}
-          {shortStamp(cues[cues.length - 1].endMs)} long
+          {shortStamp(endMs)} long
         </span>
         {onSave && (
           <button className="nb-btn" disabled={!dirty || saving} onClick={() => void save()}>
-            {saving ? "Saving…" : dirty ? "Save" : "Saved"}
+            {saving ? "Saving…" : !dirty && written.current === text ? "Saved" : "Save"}
           </button>
         )}
       </div>
-      {error && <div className="gate-error">{error}</div>}
+      {error && (
+        <div className="gate-error" role="alert">
+          {error}
+        </div>
+      )}
       <ol className="srt-list">
         {cues.map((c, i) => (
           <li key={i} className="srt-cue">

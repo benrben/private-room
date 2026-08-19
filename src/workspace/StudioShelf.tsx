@@ -8,6 +8,24 @@ import { WSActions } from "./actions";
  * memory and rewrites only its `… from "…"` specifiers, so a bare `import
  * "…css"` would survive into a data: URL module and fail to resolve. */
 
+/** Which studio kinds already have a run in flight for THIS scope.
+ *
+ * The scope is half the answer: a deck of the whole room and a deck of the open
+ * file are different work, so a run started elsewhere must not grey out the row
+ * in front of you — the same false reading AiPane's summary row was fixed for.
+ * Both facts come off the job's plan, which is what `start_studio_job` wrote. */
+function runningKinds(s: WSState, scope?: string): Set<string> {
+  const kinds = new Set<string>();
+  for (const j of s.jobs) {
+    if (j.kind !== "studio") continue;
+    if (j.status !== "running" && j.status !== "queued") continue;
+    const plan = j.plan as { kind?: string; scope?: string | null } | null;
+    if ((plan?.scope ?? undefined) !== scope) continue;
+    if (plan?.kind) kinds.add(plan.kind);
+  }
+  return kinds;
+}
+
 /** The Studio Shelf (D5/D12). `scope` is a file id (this file) or undefined
  * (whole room). Rendered inside the right pane's Studio tab and reused by
  * area views.
@@ -29,6 +47,10 @@ export default function StudioShelf({
   s: WSState;
   a: WSActions;
 }) {
+  const running = runningKinds(s, scope);
+  const cards = running.has("flashcards");
+  const mind = running.has("mindmap");
+  const pod = running.has("podcast");
   return (
     <div className="studio-shelf">
       <div className="studio-section-title">
@@ -36,6 +58,7 @@ export default function StudioShelf({
       </div>
       <button
         className="studio-row nb-mark-blue"
+        disabled={cards}
         onClick={() => a.openStudioPrompt("flashcards", scope)}
       >
         <span className="studio-row-icon">
@@ -45,10 +68,15 @@ export default function StudioShelf({
           <span className="studio-row-title">Flashcards</span>
           <span className="studio-row-copy">A flip-card deck you can review</span>
         </span>
-        <span className="studio-row-state">Create</span>
+        <span
+          className={`studio-row-state${cards ? " is-working nb-tape nb-sem-pending" : ""}`}
+        >
+          {cards ? "Working…" : "Create"}
+        </span>
       </button>
       <button
         className="studio-row ap-sig-b nb-mark-green"
+        disabled={mind}
         onClick={() => a.openStudioPrompt("mindmap", scope)}
       >
         <span className="studio-row-icon">
@@ -58,10 +86,15 @@ export default function StudioShelf({
           <span className="studio-row-title">Mind map</span>
           <span className="studio-row-copy">See how the ideas connect</span>
         </span>
-        <span className="studio-row-state">Create</span>
+        <span
+          className={`studio-row-state${mind ? " is-working nb-tape nb-sem-pending" : ""}`}
+        >
+          {mind ? "Working…" : "Create"}
+        </span>
       </button>
       <button
         className="studio-row ap-sig-c nb-mark-yellow"
+        disabled={pod}
         onClick={() => a.openStudioPrompt("podcast", scope)}
       >
         <span className="studio-row-icon">
@@ -73,7 +106,11 @@ export default function StudioShelf({
             A two-host transcript (script only)
           </span>
         </span>
-        <span className="studio-row-state">Create</span>
+        <span
+          className={`studio-row-state${pod ? " is-working nb-tape nb-sem-pending" : ""}`}
+        >
+          {pod ? "Working…" : "Create"}
+        </span>
       </button>
       {(s.aiActionDefs ?? []).some((x) => x.scope === "room") && (
         <>

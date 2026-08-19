@@ -44,10 +44,53 @@ pub const MENU_EVENT: &str = "menu-action";
 /// The View submenu's own id, so `menu_sync` can find it again.
 const VIEW_ID: &str = "view";
 
-/// The File submenu's own id. Gated by `menu_sync` exactly like View: its two
-/// rows act on the room's contents, so with no room open they are rows that
-/// cannot do what they say.
+/// The File submenu's own id. Gated by `menu_sync` exactly like View: New acts
+/// on the room's contents, so with no room open it is a row that cannot do what
+/// it says. Close is the exception — see [`always_enabled`].
 const FILE_ID: &str = "file";
+
+/// The ⌘W row. Named because three places have to agree about it: it is born
+/// enabled, `menu_sync` leaves it that way, and `dispatch` gives it a meaning
+/// with no room open. The spec below still spells the id out, so the row reads
+/// like its neighbour; `close_is_the_one_row_the_room_gate_leaves_alone` is
+/// what keeps the two spellings the same string.
+const CLOSE_ID: &str = "file.close-item";
+
+/// The ⌘Q row — ours, not the platform's, and it has to be.
+///
+/// macOS's predefined Quit item sends `terminate:`. tao installs an app
+/// delegate that implements `applicationWillTerminate:` — which fires when the
+/// process is ALREADY going down — but not `applicationShouldTerminate:`, the
+/// one hook that can still say no. So the predefined row raised no
+/// `RunEvent::ExitRequested` whatever, the unsaved-edits door in
+/// [`crate::commands::hold_quit_for_unsaved`] never ran, and Quit discarded an
+/// edited note without asking. Live QA found it on the first try, through the
+/// Apple menu rather than the shortcut: the safest-looking way out was the one
+/// with no guard on it at all.
+///
+/// A row of ours raises [`MENU_EVENT`] like any other, but [`dispatch`] answers
+/// this one in Rust rather than passing it on — "hold the exit, then ask" is
+/// not a decision a window can make about itself.
+///
+/// What this does NOT cover: Quit from the Dock icon's menu, and a logout or
+/// restart, which still go straight to `terminate:`. Those keep the old
+/// behaviour, and `RunEvent::Exit` teardown still runs for them (that arrives
+/// via `applicationWillTerminate:`), so a live recording is still flushed —
+/// only the question about an unsaved buffer is lost.
+const QUIT_ID: &str = "app.quit";
+
+/// Rows that mean something with NO room open, and so are never gated.
+///
+/// Close and Quit. ⌘W is the standard macOS "close this window" key, and
+/// the start screen and the password gate are windows: greying the row there
+/// left ⌘W doing nothing at all in the app — not closing the window, not
+/// anything — because this menu replaced the predefined Close Window row that
+/// used to own the key. What the row DOES with no room open is decided in
+/// [`dispatch`], since the frontend's handler for it is mounted with the room.
+/// ⌘Q is the same shape for the same reason — see [`QUIT_ID`].
+fn always_enabled(id: &str) -> bool {
+    id == CLOSE_ID || id == QUIT_ID
+}
 
 // ---------------------------------------------------------------- the spec
 
@@ -60,7 +103,6 @@ pub(crate) enum Platform {
     Hide,
     HideOthers,
     ShowAll,
-    Quit,
     Undo,
     Redo,
     Cut,
@@ -133,7 +175,13 @@ pub(crate) const APP: &[Section] = &[
             Row::Platform(Platform::HideOthers),
             Row::Platform(Platform::ShowAll),
             Row::Separator,
-            Row::Platform(Platform::Quit),
+            // NOT `Platform::Quit` — see QUIT_ID. The predefined row cannot be
+            // held long enough to ask about an unsaved buffer.
+            Row::Command {
+                id: QUIT_ID,
+                label: "Quit Arcelle",
+                accel: Some("CmdOrCtrl+Q"),
+            },
         ],
     },
     // ⌘T AND ⌘W ARE DECLARED HERE AND NOWHERE ELSE, for the same reason ⌘1 and
@@ -250,9 +298,16 @@ pub(crate) const APP: &[Section] = &[
                 ],
             },
             Row::Separator,
+            // NOT "Show Sidebar Labels", which is what it read for a while.
+            // "Sidebar" is already the ⌘1 row four lines up, and that row is
+            // the SECOND column; this one is the rail, the first. One word
+            // covering two columns inside one menu means a reader presses one
+            // and changes the other. The rail's own accessible name has always
+            // been "Destinations", so the menu uses the word the control
+            // already answers to.
             Row::Check {
                 id: "view.rail-labels",
-                label: "Show Sidebar Labels",
+                label: "Show Destination Names",
                 accel: None,
             },
             Row::Separator,
@@ -332,7 +387,6 @@ fn platform_item<R: Runtime>(
         Platform::Hide => PredefinedMenuItem::hide(app, None),
         Platform::HideOthers => PredefinedMenuItem::hide_others(app, None),
         Platform::ShowAll => PredefinedMenuItem::show_all(app, None),
-        Platform::Quit => PredefinedMenuItem::quit(app, None),
         Platform::Undo => PredefinedMenuItem::undo(app, None),
         Platform::Redo => PredefinedMenuItem::redo(app, None),
         Platform::Cut => PredefinedMenuItem::cut(app, None),
@@ -346,17 +400,17 @@ fn platform_item<R: Runtime>(
     }
 }
 
-/// Build one row. Every custom row is born DISABLED: the menu bar exists
-/// before any room is open, and a View menu that toggles panes in a window
-/// showing the password gate is a row that cannot do what it says. `menu_sync`
-/// enables the section when a room mounts and disables it again on the way
-/// out.
+/// Build one row. Every custom row is born DISABLED — except the ones
+/// [`always_enabled`] names: the menu bar exists before any room is open, and a
+/// View menu that toggles panes in a window showing the password gate is a row
+/// that cannot do what it says. `menu_sync` enables the section when a room
+/// mounts and disables it again on the way out.
 fn row_item<R: Runtime>(app: &AppHandle<R>, row: &'static Row) -> tauri::Result<MenuItemKind<R>> {
     Ok(match row {
         Row::Platform(which) => MenuItemKind::Predefined(platform_item(app, *which)?),
         Row::Separator => MenuItemKind::Predefined(PredefinedMenuItem::separator(app)?),
         Row::Command { id, label, accel } => {
-            MenuItemKind::MenuItem(MenuItem::with_id(app, *id, label, false, *accel)?)
+            MenuItemKind::MenuItem(MenuItem::with_id(app, *id, label, always_enabled(id), *accel)?)
         }
         Row::Check { id, label, accel } => {
             MenuItemKind::Check(CheckMenuItem::with_id(app, *id, label, false, false, *accel)?)
@@ -396,10 +450,67 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
 /// no-op, not an error path. There is nothing useful to do about it and
 /// nowhere to say it — the window IS the user interface.
 pub fn dispatch<R: Runtime>(app: &AppHandle<R>, id: &str) {
-    // main_window, never get_webview_window — see the module header.
-    if let Some(window) = crate::main_window(app) {
-        let _ = window.emit(MENU_EVENT, id.to_string());
+    // Answered here, not by the window: the question is whether to exit at all,
+    // and the window is the thing being exited. See [`QUIT_ID`] and [`quit`].
+    // BEFORE the window lookup, so ⌘Q works at the start screen too.
+    if id == QUIT_ID {
+        quit(app);
+        return;
     }
+    // main_window, never get_webview_window — see the module header.
+    let Some(window) = crate::main_window(app) else {
+        return;
+    };
+    // ⌘W with no room open has no listener to reach: `useNativeMenu` — which
+    // owns every row id on the other side — mounts with the workspace, so at
+    // the start screen and the password gate the event would go nowhere and the
+    // key would do nothing. Do here what the shell does as its own last case,
+    // and what the predefined Close Window row this menu replaced always did.
+    if id == CLOSE_ID && no_room_is_open(app) {
+        let _ = window.close();
+        return;
+    }
+    let _ = window.emit(MENU_EVENT, id.to_string());
+}
+
+/// ⌘Q, asked properly.
+///
+/// The hold is [`crate::commands::hold_quit_for_unsaved`]'s to decide and its
+/// latch to keep, exactly as it was for `RunEvent::ExitRequested`: it answers
+/// true at most once per dirty buffer, so a window that never replies still
+/// quits on the second press. `None` for the code, because this IS the quit the
+/// user asked for.
+///
+/// Every path that does not hold — nothing unsaved, already asked, or no window
+/// left to ask — exits. `app.exit` carries a code, so the `ExitRequested` arm in
+/// `lib.rs` passes it straight through to the teardown that saves the geometry
+/// and flushes a live recording.
+fn quit<R: Runtime>(app: &AppHandle<R>) {
+    if crate::commands::hold_quit_for_unsaved(None) {
+        if let Some(window) = crate::main_window(app) {
+            let _ = window.emit(crate::commands::QUIT_REQUESTED, ());
+            return;
+        }
+    }
+    app.exit(0);
+}
+
+/// True only when we LOOKED and there was no room.
+///
+/// `try_lock`, never `lock`: this runs on the thread delivering the menu event,
+/// and a room busy enough to hold its own mutex is a room that is open — so a
+/// contended (or poisoned) lock answers false and the press goes to the
+/// frontend exactly as it did before, which is the safe way round. Blocking
+/// here would stall the menu behind whatever command holds the room.
+fn no_room_is_open<R: Runtime>(app: &AppHandle<R>) -> bool {
+    use tauri::Manager;
+    let Some(state) = app.try_state::<crate::commands::AppState>() else {
+        return false;
+    };
+    let Ok(room) = state.room.try_lock() else {
+        return false;
+    };
+    room.is_none()
 }
 
 // ------------------------------------------------------------ the frontend
@@ -515,9 +626,10 @@ pub fn menu_sync<R: Runtime>(app: AppHandle<R>, view: ViewMenuState) {
                     None => crate::obs::warn("menu_check_unmapped", &[("id", crate::obs::id(id))]),
                 }
             }
-            // The rows that only act — presets and Reset — follow the section.
+            // The rows that only act — presets, Reset, New — follow the
+            // section; Close does not, because it can always close the window.
             MenuItemKind::MenuItem(item) => {
-                let _ = item.set_enabled(view.enabled);
+                let _ = item.set_enabled(view.enabled || always_enabled(id));
             }
             _ => {}
         }
@@ -589,10 +701,59 @@ mod tests {
             Platform::Services,
             Platform::Hide,
             Platform::HideOthers,
-            Platform::Quit,
         ] {
             assert!(app.contains(&item), "{item:?} is missing from the app menu");
         }
+    }
+
+    /// ⌘Q IS OURS, and it has to be — see [`QUIT_ID`].
+    ///
+    /// The row this replaced was `PredefinedMenuItem::quit`, which muda wires
+    /// to `terminate:`. tao implements `applicationWillTerminate:` and NOT
+    /// `applicationShouldTerminate:`, so that row raised no
+    /// `RunEvent::ExitRequested` at all: the unsaved-edits door in `shell_exit`
+    /// could not fire on the one exit it was written for, and Quit threw an
+    /// edited note away without a word. This test is the only thing standing
+    /// between that row and a well-meaning "use the platform item" cleanup.
+    #[test]
+    fn quit_is_a_row_of_ours_because_the_platform_row_cannot_be_asked_a_question() {
+        let quit = rows_of("app")
+            .iter()
+            .find_map(|r| match r {
+                Row::Command { id, accel, .. } if *id == QUIT_ID => Some(*accel),
+                _ => None,
+            })
+            .expect("the Quit row is not ours — unsaved edits go out with the process");
+        assert_eq!(quit, Some("CmdOrCtrl+Q"));
+        // Born enabled, like Close: the start screen and the password gate are
+        // windows too, and a ⌘Q that does nothing there would be worse than the
+        // bug this row fixes.
+        assert!(always_enabled(QUIT_ID));
+        // ...and it is NOT a gated row, so `menu_sync` never greys it and the
+        // frontend is never asked to handle it — `dispatch` answers it in Rust,
+        // because the answer is "hold the exit", which no window can decide.
+        assert!(!ids().contains(&QUIT_ID));
+    }
+
+    /// The label is a literal where the platform row read the app's own name,
+    /// so a rename would leave the Apple menu saying Quit <the old product>.
+    /// The app has been renamed once already (Private Room → Arcelle).
+    #[test]
+    fn the_quit_row_is_named_after_the_app_it_quits() {
+        let conf = include_str!("../tauri.conf.json");
+        let product = conf
+            .split("\"productName\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').nth(1))
+            .expect("tauri.conf.json has no productName");
+        let label = rows_of("app")
+            .iter()
+            .find_map(|r| match r {
+                Row::Command { id, label, .. } if *id == QUIT_ID => Some(*label),
+                _ => None,
+            })
+            .expect("no Quit row");
+        assert_eq!(label, format!("Quit {product}"));
     }
 
     #[test]
@@ -612,6 +773,33 @@ mod tests {
             10,
             "a row was added or removed — check the frontend maps too"
         );
+    }
+
+    /// ⌘W is macOS's "close this window", and the start screen and the
+    /// password gate are windows. This menu REPLACED the predefined Close
+    /// Window row that owned the key unconditionally, so gating our Close row
+    /// with the room left ⌘W doing nothing whatever with no room open — not
+    /// closing the window, not anything. It is the one row that survives the
+    /// gate, in `row_item` and in `menu_sync` alike, and `dispatch` gives it
+    /// its meaning there because the frontend's handler mounts with the room.
+    #[test]
+    fn close_is_the_one_row_the_room_gate_leaves_alone() {
+        assert!(always_enabled(CLOSE_ID));
+        for id in ids() {
+            assert_eq!(
+                always_enabled(id),
+                id == CLOSE_ID,
+                "{id} disagrees with the gate about whether it needs a room",
+            );
+        }
+        let close = rows_of(FILE_ID)
+            .iter()
+            .find_map(|r| match r {
+                Row::Command { id, accel, .. } if *id == CLOSE_ID => Some(*accel),
+                _ => None,
+            })
+            .expect("the Close row is gone — ⌘W has no owner at all now");
+        assert_eq!(close, Some("CmdOrCtrl+W"));
     }
 
     /// ⌘1 and ⌘2 have exactly one owner, and it is this file. The matching

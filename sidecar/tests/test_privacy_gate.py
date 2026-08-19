@@ -117,6 +117,46 @@ def test_add_rules_recompiles_and_dedupes() -> None:
     assert out == "[Person A] of [Hidden 1]"
 
 
+def test_ollama_writes_the_relay_marker_inside_the_tag_too() -> None:
+    # Ollama tags its hosted entries BOTH ways. An exact ":cloud" suffix test
+    # sees the first and calls the second a local model, which is the one
+    # direction of error that costs the user their content.
+    assert privacy.is_nonlocal_model("gpt-oss:120b-cloud")
+    assert privacy.is_nonlocal_model("qwen3-coder:480b-cloud")
+    assert privacy.is_nonlocal_model("qwen3-vl:235b-cloud")
+    # A local tag that merely ends in the word stays local.
+    assert not privacy.is_nonlocal_model("thundercloud")
+    assert not privacy.is_nonlocal_model("nimbus:cloudy")
+
+
+def test_door_engages_for_a_size_cloud_tag() -> None:
+    p = make_policy()
+    msgs = [user_message("Ben Reich")]
+    send, imgs, engaged = privacy.guard_outbound("gpt-oss:120b-cloud", msgs, p, ["img"])
+    assert engaged is p, "the door must engage for a relayed tag"
+    assert imgs is None, "pixels must not ride along to a relayed model"
+    assert "Ben Reich" not in send[0]["content"]
+
+
+def test_door_engages_when_the_transport_is_relayed() -> None:
+    # The Closet points a local-NAMED model at another computer. The name
+    # cannot answer "does this leave the Mac"; Rust resolved it and said so.
+    p = privacy.PrivacyPolicy(
+        active=True, rules=[("Ben Reich", "[Person A]")], relayed=True
+    )
+    msgs = [user_message("Ben Reich")]
+    send, imgs, engaged = privacy.guard_outbound("qwen3.5:4b", msgs, p, ["img"])
+    assert engaged is p, "a relayed transport must engage the door"
+    assert imgs is None
+    assert "Ben Reich" not in send[0]["content"]
+
+
+def test_relayed_flag_rides_the_wire() -> None:
+    assert privacy.policy_from_payload({"active": True, "relayed": True}).relayed is True
+    # Absent means "not relayed" — an older host that never sends it is unchanged.
+    assert privacy.policy_from_payload({"active": True}).relayed is False
+
+
 # --- the door on every path --------------------------------------------------
 
 

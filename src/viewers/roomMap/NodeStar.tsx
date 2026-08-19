@@ -1,5 +1,10 @@
+import { useRef } from "react";
 import type { SimNode, View, Tip } from "./types";
 import { nodeRadius, handCircle } from "./layout";
+
+/** How far a press may travel and still count as a click on this star — the
+ *  same 3px the backdrop's pan uses to tell a drag from a click. */
+const DRAG_SLOP = 3;
 
 interface NodeStarProps {
   n: SimNode;
@@ -55,7 +60,6 @@ export default function NodeStar({
   const neighbour = focusNeighbors?.has(n.id) ?? false;
   const openable = isFile && onOpenFile != null;
   const tipLines = [n.kind === "memory" ? "Memory" : n.folder || "Top level"];
-  if (n.summary) tipLines.push(n.summary);
   // Generous invisible hit target so small stars are clickable.
   const hit = Math.max(r * 1.6, 11 / view.k);
   // Reachable by Tab and named for a screen reader — without this the map is
@@ -71,6 +75,17 @@ export default function NodeStar({
   const activate = () => {
     setFocus(n.id);
     if (openable) onOpenFile?.(n.id);
+  };
+  // Where the press started, so a press that MOVED is not treated as a click.
+  // Opening a file unmounts the whole map — pan, zoom, filters and selection go
+  // with it — and a grab that begins on a star is the ordinary way someone
+  // tries to move the canvas.
+  const pressAt = useRef<{ x: number; y: number } | null>(null);
+  const onNodeClick = (ev: React.MouseEvent) => {
+    const start = pressAt.current;
+    pressAt.current = null;
+    if (start && Math.hypot(ev.clientX - start.x, ev.clientY - start.y) > DRAG_SLOP) return;
+    activate();
   };
   return (
     <g
@@ -106,7 +121,10 @@ export default function NodeStar({
           activate();
         }
       }}
-      onClick={activate}
+      onPointerDown={(ev) => {
+        pressAt.current = { x: ev.clientX, y: ev.clientY };
+      }}
+      onClick={onNodeClick}
     >
       <circle className="rm-node-hit" r={hit} />
       {/* The selected node is CIRCLED, the way you would circle it on paper.

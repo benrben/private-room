@@ -1,10 +1,10 @@
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 // CONTRACT-NOTE: G3 will add a `GraphIcon` (constellation) to ../icons. Until
 // then this import is the only thing tying RoomMap to that file; if it lands
 // under a different name, swap it here.
 import { GraphIcon } from "../icons";
 import "./roomMap.css";
-import type { SimNode, SimEdge, Tip, LabelBox, RoomMapProps } from "./roomMap/types";
+import type { SimNode, SimEdge, Tip, LabelBox, RoomGraph, RoomMapProps } from "./roomMap/types";
 import {
   EMPTY_TEXT,
   LABEL_MIN_R_PX,
@@ -67,6 +67,33 @@ function onCanvas(at: number, len: number, span: number): number {
   return Math.max(EDGE, Math.min(at, span - len - EDGE));
 }
 
+/* ----- tooltip box estimate -----
+ *
+ * The stage clips its overflow, so a tip opened near the right or bottom edge
+ * was cut off mid-word. The card isn't in the DOM when its position is chosen,
+ * so its box is ESTIMATED from the text with the same per-character advance the
+ * labels estimate with (LABEL_CHAR_W, at the same 12px size), bounded by
+ * .rm-tip's own max-width. Over-estimating flips the card a few pixels early;
+ * under-estimating costs the reader the end of the sentence, which is the whole
+ * content of a `similar` link's evidence — so every rounding here goes UP. */
+const TIP_MAX_W = 260; // .rm-tip max-width
+const TIP_PAD_X = 20; // .nb-tip left+right padding and border
+const TIP_PAD_Y = 14; // .nb-tip top+bottom padding and border
+const TIP_LINE_H = 19; // --fs-micro (12) × --lh-body (1.55) = 18.6, rounded up
+const TIP_LINE_GAP = 2; // .rm-tip-line margin-top
+const TIP_OFFSET = 14; // clearance from the cursor
+
+function tipBox(title: string, lines: string[]): { w: number; h: number } {
+  const runW = (s: string) => s.length * LABEL_CHAR_W;
+  const widest = Math.max(1, runW(title), ...lines.map(runW));
+  const textW = Math.min(TIP_MAX_W, widest);
+  const rows = [title, ...lines].reduce((n, s) => n + Math.max(1, Math.ceil(runW(s) / textW)), 0);
+  return {
+    w: textW + TIP_PAD_X,
+    h: TIP_PAD_Y + rows * TIP_LINE_H + lines.length * TIP_LINE_GAP,
+  };
+}
+
 export default function RoomMap({ onOpenFile }: RoomMapProps) {
   const [tip, setTip] = useState<Tip | null>(null);
   const [hovered, setHovered] = useState<string | null>(null);
@@ -91,7 +118,9 @@ export default function RoomMap({ onOpenFile }: RoomMapProps) {
   const stageRef = useRef<HTMLDivElement>(null);
   const sizeRef = useRef<{ w: number; h: number }>({ w: 0, h: 0 });
   // True once the user pans/zooms, so the settle loop and resize handler stop
-  // stealing the view back to the auto-fit. Cleared on reset / new graph.
+  // stealing the view back to the auto-fit. Cleared by "reset view" only — a
+  // new graph deliberately leaves it set, because a file write elsewhere in the
+  // room is not a reason to take the reader's frame away.
   const userAdjustedRef = useRef(false);
   // Live layout — mutated in place by the animation loop; render reads it.
   const layoutRef = useRef<{ nodes: SimNode[]; edges: SimEdge[] } | null>(null);
@@ -120,22 +149,54 @@ export default function RoomMap({ onOpenFile }: RoomMapProps) {
     nonce,
   } = useRoomGraph({ filter, stageRef, sizeRef, userAdjustedRef, layoutRef, setView, setFocus });
 
-  const focusId = focus ?? topNode;
-  const focusNeighbors = focusId ? adjacency.get(focusId) ?? null : null;
+  // Two different questions, kept apart. What the reader CHOSE is `focus`, and
+  // only that is circled — a ring that fell back to the hub meant the map had
+  // no state in which nothing was selected, so clicking empty canvas returned
+  // the ring to a node nobody picked instead of removing it. The hub is still
+  // the default the LABELS orient around, so the room reads on open.
+  const labelFocusId = focus ?? topNode;
+  const labelNeighbors = labelFocusId ? adjacency.get(labelFocusId) ?? null : null;
+  const selectedNeighbors = focus ? adjacency.get(focus) ?? null : null;
+
+  // A room-file change re-seeds every node onto a fresh circle, and a reader
+  // who has panned or zoomed keeps their frame across that — so the viewport
+  // they are staring at now holds different stars. Say so, and offer the way
+  // back, rather than letting the map silently rearrange itself.
+  const [rebuilt, setRebuilt] = useState(false);
+  const seenGraphRef = useRef<RoomGraph | null>(null);
+  useEffect(() => {
+    if (!graph) return;
+    const previous = seenGraphRef.current;
+    seenGraphRef.current = graph;
+    if (previous && userAdjustedRef.current) setRebuilt(true);
+  }, [graph]);
+  const refit = () => {
+    setRebuilt(false);
+    resetView();
+  };
 
   function showTip(e: React.MouseEvent, title: string, lines: string[]) {
     const rect = stageRef.current?.getBoundingClientRect();
-    setTip({
-      left: e.clientX - (rect?.left ?? 0) + 14,
-      top: e.clientY - (rect?.top ?? 0) + 14,
-      title,
-      lines,
-    });
+    const x = e.clientX - (rect?.left ?? 0);
+    const y = e.clientY - (rect?.top ?? 0);
+    const box = tipBox(title, lines);
+    // Flip to the other side of the cursor rather than run off the stage — the
+    // same discipline `onCanvas` applies to the labels. Without a measured
+    // stage there is nothing to flip against, so the tip keeps its offset.
+    let left = x + TIP_OFFSET;
+    if (rect && left + box.w > rect.width) left = Math.max(4, x - TIP_OFFSET - box.w);
+    let top = y + TIP_OFFSET;
+    if (rect && top + box.h > rect.height) top = Math.max(4, y - TIP_OFFSET - box.h);
+    setTip({ left, top, title, lines });
   }
 
   // ---------------- derived render data ----------------
   const layout = layoutRef.current;
-  const showEmpty = graph != null && fileNodeCount < 2;
+  // "Nothing to map" is about the GRAPH, not the file count: one file with
+  // linked memories is a real constellation, and hiding it behind the empty
+  // sentence also took the legend, the list toggle and the controls with it.
+  // A room with no files at all, or a single lone node, still gets the words.
+  const showEmpty = graph != null && (fileNodeCount === 0 || graph.nodes.length < 2);
   const hasStage = size.w > 0 && size.h > 0;
 
   // Persistent, de-cluttered labels (computed in screen space each frame).
@@ -153,12 +214,24 @@ export default function RoomMap({ onOpenFile }: RoomMapProps) {
     for (const n of layout.nodes) {
       const sx = n.x * view.k + view.x;
       const sy = n.y * view.k + view.y;
-      if (sx < -60 || sx > size.w + 60 || sy < -30 || sy > size.h + 30) continue; // offscreen
       const deg = degree.get(n.id) ?? 0;
       const rScreen = nodeRadius(deg) * view.k;
+      // Cull on the STAR's own geometry. A fixed 60/30px margin kept a card for
+      // a node up to 60px past the edge, and the card was then clamped fully
+      // into view — a label pinned to the boundary naming a star that is not on
+      // screen. If no part of the disc is on the stage, there is nothing here
+      // to name.
+      if (
+        sx + rScreen < 0 ||
+        sx - rScreen > size.w ||
+        sy + rScreen < 0 ||
+        sy - rScreen > size.h
+      ) {
+        continue;
+      }
       let prio = 0;
-      if (n.id === focusId) prio = 3;
-      else if (focusNeighbors?.has(n.id)) prio = 2;
+      if (n.id === labelFocusId) prio = 3;
+      else if (labelNeighbors?.has(n.id)) prio = 2;
       else if (rScreen >= LABEL_MIN_R_PX) prio = 1; // more of these appear as you zoom in
       if (prio === 0) continue;
       cands.push({ n, sx, sy, rScreen, prio, deg });
@@ -241,30 +314,38 @@ export default function RoomMap({ onOpenFile }: RoomMapProps) {
     return out;
     // `nonce` forces a recompute each settle frame (layout mutates via ref).
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [view, size, hasStage, focusId, focusNeighbors, degree, nonce]);
+  }, [view, size, hasStage, labelFocusId, labelNeighbors, degree, nonce]);
 
-  // The same graph as plain text: every file, its folder and what it links to.
-  // The canvas is mouse-only by nature, so this is the keyboard / screen-reader
-  // route to the exact same information.
   // The same graph as plain text, links GROUPED BY KIND — now that a line can
   // mean six different things, a list that only said "linked to X" would be
-  // strictly less informative than the canvas it stands in for.
+  // strictly less informative than the canvas it stands in for. The canvas is
+  // mouse-only by nature, so this is the keyboard / screen-reader route to the
+  // exact same information — which is why it covers MEMORY nodes too. It used
+  // to list files only, so a memory drawn on the canvas appeared in the list
+  // either not at all or as a bare name inside some file's group, with nothing
+  // saying it was a memory.
   const listRows = useMemo(() => {
     const byId = new Map((graph?.nodes ?? []).map((n) => [n.id, n]));
+    // A memory carries its kind into every place its name is printed, the same
+    // way the canvas gives it its own shape and NodeStar its own aria-label.
+    const printed = (id: string) => {
+      const node = byId.get(id);
+      if (!node) return id;
+      return node.kind === "memory" ? `Memory: ${node.name}` : node.name;
+    };
     const perNode = new Map<string, Map<string, string[]>>();
     const note = (from: string, to: string, kind: string) => {
       const kinds = perNode.get(from) ?? new Map<string, string[]>();
       perNode.set(from, kinds);
       const names = kinds.get(kind) ?? [];
       kinds.set(kind, names);
-      names.push(byId.get(to)?.name ?? to);
+      names.push(printed(to));
     };
     for (const e of visibleEdges) {
       note(e.a, e.b, e.kind);
       note(e.b, e.a, e.kind);
     }
     return (graph?.nodes ?? [])
-      .filter((n) => n.kind === "file")
       .map((n) => {
         const kinds = perNode.get(n.id) ?? new Map<string, string[]>();
         const groups = [...kinds.entries()]
@@ -277,7 +358,11 @@ export default function RoomMap({ onOpenFile }: RoomMapProps) {
         return {
           id: n.id,
           name: n.name,
-          folder: n.folder || "Top level",
+          // The "where this lives" slot: a folder for a file, and for a memory
+          // the one thing there is to say about where it lives — it is a
+          // memory, not a document, and it cannot be opened.
+          folder: n.kind === "memory" ? "Memory" : n.folder || "Top level",
+          openable: n.kind === "file",
           groups,
           total: groups.reduce((sum, g) => sum + g.names.length, 0),
         };
@@ -323,6 +408,19 @@ export default function RoomMap({ onOpenFile }: RoomMapProps) {
             onClick={() => setShowLegend((v) => !v)}
           >
             Links
+          </button>
+        )}
+        {/* The map was re-laid-out under a frame the reader chose. Said out
+            loud, with the way back, instead of leaving them to work out why the
+            stars under their viewport changed. */}
+        {rebuilt && !showEmpty && !listView && (
+          <button
+            type="button"
+            className="nb-chip nb-chip-btn rm-toolchip"
+            title="The room changed, so the map was laid out again — the stars have moved. Fit it back to the screen."
+            onClick={refit}
+          >
+            Map rebuilt — reset view
           </button>
         )}
         {graph && !showEmpty && (
@@ -443,8 +541,8 @@ export default function RoomMap({ onOpenFile }: RoomMapProps) {
                   <button
                     type="button"
                     className="rm-list-name"
-                    onClick={() => onOpenFile?.(row.id)}
-                    disabled={!onOpenFile}
+                    onClick={() => row.openable && onOpenFile?.(row.id)}
+                    disabled={!row.openable || !onOpenFile}
                   >
                     {row.name}
                   </button>
@@ -527,7 +625,7 @@ export default function RoomMap({ onOpenFile }: RoomMapProps) {
                         b={layout.nodes[se.bi]}
                         view={view}
                         hovered={hovered}
-                        focusId={focusId}
+                        focusId={focus}
                         degree={degree}
                         showTip={showTip}
                         setTip={setTip}
@@ -543,8 +641,8 @@ export default function RoomMap({ onOpenFile }: RoomMapProps) {
                       n={n}
                       degree={degree}
                       hovered={hovered}
-                      focusId={focusId}
-                      focusNeighbors={focusNeighbors}
+                      focusId={focus}
+                      focusNeighbors={selectedNeighbors}
                       view={view}
                       onOpenFile={onOpenFile}
                       setHovered={setHovered}
@@ -596,7 +694,7 @@ export default function RoomMap({ onOpenFile }: RoomMapProps) {
               className="nb-btn nb-btn-icon rm-btn rm-btn-reset"
               title="Reset view (fit to screen)"
               aria-label="Reset view"
-              onClick={resetView}
+              onClick={refit}
             >
               <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
                 <path

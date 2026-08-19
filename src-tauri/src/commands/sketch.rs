@@ -45,6 +45,30 @@ fn list_sketches(conn: &Connection) -> Result<Vec<(String, String)>, String> {
         .collect())
 }
 
+/// Why a name did not land on a drawing.
+///
+/// The two answers lead opposite ways, and the difference was being thrown
+/// away: an unknown name may be created, an ambiguous one must go back to the
+/// model. `tool_draw` matched on `Err(_)` and so answered an ambiguity by
+/// starting a THIRD drawing — or by renaming a blank one — while the diagram
+/// the user meant sat untouched under a name they never chose.
+enum Unresolved {
+    /// Nothing here carries this name. Creating one is a fair reading.
+    NotFound(String),
+    /// The name fits more than one drawing. Only the asker can settle it.
+    Ambiguous(String),
+    /// The room's files could not be read at all.
+    Failed(String),
+}
+
+impl Unresolved {
+    fn message(self) -> String {
+        match self {
+            Unresolved::NotFound(m) | Unresolved::Ambiguous(m) | Unresolved::Failed(m) => m,
+        }
+    }
+}
+
 /// Find the drawing the model means.
 ///
 /// Exact name, then a fragment, then — if the room holds exactly one drawing —
@@ -56,21 +80,27 @@ fn list_sketches(conn: &Connection) -> Result<Vec<(String, String)>, String> {
 /// fragment to the NEWEST match, which for files the agent itself just created
 /// means a typo silently retargets the wrong drawing.
 fn resolve(conn: &Connection, name: &str) -> Result<(String, String), String> {
-    let all = list_sketches(conn)?;
+    resolve_named(conn, name).map_err(Unresolved::message)
+}
+
+/// The same lookup, with the reason it failed kept apart from its wording.
+fn resolve_named(conn: &Connection, name: &str) -> Result<(String, String), Unresolved> {
+    let all = list_sketches(conn).map_err(Unresolved::Failed)?;
     if all.is_empty() {
-        return Err("This room has no drawings yet. Use `draw` with a new name to start one."
-            .to_string());
+        return Err(Unresolved::NotFound(
+            "This room has no drawings yet. Use `draw` with a new name to start one.".to_string(),
+        ));
     }
     let want = name.trim();
     if want.is_empty() {
         if all.len() == 1 {
             return Ok(all.into_iter().next().unwrap());
         }
-        return Err(format!(
+        return Err(Unresolved::Ambiguous(format!(
             "Which drawing? This room has {}: {}.",
             all.len(),
             name_list(&all)
-        ));
+        )));
     }
     let lower = want.to_lowercase();
     let stem = lower.trim_end_matches(".sketch").trim().to_string();
@@ -86,15 +116,53 @@ fn resolve(conn: &Connection, name: &str) -> Result<(String, String), String> {
         all.iter().filter(|(_, n)| n.to_lowercase().contains(&stem)).collect();
     match hits.len() {
         1 => Ok(hits[0].clone()),
-        0 => Err(format!(
+        0 => Err(Unresolved::NotFound(format!(
             "There is no drawing called \"{want}\". This room has: {}.",
             name_list(&all)
-        )),
-        _ => Err(format!(
+        ))),
+        _ => Err(Unresolved::Ambiguous(format!(
             "\"{want}\" matches {} drawings: {}. Use the full name.",
             hits.len(),
             name_list(&hits.iter().map(|h| (*h).clone()).collect::<Vec<_>>())
-        )),
+        ))),
+    }
+}
+
+/// The drawing a `draw` call is about: an existing one, an empty one claimed,
+/// or a new file — and which of the three it was.
+///
+/// An unknown name is a NEW drawing rather than an error. The result says which
+/// happened, because a typo that quietly created "Login flwo" beside the real
+/// drawing is otherwise invisible until the user opens the Library.
+///
+/// An unknown name is a new drawing — but not necessarily a new FILE. The
+/// overwhelmingly common way this feature is used is: press "New sketch", look
+/// at the blank page, ask for a diagram. Creating a second file there is
+/// correct by the letter and wrong by every other measure — the user watches a
+/// blank canvas while their diagram lands somewhere they have to go and find,
+/// and the page they started is left behind as litter (live QA 2026-08-13).
+///
+/// So an EMPTY sketch is claimed and renamed rather than orphaned. Only an
+/// empty one: a drawing with anything on it is work, and work is never silently
+/// repurposed. And an AMBIGUOUS name claims nothing at all — it goes back to
+/// the model, which is the only place the answer is.
+fn draw_target(conn: &Connection, name: &str) -> Result<(String, String, bool), String> {
+    match resolve_named(conn, name) {
+        Ok((id, real)) => Ok((id, real, false)),
+        Err(Unresolved::NotFound(_)) => match take_empty_sketch(conn, name)? {
+            Some((id, real)) => Ok((id, real, false)),
+            None => {
+                let meta = insert_sketch(conn, name, &Sketch::default(), "generated")?;
+                // Section-only, exactly like one the user starts. A drawing is
+                // a drawing whoever made it: filing the assistant's in Home
+                // while the user's own stays in Sketches would make the rule
+                // depend on who held the pen, and would put an object in the
+                // Library that nobody asked to put there.
+                db::mark_section_only(conn, &meta.id, "sketch");
+                Ok((meta.id, meta.name, true))
+            }
+        },
+        Err(other) => Err(other.message()),
     }
 }
 
@@ -330,7 +398,7 @@ pub(crate) fn draw_tools_specs() -> Vec<serde_json::Value> {
         {"type": "function", "function": {"name": "draw",
             "description": "Draw on a room sketch. Put EVERY shape in one call's script — never one \
 call per shape. Starts a new sketch if the name is new. Read it first when changing existing \
-work, and see_drawing after to check.",
+work, and read_drawing after to check.",
             "parameters": {"type": "object", "properties": {
                 "name": {"type": "string", "description": "Sketch to draw on; a new name starts one"},
                 "script": {"type": "string", "description": SCRIPT_ARG_DOC}},
@@ -355,6 +423,12 @@ that stop short. Use it before changing existing work, and again after drawing t
 /// near-duplicate a 4B model picks between wrongly. Reading a drawing and
 /// looking at one are now the same act.
 pub(crate) const DRAW_TOOL_NAMES: &[&str] = &["draw", "read_drawing"];
+
+/// How a drawing that measures wrong ends, in the tool result the model reads.
+/// Held next to [`DRAW_TOOL_NAMES`] because it names one of them: it sent the
+/// model after `see_drawing` for as long as that tool had not existed, which
+/// costs a turn on a call the catalog cannot accept.
+const DRAW_FOLLOWUP: &str = "Call read_drawing to look at it, then draw again to correct it.";
 
 /// How a drawing reads to a model: the script, then what is wrong with it.
 fn describe(doc: &Sketch, name: &str) -> String {
@@ -449,37 +523,7 @@ pub(crate) fn tool_draw(
     }
 
     let (id, real, created, outcome, doc) = state.with_room(|room| {
-        // An unknown name is a NEW drawing rather than an error. The result
-        // says which of the two happened, because a typo that quietly created
-        // "Login flwo" beside the real drawing is otherwise invisible until
-        // the user opens the Library.
-        let (id, real, created) = match resolve(&room.conn, &name) {
-            Ok((id, real)) => (id, real, false),
-            // An unknown name is a NEW drawing — but not necessarily a new
-            // FILE. The overwhelmingly common way this feature is used is:
-            // press "New sketch", look at the blank page, ask for a diagram.
-            // Creating a second file there is correct by the letter and wrong
-            // by every other measure — the user watches a blank canvas while
-            // their diagram lands somewhere they have to go and find, and the
-            // page they started is left behind as litter (live QA 2026-08-13).
-            //
-            // So an EMPTY sketch is claimed and renamed rather than orphaned.
-            // Only an empty one: a drawing with anything on it is work, and
-            // work is never silently repurposed.
-            Err(_) => match take_empty_sketch(&room.conn, &name)? {
-                Some((id, real)) => (id, real, false),
-                None => {
-                    let meta = insert_sketch(&room.conn, &name, &Sketch::default(), "generated")?;
-                    // Section-only, exactly like one the user starts. A drawing
-                    // is a drawing whoever made it: filing the assistant's in
-                    // Home while the user's own stays in Sketches would make
-                    // the rule depend on who held the pen, and would put an
-                    // object in the Library that nobody asked to put there.
-                    db::mark_section_only(&room.conn, &meta.id, "sketch");
-                    (meta.id, meta.name, true)
-                }
-            },
-        };
+        let (id, real, created) = draw_target(&room.conn, &name)?;
         let mut doc = load(&room.conn, &id)?;
         let outcome = sketchdoc::apply_script(&mut doc, script)?;
         if !outcome.is_empty() {
@@ -533,7 +577,7 @@ pub(crate) fn tool_draw(
             msg.push_str(n);
             msg.push('\n');
         }
-        msg.push_str("Call see_drawing to look at it, then draw again to correct it.");
+        msg.push_str(DRAW_FOLLOWUP);
     }
     Ok(msg)
 }
@@ -885,6 +929,71 @@ mod tests {
         for name in DRAW_TOOL_NAMES {
             assert!(all.contains(&format!("\"{name}\"")), "{name} is not in the specs");
         }
+    }
+
+    #[test]
+    fn no_description_sends_the_model_after_a_tool_that_is_not_there() {
+        // `see_drawing` was deleted and both the draw description and the draw
+        // RESULT went on naming it, so every layout report ended by telling the
+        // model to call a tool it did not hold. Any snake_case word inside a
+        // description is read as a tool name here — that is the shape a model
+        // reads it as too.
+        let specs = draw_tools_specs();
+        let mut texts: Vec<String> = Vec::new();
+        for spec in &specs {
+            texts.push(spec["function"]["description"].as_str().unwrap_or_default().to_string());
+            for (_, schema) in spec["function"]["parameters"]["properties"]
+                .as_object()
+                .into_iter()
+                .flatten()
+            {
+                texts.push(schema["description"].as_str().unwrap_or_default().to_string());
+            }
+        }
+        // The tool RESULT that closes the look-then-fix loop is held to the
+        // same rule: it is what a drawing with anything wrong with it ends on.
+        texts.push(DRAW_FOLLOWUP.to_string());
+
+        for text in &texts {
+            for word in text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+                if !word.contains('_') {
+                    continue;
+                }
+                assert!(
+                    DRAW_TOOL_NAMES.contains(&word),
+                    "\"{word}\" reads as a tool name and is not one of {DRAW_TOOL_NAMES:?}: {text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_ambiguous_name_reports_itself_instead_of_starting_a_third_drawing() {
+        let c = room();
+        let a = add(&c, "Login flow");
+        let b = add(&c, "Login flow old");
+        // Neither is empty, so the "claim the blank page" path is not in play.
+        for id in [&a, &b] {
+            let mut doc = Sketch::default();
+            sketchdoc::apply_script(&mut doc, "rect 100 100 200 100 blue \"box\"").unwrap();
+            save(&c, id, &doc, "test").unwrap();
+        }
+        let before = list_sketches(&c).unwrap();
+        let err = draw_target(&c, "Login").unwrap_err();
+        assert!(err.contains("matches 2 drawings"), "{err}");
+        assert_eq!(list_sketches(&c).unwrap(), before, "a drawing was created or renamed");
+    }
+
+    #[test]
+    fn an_unknown_name_still_claims_the_blank_page_it_finds() {
+        // The fall-through the ambiguity fix must not take with it.
+        let c = room();
+        let blank = add(&c, "Sketch");
+        let (id, real, created) = draw_target(&c, "Order flow").unwrap();
+        assert_eq!(id, blank);
+        assert!(!created, "an existing blank page was reported as a new file");
+        assert_eq!(real, "Order flow.sketch");
+        assert_eq!(list_sketches(&c).unwrap().len(), 1);
     }
 
     #[test]

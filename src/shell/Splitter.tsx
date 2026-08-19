@@ -1,7 +1,15 @@
 import { LayoutApi } from "./useLayout";
 
-/** A draggable, keyboard-operable divider between two panes. Arrow keys
- * resize (Shift for bigger steps), double-click resets the whole layout. */
+/** A draggable, keyboard-operable divider between two panes. Arrow keys resize
+ * (Shift for bigger steps).
+ *
+ * Double-click and Enter used to call `resetLayout`, which is not this
+ * divider's business: it restores BOTH pane widths, un-hides both side panes,
+ * leaves focus mode, puts the rail's label preference back and re-arms the AI
+ * column's step-aside. One mis-timed second click while dragging threw out
+ * every layout choice in the room, with no undo, from a control 5px wide that
+ * looks local. The whole-window reset stays where it is named: the toolbar's
+ * Layout menu, View → Layout → Reset Layout, and ⌘K. */
 export default function Splitter({
   side,
   layout,
@@ -28,18 +36,14 @@ export default function Splitter({
       aria-valuenow={value}
       aria-valuemin={0}
       aria-valuemax={100}
-      title="Drag to resize. Double-click to reset the layout."
+      title="Drag to resize, or use the arrow keys."
       className={`splitter${layout.dragging === side ? " is-dragging" : ""}${show ? "" : " is-off"}`}
       onPointerDown={(e) => layout.startDrag(side, e)}
-      onDoubleClick={() => layout.resetLayout()}
       onKeyDown={(e) => {
         if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
           e.preventDefault();
           const dir = e.key === "ArrowRight" ? 1 : -1;
           layout.keyResize(side, dir, e.shiftKey);
-        } else if (e.key === "Enter") {
-          e.preventDefault();
-          layout.resetLayout();
         }
       }}
     />

@@ -101,11 +101,6 @@ export function UnlockScreen({
               {error}
             </div>
           )}
-          {!canTouchId && (
-            <p className="gate-hint">
-              Tip: enable fingerprint unlock in Settings → Privacy.
-            </p>
-          )}
           <div className="gate-actions">
             <button className="primary" type="submit" disabled={busy}>
               {busy ? "Unlocking…" : "Unlock"}
@@ -186,8 +181,17 @@ export function UnlockScreen({
               Use password instead
             </button>
           </div>
+          {/* A code can come from three places (setup, Settings → Recovery
+              key, a password change), and each new one is written over the
+              single `<room>.recovery` sidecar — so an older code is not a
+              wrong code, it is a code that no longer exists. Using one does
+              not consume it: open_room_with_recovery only unseals the
+              password it already held. */}
           <p className="gate-note">
-            The recovery code was shown once, when this room was created.
+            The recovery code was shown once, when it was made — at setup, in
+            Settings, or when the password was last changed. Only the newest
+            one works. Unlocking with a code doesn't change the password, and
+            the same code keeps working until you make a new one.
           </p>
         </form>
       )}

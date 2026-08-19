@@ -107,7 +107,18 @@ pub(crate) fn parse_delim_quoted(text: &str, delim: char) -> Vec<Vec<DelimField>
                     in_quotes = true;
                     field.quoted = true;
                 }
-                '\r' => {}
+                // A bare CR ENDS THE ROW. Classic Mac exports ("CSV
+                // (Macintosh)") still use CR alone, and dropping it fused the
+                // last field of each line to the first of the next — one row
+                // where the file has hundreds, which the next write then made
+                // permanent.
+                '\r' => {
+                    if chars.peek() == Some(&'\n') {
+                        chars.next();
+                    }
+                    row.push(std::mem::take(&mut field));
+                    rows.push(std::mem::take(&mut row));
+                }
                 '\n' => {
                     row.push(std::mem::take(&mut field));
                     rows.push(std::mem::take(&mut row));
@@ -149,10 +160,29 @@ impl Default for DelimStyle {
 /// Read the conventions off the file we are about to rewrite.
 pub(crate) fn delim_style(text: &str) -> DelimStyle {
     DelimStyle {
-        newline: if text.contains("\r\n") { "\r\n" } else { "\n" },
+        newline: first_line_break(text).unwrap_or("\n"),
         // An empty file gets the usual trailing newline; otherwise match it.
-        trailing_newline: text.is_empty() || text.ends_with('\n'),
+        trailing_newline: text.is_empty() || text.ends_with('\n') || text.ends_with('\r'),
     }
+}
+
+/// The line ending this file actually uses, taken from the first break OUTSIDE
+/// a quoted field — a CR or LF inside a quoted value is data, not a row end,
+/// and must not decide how every other line is written.
+fn first_line_break(text: &str) -> Option<&'static str> {
+    let mut in_quotes = false;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => in_quotes = !in_quotes,
+            '\r' if !in_quotes => {
+                return Some(if chars.peek() == Some(&'\n') { "\r\n" } else { "\r" });
+            }
+            '\n' if !in_quotes => return Some("\n"),
+            _ => {}
+        }
+    }
+    None
 }
 
 pub(crate) fn serialize_delim_styled(
@@ -168,9 +198,11 @@ pub(crate) fn serialize_delim_styled(
 }
 
 /// Quoting a field is not optional when the bare spelling would parse back as
-/// something else: an embedded delimiter, quote or newline.
+/// something else: an embedded delimiter, quote or line break — CR included,
+/// since a bare CR ends a row for the parser above, so an unquoted one would
+/// come back as two rows with the value torn in half.
 fn must_quote(value: &str, delim: char) -> bool {
-    value.contains(delim) || value.contains('"') || value.contains('\n')
+    value.contains(delim) || value.contains('"') || value.contains('\n') || value.contains('\r')
 }
 
 /// Write rows that came from `parse_delim_quoted`, keeping each field's own
@@ -203,6 +235,60 @@ fn serialize_fields_styled(
     out
 }
 
+/// The separators a delimited file may be read with, and the tie-break weights
+/// the grid's reader uses: on an equal count the comma wins, then tab, then
+/// semicolon, then pipe.
+const SEP_WEIGHTS: [(char, u8); 4] = [(',', 3), ('\t', 2), (';', 1), ('|', 0)];
+
+/// The separator the file will be READ with — SheetJS's `guess_sep`, which is
+/// what the viewer's grid runs on (`XLSX.read(text)`, no forced separator), and
+/// therefore what decides which field the address "B2" names. Counted outside
+/// quotes over the first 1024 characters; a file with none of them is a comma.
+fn guess_sep(text: &str) -> char {
+    let mut counts = [0usize; SEP_WEIGHTS.len()];
+    let mut in_quotes = false;
+    for c in text.chars().take(1024) {
+        if c == '"' {
+            in_quotes = !in_quotes;
+        } else if !in_quotes {
+            if let Some(i) = SEP_WEIGHTS.iter().position(|(s, _)| *s == c) {
+                counts[i] += 1;
+            }
+        }
+    }
+    SEP_WEIGHTS
+        .iter()
+        .enumerate()
+        .max_by_key(|(i, (_, weight))| (counts[*i], *weight))
+        .map(|(_, (sep, _))| *sep)
+        .unwrap_or(',')
+}
+
+/// How a delimited file is read, so a write lands on the cell the grid showed.
+struct DelimRead<'a> {
+    /// An Excel-authored `sep=;` line, verbatim with its terminator. The reader
+    /// consumes it as configuration rather than as row 1 — so the grid's row 1
+    /// is the file's SECOND line, and writing it back unchanged is what keeps
+    /// the addresses lined up (editing A1 used to overwrite the directive).
+    header: &'a str,
+    body: &'a str,
+    delim: char,
+}
+
+fn read_as(text: &str) -> DelimRead<'_> {
+    let b = text.as_bytes();
+    if b.len() >= 6 && b.starts_with(b"sep=") && b[4].is_ascii() {
+        let sep = b[4] as char;
+        if b[5] == b'\r' && b.get(6) == Some(&b'\n') {
+            return DelimRead { header: &text[..7], body: &text[7..], delim: sep };
+        }
+        if b[5] == b'\r' || b[5] == b'\n' {
+            return DelimRead { header: &text[..6], body: &text[6..], delim: sep };
+        }
+    }
+    DelimRead { header: "", body: text, delim: guess_sep(text) }
+}
+
 /// Set one cell (A1 notation) in spreadsheet bytes. Returns the new bytes
 /// plus the re-extracted text for the search index. Shared by the agent's
 /// set_cells tool and the viewer's grid editing.
@@ -220,15 +306,20 @@ pub(crate) fn set_cell_in_bytes(
     let ext = extraction::extension_of(name);
     match ext.as_str() {
         "csv" | "tsv" => {
-            let delim = if ext == "tsv" { '\t' } else { ',' };
             // Bytes that aren't UTF-8 read back as replacement characters, and
             // writing them out would destroy the file's accented letters for
             // good. Refuse rather than corrupt (Wave: encoding safety).
             let text = std::str::from_utf8(bytes).map_err(|_| non_utf8_error(name))?;
+            // Split the file the way it is READ. The delimiter used to come
+            // from the extension, so a semicolon- or pipe-separated .csv — and
+            // any file with Excel's `sep=` line — was written on a grid that
+            // was not the one the user clicked in: the edit landed at a
+            // different address and fused the row it touched.
+            let read = read_as(text);
             // Quoting is read along with the values: rewriting a quoted
             // `"=SUM(A1:A2)"` bare would turn a cell of literal text into a
             // formula, in a file the caller only meant to change one cell of.
-            let mut rows = parse_delim_quoted(text, delim);
+            let mut rows = parse_delim_quoted(read.body, read.delim);
             if rows.len() <= row {
                 rows.resize(row + 1, Vec::new());
             }
@@ -238,7 +329,11 @@ pub(crate) fn set_cell_in_bytes(
             rows[row][col] = DelimField::written(value);
             // Keep the file's own line endings and final-newline convention, so
             // a one-cell edit reads as a one-line change everywhere else.
-            let out = serialize_fields_styled(&rows, delim, delim_style(text));
+            let out = format!(
+                "{}{}",
+                read.header,
+                serialize_fields_styled(&rows, read.delim, delim_style(read.body))
+            );
             Ok((out.clone().into_bytes(), Some(out)))
         }
         "xlsx" => {
@@ -424,6 +519,70 @@ mod tests {
         let lf = "a,b\n1,2\n";
         let (bytes, _) = set_cell_in_bytes("t.csv", lf.as_bytes(), None, "B2", "9").unwrap();
         assert_eq!(String::from_utf8(bytes).unwrap(), "a,b\n1,9\n");
+    }
+
+    #[test]
+    fn a_semicolon_csv_is_edited_on_the_grid_the_viewer_shows() {
+        // The grid's reader guesses the separator, so "name;total" is two
+        // columns there. Writing on a hard-coded comma put the new value at the
+        // end of the row instead of in B2: "alpha;5,7".
+        let src = "name;total\nalpha;5\n";
+        let (bytes, _) = set_cell_in_bytes("data.csv", src.as_bytes(), None, "B2", "7").unwrap();
+        assert_eq!(String::from_utf8(bytes).unwrap(), "name;total\nalpha;7\n");
+        // A pipe-separated one lands the same way.
+        let (bytes, _) =
+            set_cell_in_bytes("data.csv", b"a|b\n1|2\n", None, "A2", "x").unwrap();
+        assert_eq!(String::from_utf8(bytes).unwrap(), "a|b\nx|2\n");
+        // A comma file is unaffected — the guess still says comma.
+        let (bytes, _) = set_cell_in_bytes("t.csv", b"a,b\n1,2\n", None, "B2", "9").unwrap();
+        assert_eq!(String::from_utf8(bytes).unwrap(), "a,b\n1,9\n");
+    }
+
+    #[test]
+    fn an_excel_sep_line_is_configuration_not_row_one() {
+        // The reader consumes `sep=;` and starts the grid on the next line, so
+        // A1 is "name". Editing A1 used to overwrite the directive itself.
+        let src = "sep=;\nname;total\nalpha;5\n";
+        let (bytes, _) = set_cell_in_bytes("data.csv", src.as_bytes(), None, "A1", "who").unwrap();
+        assert_eq!(String::from_utf8(bytes).unwrap(), "sep=;\nwho;total\nalpha;5\n");
+        // …and with Excel's own CRLF after it.
+        let src = "sep=;\r\nname;total\r\nalpha;5\r\n";
+        let (bytes, _) = set_cell_in_bytes("data.csv", src.as_bytes(), None, "B2", "7").unwrap();
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            "sep=;\r\nname;total\r\nalpha;7\r\n"
+        );
+    }
+
+    #[test]
+    fn a_value_holding_a_bare_cr_survives_the_round_trip() {
+        // Written unquoted, the CR came back as a row break and the value was
+        // torn in half — permanently, on the next read.
+        let (bytes, _) =
+            set_cell_in_bytes("t.csv", b"a,b\n1,2\n", None, "B2", "line1\rline2").unwrap();
+        let written = String::from_utf8(bytes).unwrap();
+        assert_eq!(written, "a,b\n1,\"line1\rline2\"\n");
+        let rows = parse_delim(&written, ',');
+        assert_eq!(rows.len(), 2, "still two rows: {rows:?}");
+        assert_eq!(rows[1][1], "line1\rline2");
+    }
+
+    #[test]
+    fn a_cr_only_file_keeps_its_rows_and_its_line_endings() {
+        // "CSV (Macintosh)" writes CR alone. The parser used to delete every
+        // CR, fusing the whole file into one row that the next write then made
+        // permanent.
+        let src = "a,b\r1,2\r";
+        let rows = parse_delim(src, ',');
+        assert_eq!(rows, vec![vec!["a", "b"], vec!["1", "2"]]);
+        let (bytes, _) = set_cell_in_bytes("t.csv", src.as_bytes(), None, "A1", "x").unwrap();
+        assert_eq!(String::from_utf8(bytes).unwrap(), "x,b\r1,2\r");
+        // A quoted CR inside a field is data, and does not decide the file's
+        // line endings.
+        assert_eq!(parse_delim("a,\"x\ry\"\n1,2\n", ','), vec![
+            vec!["a", "x\ry"],
+            vec!["1", "2"]
+        ]);
     }
 
     #[test]

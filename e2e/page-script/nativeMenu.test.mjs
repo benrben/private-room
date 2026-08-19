@@ -93,10 +93,43 @@ test("the menu is greyed out while no room is open", () => {
   // are BORN disabled in Rust and the room turns them on, so the failure mode
   // is a menu that does nothing rather than one that acts on a room that
   // isn't there.
+  //
+  // With TWO exceptions, and they are the reason this asks `always_enabled`
+  // rather than pinning the literal `false`. Both are rows that REPLACED a
+  // predefined one whose key equivalent works everywhere in macOS, so greying
+  // them leaves a standard key doing nothing at all:
+  //
+  //   ⌘W closes the WINDOW when there is no room, and the start screen and the
+  //   password gate are windows.
+  //
+  //   ⌘Q quits, and it must quit from the password gate as much as from a room.
+  //   This row exists at all because the predefined Quit sends `terminate:`,
+  //   which tao never gets the chance to refuse — so the unsaved-edits question
+  //   could not be asked on the one exit that most needed it.
   assert.match(
     MENU_RS,
-    /MenuItem::with_id\(app, \*id, label, false, \*accel\)/,
-    "command rows must be built disabled",
+    /MenuItem::with_id\(app, \*id, label, always_enabled\(id\), \*accel\)/,
+    "command rows must be built from the gate, not born enabled",
+  );
+  assert.match(
+    MENU_RS,
+    /fn always_enabled\(id: &str\) -> bool \{\s*id == CLOSE_ID \|\| id == QUIT_ID,?\s*\}/,
+    "Close and Quit are the rows that mean something with no room open",
+  );
+  // Quit is answered in Rust and never reaches the frontend, so it has to be
+  // handled BEFORE the window lookup that every other row goes through — or
+  // ⌘Q at the start screen would be enabled and dead.
+  assert.match(
+    MENU_RS,
+    /if id == QUIT_ID \{\s*quit\(app\);\s*return;\s*\}\s*\/\/[^\n]*\n\s*let Some\(window\)/,
+    "Quit must be answered before the window lookup, or ⌘Q dies at the gate",
+  );
+  // …and the row it names has to reach something with no frontend listening,
+  // or it is enabled and dead, which is worse than grey.
+  assert.match(
+    MENU_RS,
+    /if id == CLOSE_ID && no_room_is_open\(app\) \{\s*let _ = window\.close\(\);/,
+    "an ungated Close must close the window itself when no room is open",
   );
   assert.match(
     MENU_RS,

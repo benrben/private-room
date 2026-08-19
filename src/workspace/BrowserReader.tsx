@@ -40,6 +40,19 @@ import { hostOf } from "./browserAnnounce";
 
 type Mode = "main" | "full";
 
+/** The scheme of the address this text came from — `null` for a blank tab or an
+ *  address that will not parse, exactly as the chrome above reads it. Three
+ *  values, not two: "not http://" is not the same fact as "https://", and the
+ *  reader used to print a green ENCRYPTED tape over an empty address. */
+function schemeOf(url?: string | null): string | null {
+  if (!url) return null;
+  try {
+    return new URL(url).protocol;
+  } catch {
+    return null;
+  }
+}
+
 interface Loaded {
   text: string;
   title: string;
@@ -80,14 +93,26 @@ export function BrowserReader({
   // How far down the copy you have read. The panel is its own scroll region,
   // so this is the real scroll position and not an estimate.
   const read = useReadingProgress(bodyRef);
+  /* Which extraction the panel is showing.
+   *
+   * An extraction is a full re-walk of the page's DOM and takes as long as the
+   * page is big, so two can be in the air at once — press "Read the next part"
+   * on a slow page and then follow a link in the text already rendered. The
+   * `load` for the new page landed first and painted it; the older `more` then
+   * resolved and APPENDED the previous document's next chunk underneath it,
+   * with no seam and no warning. Every start claims the next number; an answer
+   * whose number has been superseded is dropped rather than merged. */
+  const runRef = useRef(0);
 
   const load = useCallback(
     async (which: Mode) => {
+      const run = ++runRef.current;
       setBusy(true);
       setError(null);
       onExtracting(true);
       try {
         const got: BrowserPageText = await api.browserPageText(which, 0);
+        if (runRef.current !== run) return;
         setPage({
           text: got.text ?? "",
           title: got.title ?? "",
@@ -99,7 +124,10 @@ export function BrowserReader({
       } catch (e) {
         // Printed, never swallowed: a page that refuses the script (a PDF, a
         // strict-CSP site) must say so rather than render as a blank document
-        // that reads like an empty page.
+        // that reads like an empty page. Still only for the extraction the
+        // panel is showing — a refusal from a page we have already navigated
+        // away from would blank the one that is there.
+        if (runRef.current !== run) return;
         setPage(null);
         setError(String(e));
       } finally {
@@ -122,10 +150,12 @@ export function BrowserReader({
    * the honest shape. */
   const more = useCallback(async () => {
     if (!page || !page.truncated) return;
+    const run = ++runRef.current;
     setBusy(true);
     onExtracting(true);
     try {
       const got: BrowserPageText = await api.browserPageText(mode, page.next);
+      if (runRef.current !== run) return;
       setPage((p) =>
         p === null
           ? p
@@ -138,6 +168,7 @@ export function BrowserReader({
             },
       );
     } catch (e) {
+      if (runRef.current !== run) return;
       setError(String(e));
     } finally {
       setBusy(false);
@@ -163,7 +194,9 @@ export function BrowserReader({
   }, [info.url]);
 
   const host = hostOf(page?.url ?? info.url);
-  const insecure = (page?.url ?? info.url ?? "").startsWith("http://");
+  const scheme = schemeOf(page?.url ?? info.url);
+  const secure = scheme === "https:";
+  const insecure = scheme === "http:";
   const shown = page ? page.text.length : 0;
 
   return (
@@ -198,19 +231,25 @@ export function BrowserReader({
         </h1>
         <p className="browser-reader-where">
           <span>{host ?? page?.url ?? info.url ?? "no address"}</span>
-          <span className="sep">·</span>
           {/* Whether the connection is encrypted is a STATE, so it is drawn as
               a strip of tape: red for urgent, green for verified, per the
               product-wide marker meanings. The sentence is what carries it —
               the marker only reinforces a word that already says everything,
-              so the badge still works for a reader who sees no colour. */}
-          <span
-            className={`nb-tape ${insecure ? "nb-sem-urgent" : "nb-sem-done"}`}
-          >
-            {insecure
-              ? "Not encrypted — anything typed into this page travels in the clear"
-              : "Encrypted connection"}
-          </span>
+              so the badge still works for a reader who sees no colour.
+              Nothing is drawn for an address that is neither — a blank tab or
+              a scheme this reader cannot vouch for gets no claim at all. */}
+          {(secure || insecure) && (
+            <>
+              <span className="sep">·</span>
+              <span
+                className={`nb-tape ${insecure ? "nb-sem-urgent" : "nb-sem-done"}`}
+              >
+                {insecure
+                  ? "Not encrypted — anything typed into this page travels in the clear"
+                  : "Encrypted connection"}
+              </span>
+            </>
+          )}
         </p>
         {/* The double-Escape chord is how you get the keyboard back OUT of the
             native page, so the instruction only belongs here while the page is
@@ -238,16 +277,21 @@ export function BrowserReader({
               two readers of the page's borrowed viewport, and the refcount in
               BrowserView exists precisely because they overlap. Gating it
               stops the overlap rather than only surviving it. */}
+          {/* One fixed label naming what the toggle controls, with
+              `aria-pressed` carrying the state — the shape "Read as text"
+              already uses. Swapping the label as well announced the reverse
+              of the truth: in full mode a screen reader read out "Main
+              content only, pressed". The wiped-in `[aria-pressed="true"]`
+              style is what shows the state to everyone else. */}
           <button
             className="browser-btn"
             type="button"
             disabled={busy}
             aria-pressed={mode === "full"}
+            title="Include the parts around the article — menus, banners, footers"
             onClick={() => setMode((m) => (m === "full" ? "main" : "full"))}
           >
-            {mode === "full"
-              ? "Main content only"
-              : "Include navigation, headers and footers"}
+            Navigation, headers and footers
           </button>
           <button
             className="browser-btn"
@@ -258,11 +302,13 @@ export function BrowserReader({
             Re-read the page
           </button>
           {/* The audit asked for the split to be an option rather than the
-              default. This is that option. */}
+              default. This is that option. The label names the action the
+              press will take, so there is no `aria-pressed`: the two together
+              read as one sentence, and it was the wrong one — "Hide the live
+              page, pressed" while the page was on screen. */}
           <button
             className="browser-btn"
             type="button"
-            aria-pressed={comparing}
             onClick={() => onCompare(!comparing)}
           >
             {comparing ? "Hide the live page" : "Compare with page"}

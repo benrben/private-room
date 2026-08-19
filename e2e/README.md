@@ -62,7 +62,10 @@ than descriptions.
 | `gh3-feedback-modal.e2e.mjs` | the feedback modal opens empty after publishing **and** after cancelling |
 | `gh4-mic-volume.e2e.mjs` | `autoGainControl` is never requested on any mic path; echo cancellation stays on by default and the Settings toggle releases it |
 | `gh5-speaker-names.e2e.mjs` | naming a speaker renames every line they said, persists, clears (by emptying it *or* by typing the machine label back), caps a pasted essay at 60 characters, and Escape abandons |
-| `areas-and-viewers.e2e.mjs` | every rail area opens its tab and draws something rather than falling into an error boundary, every viewer kind (markdown, PDF, docx, spreadsheet, code, recording) renders its file, and no pane reaches a command the mock does not fake |
+| `areas-and-viewers.e2e.mjs` | every rail area opens its tab and draws something rather than falling into an error boundary, six of the 25 kinds in `ViewerKind` (markdown, PDF, docx, spreadsheet, code, recording) render their file, and no pane reaches a command the mock does not fake |
+| `recording-reading.e2e.mjs` | Notes, Highlights and Chapters: every item says who put it there, and an item the ROOM wrote is drawn differently and carries "?" in TEXT — a difference that survives a screenshot, a colourblind reader and a screen reader |
+| `voice-recognition.e2e.mjs` | a name the app GUESSED is never indistinguishable from one the user typed, and a voice the room isn't sure about stays "Speaker N" |
+| `create-look.e2e.mjs` | the Create page opens as a workspace rather than a wall of model cards, each tab offers only the lengths and starting pictures the model allows, and every script shows its shot arithmetic *before* it charges — and, its own reason for existing, it writes PNGs of each step to `qa/shots/`, because a panel can be the right width, carry the right text and still be unusable because it fills the page |
 
 ```bash
 npm run e2e:qa                 # build, generate qa.html, serve, run

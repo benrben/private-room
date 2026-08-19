@@ -26,9 +26,6 @@ export default function FileRow({
       // about to act on", and they are genuinely different — the file you have
       // open is very often NOT one of the seven you just selected to move.
       className={`file-row${isOpen ? " selected" : ""}${attached ? " attached" : ""}${picked ? " is-picked" : ""}`}
-      // A picked row is a checkbox in every way that matters to a screen
-      // reader, without a checkbox column stealing width from the name.
-      aria-selected={picked}
       draggable
       onDragStart={(e) => {
         // Dragging a row that is part of the selection drags the WHOLE
@@ -82,6 +79,13 @@ export default function FileRow({
             a.clickFile(f, { meta: e.metaKey || e.ctrlKey, shift: e.shiftKey })
           }
         >
+          {/* Selection is what makes Move / Export / Remove act on seven files
+              instead of one, so it has to be READABLE, not just tinted. It used
+              to be `aria-selected` on the row's wrapper div — an attribute every
+              browser drops on an element with no role and no listbox above it,
+              so the state was announced on nothing. The word rides inside the
+              button's own name instead, where it is read out with the file. */}
+          {picked && <span className="sr-only">Selected. </span>}
           <span className="file-icon">
             <FileTypeIcon file={f} />
           </span>

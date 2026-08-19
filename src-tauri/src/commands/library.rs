@@ -23,6 +23,29 @@ pub(crate) fn normalize_category(raw: &str) -> Option<&'static str> {
     }
 }
 
+/// CHG-7: memories are injected into the prompt, so their length is capped —
+/// but the cap REFUSES rather than truncates, the way the agent's own
+/// `add_memory` tool already does (agent.rs).
+///
+/// Cutting the text at the cap was silent and unrecoverable: a 1,200-character
+/// note came back 500 characters long with no warning, no marker and no toast,
+/// and memories have no version history to restore the rest from. Both commands
+/// below surface this through `tryToast`, so the user is told before anything is
+/// destroyed and their text is still on screen to shorten.
+///
+/// Counted in CHARACTERS, like the cap itself: counting bytes ate a note typed
+/// in Hebrew at half its length while the same note in English went through.
+fn memory_within_cap(content: String) -> Result<String, String> {
+    let len = content.chars().count();
+    if len > MAX_MEMORY_CONTENT_CHARS {
+        return Err(format!(
+            "That memory is {len} characters — {MAX_MEMORY_CONTENT_CHARS} at most, \
+             so it stays short enough to travel with every question."
+        ));
+    }
+    Ok(content)
+}
+
 #[tauri::command]
 pub fn add_memory(
     state: State<'_, AppState>,
@@ -30,8 +53,7 @@ pub fn add_memory(
     category: Option<String>,
 ) -> Result<Memory, String> {
     state.with_room(|room| {
-        // CHG-7: cap length so injected memories stay within the prompt budget.
-        let content = clamp_chars(content, MAX_MEMORY_CONTENT_CHARS);
+        let content = memory_within_cap(content)?;
         // UX-5: never store an exact duplicate; hand back the existing entry
         // instead (callers can tell by its old created_at).
         if let Some(existing) = duplicate_memory(&room.conn, &content)? {
@@ -56,7 +78,7 @@ pub fn update_memory(
     category: Option<String>,
 ) -> Result<(), String> {
     state.with_room(|room| {
-        let content = clamp_chars(content, MAX_MEMORY_CONTENT_CHARS);
+        let content = memory_within_cap(content)?;
         let category = category.as_deref().and_then(normalize_category);
         db::update_memory(&room.conn, &id, &content, category)
     })
@@ -135,32 +157,49 @@ pub fn set_setting(
 mod tests {
     use super::*;
 
-    /// The memory commands take a `State` and so cannot be called from a unit
-    /// test; what CAN be pinned is that neither of them goes back to counting
-    /// bytes against a cap stated in characters, which silently ate half of a
-    /// note typed in Hebrew while the same note in English went through whole.
-    ///
-    /// A textual assertion is this repo's own answer for a seam a test cannot
-    /// reach (see `ollama_lifecycle`'s `include_str!` guard), and unlike a test
-    /// of `clamp_chars` itself it is red on the revert that actually matters.
     #[test]
-    fn the_memory_length_cap_is_counted_in_characters_at_both_call_sites() {
+    fn an_over_long_memory_is_refused_rather_than_quietly_cut_in_half() {
+        // Exactly the cap is a memory, not an error.
+        let at_cap = "a".repeat(MAX_MEMORY_CONTENT_CHARS);
+        assert_eq!(
+            memory_within_cap(at_cap.clone()).unwrap().chars().count(),
+            MAX_MEMORY_CONTENT_CHARS,
+        );
+        assert_eq!(memory_within_cap(String::new()).unwrap(), "");
+        // One past it is refused — the paragraph used to come back 500
+        // characters long, with the rest gone and nothing to restore it from.
+        let over = "a".repeat(MAX_MEMORY_CONTENT_CHARS + 1);
+        let err = memory_within_cap(over).expect_err("truncation is not an answer");
+        assert!(err.contains(&(MAX_MEMORY_CONTENT_CHARS + 1).to_string()), "{err}");
+        // Counted in CHARACTERS: a full-length note typed in Hebrew is twice
+        // the cap in bytes, and counting those ate half of it.
+        let hebrew = "א".repeat(MAX_MEMORY_CONTENT_CHARS);
+        assert!(hebrew.len() > MAX_MEMORY_CONTENT_CHARS, "the fixture must be multi-byte");
+        assert_eq!(memory_within_cap(hebrew.clone()).unwrap(), hebrew);
+    }
+
+    /// The rule above is only worth having if BOTH commands still ask it. They
+    /// take a `State` and cannot be called from a unit test, so the call sites
+    /// are pinned textually — this repo's own answer for a seam a test cannot
+    /// reach (see `ollama_lifecycle`'s `include_str!` guard).
+    #[test]
+    fn both_memory_commands_check_the_cap_before_storing() {
         let source = include_str!("library.rs");
         // Split so this test's own text is not one of the matches it counts —
         // `concat!` rebuilds the needle at compile time while the source line
         // stays broken in two.
-        let good = concat!("clamp_", "chars(content, MAX_MEMORY_CONTENT_CHARS)");
-        let bad = concat!("clamp_", "bytes(content, MAX_MEMORY_CONTENT_CHARS)");
+        let checked = concat!("memory_within", "_cap(content)?");
+        let truncating = concat!("clamp_", "chars(content, MAX_MEMORY_CONTENT_CHARS)");
         assert_eq!(
-            source.matches(good).count(),
+            source.matches(checked).count(),
             2,
-            "add_memory and update_memory must both clamp CHARACTERS"
+            "add_memory and update_memory must both refuse an over-long memory"
         );
         assert_eq!(
-            source.matches(bad).count(),
+            source.matches(truncating).count(),
             0,
-            "clamping BYTES against a cap stated in characters truncates a note typed \
-             in Hebrew at half its length, silently"
+            "silently cutting the text at the cap destroys the rest of a note that \
+             has no version history to restore it from"
         );
     }
 

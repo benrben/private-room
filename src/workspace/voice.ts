@@ -164,6 +164,19 @@ export function isSpeaking(): boolean {
  * turn was opened without one (nothing to distinguish, so everything passes). */
 let turnChat: string | null = null;
 
+/** A streamed ask is open and still owes hands-free its re-arm.
+ *
+ * Deliberately NOT `streamedTurn`, which says who owns the audio pipeline: a
+ * per-message Play or a Settings Preview takes the pipeline mid-answer without
+ * ending the ask behind it. Reading the re-arm off ownership meant that ask's
+ * `endOfTurn` no-opped, the mic was never re-armed, and hands-free died with
+ * nothing on screen saying why. Only beginTurn opens this; only cancelAll (Stop,
+ * lock — the turn is dead) and the fired signal close it. */
+let turnOpen = false;
+/** That ask has closed and the signal is owed as soon as the pipeline is quiet
+ * — never while audio is still playing, or the mic would hear the speaker. */
+let turnDonePending = false;
+
 /** A new ask begins: silence the old answer, invalidate every in-flight
  * continuation, and open a fresh turn. `chatId` is the conversation whose turn
  * this is (owner replacement #4) — there is one voice pipeline, so it belongs
@@ -181,6 +194,8 @@ export function beginTurn(chatId: string | null = null): void {
   deltasFed = false;
   turnEnded = false;
   streamedTurn = true;
+  turnOpen = true;
+  turnDonePending = false;
   problemReported = false;
   overrides = null;
 }
@@ -235,12 +250,22 @@ export function feedStreamDelta(delta: string): void {
  * turns (cancelAll ran: user Stop, lock) no-op — runGuarded's `finally`
  * reaches here even on a cancelled ask. */
 export function endOfTurn(finalText?: string): void {
-  if (!streamedTurn || turnEpoch !== epoch || turnEnded) return;
-  turnEnded = true;
-  if (autoSpeakOn()) {
-    if (!deltasFed && finalText) pending = finalText;
-    extractSentences(true);
+  if (streamedTurn && turnEpoch === epoch) {
+    if (turnEnded) return;
+    turnEnded = true;
+    if (autoSpeakOn()) {
+      if (!deltasFed && finalText) pending = finalText;
+      extractSentences(true);
+    }
+  } else if (!turnOpen) {
+    // The turn is dead (cancelAll: Stop, lock) or there was never one.
+    return;
   }
+  // Otherwise the ask closed while a manual Play or Preview owned the pipeline:
+  // none of this answer will be spoken, but the ask still ENDED, and hands-free
+  // is owed its re-arm as soon as whatever is playing has played out.
+  turnOpen = false;
+  turnDonePending = true;
   // Always close the turn: with auto-speak off nothing was scheduled, and
   // hands-free still needs the done signal to re-arm the mic (silent mode —
   // the user reads the answer instead of hearing it).
@@ -258,6 +283,8 @@ export function cancelAll(): void {
   firstChunkSent = false;
   turnEnded = false;
   streamedTurn = false;
+  turnOpen = false;
+  turnDonePending = false;
   overrides = null;
   if (onManualState) {
     onManualState(false);
@@ -278,7 +305,15 @@ export function speakText(
     onState?: (playing: boolean) => void;
   },
 ): void {
+  // A manual play TAKES the pipeline; it does not end the ask that may still be
+  // streaming behind it. `cancelAll` closes a turn for good (Stop, lock), so the
+  // ask's outstanding re-arm is carried across it rather than lost — see
+  // `turnOpen`.
+  const askOpen = turnOpen;
+  const askOwedDone = turnDonePending;
   cancelAll();
+  turnOpen = askOpen;
+  turnDonePending = askOwedDone;
   epoch += 1;
   turnEpoch = epoch;
   streamedTurn = false;
@@ -418,10 +453,20 @@ function extractSentences(force: boolean): void {
   let m: RegExpExecArray | null;
   while ((m = re.exec(work))) {
     const end = m.index + m[0].length;
-    // Don't cut decimal points ("3.5b"): a bare "." between digits.
-    const before = work[m.index - 1] ?? "";
+    // Don't cut INSIDE a token: a decimal ("3.5b"), a filename, a host and path
+    // ("example.com/setup.html"). Cutting there also splits a markdown link
+    // across two chunks, where `stripForSpeech` can no longer match it and the
+    // raw URL is read out, brackets and all.
+    //
+    // The match ITSELF is what separates the two: the trailing class above has
+    // already eaten any space, so `m[0] === "."` exactly means nothing at all
+    // stands between this dot and the next character. A capital still ends the
+    // sentence, for the missing-space case ("…done.Next…"). Testing the
+    // FOLLOWING character instead would have kept every script without capitals
+    // — Hebrew and Arabic, both first-class here — in one unbroken chunk until
+    // the force-flush size, cut mid-clause.
     const after = work[end] ?? "";
-    if (m[0].trimEnd() === "." && /\d/.test(before) && /\d/.test(after)) continue;
+    if (m[0] === "." && after !== "" && !/\p{Lu}/u.test(after)) continue;
     emit(work.slice(cut, end));
     cut = end;
   }
@@ -516,6 +561,10 @@ async function pump(): Promise<void> {
         // not synthesis-side.
         b64 = await api.speakTextNeural(text, activeNeuralVoiceId());
       } catch (e) {
+        // Stopped (or the room locked) while this call was in flight: the user
+        // ended this turn, so a failure that lands afterwards is not a problem
+        // to report — the epoch check comes FIRST, before the toast.
+        if (epoch !== myEpoch) return;
         // Offline / sidecar down / this room's internet switch off: skip this
         // sentence and try the next — but say so, once, in the words that fit
         // what actually happened. Silence is indistinguishable from a broken app.
@@ -801,7 +850,8 @@ function maybeFireTurnDone(): void {
     onManualState(false);
     onManualState = null;
   }
-  if (streamedTurn && turnEpoch === epoch) {
+  if (turnDonePending) {
+    turnDonePending = false;
     streamedTurn = false;
     onTurnAudioDone?.();
   }

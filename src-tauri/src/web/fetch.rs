@@ -671,8 +671,11 @@ mod tests {
     fn the_redirect_chain_is_bounded() {
         assert!(MAX_REDIRECTS > 0 && MAX_REDIRECTS <= 10);
         let src = include_str!("fetch.rs");
+        // Split so the assertion's own text is not the match: `src` is this
+        // whole file, so a one-piece literal would satisfy itself and this
+        // SSRF-relevant guard could never fail.
         assert!(
-            src.contains("redirect(reqwest::redirect::Policy::none())"),
+            src.contains(concat!("redirect(reqwest::", "redirect::Policy::none())")),
             "reqwest must not follow redirects itself — an auto-followed hop is \
              resolved a second time, unpinned"
         );

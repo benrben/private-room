@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import {
+  api,
   regenerateLeashToken,
   roomServerStatus,
   setRoomServer,
@@ -27,15 +28,33 @@ export function useRoomServer() {
   const [leashCopied, setLeashCopied] = useState(false);
 
   useEffect(() => {
+    let live = true;
     roomServerStatus()
       .then((st) => {
+        if (!live) return;
         setLeash(st);
         if (st.running) {
           setAllowCloud(st.allowCloud);
           setScope(st.scope);
+          return;
         }
+        // STOPPED is not "files". A stopped bridge has no scope to report, so
+        // the snapshot answers with the struct's default — and the switch then
+        // restarts at THAT tier, persisting "files" over a saved "full": the
+        // fixed port and stable token go away and the external-agent config the
+        // user already pasted stops authenticating, with nothing said. The
+        // saved answer outlives the bridge, so read it from the room.
+        return api
+          .getSetting("room_server_scope")
+          .then((saved) => {
+            if (live && saved === "full") setScope("full");
+          })
+          .catch(() => {});
       })
       .catch(() => {});
+    return () => {
+      live = false;
+    };
   }, []);
 
   // THE LEASH — start/stop/restart the room MCP server with the full policy

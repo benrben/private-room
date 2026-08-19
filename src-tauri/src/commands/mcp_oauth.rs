@@ -66,11 +66,23 @@ pub(crate) fn parse_www_authenticate(header: &str) -> Option<String> {
     Some(after[..end].to_string())
 }
 
-/// The `/.well-known/oauth-protected-resource` URL for a base resource URL —
-/// the fallback when a server sends no `WWW-Authenticate` (probe path).
-pub(crate) fn well_known_prm(resource_url: &str) -> String {
-    let origin = origin_of(resource_url);
-    format!("{origin}/.well-known/oauth-protected-resource")
+/// The `/.well-known/oauth-protected-resource` URLs to try for a base resource
+/// URL — the fallback when a server sends no `WWW-Authenticate` (probe path).
+///
+/// RFC 9728 §3.1 puts the RESOURCE's own path after the well-known segment, so
+/// a server hosting several MCP resources publishes one document per path and
+/// the origin-only URL 404s. The origin-only form stays as the second
+/// candidate: a server with a single resource commonly publishes only that.
+pub(crate) fn well_known_prm(resource_url: &str) -> Vec<String> {
+    let base = resource_url.trim_end_matches('/');
+    let origin = origin_of(base);
+    let path = base.strip_prefix(&origin).unwrap_or("");
+    let mut out = vec![format!("{origin}/.well-known/oauth-protected-resource{path}")];
+    let origin_only = format!("{origin}/.well-known/oauth-protected-resource");
+    if !out.contains(&origin_only) {
+        out.push(origin_only);
+    }
+    out
 }
 
 fn origin_of(url: &str) -> String {
@@ -92,13 +104,23 @@ pub(crate) fn parse_resource_metadata(json: &serde_json::Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// What the RESOURCE says it needs (RFC 9728 `scopes_supported`) — the only
+/// scopes the consent screen may be asked for. The authorization server's own
+/// list is everything it CAN issue, which for a read-only connector means
+/// putting write and admin on the consent screen for nothing.
+pub(crate) fn parse_prm_scopes(json: &serde_json::Value) -> Vec<String> {
+    json["scopes_supported"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default()
+}
+
 /// The endpoints we need off an Authorization Server Metadata document.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct AuthServerMeta {
     pub authorization_endpoint: String,
     pub token_endpoint: String,
     pub registration_endpoint: Option<String>,
-    pub scopes_supported: Vec<String>,
 }
 
 pub(crate) fn parse_auth_server_metadata(json: &serde_json::Value) -> Option<AuthServerMeta> {
@@ -106,10 +128,6 @@ pub(crate) fn parse_auth_server_metadata(json: &serde_json::Value) -> Option<Aut
         authorization_endpoint: json["authorization_endpoint"].as_str()?.to_string(),
         token_endpoint: json["token_endpoint"].as_str()?.to_string(),
         registration_endpoint: json["registration_endpoint"].as_str().map(String::from),
-        scopes_supported: json["scopes_supported"]
-            .as_array()
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-            .unwrap_or_default(),
     })
 }
 
@@ -332,51 +350,177 @@ fn http() -> Result<reqwest::Client, String> {
 /// endpoints. A hostile (or merely compromised) connector could therefore point
 /// any of them at `http://127.0.0.1:…` or a `192.168.x.x` box and use this Mac
 /// as a probe of its own network — the classic SSRF shape, and the reason
-/// `web::check_public_http_url` exists for every other outbound fetch. Applied
-/// at the three funnels that actually leave the machine, so a new discovery
-/// step cannot forget it.
-fn checked_endpoint(url: &str) -> Result<(), String> {
+/// `web::check_public_http_url` exists for every other outbound fetch.
+///
+/// This is the LITERAL half of the check, and on its own it was never enough: a
+/// name that resolves to 127.0.0.1 passes it. Nothing outbound calls it
+/// directly — [`guarded_client`] does, and every address the CONNECTOR chose
+/// goes through that, so a new discovery step cannot leave with less. The one
+/// request that does not is [`probe_www_authenticate`], which asks the server
+/// the user themselves configured — an MCP server on this Mac is a legitimate
+/// thing to connect to, and refusing it here would only break that.
+fn checked_endpoint(url: &str) -> Result<reqwest::Url, String> {
     crate::web::check_public_http_url(url)
-        .map(|_| ())
         .map_err(|_| format!("{url} is a local or private-network address — refused."))
+}
+
+/// One hop of one OAuth request, with the whole outbound guard on it.
+///
+/// The literal check above only sees what the connector WROTE. A hostname it
+/// controls can still resolve to 127.0.0.1 (DNS rebinding), so the host is
+/// resolved here and every address it returns has to be public — and the
+/// client is then pinned to the address that was checked, closing the window
+/// where the check and the connection resolve differently. Redirects are never
+/// followed by reqwest: a `Location` is chosen by the same untrusted server, so
+/// it comes back through this function ([`fetch_json`]) or is not followed at
+/// all. Same doctrine, and the same reasons, as `web::fetch`'s `guarded_get`.
+async fn guarded_client(url: &str) -> Result<(reqwest::Url, reqwest::Client), String> {
+    let parsed = checked_endpoint(url)?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| format!("{url} has no host — refused."))?
+        .to_string();
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    crate::web::resolve_public_addr(&host, port)
+        .await
+        .map_err(|e| format!("{url}: {e}"))
+        .and_then(|addr| {
+            // rustls: auth servers are HTTPS/h2 and macOS native-tls doesn't
+            // reliably negotiate h2 via ALPN (see mcp_registry). Identify
+            // ourselves too.
+            reqwest::Client::builder()
+                .use_rustls_tls()
+                .user_agent(concat!("Arcelle/", env!("CARGO_PKG_VERSION")))
+                .timeout(HTTP_TIMEOUT)
+                .redirect(reqwest::redirect::Policy::none())
+                .resolve(&host, addr)
+                .build()
+                .map_err(|e| e.to_string())
+        })
+        .map(|client| (parsed, client))
+}
+
+/// How many redirects one metadata fetch may follow. Every hop is re-checked
+/// by [`guarded_client`], which is the only reason following them is safe.
+const MAX_REDIRECTS: usize = 3;
+
+/// Where a response says to go next, absolutized against the URL it came from.
+/// `None` for anything that is not a redirect carrying a usable `Location` —
+/// which then falls through to the normal status handling. Pure — unit-tested.
+fn redirect_target(status: u16, location: Option<&str>, from: &reqwest::Url) -> Option<String> {
+    if !matches!(status, 301 | 302 | 303 | 307 | 308) {
+        return None;
+    }
+    let location = location?.trim();
+    if location.is_empty() {
+        return None;
+    }
+    from.join(location).ok().map(|u| u.to_string())
 }
 
 /// Fetch a JSON metadata document.
 async fn fetch_json(url: &str) -> Result<serde_json::Value, String> {
-    checked_endpoint(url)?;
-    let resp = http()?
-        .get(url)
-        .header("Accept", "application/json")
-        .send()
-        .await
-        .map_err(|e| format!("discovery request to {url} failed: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("{url} returned HTTP {}", resp.status().as_u16()));
+    let mut next = url.to_string();
+    for _ in 0..=MAX_REDIRECTS {
+        let (parsed, client) = guarded_client(&next).await?;
+        let resp = client
+            .get(parsed.clone())
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .map_err(|e| format!("discovery request to {next} failed: {e}"))?;
+        let location = resp
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        if let Some(hop) = redirect_target(resp.status().as_u16(), location.as_deref(), &parsed) {
+            next = hop;
+            continue;
+        }
+        if !resp.status().is_success() {
+            return Err(format!("{next} returned HTTP {}", resp.status().as_u16()));
+        }
+        return resp
+            .json()
+            .await
+            .map_err(|e| format!("{next} sent invalid JSON: {e}"));
     }
-    resp.json().await.map_err(|e| format!("{url} sent invalid JSON: {e}"))
+    Err(format!("{url} redirected too many times"))
 }
 
-/// PRM URL → the auth server's endpoints. Follows RFC 9728 → RFC 8414.
-pub(crate) async fn discover(prm_url: &str) -> Result<AuthServerMeta, String> {
-    let prm = fetch_json(prm_url).await?;
-    let servers = parse_resource_metadata(&prm);
-    let auth_server = servers
-        .into_iter()
-        .next()
-        .ok_or("the resource metadata lists no authorization servers")?;
-    // RFC 8414: metadata lives at /.well-known/oauth-authorization-server.
-    let meta_url = format!(
-        "{}/.well-known/oauth-authorization-server",
-        auth_server.trim_end_matches('/')
-    );
-    let asm = fetch_json(&meta_url).await?;
-    parse_auth_server_metadata(&asm)
-        .ok_or_else(|| "authorization server metadata is missing required endpoints".into())
+/// The authorization-server metadata URLs to try for one issuer, in order.
+///
+/// RFC 8414 §3.1 INSERTS the well-known segment between the host and the
+/// issuer's path (`https://host/.well-known/oauth-authorization-server/tenant-42`)
+/// — which is what multi-tenant deployments publish, and what appending the
+/// segment could never find. The appended form is the OIDC Discovery 1.0
+/// layout, which many of the same servers also answer, and an OIDC-only server
+/// has no `oauth-authorization-server` document at all. An issuer without a
+/// path makes the two forms identical, hence the de-duplication.
+pub(crate) fn auth_metadata_urls(issuer: &str) -> Vec<String> {
+    let issuer = issuer.trim_end_matches('/');
+    let origin = origin_of(issuer);
+    let path = issuer.strip_prefix(&origin).unwrap_or("");
+    let mut out: Vec<String> = Vec::new();
+    for name in ["oauth-authorization-server", "openid-configuration"] {
+        for candidate in [
+            format!("{origin}/.well-known/{name}{path}"),
+            format!("{issuer}/.well-known/{name}"),
+        ] {
+            if !out.contains(&candidate) {
+                out.push(candidate);
+            }
+        }
+    }
+    out
+}
+
+/// PRM URL candidates → the auth server's endpoints, plus the scopes the
+/// RESOURCE asks for. Follows RFC 9728 → RFC 8414.
+///
+/// Every candidate is tried before the sign-in is declared impossible: a
+/// resource may publish its metadata under either well-known form, and a
+/// document listing several authorization servers means the first one being
+/// down or misconfigured is not the resource's last word. Only the final
+/// failure is reported — an earlier 404 on a URL that was only ever a guess is
+/// not what went wrong.
+pub(crate) async fn discover(prm_urls: &[String]) -> Result<(AuthServerMeta, Vec<String>), String> {
+    let mut last = "no protected-resource metadata URL to try".to_string();
+    for prm_url in prm_urls {
+        let prm = match fetch_json(prm_url).await {
+            Ok(v) => v,
+            Err(e) => {
+                last = e;
+                continue;
+            }
+        };
+        let scopes = parse_prm_scopes(&prm);
+        let servers = parse_resource_metadata(&prm);
+        if servers.is_empty() {
+            last = format!("{prm_url} lists no authorization servers");
+            continue;
+        }
+        for server in &servers {
+            for meta_url in auth_metadata_urls(server) {
+                match fetch_json(&meta_url).await {
+                    Ok(asm) => match parse_auth_server_metadata(&asm) {
+                        Some(meta) => return Ok((meta, scopes)),
+                        None => {
+                            last = format!("{meta_url} is missing required endpoints");
+                        }
+                    },
+                    Err(e) => last = e,
+                }
+            }
+        }
+    }
+    Err(last)
 }
 
 /// RFC 7591 dynamic client registration for a public + PKCE client.
 async fn register_client(endpoint: &str, redirect_uri: &str) -> Result<String, String> {
-    checked_endpoint(endpoint)?;
+    let (url, client) = guarded_client(endpoint).await?;
     let body = serde_json::json!({
         "client_name": "Arcelle",
         "redirect_uris": [redirect_uri],
@@ -384,8 +528,8 @@ async fn register_client(endpoint: &str, redirect_uri: &str) -> Result<String, S
         "response_types": ["code"],
         "token_endpoint_auth_method": "none",
     });
-    let resp = http()?
-        .post(endpoint)
+    let resp = client
+        .post(url)
         .json(&body)
         .send()
         .await
@@ -444,10 +588,11 @@ async fn post_token(
     // Unreachable, not Rejected: a refused address says nothing about whether
     // the stored refresh token is still good, and `mark_refresh_rejected` must
     // not retire a live sign-in over it.
-    checked_endpoint(endpoint).map_err(TokenError::Unreachable)?;
-    let resp = http()
-        .map_err(TokenError::Unreachable)?
-        .post(endpoint)
+    let (url, client) = guarded_client(endpoint)
+        .await
+        .map_err(TokenError::Unreachable)?;
+    let resp = client
+        .post(url)
         .form(form)
         .send()
         .await
@@ -523,23 +668,40 @@ async fn bind_callback() -> Result<(String, TcpListener), String> {
     Ok((format!("http://127.0.0.1:{port}/callback"), listener))
 }
 
-/// Serve exactly one request, extract `?code=&state=`, and show the user a
-/// "you can close this tab" page. Times out so a cancelled sign-in can't hang.
-async fn await_callback(listener: TcpListener, expected_state: &str) -> Result<String, String> {
-    let accept = tokio::time::timeout(AUTH_TIMEOUT, listener.accept())
-        .await
-        .map_err(|_| "timed out waiting for the browser sign-in".to_string())?;
-    let (mut stream, _) = accept.map_err(|e| e.to_string())?;
-    let mut buf = [0u8; 4096];
-    let n = stream.read(&mut buf).await.map_err(|e| e.to_string())?;
-    let req = String::from_utf8_lossy(&buf[..n]);
-    let target = req
-        .lines()
-        .next()
-        .and_then(|l| l.split_whitespace().nth(1))
-        .unwrap_or("");
-    let (code, state) = parse_callback_query(target);
-    let ok = !code.is_empty() && state == expected_state;
+/// How long one connection has to send its request line. Short: the browser
+/// has already made the request by the time it connects.
+const CALLBACK_READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// Cap on the bytes read looking for the request line. Far above any real
+/// authorization code (the old single 4 KB read could truncate a long one),
+/// and small enough that a local process cannot stream memory into us.
+const MAX_CALLBACK_REQUEST: usize = 64 * 1024;
+
+/// The request target ("/callback?code=…") of one connection, read with its own
+/// timeout and a bounded buffer. `None` for a connection that sends nothing in
+/// time, closes early, or overruns the cap — none of those is the callback.
+async fn read_request_target(stream: &mut tokio::net::TcpStream) -> Option<String> {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 2048];
+    let line = tokio::time::timeout(CALLBACK_READ_TIMEOUT, async {
+        loop {
+            if let Some(at) = buf.iter().position(|b| *b == b'\n') {
+                return Some(String::from_utf8_lossy(&buf[..at]).into_owned());
+            }
+            if buf.len() >= MAX_CALLBACK_REQUEST {
+                return None;
+            }
+            match stream.read(&mut chunk).await {
+                Ok(0) | Err(_) => return None,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            }
+        }
+    })
+    .await
+    .ok()??;
+    line.split_whitespace().nth(1).map(str::to_string)
+}
+
+async fn write_callback_page(stream: &mut tokio::net::TcpStream, ok: bool) {
     let page = if ok {
         "<h2>Signed in.</h2><p>You can close this tab and return to Arcelle.</p>"
     } else {
@@ -551,10 +713,74 @@ async fn await_callback(listener: TcpListener, expected_state: &str) -> Result<S
     );
     let _ = stream.write_all(body.as_bytes()).await;
     let _ = stream.flush().await;
-    if !ok {
-        return Err("the sign-in did not complete (state mismatch or denied)".into());
+}
+
+/// Serve the browser's redirect, extract `?code=&state=`, and show the user a
+/// "you can close this tab" page.
+///
+/// Every connection until the deadline gets a look, not just the first one.
+/// Browsers open speculative connections and close them again, and serving
+/// exactly one accepted socket lost real sign-ins to them: a socket that sent
+/// nothing blocked the read forever (only the accept was under a timeout), and
+/// one that closed immediately consumed the single accept and reported failure
+/// for a sign-in the user had completed correctly. Only a request that carries
+/// a `code` — or the provider's own `error` — ends the wait.
+async fn await_callback(listener: TcpListener, expected_state: &str) -> Result<String, String> {
+    let timed_out = || "timed out waiting for the browser sign-in".to_string();
+    let deadline = tokio::time::Instant::now() + AUTH_TIMEOUT;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(timed_out());
+        }
+        let accepted = tokio::time::timeout(remaining, listener.accept())
+            .await
+            .map_err(|_| timed_out())?;
+        let (mut stream, _) = accepted.map_err(|e| e.to_string())?;
+        let Some(target) = read_request_target(&mut stream).await else {
+            continue;
+        };
+        // The user pressed Deny, or the provider refused: that IS an answer,
+        // and it is the provider's words rather than our guess at them.
+        if let Some(why) = callback_error(&target) {
+            write_callback_page(&mut stream, false).await;
+            return Err(format!("the provider refused the sign-in: {why}"));
+        }
+        let (code, state) = parse_callback_query(&target);
+        if code.is_empty() {
+            // A speculative connection, a favicon request, anything that is not
+            // the redirect: leave the wait open for the real one.
+            continue;
+        }
+        let ok = state == expected_state;
+        write_callback_page(&mut stream, ok).await;
+        if !ok {
+            return Err("the sign-in did not complete (the browser sent back a different sign-in's state)".into());
+        }
+        return Ok(code);
     }
-    Ok(code)
+}
+
+/// The provider's own refusal off a callback target, `error_description` for
+/// preference. Pure — unit-tested.
+pub(crate) fn callback_error(target: &str) -> Option<String> {
+    let query = target.split_once('?').map(|(_, q)| q).unwrap_or("");
+    let mut error = None;
+    let mut description = None;
+    for pair in query.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            match k {
+                "error" => error = Some(urldecode(v)),
+                "error_description" => description = Some(urldecode(v)),
+                _ => {}
+            }
+        }
+    }
+    let error = error.filter(|e| !e.is_empty())?;
+    Some(match description.filter(|d| !d.is_empty()) {
+        Some(d) => format!("{error} — {d}"),
+        None => error,
+    })
 }
 
 /// Pull `code` and `state` out of a `/callback?code=…&state=…` request target.
@@ -576,20 +802,40 @@ pub(crate) fn parse_callback_query(target: &str) -> (String, String) {
     (code, state)
 }
 
+/// Percent-decode a query value.
+///
+/// Byte by byte, never by re-slicing the `&str`: `&s[i + 1..i + 3]` panics when
+/// a `%` is followed by a multi-byte character, and the whole sign-in task went
+/// down with it — the drawer sat on "Waiting for your browser…" for ever. This
+/// runs on anything a local process can send the loopback port.
 fn urldecode(s: &str) -> String {
-    let bytes = s.replace('+', " ");
-    let bytes = bytes.as_bytes();
+    fn hex(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    }
+    let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                out.push(b);
-                i += 3;
-                continue;
+        match bytes[i] {
+            b'+' => out.push(b' '),
+            b'%' if i + 2 < bytes.len() => {
+                match (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                    (Some(hi), Some(lo)) => {
+                        out.push(hi * 16 + lo);
+                        i += 3;
+                        continue;
+                    }
+                    // Not an escape after all — keep the byte as it arrived.
+                    _ => out.push(bytes[i]),
+                }
             }
+            b => out.push(b),
         }
-        out.push(bytes[i]);
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
@@ -604,10 +850,12 @@ pub(crate) async fn authorize(
     www_authenticate: Option<&str>,
     open_browser: impl Fn(&str) -> Result<(), String>,
 ) -> Result<TokenSet, String> {
-    let prm_url = www_authenticate
-        .and_then(parse_www_authenticate)
-        .unwrap_or_else(|| well_known_prm(resource_url));
-    let meta = discover(&prm_url).await?;
+    let prm_urls = match www_authenticate.and_then(parse_www_authenticate) {
+        // The server named its own metadata document; nothing to guess at.
+        Some(url) => vec![url],
+        None => well_known_prm(resource_url),
+    };
+    let (meta, prm_scopes) = discover(&prm_urls).await?;
     let (redirect_uri, listener) = bind_callback().await?;
     let client_id = match &meta.registration_endpoint {
         Some(reg) => register_client(reg, &redirect_uri).await?,
@@ -619,7 +867,13 @@ pub(crate) async fn authorize(
         rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut s);
         s
     });
-    let scope = meta.scopes_supported.join(" ");
+    // Only what the RESOURCE published. Asking for the union of everything the
+    // authorization server supports put write and admin on the consent screen
+    // for a connector that may only need to read, and the stored token then
+    // carried them. With nothing published we send no `scope` at all
+    // (`build_authorize_url` drops empty parameters) and the provider applies
+    // its own default, which is a narrower ask than its superset.
+    let scope = prm_scopes.join(" ");
     let url = build_authorize_url(
         &meta.authorization_endpoint,
         &client_id,
@@ -662,6 +916,40 @@ mod tests {
         assert!(checked_endpoint("https://auth.example.com/token").is_ok());
     }
 
+    /// The literal check above is only half of it: the client that actually
+    /// leaves the machine has to resolve the name, refuse a private answer, and
+    /// pin what it checked. A private literal must never get that far.
+    #[tokio::test]
+    async fn the_outbound_client_refuses_a_private_address() {
+        for url in ["http://127.0.0.1:11434/token", "http://192.168.1.20/register"] {
+            assert!(guarded_client(url).await.is_err(), "should refuse {url}");
+        }
+    }
+
+    /// A redirect is chosen by the same server the guard exists to distrust, so
+    /// following one means running the WHOLE check again on the target — which
+    /// is only possible because the hop is computed rather than handed to
+    /// reqwest's redirect policy.
+    #[test]
+    fn a_redirect_hop_is_resolved_and_then_re_checked() {
+        let from = reqwest::Url::parse("https://auth.example.com/.well-known/x").unwrap();
+        assert_eq!(
+            redirect_target(302, Some("http://127.0.0.1:11434/api/generate"), &from).as_deref(),
+            Some("http://127.0.0.1:11434/api/generate"),
+        );
+        // …and that computed hop is exactly what the guard then refuses.
+        assert!(checked_endpoint("http://127.0.0.1:11434/api/generate").is_err());
+        // Relative Location, absolutized against the URL it came from.
+        assert_eq!(
+            redirect_target(301, Some("/other"), &from).as_deref(),
+            Some("https://auth.example.com/other"),
+        );
+        // Not a redirect, or a redirect with nothing usable → normal handling.
+        assert_eq!(redirect_target(200, Some("/other"), &from), None);
+        assert_eq!(redirect_target(302, None, &from), None);
+        assert_eq!(redirect_target(302, Some("  "), &from), None);
+    }
+
     /// A refused endpoint must never be read as the provider REFUSING the
     /// refresh token: that retires the sign-in and forces the user back through
     /// the browser for something the server never said.
@@ -695,31 +983,77 @@ mod tests {
         assert_eq!(parse_www_authenticate("Bearer").none_ish(), true);
     }
 
+    /// RFC 9728 §3.1: the resource's path goes AFTER the well-known segment, so
+    /// a host with several MCP resources 404s on the origin-only URL. Both
+    /// forms are tried, path first.
     #[test]
-    fn well_known_prm_uses_origin_only() {
+    fn well_known_prm_tries_the_resource_path_first() {
         assert_eq!(
             well_known_prm("https://mcp.example.com/mcp/v1"),
-            "https://mcp.example.com/.well-known/oauth-protected-resource"
+            vec![
+                "https://mcp.example.com/.well-known/oauth-protected-resource/mcp/v1",
+                "https://mcp.example.com/.well-known/oauth-protected-resource",
+            ]
+        );
+        // A resource at the root makes the two identical — one candidate, not
+        // the same request twice.
+        assert_eq!(
+            well_known_prm("https://mcp.example.com/"),
+            vec!["https://mcp.example.com/.well-known/oauth-protected-resource"]
+        );
+    }
+
+    /// A multi-tenant issuer (`https://auth.example.com/tenant-42`) publishes
+    /// its metadata with the well-known segment INSERTED, so appending it — the
+    /// only form this used to build — could never find the document, and every
+    /// such connector died on a 404 with no way forward in the app.
+    #[test]
+    fn auth_metadata_urls_cover_the_path_and_oidc_forms() {
+        assert_eq!(
+            auth_metadata_urls("https://auth.example.com/tenant-42"),
+            vec![
+                "https://auth.example.com/.well-known/oauth-authorization-server/tenant-42",
+                "https://auth.example.com/tenant-42/.well-known/oauth-authorization-server",
+                "https://auth.example.com/.well-known/openid-configuration/tenant-42",
+                "https://auth.example.com/tenant-42/.well-known/openid-configuration",
+            ]
+        );
+        // A path-less issuer: the two forms coincide, so two candidates, and a
+        // trailing slash must not produce a doubled one.
+        assert_eq!(
+            auth_metadata_urls("https://auth.example.com/"),
+            vec![
+                "https://auth.example.com/.well-known/oauth-authorization-server",
+                "https://auth.example.com/.well-known/openid-configuration",
+            ]
         );
     }
 
     #[test]
     fn parses_metadata_documents() {
         let prm = serde_json::json!({
-            "authorization_servers": ["https://auth.example.com"]
+            "authorization_servers": ["https://auth.example.com"],
+            "scopes_supported": ["read"]
         });
         assert_eq!(parse_resource_metadata(&prm), vec!["https://auth.example.com"]);
+        // The consent screen asks for what the RESOURCE published, never the
+        // authorization server's whole catalogue.
+        assert_eq!(parse_prm_scopes(&prm), vec!["read"]);
         let asm = serde_json::json!({
             "authorization_endpoint": "https://auth.example.com/authorize",
             "token_endpoint": "https://auth.example.com/token",
             "registration_endpoint": "https://auth.example.com/register",
-            "scopes_supported": ["read", "write"]
+            "scopes_supported": ["read", "write", "admin"]
         });
         let m = parse_auth_server_metadata(&asm).unwrap();
         assert_eq!(m.authorization_endpoint, "https://auth.example.com/authorize");
         assert_eq!(m.token_endpoint, "https://auth.example.com/token");
         assert_eq!(m.registration_endpoint.as_deref(), Some("https://auth.example.com/register"));
-        assert_eq!(m.scopes_supported, vec!["read", "write"]);
+        // A PRM with no scopes means NO scope parameter — the provider's own
+        // default — rather than the AS-wide superset above.
+        assert!(parse_prm_scopes(&serde_json::json!({"authorization_servers": []})).is_empty());
+        let url = build_authorize_url("https://a/authorize", "c", "http://127.0.0.1:1/cb", "CH", "ST", "", "https://r");
+        assert!(!url.contains("scope="), "{url}");
         // Missing token_endpoint → None (can't proceed).
         let bad = serde_json::json!({"authorization_endpoint": "x"});
         assert!(parse_auth_server_metadata(&bad).is_none());
@@ -756,6 +1090,71 @@ mod tests {
         assert_eq!(code, "a/b");
         // No query → empty.
         assert_eq!(parse_callback_query("/callback"), (String::new(), String::new()));
+        // A malformed escape used to PANIC the sign-in task (re-slicing the
+        // &str through a multi-byte character), leaving the drawer waiting for
+        // a browser that had already answered. Anything on the loopback port
+        // can send these.
+        assert_eq!(parse_callback_query("/callback?code=%a\u{FFFD}&state=s").0, "%a\u{FFFD}");
+        assert_eq!(parse_callback_query("/callback?code=ab%").0, "ab%");
+        assert_eq!(parse_callback_query("/callback?code=%zz").0, "%zz");
+        assert_eq!(parse_callback_query("/callback?code=a%2").0, "a%2");
+        // `+` is a space, and a lone trailing `%` after a decoded escape still
+        // survives.
+        assert_eq!(parse_callback_query("/callback?code=a+b%2Fc%").0, "a b/c%");
+    }
+
+    /// A denied consent screen redirects with `error=`, not `code=`. The wait
+    /// now ignores requests without a code (browsers pre-connect), so a refusal
+    /// has to be recognised or the drawer would sit there until it timed out.
+    #[test]
+    fn a_refused_signin_is_read_off_the_callback() {
+        assert_eq!(
+            callback_error("/callback?error=access_denied&state=s").as_deref(),
+            Some("access_denied"),
+        );
+        assert_eq!(
+            callback_error("/callback?error=invalid_scope&error_description=Scope+admin+is+unknown")
+                .as_deref(),
+            Some("invalid_scope — Scope admin is unknown"),
+        );
+        // The successful callback is not an error, and neither is a browser's
+        // speculative GET.
+        assert_eq!(callback_error("/callback?code=abc&state=s"), None);
+        assert_eq!(callback_error("/favicon.ico"), None);
+        assert_eq!(callback_error("/callback?error=&state=s"), None);
+    }
+
+    /// Browsers open speculative connections and close them again, and one can
+    /// land on the callback port before the redirect does. Serving exactly one
+    /// accepted socket meant that connection consumed the sign-in: the user
+    /// completed it correctly and got "the sign-in did not complete".
+    #[tokio::test]
+    async fn only_the_real_callback_ends_the_wait() {
+        let (_redirect, listener) = bind_callback().await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move { await_callback(listener, "ST").await });
+
+        // A speculative connection: accepted, then closed with nothing sent.
+        drop(tokio::net::TcpStream::connect(addr).await.unwrap());
+        // A request that is not the callback at all.
+        let mut noise = tokio::net::TcpStream::connect(addr).await.unwrap();
+        noise
+            .write_all(b"GET /favicon.ico HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            .await
+            .unwrap();
+        // The redirect the user's browser actually makes.
+        let mut real = tokio::net::TcpStream::connect(addr).await.unwrap();
+        real.write_all(b"GET /callback?code=abc123&state=ST HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            .await
+            .unwrap();
+
+        // Bounded so a regression fails the suite instead of hanging it for
+        // the five minutes a real sign-in is allowed.
+        let got = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("the wait should have ended at the real callback")
+            .unwrap();
+        assert_eq!(got.unwrap(), "abc123");
     }
 
     #[test]

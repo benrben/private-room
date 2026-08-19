@@ -220,8 +220,10 @@ export default function PdfView({
   const [numPages, setNumPages] = useState(0);
   const [scale, setScale] = useState(1);
   // A document that can't be opened gets a calm recovery panel, never a raw
-  // exception — the technical error goes to the console for debugging.
-  const [failed, setFailed] = useState(false);
+  // exception — the technical error goes to the console for debugging. WHICH
+  // panel matters: an encrypted PDF is not a damaged one, and telling its
+  // reader to re-import it sends them round a loop that cannot end.
+  const [failed, setFailed] = useState<null | "damaged" | "locked">(null);
   /** Live readout of the "find the quoted passage" scan, so a long search
    * never looks frozen — and can be abandoned. */
   const [scan, setScan] = useState<{ at: number; total: number } | null>(null);
@@ -488,8 +490,15 @@ export default function PdfView({
       observerRef.current?.disconnect();
       container.innerHTML = "";
       livePagesRef.current = [];
-      highlightRef.current = null;
-      findHlRef.current = null;
+      // These name the TARGET, not the DOM. Clearing them on a zoom re-render
+      // threw the citation highlight and its receipt away for good — the pages
+      // came back at the new scale with nothing painted on them — and did the
+      // same to the ⌘F hit while the find bar went on counting it. Kept on a
+      // re-render, `renderPage` repaints both as each page rasterizes.
+      if (!restoring) {
+        highlightRef.current = null;
+        findHlRef.current = null;
+      }
       const wraps: HTMLDivElement[] = [];
       pageWrapsRef.current = wraps;
 
@@ -540,7 +549,7 @@ export default function PdfView({
         if (token === renderTokenRef.current) {
           console.error("PDF render failed:", e);
           setStatus("");
-          setFailed(true);
+          setFailed("damaged");
         }
       }
     },
@@ -557,7 +566,7 @@ export default function PdfView({
     if (!container) return;
     if (!fileBytes) return;
     setStatus("Rendering PDF…");
-    setFailed(false);
+    setFailed(null);
     // `slice()` hands pdf.js its own copy: it TRANSFERS the buffer it is given
     // to the worker, which would detach the shared streamed array and leave a
     // reopened document reading zero bytes.
@@ -574,7 +583,12 @@ export default function PdfView({
         if (!cancelled) {
           console.error("PDF open failed:", e);
           setStatus("");
-          setFailed(true);
+          // pdf.js rejects an encrypted document with a PasswordException, and
+          // this viewer never asks for a password. That is not damage: calling
+          // it damage offered three remedies (re-import, export, close) that
+          // cannot work, and re-importing produced the same panel for ever.
+          const locked = (e as { name?: string } | null)?.name === "PasswordException";
+          setFailed(locked ? "locked" : "damaged");
         }
       }
     })();
@@ -798,7 +812,8 @@ export default function PdfView({
   const zoomOut = useCallback(() => setScale((s) => clamp(s - SCALE_STEP)), []);
   const fitWidth = useCallback(() => setScale(1), []);
 
-  // ⌘+ / ⌘- / ⌘0 / ⌘F while the viewer is hovered or focused.
+  // ⌘+ / ⌘- / ⌘0 / ⌘F while the viewer is focused, or hovered with the caret
+  // nowhere — see `typing` below.
   //
   // CAPTURE phase on purpose: the workspace's own ⌘F (the room-wide search)
   // listens on the window too, and it checks `defaultPrevented`. Claiming the
@@ -808,8 +823,18 @@ export default function PdfView({
     const onKey = (e: KeyboardEvent) => {
       if (!e.metaKey) return;
       const root = rootRef.current;
-      const active =
-        hoverRef.current || (root ? root.contains(document.activeElement) : false);
+      const el = document.activeElement;
+      // The pointer may only decide when nothing is being typed into. With the
+      // caret in the chat composer and the pointer left resting over the page
+      // — where it sits after any scroll — ⌘F used to open this find bar and
+      // suppress the room-wide search, and ⌘+ zoomed the PDF mid-sentence.
+      const typing =
+        el instanceof HTMLElement &&
+        (el.isContentEditable ||
+          el.tagName === "INPUT" ||
+          el.tagName === "TEXTAREA");
+      const inViewer = root ? root.contains(el) : false;
+      const active = inViewer || (hoverRef.current && !typing);
       if (!active) return;
       if (e.key === "+" || e.key === "=") {
         e.preventDefault();
@@ -854,8 +879,24 @@ export default function PdfView({
           <p className="pdf-failed-body">{readError}</p>
         </div>
       )}
-      {readLoading && !failed && <div className="viewer-status">Loading PDF…</div>}
-      {failed && (
+      {/* "Opening {object}…" is the whole family's word for the byte fetch —
+          this was the one that named a file format instead. */}
+      {readLoading && !failed && (
+        <div className="viewer-status">Opening document…</div>
+      )}
+      {failed === "locked" && (
+        <div className="pdf-failed" role="alert">
+          <div className="pdf-failed-title">This PDF is password-protected.</div>
+          <p className="pdf-failed-body">
+            It is encrypted, and this app can neither open it nor read its text
+            — so it won't appear in search either. Unlock it in an app that can
+            ask for the password and import the unlocked copy, or{" "}
+            <strong>Export</strong> the original from the toolbar above. The
+            file itself is stored here unchanged.
+          </p>
+        </div>
+      )}
+      {failed === "damaged" && (
         <div className="pdf-failed" role="alert">
           <div className="pdf-failed-title">This PDF could not be opened.</div>
           <p className="pdf-failed-body">

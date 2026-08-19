@@ -1,12 +1,13 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { formatWhen } from "./composer";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
 import DiffView, { isRtlDominant } from "../viewers/DiffView";
+import { useFocusTrap } from "../settings/useFocusTrap";
 
 /** Idea 11: a read-only side-by-side diff of one saved version against the
- * file's current text. Cribs the house modal pattern (StudioModal): backdrop
- * div, role="dialog" aria-modal, capture-phase Escape, backdrop click closes.
+ * file's current text. Cribs the house modal pattern (ApproveCard): backdrop
+ * div, role="dialog" aria-modal, a focus trap, backdrop click closes.
  * Restore stays reachable from here behind an armed, data-agent-blocked confirm
  * (the agent driver must not restore what it didn't earn). */
 export default function CompareModal({
@@ -30,20 +31,6 @@ export default function CompareModal({
     setArmed(false);
   }, [open, compare?.versionId]);
 
-  useEffect(() => {
-    if (!open) return;
-    function onKey(e: KeyboardEvent) {
-      if (e.key !== "Escape") return;
-      // Capture-phase + stopPropagation so the app-level Escape (which closes
-      // the file viewer) never fires underneath this dialog.
-      e.stopPropagation();
-      s.setCompare(null);
-    }
-    window.addEventListener("keydown", onKey, true);
-    return () => window.removeEventListener("keydown", onKey, true);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open]);
-
   if (!compare) return null;
 
   const bothText =
@@ -54,12 +41,9 @@ export default function CompareModal({
 
   return (
     <div className="compare-backdrop" onClick={() => s.setCompare(null)}>
-      <div
-        className="compare-modal"
-        role="dialog"
-        aria-modal="true"
-        aria-label={`Compare — ${compare.fileName}`}
-        onClick={(e) => e.stopPropagation()}
+      <ComparePanel
+        label={`Compare — ${compare.fileName}`}
+        onClose={() => s.setCompare(null)}
       >
         <div className="compare-head">
           <div className="compare-title">
@@ -146,7 +130,48 @@ export default function CompareModal({
             </div>
           )}
         </div>
-      </div>
+      </ComparePanel>
+    </div>
+  );
+}
+
+/** The trapped panel. A component of its own so `useFocusTrap`'s mount and
+ * unmount effects line up with the dialog opening and closing — the outer
+ * component stays mounted for the whole session with `compare` null. */
+function ComparePanel({
+  label,
+  onClose,
+  children,
+}: {
+  label: string;
+  onClose: () => void;
+  children: ReactNode;
+}) {
+  const { modalRef, onModalKeyDown } = useFocusTrap(onClose);
+  return (
+    <div
+      ref={modalRef}
+      tabIndex={-1}
+      // Escape is answered in the CAPTURE phase, unlike the app's other trapped
+      // dialogs, because this one hosts Monaco: the diff editor consumes the key
+      // whenever it has a selection or an open find widget and stops it there,
+      // so a bubble-phase handler would never see it. Stopping it here also
+      // keeps it off the app-level Escape (effects.ts), which closes the open
+      // FILE this dialog is drawn over.
+      onKeyDownCapture={(e) => {
+        if (e.key !== "Escape") return;
+        e.preventDefault();
+        e.stopPropagation();
+        onClose();
+      }}
+      onKeyDown={onModalKeyDown}
+      className="compare-modal"
+      role="dialog"
+      aria-modal="true"
+      aria-label={label}
+      onClick={(e) => e.stopPropagation()}
+    >
+      {children}
     </div>
   );
 }

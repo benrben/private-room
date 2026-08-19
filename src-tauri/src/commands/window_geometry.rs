@@ -83,7 +83,16 @@ pub(crate) fn geometry_is_usable(g: &Geometry, screens: &[Screen]) -> bool {
 
 /// Remember the rectangle a window event just reported. Cheap by design: this
 /// runs on every move and resize.
+///
+/// Full screen is NOT a rectangle worth remembering: entering it emits a
+/// `Resized` for the whole display, and quitting from there would relaunch the
+/// app as a display-sized window parked in the corner, with the arrangement the
+/// user actually chose overwritten and gone. Skipping the note leaves the last
+/// NORMAL-state rectangle as the one written on the way out.
 pub(crate) fn note_geometry(window: &tauri::Window) {
+    if window.is_fullscreen().unwrap_or(false) {
+        return;
+    }
     let (Ok(pos), Ok(size)) = (window.outer_position(), window.inner_size()) else {
         return;
     };

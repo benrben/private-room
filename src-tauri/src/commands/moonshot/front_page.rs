@@ -173,7 +173,14 @@ mod tests {
         let fp = front_page_of(&conn).unwrap();
         assert_eq!(fp.file_count, 6, "browser pages, downloads and generated artifacts are all in the room");
         assert_eq!(fp.file_count, crate::db::room_counts(&conn).unwrap().0, "RoomInfo agrees");
-        assert_eq!(fp.file_count, crate::db::list_files(&conn).unwrap().len() as i64, "the Library badge agrees");
+        // `list_files` is what this page's own strip is drawn from — NOT the
+        // Library badge, which is the narrower question and is answered in
+        // `isLibraryVisible` (fileVisibility.ts). The label used to say badge.
+        assert_eq!(
+            fp.file_count,
+            crate::db::list_files(&conn).unwrap().len() as i64,
+            "the strip this page draws agrees"
+        );
         // The summary file is kept off the recent-files STRIP (it is the app's
         // own output, not something to reopen) — that is a display choice and
         // must not shrink the count.
@@ -184,5 +191,37 @@ mod tests {
         assert_eq!(fp.file_count, 5, "a deleted file is not in the room any more");
         assert_eq!(fp.file_count, crate::db::room_counts(&conn).unwrap().0);
         assert_eq!(fp.file_count, crate::db::list_files(&conn).unwrap().len() as i64);
+    }
+
+    /// Home shows two numbers and they are two questions: this page counts the
+    /// ROOM, the sidebar badge counts the LIBRARY. A section-only sketch is in
+    /// the first and not the second — the owner's 2026-08-03 ruling, spelled out
+    /// in `db::room_file_count`'s contract. Pinned here because this is the page
+    /// where the two sit side by side and reading one as the other is the easy
+    /// mistake.
+    #[test]
+    fn a_section_only_sketch_is_counted_by_the_room_not_by_the_library() {
+        let conn = crate::db::mem();
+        crate::db::insert_file(&conn, "lease.pdf", "application/pdf", b"%PDF", Some("rent"), "upload")
+            .unwrap();
+        let sketch = crate::db::insert_file(
+            &conn, "Untitled.sketch", "application/json", b"{}", None, "generated",
+        )
+        .unwrap();
+        crate::db::mark_section_only(&conn, &sketch.id, "sketch");
+
+        let fp = front_page_of(&conn).unwrap();
+        assert_eq!(fp.file_count, 2, "a sketch is a file the room holds");
+        // Which rows Home leaves out is asked of production code, not restated
+        // here: `db::placement_note` is the Rust side's own "not in the
+        // Library", so if that rule moves this moves with it.
+        let kept_out = crate::db::list_files(&conn)
+            .unwrap()
+            .into_iter()
+            .filter(|f| {
+                !crate::db::placement_note(&f.origin_destination, &f.library_visibility).is_empty()
+            })
+            .count();
+        assert_eq!(kept_out, 1, "one of the two rows is kept out of the Library");
     }
 }

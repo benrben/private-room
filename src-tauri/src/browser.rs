@@ -135,6 +135,69 @@ struct Page {
 /// The agent's page script, injected at document start into every frame.
 pub const PAGE_JS: &str = include_str!("browser/page.js");
 
+/// Injected beside [`PAGE_JS`]: a request for a SECOND window becomes an
+/// ordinary navigation of this one.
+///
+/// THE BUG THIS EXISTS FOR. `target="_blank"` and `window.open()` both ask
+/// WebKit's UI delegate for a new web view, and wry answers `nil` unless a
+/// new-window handler is installed — so every such link did nothing at all. The
+/// navigation hook, meanwhile, cannot tell that action from a real one: it
+/// recorded the destination as this tab's address for a page the browser had
+/// not left, and the address bar, the tab strip and `browse_open`'s answer all
+/// read off that record.
+///
+/// Headed off in the PAGE rather than in wry's handler on purpose: wry 0.55
+/// unwraps the request's URL before it calls the handler, and a bare
+/// `window.open()` (the "open a window, then write into it" idiom) carries
+/// none — installing the handler would trade a dead link for an abort. The two
+/// things that ask are answered here instead; a form's `target`, a `<base
+/// target>` and a ⌘-click still reach WebKit and are still dead.
+///
+/// Total, like the page script: every branch is wrapped, because an exception
+/// thrown from a capture-phase listener on somebody else's page is a page we
+/// broke.
+const NO_POPUPS_JS: &str = r#"(function () {
+  "use strict";
+  if (window.__arcelleInPlace) { return; }
+  window.__arcelleInPlace = true;
+
+  function wantsNewWindow(target) {
+    var t = String(target == null ? "" : target).trim().toLowerCase();
+    return t === "_blank" || t === "_new";
+  }
+
+  // The whole page moves, not the frame the link sat in: "open in a new window"
+  // from an embedded ad means leave this site, and replacing the iframe would
+  // leave the reader looking at the ad. A cross-origin frame may be refused the
+  // top-level navigation, so this frame is the fallback rather than the plan.
+  function goTo(url) {
+    if (!url) { return; }
+    try { window.top.location.href = url; return; } catch (e) {}
+    try { window.location.href = url; } catch (e) {}
+  }
+
+  window.open = function (url) {
+    goTo(url == null ? "" : String(url));
+    // A page that tests for a blocked popup gets the answer it knows.
+    return null;
+  };
+
+  document.addEventListener("click", function (ev) {
+    try {
+      if (ev.defaultPrevented) { return; }
+      var node = ev.target;
+      var anchor = node && typeof node.closest === "function" ? node.closest("a[href]") : null;
+      if (!anchor || !wantsNewWindow(anchor.getAttribute("target"))) { return; }
+      // `download` is decided before the new-window request is ever made, so
+      // that link works today — leave it to the download path.
+      if (anchor.hasAttribute("download")) { return; }
+      ev.preventDefault();
+      goTo(anchor.href || anchor.getAttribute("href"));
+    } catch (e) {}
+  }, true);
+})();
+"#;
+
 /// How long one `evaluateJavaScript` round trip may take. Generous because a
 /// heavy page can block its own main thread for a while; the poll loop in
 /// [`call_async`] has its own, larger budget.
@@ -306,7 +369,10 @@ impl Bounds {
 // ---------------------------------------------------------------------------
 
 /// The page that is showing, if any.
-pub fn active_id(app: &tauri::AppHandle) -> Option<String> {
+///
+/// Runtime-generic like [`recorded_url`]: the page-record reads around it are
+/// only testable against a mock runtime.
+pub fn active_id<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Option<String> {
     let id = app.state::<BrowserState>().active.lock().unwrap().clone();
     (!id.is_empty()).then_some(id)
 }
@@ -534,17 +600,55 @@ fn reposition(app: &tauri::AppHandle) {
 /// `url` has ALREADY been guard-checked by the caller.
 pub fn ensure(app: &tauri::AppHandle, url: &str) -> Result<(), String> {
     let parsed = reqwest::Url::parse(url).map_err(|_| format!("Invalid URL: {url}"))?;
-    if let Some(wv) = webview(app) {
-        // Stamp the outgoing document BEFORE navigating, so `wait_ready`
-        // cannot mistake the page we are leaving for the page we asked for.
-        mark_superseded(app);
-        wv.navigate(parsed).map_err(|e| e.to_string())?;
-        if let Some(id) = active_id(app) {
+    if let Some(id) = active_id(app) {
+        if let Some(wv) = webview_of(app, &id) {
+            // Stamp the outgoing document BEFORE navigating, so `wait_ready`
+            // cannot mistake the page we are leaving for the page we asked for.
+            mark_superseded(app);
+            // THE BLOCKER RACE, second half. `create` parks a new page on
+            // `about:blank` so nothing loads before the rule list is on — but
+            // an address typed into that page while the compile is still
+            // running used to navigate it straight from here, and its opening
+            // burst of requests (trackers, private-range sub-resources) went
+            // out with no content blocker attached. Nothing said so: the
+            // shield only reads `Unknown`, which the chrome renders as "not
+            // yet", not as "this load was unprotected". Recording the
+            // destination first also supersedes whatever the pending attach
+            // was going to navigate to (`should_go_after_rules`).
+            if awaits_blocker(app, &id) {
+                record_url(app, &id, url);
+                attach_rules(app, &id, ThenGo::Navigate(url.to_string()));
+                return Ok(());
+            }
+            wv.navigate(parsed).map_err(|e| e.to_string())?;
             record_url(app, &id, url);
+            return Ok(());
         }
-        return Ok(());
     }
     new_tab(app, url).map(|_| ())
+}
+
+/// Is this page still without a content blocker — so a navigation must go
+/// through the attach rather than straight out?
+fn awaits_blocker<R: tauri::Runtime>(app: &tauri::AppHandle<R>, id: &str) -> bool {
+    let state = app.state::<BrowserState>();
+    let tabs = state.tabs.lock().unwrap();
+    tabs.iter()
+        .find(|p| p.id == id)
+        .is_some_and(|p| blocker_not_on_yet(&p.protection, p.deferred_since))
+}
+
+/// `Unknown` is the verdict of a page nobody has heard back about: the compile
+/// is still running (a blank new tab records no deferral, so the timestamp
+/// alone cannot see it), or its completion block was dropped — and in the
+/// dropped case the page is parked anyway, so re-attaching is the only thing
+/// that can still move it.
+///
+/// A page whose attach already failed navigates NORMALLY: that verdict is
+/// recorded, the shield is showing it, and holding the address bar hostage to
+/// a blocker WebKit refuses to compile would leave the browser unusable.
+fn blocker_not_on_yet(protection: &Protection, deferred_since: Option<Instant>) -> bool {
+    matches!(protection, Protection::Unknown) || deferral_is_live(deferred_since)
 }
 
 /// Where every page starts before its blocker is on. Fetches nothing, so the
@@ -567,24 +671,13 @@ fn create(app: &tauri::AppHandle, id: &str, url: &str) -> Result<(), String> {
     let window = crate::main_window(app).ok_or_else(|| "The app window is gone.".to_string())?;
     let state = app.state::<BrowserState>();
     // The agent can open a page from any area, so there may be no cached rect
-    // yet (the browser pane has never mounted). Falling back to a fixed
-    // 800x600 would load the page at a viewport it will never actually have —
-    // and a first snapshot taken at that width can report a MOBILE layout, with
-    // different controls than the one the user ends up looking at. Default to
-    // the window's own size instead; `BrowserView` corrects the rect as soon
-    // as it mounts, but the page never lays out at a fictional width.
-    let fallback = window
-        .inner_size()
-        .ok()
-        .zip(window.scale_factor().ok())
-        .map(|(size, scale)| Bounds {
-            x: 0.0,
-            y: 0.0,
-            width: size.width as f64 / scale,
-            height: size.height as f64 / scale,
-        })
-        .unwrap_or(Bounds { x: 0.0, y: 0.0, width: 1200.0, height: 800.0 });
-    let b = state.bounds.lock().unwrap().unwrap_or(fallback).sane();
+    // yet (the browser pane has never mounted). Such a page is PARKED until it
+    // has one, exactly like a background tab: a child webview is positioned on
+    // screen rather than clipped by any pane, so sizing it to the window here
+    // would float a web page over the workspace. It also cannot be given a
+    // fictional rect and left there — `select_tab` reposition()s every page
+    // before this call returns, and would park it again anyway.
+    let b = state.bounds.lock().unwrap().unwrap_or(PARKED).sane();
 
     let app_for_nav = app.clone();
     let app_for_dl = app.clone();
@@ -601,6 +694,9 @@ fn create(app: &tauri::AppHandle, id: &str, url: &str) -> Result<(), String> {
     // Document-start, all frames: the script is in place before page code runs
     // and works on every origin without an allowlist.
     .initialization_script_for_all_frames(PAGE_JS)
+    // Also all frames: an ad iframe's `target="_blank"` asks WebKit for a new
+    // window exactly as the main document's does.
+    .initialization_script_for_all_frames(NO_POPUPS_JS)
     .on_navigation(move |url| {
         if !navigation_allowed(&app_for_nav, &nav_id, url) {
             return false;
@@ -612,7 +708,7 @@ fn create(app: &tauri::AppHandle, id: &str, url: &str) -> Result<(), String> {
         // showing perfectly well. `BrowserView` then parked the live page at
         // 1×1 and put the start screen back: the page "vanished" a second after
         // every navigation (owner report 2026-08-01).
-        if is_recordable_url(url) {
+        if is_recordable_url(url) && believable_for(&app_for_nav, &nav_id, url) {
             record_url(&app_for_nav, &nav_id, url.as_str());
         }
         true
@@ -644,6 +740,42 @@ fn create(app: &tauri::AppHandle, id: &str, url: &str) -> Result<(), String> {
     // attach, so the blocker is never a step behind the page.
     attach_rules_then_go(app, id, url);
     Ok(())
+}
+
+/// Does a navigation reported for `id` describe the PAGE, or one of its frames?
+///
+/// `on_navigation` fires for sub-frames as well as the main frame and cannot
+/// tell them apart. The showing page self-heals — [`record_active_url`] writes
+/// the main frame's own `location.href` back on every info poll — but a
+/// BACKGROUND page has no poll, so a late-loading consent wall or a YouTube
+/// embed overwrote its record, cleared its `<title>`, and left the strip
+/// showing somebody else's host until the user selected that tab and waited.
+///
+/// Believed unless it contradicts where the page was actually sent: same host
+/// bar `www.`, which lets a site's own redirects and http→https upgrades
+/// through and refuses third-party frames. A background page that genuinely
+/// redirects across domains keeps the row it had until it is selected, which
+/// is the destination the user asked for rather than an advertiser's.
+fn believable_for<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    id: &str,
+    next: &reqwest::Url,
+) -> bool {
+    if active_id(app).as_deref() == Some(id) {
+        return true;
+    }
+    recorded_url(app, id).is_none_or(|current| same_site(&current, next))
+}
+
+fn same_site(current: &str, next: &reqwest::Url) -> bool {
+    let Ok(current) = reqwest::Url::parse(current) else { return true };
+    match (current.host_str(), next.host_str()) {
+        (Some(a), Some(b)) => a.trim_start_matches("www.") == b.trim_start_matches("www."),
+        // A page with no host of its own — `about:blank` — has nothing to
+        // contradict, so the first real destination is believed.
+        (None, _) => true,
+        _ => false,
+    }
 }
 
 /// Send a page that is parked on [`START_BLANK`] to where it was actually
@@ -1203,20 +1335,42 @@ pub async fn eval_json(
     serde_json::from_str(&raw).map_err(|e| format!("The page answered with something unreadable: {e}"))
 }
 
-/// Call a SYNCHRONOUS page op (`snapshot`, `read`, `find`, `info`, `ping`).
+/// Call a SYNCHRONOUS page op (`snapshot`, `read`, `find`, `info`, `ping`) on
+/// the page that is SHOWING.
 pub async fn call(
     app: &tauri::AppHandle,
     op: &str,
     args: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     let wv = webview(app).ok_or("The browser isn't open. Use browse_open first.")?;
+    call_webview(&wv, op, args).await
+}
+
+/// The same op, addressed to ONE page rather than to whichever page happens to
+/// be showing — see [`call_async`] for why an op in flight must not follow the
+/// user's tab switch.
+async fn call_page(
+    app: &tauri::AppHandle,
+    id: &str,
+    op: &str,
+    args: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let wv = webview_of(app, id).ok_or("That page was closed while it was working.")?;
+    call_webview(&wv, op, args).await
+}
+
+async fn call_webview(
+    wv: &Webview<Wry>,
+    op: &str,
+    args: serde_json::Value,
+) -> Result<serde_json::Value, String> {
     let js = format!(
         "(window.__arcelleBrowse ? window.__arcelleBrowse.call({}, {}) \
          : {{ok:false,error:\"The page script isn't loaded on this page yet.\"}})",
         serde_json::to_string(op).unwrap_or_else(|_| "\"\"".into()),
         serde_json::to_string(&args).unwrap_or_else(|_| "{}".into()),
     );
-    let v = eval_json(&wv, &js).await?;
+    let v = eval_json(wv, &js).await?;
     if v.get("ok").and_then(|o| o.as_bool()) == Some(false) {
         return Err(v
             .get("error")
@@ -1375,10 +1529,11 @@ pub async fn wait_ready(app: &tauri::AppHandle, budget: Duration) -> Result<(), 
     }
 }
 
-/// Which document is answering right now, or `None` if the script cannot be
-/// reached at all. Used to tell a NAVIGATION from a genuine page-script failure.
-async fn doc_id(app: &tauri::AppHandle) -> Option<String> {
-    let wv = webview(app)?;
+/// Which document is answering on ONE page right now, or `None` if the script
+/// cannot be reached at all. Used to tell a NAVIGATION from a genuine
+/// page-script failure.
+async fn doc_id(app: &tauri::AppHandle, id: &str) -> Option<String> {
+    let wv = webview_of(app, id)?;
     const JS: &str = r#"(window.__arcelleBrowse
         ? window.__arcelleBrowse.call("info", {})
         : { ok: false })"#;
@@ -1408,14 +1563,22 @@ async fn doc_id(app: &tauri::AppHandle) -> Option<String> {
 /// Against a new one it means "the op ran and took the page with it", which is
 /// reported as exactly that — never as completion, because a batch interrupted
 /// by a navigation genuinely did not finish its later steps.
+///
+/// EVERY hop addresses the page the op was STARTED on, not the page that is
+/// showing when the hop runs. The user can select another tab mid-batch, and
+/// against the active webview the ticket then belongs to a document that never
+/// heard of it: `take` failed, the doc id differed, and the model was handed a
+/// navigation report — with the other tab's URL and the other tab's snapshot —
+/// for a page the action never touched. A tab switch is not news about the op.
 pub async fn call_async(
     app: &tauri::AppHandle,
     op: &str,
     args: serde_json::Value,
     budget: Duration,
 ) -> Result<serde_json::Value, String> {
-    let doc_before = doc_id(app).await;
-    let begun = call(app, "begin", serde_json::json!({ "op": op, "args": args })).await?;
+    let page = active_id(app).ok_or("The browser isn't open. Use browse_open first.")?;
+    let doc_before = doc_id(app, &page).await;
+    let begun = call_page(app, &page, "begin", serde_json::json!({ "op": op, "args": args })).await?;
     let ticket = begun
         .get("ticket")
         .and_then(|t| t.as_str())
@@ -1425,7 +1588,7 @@ pub async fn call_async(
     let started = Instant::now();
     loop {
         tokio::time::sleep(POLL_INTERVAL).await;
-        match call(app, "take", serde_json::json!({ "ticket": ticket })).await {
+        match call_page(app, &page, "take", serde_json::json!({ "ticket": ticket })).await {
             Ok(taken) => {
                 if taken.get("done").and_then(|d| d.as_bool()) == Some(true) {
                     return Ok(taken.get("value").cloned().unwrap_or(serde_json::Value::Null));
@@ -1436,7 +1599,7 @@ pub async fn call_async(
             Err(e) => {
                 // Let the replacement document finish arriving before judging.
                 wait_ready(app, READY_BUDGET_NAV).await.ok();
-                let doc_after = doc_id(app).await;
+                let doc_after = doc_id(app, &page).await;
                 let navigated = doc_after.is_some() && doc_after != doc_before;
                 if !navigated {
                     return Err(e);
@@ -1445,7 +1608,7 @@ pub async fn call_async(
                 return Ok(serde_json::json!({
                     "ok": true,
                     "navigated": true,
-                    "snapshot": call(app, "snapshot", serde_json::json!({}))
+                    "snapshot": call_page(app, &page, "snapshot", serde_json::json!({}))
                         .await
                         .unwrap_or(serde_json::Value::Null),
                 }));
@@ -2466,9 +2629,13 @@ mod tests {
         assert_eq!(readiness_from_probe_error("The page answered with something unreadable: x"), None);
         // …and the messages must stay the ones `eval_json` actually produces.
         let src = include_str!("browser.rs");
+        // The needles are split so the assertion's OWN source does not contain
+        // them: `src` is this whole file, so a one-piece literal would match
+        // itself and the check could never fail however the production code
+        // changed.
         assert!(
-            src.contains("map_err(|_| EVAL_TIMED_OUT.to_string())")
-                && src.contains("map_err(|_| EVAL_LOST.to_string())"),
+            src.contains(concat!("map_err(|_| EVAL_TIMED", "_OUT.to_string())"))
+                && src.contains(concat!("map_err(|_| EVAL_", "LOST.to_string())")),
             "eval_json must report both failures through the constants probe_ready matches on"
         );
         // "closed" was a guess, and the wrong one: nothing closed.
@@ -2534,6 +2701,92 @@ mod tests {
         }
     }
 
+    /// A page navigated while its blocker is still compiling loads its opening
+    /// burst of requests — trackers, private-range sub-resources — with nothing
+    /// attached, and nothing tells the user: the shield reads `Unknown`, which
+    /// the chrome renders as "not yet", not as "that load was unprotected". So
+    /// `ensure` routes such a navigation through the attach instead, exactly as
+    /// `create` does for a brand-new page.
+    #[test]
+    fn a_navigation_onto_a_page_with_no_blocker_yet_goes_through_the_attach() {
+        // Nobody has heard back: the compile is running (a blank new tab
+        // records no deferral, so the timestamp alone cannot see this one).
+        assert!(blocker_not_on_yet(&Protection::Unknown, None));
+        // A destination is parked behind a compile that IS recorded.
+        assert!(blocker_not_on_yet(&Protection::Unknown, Some(Instant::now())));
+        // The blocker is on this webview and stays on across navigations.
+        assert!(!blocker_not_on_yet(&Protection::Active, None));
+        // A recorded failure is not a wait. The shield is already showing it,
+        // and holding the address bar hostage to a list WebKit refuses to
+        // compile would leave the browser unusable.
+        assert!(!blocker_not_on_yet(&Protection::Failed { reason: "code 6".into() }, None));
+        assert!(!blocker_not_on_yet(&Protection::Unavailable { reason: "no store".into() }, None));
+        // An abandoned wait is not believed forever — same ceiling the toolbar
+        // uses, so the two cannot disagree about whether a page is waiting.
+        let ancient = Instant::now()
+            .checked_sub(DEFER_GRACE + Duration::from_secs(1))
+            .expect("the clock has been up longer than the grace");
+        assert!(!blocker_not_on_yet(&Protection::Active, Some(ancient)));
+
+        // …and the state-reading half `ensure` actually calls.
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        app.manage(BrowserState::default());
+        assert!(!awaits_blocker(app.handle(), "0"), "a page we have no record of");
+        app.state::<BrowserState>().add_page(Page {
+            id: "0".into(),
+            url: "https://example.com/".into(),
+            title: String::new(),
+            protection: Protection::Unknown,
+            deferred_since: None,
+        });
+        assert!(awaits_blocker(app.handle(), "0"));
+        set_protection(app.handle(), "0", Protection::Active);
+        assert!(!awaits_blocker(app.handle(), "0"));
+    }
+
+    /// `on_navigation` fires for SUB-FRAMES too and cannot tell them apart. The
+    /// showing page self-heals on the next info poll; a background page has no
+    /// poll, so a late-loading consent wall or embed retitled its row after
+    /// somebody else's domain and kept it there until the tab was selected.
+    #[test]
+    fn a_frame_cannot_retitle_a_background_page() {
+        let url = |u: &str| reqwest::Url::parse(u).unwrap();
+        // The page's own redirects: path, then http→https, then the www split.
+        assert!(same_site("https://example.com/a", &url("https://example.com/b")));
+        assert!(same_site("http://example.com/", &url("https://example.com/")));
+        assert!(same_site("https://www.example.com/", &url("https://example.com/")));
+        // A third-party frame is not where this page went.
+        assert!(!same_site("https://example.com/", &url("https://ads.example.net/f")));
+        assert!(!same_site("https://example.com/", &url("https://other.example.com/")));
+        // A page with no host of its own has nothing to contradict.
+        assert!(same_site("about:blank", &url("https://example.com/")));
+        assert!(same_site("not a url at all", &url("https://example.com/")));
+
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        app.manage(BrowserState::default());
+        let state = app.state::<BrowserState>();
+        for id in ["0", "1"] {
+            state.add_page(Page {
+                id: id.into(),
+                url: "https://example.com/".into(),
+                title: "Example".into(),
+                protection: Protection::Active,
+                deferred_since: None,
+            });
+        }
+        *state.active.lock().unwrap() = "0".into();
+        // The SHOWING page keeps taking every navigation: `record_active_url`
+        // corrects it from the main frame's own `location.href` 1.2s later.
+        assert!(believable_for(app.handle(), "0", &url("https://consent.example.net/wall")));
+        // The background one does not, and its row survives the frame.
+        assert!(!believable_for(app.handle(), "1", &url("https://consent.example.net/wall")));
+        assert!(believable_for(app.handle(), "1", &url("https://example.com/next")));
+    }
+
     /// The backstop, for the one ending no exit of ours can see: WebKit drops
     /// the compile's completion block without ever calling it. The page has to
     /// go back to telling the ordinary truth rather than claiming to be loading
@@ -2568,7 +2821,8 @@ mod tests {
         assert!(probe.contains("!window.__arcelleSuperseded"));
         assert!(probe.contains("\"ping\""));
         // …and the mark must actually be set somewhere, or the guard is dead.
-        assert!(src.contains("window.__arcelleSuperseded = 1"));
+        // Split, so this line is not itself the match — see the note above.
+        assert!(src.contains(concat!("window.__arcelleSuper", "seded = 1")));
     }
 
     /// The page script must be present and expose the entry point the Rust

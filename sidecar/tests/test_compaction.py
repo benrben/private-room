@@ -421,3 +421,192 @@ async def test_a_failed_digest_still_cuts_the_oversized_result():
     assert all(
         msg_len(m) < 10_000 for m in out if m.get("role") == "tool"
     ), "an oversized tool result survived the digest-failed path"
+
+
+# --------------------------------------------------------------------------- #
+# a tool exchange is one unit: the call and its results move together
+# --------------------------------------------------------------------------- #
+
+
+def _tool_turn(i: int, result_bytes: int = 2_500):
+    """One realistic tool round: question, call, result, answer."""
+    return [
+        {"role": "user", "content": f"Q{i} " + "u" * 800},
+        {
+            "role": "assistant",
+            "content": f"A{i} looking that up",
+            "tool_calls": [
+                {
+                    "id": f"call_{i}",
+                    "type": "function",
+                    "function": {"name": "search_room", "arguments": {"query": f"q{i}"}},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "content": f"T{i} " + "t" * result_bytes,
+            "tool_name": "search_room",
+            "tool_call_id": f"call_{i}",
+        },
+        {"role": "assistant", "content": f"R{i} " + "r" * 1_000},
+    ]
+
+
+def _tool_convo(n_turns: int):
+    msgs = [{"role": "system", "content": "SYSTEM PROMPT"}]
+    for i in range(n_turns):
+        msgs += _tool_turn(i)
+    return msgs
+
+
+def _orphaned_results(messages):
+    """Tool results with no assistant `tool_calls` turn in front of them."""
+    orphans = []
+    answered = False
+    for m in messages:
+        role = m.get("role")
+        if role == "tool":
+            if not answered:
+                orphans.append(m.get("tool_call_id") or m.get("tool_name"))
+        else:
+            answered = role == "assistant" and bool(m.get("tool_calls"))
+    return orphans
+
+
+async def test_the_recent_boundary_never_lands_inside_a_tool_exchange():
+    """The verbatim tail is measured in BYTES, and the byte where it ends can
+    fall between an assistant `tool_calls` turn and the result answering it —
+    digesting the call and keeping the result. Providers reject that shape.
+
+    Sized so the tail holds the last answer and its result but not the call:
+    1003 + 2503 <= 3560 < 1003 + 2503 + 114.
+    """
+    msgs = _tool_convo(4)
+    budget = 7_120  # RECENT_SHARE 0.5 -> a 3,560-byte tail
+    total = sum(msg_len(m) for m in msgs)
+    assert budget < total and total >= MIN_COMPACT_BYTES
+
+    out, did = await compact_to_budget(msgs, budget, _fake_digest)
+
+    assert did is True
+    assert not _orphaned_results(out), (
+        "compaction digested the assistant turn that asked for these results "
+        "and left the results behind"
+    )
+
+
+async def test_a_chunk_boundary_never_lands_inside_a_tool_exchange():
+    """The other seam. The last digest chunk is left verbatim (it is the one
+    that keeps moving, so digesting it would miss the cache every round) — and
+    that chunk begins wherever the byte-sized chunking happened to break, which
+    can be between a call and its result.
+
+    Here the recent tail starts cleanly on turn 5, so the only boundary that
+    can orphan anything is the chunk one.
+    """
+    msgs = _tool_convo(6)
+    out, did = await compact_to_budget(msgs, 9_600, _fake_digest, chunk_bytes=6_000)
+
+    assert did is True
+    assert not _orphaned_results(out), (
+        "the verbatim tail chunk starts on a tool result whose call was digested"
+    )
+
+
+async def test_parallel_results_move_with_their_call():
+    """Several results answering one turn: the boundary must clear all of them.
+
+    The 3,000-byte tail holds the last answer and the SECOND result only, so
+    stepping back one message is not enough — the walk has to reach the call.
+    """
+    msgs = [
+        {"role": "system", "content": "SYSTEM PROMPT"},
+        {"role": "user", "content": "Q0 " + "u" * 6_000},
+        {"role": "assistant", "content": "A0 " + "a" * 6_000},
+        {"role": "user", "content": "Q1 compare the two rooms"},
+        {
+            "role": "assistant",
+            "content": "A1 reading both",
+            "tool_calls": [{"id": "call_a"}, {"id": "call_b"}],
+        },
+        {"role": "tool", "content": "TA " + "t" * 2_000, "tool_name": "search_room",
+         "tool_call_id": "call_a"},
+        {"role": "tool", "content": "TB " + "t" * 2_000, "tool_name": "search_room",
+         "tool_call_id": "call_b"},
+        {"role": "assistant", "content": "R1 " + "r" * 500},
+    ]
+    out, did = await compact_to_budget(msgs, 6_000, _fake_digest)
+
+    assert did is True
+    assert not _orphaned_results(out)
+
+
+async def test_the_digest_sees_which_tool_ran_and_with_what_arguments():
+    """The digested stretch used to keep the fetched page and lose the fetch.
+
+    An assistant turn that only asked for a tool rendered as the bare line
+    `assistant: `, and its answer as `tool: <page>` — so the model's memory of
+    the older half held a page of text with no record of which tool produced
+    it, against which URL, while DIGEST_PROMPT asks for every value "with what
+    it refers to".
+    """
+    seen: list[str] = []
+
+    async def _capture(text: str) -> str:
+        seen.append(text)
+        return "facts"
+
+    msgs = [
+        {"role": "system", "content": "SYSTEM PROMPT"},
+        {"role": "user", "content": "Q0 what does the lease say " + "x" * 4_000},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "browse_read",
+                        "arguments": {"url": "https://example.org/lease"},
+                    },
+                }
+            ],
+        },
+        {"role": "tool", "content": "PAGE " + "p" * 4_000, "tool_name": "browse_read"},
+        {"role": "assistant", "content": "A0 " + "y" * 4_000},
+        {"role": "user", "content": "Q1 and the deposit?"},
+        {"role": "assistant", "content": "A1 " + "z" * 400},
+    ]
+    out, did = await compact_to_budget(msgs, 9_000, _capture, chunk_bytes=6_000)
+
+    assert did is True and seen, "nothing was digested, so nothing is proved"
+    text = "\n".join(seen)
+    assert "browse_read" in text, "the tool that ran is missing from the digest"
+    assert "https://example.org/lease" in text, "the URL it ran against is missing"
+    # The result still names its tool rather than arriving anonymous.
+    assert "tool browse_read: PAGE" in text
+    # An ordinary turn is unchanged.
+    assert "user: Q0 what does the lease say" in text
+    assert set(m.get("role") for m in out) <= {"system", "user", "assistant", "tool"}
+
+
+async def test_two_chunks_differing_only_in_their_calls_are_not_one_digest():
+    """The cache key hashes role+content; the calls are now IN the text, so a
+    key blind to them would hand a chunk the other chunk's digest."""
+    compaction.clear_cache()
+    call = {"type": "function", "function": {"name": "web_search", "arguments": {"q": "a"}}}
+    other = {"type": "function", "function": {"name": "web_search", "arguments": {"q": "b"}}}
+    base = [
+        {"role": "user", "content": "same question"},
+        {"role": "assistant", "content": "", "tool_calls": [call]},
+    ]
+    variant = [
+        {"role": "user", "content": "same question"},
+        {"role": "assistant", "content": "", "tool_calls": [other]},
+    ]
+    assert compaction._key(base) != compaction._key(variant)
+    # …and the tool that answered counts too.
+    a = [{"role": "tool", "content": "RESULT", "tool_name": "web_search"}]
+    b = [{"role": "tool", "content": "RESULT", "tool_name": "search_room"}]
+    assert compaction._key(a) != compaction._key(b)

@@ -85,6 +85,10 @@ fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
 /// is left exactly as it came, because guessing at an unknown field is how a
 /// converter starts eating real text.
 pub fn resolve_field_codes(text: &str, as_html: bool) -> String {
+    /// How much may sit between the keyword and its target — room for a space
+    /// and a switch, and nothing like a clause of prose.
+    const MAX_FIELD_GAP: usize = 8;
+
     // ` HYPERLINK "target" ` — optionally preceded by the field-start char and
     // followed by switches like \l "anchor" or \o "tooltip".
     let mut out = String::with_capacity(text.len());
@@ -105,11 +109,16 @@ pub fn resolve_field_codes(text: &str, as_html: bool) -> String {
             rest = after;
             continue;
         };
-        // Only treat it as a field if nothing but whitespace/switches sit
-        // between the keyword and the quote — otherwise the word "HYPERLINK"
-        // is just a word someone wrote.
+        // Only treat it as a field if what sits between the keyword and the
+        // quote looks like the rest of a field instruction — otherwise the
+        // word "HYPERLINK" is just a word someone wrote. Everything Word puts
+        // there before the target is a SWITCH, and every switch starts with a
+        // backslash (`\l`, `\o`), so a bare word in that gap means the next
+        // quote belongs to a later sentence and swallowing it would delete
+        // every word in between. Length alone was not enough: "The HYPERLINK
+        // is \"great\"" has a four-character gap and came back as "The great".
         let gap = &after[..q1];
-        if !gap.chars().all(|c| c.is_whitespace() || c == '\\' || c.is_alphanumeric()) {
+        if gap.len() > MAX_FIELD_GAP || !gap.split_whitespace().all(|tok| tok.starts_with('\\')) {
             out.push_str(before);
             out.push_str("HYPERLINK");
             rest = after;
@@ -246,6 +255,37 @@ mod tests {
     fn the_word_hyperlink_in_ordinary_prose_is_left_alone() {
         let src = "The HYPERLINK, as it is called, points elsewhere.";
         assert_eq!(resolve_field_codes(src, false), src);
+    }
+
+    /// The keyword in prose with a quoted string LATER in the sentence: the
+    /// resolver used to accept any run of letters as the field's instruction,
+    /// so everything between the two was deleted from the search text and from
+    /// the preview.
+    #[test]
+    fn prose_between_the_word_and_a_later_quote_survives() {
+        let src = "We use HYPERLINK fields to link \"https://x\" pages.";
+        assert_eq!(resolve_field_codes(src, false), src);
+
+        // A switch before the target is still a field, and still resolves.
+        let switched = "HYPERLINK \\l \"https://one.example\"one";
+        let text = resolve_field_codes(switched, false);
+        assert!(!text.contains("HYPERLINK"), "a real field stopped resolving: {text}");
+        assert!(text.contains("https://one.example") && text.contains("one"), "{text}");
+    }
+
+    /// The same deletion with a SHORT gap, which a length bound cannot see: two
+    /// words and a quoted phrase in one sentence, and the sentence came back as
+    /// "The great, they said." — the word between them and both quotes gone
+    /// from the search text and from the preview alike.
+    #[test]
+    fn a_quoted_phrase_a_few_words_after_the_keyword_survives() {
+        for src in [
+            "The HYPERLINK is \"great\", they said.",
+            "A HYPERLINK to \"the deposit\" clause.",
+        ] {
+            assert_eq!(resolve_field_codes(src, false), src);
+            assert_eq!(resolve_field_codes(src, true), src);
+        }
     }
 
     #[test]

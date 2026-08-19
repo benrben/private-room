@@ -73,6 +73,31 @@ pub struct ReadPlan {
     pub stamp: ReadStamp,
     /// Half-open turn-index ranges, consecutive and gapless.
     pub windows: Vec<(usize, usize)>,
+    /// How many characters of VISIBLE transcript the plan was built from.
+    /// `None` on plans written before this field existed — those keep the older,
+    /// weaker check rather than being refused wholesale. See [`turns_moved`].
+    #[serde(default)]
+    pub visible_chars: Option<usize>,
+}
+
+/// Have the turns moved out from under a plan built on them?
+///
+/// [`ReadStamp`] counts SEGMENTS and their raw text, and deleting words changes
+/// neither: "Delete from recording" marks the words `del` and leaves the segment
+/// row and its `text` exactly as they were. But [`turns_of`] drops a phrase whose
+/// words are all deleted, so the turn list the publish step resolves numbers
+/// against was one turn SHORTER than the one the model was shown — and every
+/// chapter, note and highlight after the deleted phrase was written onto the
+/// preceding speaker's sentence. The turn count is derivable from any plan (the
+/// windows are gapless and cover every turn), so this check protects old plans
+/// too; `visible_chars` adds the words themselves for plans that carry it.
+fn turns_moved(plan: &ReadPlan, turns: &[Turn]) -> bool {
+    let planned = plan.windows.last().map_or(0, |w| w.1);
+    turns.len() != planned || plan.visible_chars.is_some_and(|c| c != visible_chars(turns))
+}
+
+fn visible_chars(turns: &[Turn]) -> usize {
+    turns.iter().map(|t| t.text.len()).sum()
 }
 
 /// What one window's model call found. Turn NUMBERS, not times — see the module
@@ -477,11 +502,20 @@ pub(crate) async fn execute_read_step<R: tauri::Runtime>(
                 let speakers = turns.iter().map(|t| t.who.clone()).collect();
                 (turns, speakers, ReadStamp::of(&meta.segments))
             };
-            // The words moved under us (a re-transcribe, a correction) — the
-            // findings are about a transcript that no longer exists, so writing
-            // them would put marks on the wrong moments.
-            if stamp != plan.stamp {
+            // The words moved under us (a re-transcribe, a correction, a phrase
+            // deleted) — the findings are about a transcript that no longer
+            // exists, so writing them would put marks on the wrong moments.
+            if stamp != plan.stamp || turns_moved(plan, &turn_now) {
                 return Err("That recording's transcript changed while it was being read — read it again.".into());
+            }
+            if n > 0 && skipped == n {
+                // Not "the room read it and found nothing": the room read NONE
+                // of it. Stamping `read_of` here would also retire the file from
+                // the background sweep, so nothing would ever look at it again.
+                return Err(format!(
+                    "No part of \"{}\" could be read — the model answered for none of the {n} parts. Read it again.",
+                    plan.file_name
+                ));
             }
             let (chapters, highlights, notes) = merge_findings(&found, &turn_now, &speakers);
             let rec = app.state::<crate::commands::RecState>();
@@ -545,6 +579,7 @@ pub(crate) async fn start_rec_read(
         file_name: file_name.clone(),
         stamp,
         windows,
+        visible_chars: Some(visible_chars(&turns)),
     };
     let plan_json = serde_json::to_value(&plan).map_err(|e| e.to_string())?;
     let job_id = state.with_room(|room| {
@@ -611,10 +646,11 @@ pub(crate) async fn start_rec_read_row(
         // Same guard as `file_pass`: a plan is only valid against the words it
         // was built from. Findings written against a transcript that has since
         // been re-transcribed would land on the wrong moments.
-        if ReadStamp::of(&meta.segments) != plan.stamp {
+        let turns = turns_of(&meta);
+        if ReadStamp::of(&meta.segments) != plan.stamp || turns_moved(&plan, &turns) {
             return Err("That recording's transcript changed — read it again.".to_string());
         }
-        Ok(turns_of(&meta))
+        Ok(turns)
     })?;
     let (chat_model, lane) = resolve_pass_engine(state).await;
     let steps = build_read_steps(plan.windows.len(), lane);
@@ -664,6 +700,10 @@ fn spawn_rec_read(
         let (exec_plan, exec_cancel, exec_turns) =
             (plan.clone(), cancel.clone(), turns.clone());
         let label_plan = plan.clone();
+        // How far the read actually got, for the terminal tick below — a paused
+        // or failed card must not lose a bar that had honestly advanced.
+        let last_cursor = Arc::new(std::sync::atomic::AtomicUsize::new(start_cursor));
+        let lc = last_cursor.clone();
         let outcome = run_plan(
             &steps,
             (0..start_cursor).collect(),
@@ -685,6 +725,7 @@ fn spawn_rec_read(
             },
             |done_set| {
                 let cursor = dense_prefix(done_set);
+                lc.store(cursor, Ordering::SeqCst);
                 let state = app.state::<AppState>();
                 let guard = state.room.lock().unwrap();
                 if let Some(r) = guard.as_ref().filter(|r| r.path == room_path) {
@@ -715,11 +756,51 @@ fn spawn_rec_read(
             }
         }
         state.job_cancels.lock().unwrap().remove(&job_id);
-        // The viewer reloads the recording so the tabs fill in without a click.
-        if matches!(outcome, RunOutcome::Done) {
-            use tauri::Emitter;
-            let _ = window.emit("rec-read-done", serde_json::json!({ "fileId": plan.file_id }));
-        }
+        use tauri::Emitter;
+        // EVERY outcome is terminal for the viewer, and only Done used to say
+        // so: a read that failed (Ollama down, MODEL_MISSING, the
+        // transcript-changed refusal) or was stopped left the Notes / Highlights
+        // / Chapters tabs reading "Reading this recording…" and the button
+        // disabled until the file was closed and reopened, with nothing
+        // anywhere reporting that the read had ended.
+        let _ = window.emit(
+            "rec-read-done",
+            match &outcome {
+                RunOutcome::Done => {
+                    serde_json::json!({ "fileId": plan.file_id, "ok": true })
+                }
+                RunOutcome::Paused => {
+                    serde_json::json!({ "fileId": plan.file_id, "ok": false })
+                }
+                RunOutcome::Error(e) => {
+                    serde_json::json!({ "fileId": plan.file_id, "ok": false, "error": e })
+                }
+            },
+        );
+        // …and the terminal job tick every other runner emits, so the sidebar's
+        // live card clears and a failure reaches the standard toast instead of
+        // resting on a job row nobody is looking at. No `fileId`: the file is
+        // already open in the view that asked for the read, and a background
+        // sweep must not pull the room away from what the reader is doing.
+        let done_now = last_cursor.load(Ordering::SeqCst);
+        let _ = window.emit(
+            "job-progress",
+            match &outcome {
+                RunOutcome::Done => serde_json::json!({
+                    "jobId": job_id, "label": format!("Finished reading \"{}\"", plan.file_name),
+                    "done": total, "total": total, "finished": true,
+                }),
+                RunOutcome::Paused => serde_json::json!({
+                    "jobId": job_id, "label": "Paused", "done": done_now, "total": total,
+                    "paused": true,
+                }),
+                RunOutcome::Error(e) => serde_json::json!({
+                    "jobId": job_id, "label": format!("Stopped — {e}"), "done": done_now,
+                    "total": total, "failed": true,
+                }),
+            },
+        );
+        super::queue::finish_and_pump(&app, &window, &job_id).await;
     });
 }
 
@@ -902,6 +983,51 @@ mod tests {
             ["c1", "new"]
         );
         assert_eq!(meta.read_of, Some(ReadStamp { turns: 3, chars: 40 }));
+    }
+
+    /// The publish guard has to fire when a phrase is DELETED while the read
+    /// runs, and `ReadStamp` cannot see that: deleting marks the words `del` and
+    /// leaves the segment row and its raw text exactly as they were. The turn
+    /// list was one turn shorter, the stamp still matched, and every finding
+    /// after the deleted phrase was written onto the previous speaker's sentence.
+    #[test]
+    fn a_deleted_phrase_is_caught_even_though_the_stamp_matches() {
+        let all = turns(6);
+        let plan = ReadPlan {
+            file_id: "f".into(),
+            file_name: "standup.wav".into(),
+            stamp: ReadStamp::of(&[]),
+            windows: partition_turns(&all, 400),
+            visible_chars: Some(visible_chars(&all)),
+        };
+        assert!(!turns_moved(&plan, &all), "an untouched transcript read as changed");
+
+        // The delete: `turns_of` drops the emptied phrase.
+        let mut shorter = all.clone();
+        shorter.remove(1);
+        assert!(turns_moved(&plan, &shorter));
+
+        // Words changed without changing the count — same length of list, other
+        // words in it.
+        let mut retyped = all.clone();
+        retyped[2].text.push_str(" and then some more");
+        assert!(turns_moved(&plan, &retyped));
+
+        // A plan written before `visible_chars` existed keeps the count check,
+        // which is what catches the delete; it cannot see the retype.
+        let old = ReadPlan { visible_chars: None, ..plan.clone() };
+        assert!(turns_moved(&old, &shorter));
+        assert!(!turns_moved(&old, &retyped));
+
+        // Edges: a one-turn recording, and one turn added rather than removed.
+        let one = turns(1);
+        let solo = ReadPlan {
+            windows: partition_turns(&one, 400),
+            visible_chars: Some(visible_chars(&one)),
+            ..plan.clone()
+        };
+        assert!(!turns_moved(&solo, &one));
+        assert!(turns_moved(&solo, &turns(2)));
     }
 
     /// The step DAG: windows in order, then one publish that waits for all of

@@ -168,6 +168,51 @@ test("a .vtt saves back as WebVTT, not as SRT", () => {
   assert.match(out, /00:00:01\.000 --> 00:00:02\.000/);
 });
 
+test("clearing a cue's words keeps the cue, its timing and every number after it", () => {
+  // Emptying a textarea in the editor and pressing Save used to DELETE the
+  // cue: the parse dropped a timed block with no body, so the file came back
+  // one cue short with everything after it renumbered.
+  const original =
+    "1\n00:00:01,000 --> 00:00:04,000\nFirst.\n\n" +
+    "2\n00:00:05,000 --> 00:00:06,000\nSecond.\n\n" +
+    "3\n00:00:07,000 --> 00:00:08,000\nThird.\n";
+  const cues = parseCues(original);
+  cues[1].text = "";
+  const again = parseCues(toSrt(cues));
+  assert.equal(again.length, 3, "the emptied cue was dropped from the file");
+  assert.equal(again[1].text, "");
+  assert.equal(again[1].startMs, 5000, "the emptied cue's timing went with it");
+  assert.equal(again[2].text, "Third.");
+  assert.equal(again[2].index, 3, "the cues after it were renumbered");
+});
+
+test("saving a .vtt keeps its header, its NOTE/STYLE blocks, cue ids and settings", () => {
+  const original =
+    "WEBVTT - Rent hearing\nKind: captions\n\n" +
+    "NOTE recorded live\n\n" +
+    "STYLE\n::cue { color: yellow }\n\n" +
+    "intro\n00:00:01.000 --> 00:00:04.000 line:90% align:start\nGood morning.\n\n" +
+    "00:00:05.000 --> 00:00:06.000\nLet's begin.\n";
+  const cues = parseCues(original);
+  cues[1].text = "Let us begin.";
+  const out = toVtt(cues);
+  assert.match(out, /^WEBVTT - Rent hearing\nKind: captions/, "the header was rewritten bare");
+  assert.match(out, /NOTE recorded live/);
+  assert.match(out, /STYLE\n::cue \{ color: yellow \}/);
+  assert.match(out, /intro\n00:00:01\.000 --> 00:00:04\.000 line:90% align:start/);
+  assert.match(out, /Let us begin\./);
+  // And the result still parses as the same two cues.
+  const again = parseCues(out);
+  assert.equal(again.length, 2);
+  assert.equal(again[0].text, "Good morning.");
+  assert.equal(again[1].endMs, 6000);
+});
+
+test("a NOTE after the last cue survives a save", () => {
+  const out = toVtt(parseCues("WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHi.\n\nNOTE end of reel\n"));
+  assert.match(out, /NOTE end of reel/);
+});
+
 // ------------------------------------------------------- zip-container bits
 
 test("relationship targets resolve against the referencing part's folder", () => {

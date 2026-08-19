@@ -16,7 +16,7 @@ export function makeStudioActions(
 ) {
   const { openOllamaApp } = deps;
 
-  // ---- ADD-30: durable background jobs (the sidebar cards) ----
+  // ---- ADD-30: durable background jobs (the cards in Activity) ----
 
   /** Reload the cards: EVERY job, finished ones included.
    *
@@ -34,10 +34,12 @@ export function makeStudioActions(
     }
   }
 
-  /** Kick off the room deep-summary as a background job. The sidebar card
-   *  shows progress; the finished summary opens itself. The optimistic
-   *  `summaryStarting` flag makes the click acknowledge instantly even when the
-   *  backend takes seconds to resolve on a cold local model. */
+  /** Kick off the room deep-summary as a background job. Its card in the
+   *  assistant pane's Activity shows progress — the Library sidebar lists
+   *  `create` jobs only, so no summary ever appears there. The finished summary
+   *  opens itself. The optimistic `summaryStarting` flag makes the click
+   *  acknowledge instantly even when the backend takes seconds to resolve on a
+   *  cold local model. */
   async function startDeepSummary() {
     if (s.summaryStarting) return;
     // Never a silent no-op: if a summary job already exists, act on it instead
@@ -52,7 +54,7 @@ export function makeStudioActions(
     );
     if (existing) {
       if (existing.status === "running" || existing.status === "queued") {
-        s.pushToast("info", "Already summarizing — see the card in the sidebar.");
+        s.pushToast("info", "Already summarizing — it's in Activity.");
         return;
       }
       await resumeJob(existing.id);
@@ -117,7 +119,7 @@ export function makeStudioActions(
   }
 
   /** Kick off a Studio artifact as a background job (like the room summary): the
-   *  sidebar card shows progress and the finished HTML opens itself via the
+   *  card in Activity shows progress and the finished HTML opens itself via the
    *  terminal job-progress event. Stop/Resume live on the card, so there's no
    *  in-modal running state anymore. */
   async function runStudio(

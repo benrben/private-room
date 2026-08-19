@@ -134,6 +134,15 @@ const GRID_GAP = 22;
  * loses work by closing a tab. The unmount flush covers the gap. */
 const SAVE_IDLE_MS = 1400;
 
+/** How long after a write that FAILED the drawing tries again, and the ceiling
+ * the backoff stops doubling at.
+ *
+ * A canvas has no Save button, so a failed save has no way back to disk unless
+ * it asks for itself: before this the footer said "Couldn't save" and nothing
+ * whatsoever happened afterwards. */
+const SAVE_RETRY_MS = 2000;
+const SAVE_RETRY_MAX_MS = 30000;
+
 /** How far in and out the page can be taken. Past 6x a stroke is wider than
  * the pane; below 0.3x a label is smaller than the dots behind it. */
 const MIN_ZOOM = 0.3;
@@ -155,6 +164,19 @@ const FRESH_HOLD_MS = 1400;
 interface Props {
   fileId: string;
   text: string;
+}
+
+/** Is a key pressed on `window` meant for the drawing?
+ *
+ * Three of this page's handlers listen on `window`, because the canvas is an
+ * SVG and cannot hold focus — and the sketch is the CENTRE pane, with the
+ * sidebar and the assistant beside it and focusable buttons in both. `body`
+ * (or nothing) counts as the drawing: clicking the canvas focuses no element
+ * at all, which is the ordinary way to be drawing. */
+function keysAreForThePage(page: HTMLElement | null): boolean {
+  const el = document.activeElement;
+  const focused = el && el !== document.body ? el : null;
+  return !focused || !!page?.contains(focused);
 }
 
 /* No `saveEdit`. Every other viewer saves through the shell's shared handler,
@@ -203,6 +225,12 @@ export default function SketchView({ fileId, text }: Props) {
   const [fresh, setFresh] = useState<Set<string>>(new Set());
 
   const svgRef = useRef<SVGSVGElement | null>(null);
+  /** The whole editor — toolbar, canvas, object strip, footer. The drawing's
+   * keyboard shortcuts live on `window` (an SVG cannot hold focus) and this is
+   * what tells them the keypress was meant for the drawing. */
+  const pageRef = useRef<HTMLDivElement | null>(null);
+  /** The box the note field is positioned inside — the canvas's parent. */
+  const stageRef = useRef<HTMLDivElement | null>(null);
   /** Each object's chip in the strip below, so the selected one can be brought
    * back into a row that scrolls sideways. */
   const chipRefs = useRef(new Map<string, HTMLButtonElement>());
@@ -232,9 +260,21 @@ export default function SketchView({ fileId, text }: Props) {
   const drawingRef = useRef(false);
   const pendingAgent = useRef<{ doc: Sketch; added: string[]; removed: string[] } | null>(null);
   const saveTimer = useRef<number | null>(null);
+  /** The pending retry after a save that failed, and how long the next one
+   * waits. Reset the moment a write succeeds. */
+  const retryTimer = useRef<number | null>(null);
+  const retryIn = useRef(SAVE_RETRY_MS);
   /** Every pending reveal timer, so a new drawing or an unmount can drop them. */
   const revealTimers = useRef<number[]>([]);
   const dirty = useRef(false);
+  /** How many edits have been scheduled for saving, ever.
+   *
+   * A write in flight carries the number it started with. If an edit is made
+   * while it is out, the number has moved on by the time it lands — and the
+   * document it wrote is no longer the document on screen, so it must NOT
+   * report the page clean. It did that, and the unmount flush then skipped the
+   * newer edit because nothing said the page was still dirty. */
+  const docVersion = useRef(0);
   /** Version history is taken once per editing session, not once per stroke. */
   const snapshotted = useRef(false);
 
@@ -271,38 +311,74 @@ export default function SketchView({ fileId, text }: Props) {
   // ----------------------------------------------------------------- saving
   const flush = useCallback(
     async (next: Sketch) => {
+      const wrote = docVersion.current;
       try {
         await api.saveSketch(fileId, serializeSketch(next), !snapshotted.current);
         snapshotted.current = true;
-        dirty.current = false;
-        setSaveState("saved");
+        if (retryTimer.current) window.clearTimeout(retryTimer.current);
+        retryTimer.current = null;
+        retryIn.current = SAVE_RETRY_MS;
+        // Only the write that carried the CURRENT document may call the page
+        // clean; an edit made while this one was in flight is still unwritten.
+        if (docVersion.current === wrote) {
+          dirty.current = false;
+          setSaveState("saved");
+        }
       } catch {
+        // The same version test the success arm makes, for the same reason: a
+        // write of a SUPERSEDED document failing says nothing about the one on
+        // screen. Reporting it announced "Couldn't save" over a page whose
+        // current document the newer write had already put on disk — and armed
+        // a retry for it. `scheduleSave` has already re-flagged the page dirty
+        // and armed the newer write, so there is nothing here left to do.
+        if (docVersion.current !== wrote) return;
         dirty.current = true;
         setSaveState("failed");
+        // Ask again, on a backoff, with whatever the document is by then — the
+        // newest one supersedes the failed one and contains it.
+        if (retryTimer.current) window.clearTimeout(retryTimer.current);
+        retryTimer.current = window.setTimeout(
+          () => void flushRef.current(docRef.current),
+          retryIn.current,
+        );
+        retryIn.current = Math.min(retryIn.current * 2, SAVE_RETRY_MAX_MS);
       }
     },
     [fileId],
   );
+  /** The live `flush`, so the retry it schedules can call the next one without
+   * the callback having to name itself. */
+  const flushRef = useRef(flush);
+  flushRef.current = flush;
 
   const scheduleSave = useCallback(
     (next: Sketch) => {
       dirty.current = true;
+      docVersion.current += 1;
       setSaveState("saving");
       // The note occupies the same slot as the save state, so it has to stand
       // down once the save state has something live to report.
       setNote(null);
+      // This write supersedes a retry of an older document.
+      if (retryTimer.current) window.clearTimeout(retryTimer.current);
+      retryTimer.current = null;
       if (saveTimer.current) window.clearTimeout(saveTimer.current);
       saveTimer.current = window.setTimeout(() => void flush(next), SAVE_IDLE_MS);
     },
     [flush],
   );
 
-  /** Every change to the document goes through here: one undo entry, one save. */
+  /** Every change to the document goes through here: one undo entry, one save.
+   *
+   * `advance`, not `setDoc`: `endGesture` folds a held agent drawing in
+   * IMMEDIATELY after committing the shape the user just finished, and a merge
+   * that read `docRef.current` before React had rendered merged against the
+   * document without that shape — so the shape flashed on and vanished. */
   const commit = useCallback(
     (next: Sketch, opts: { undoable?: boolean } = {}) => {
       const before = docRef.current;
       if (opts.undoable !== false) setHistory((h) => pushHistory(h, before));
-      setDoc(next);
+      advance(next);
       scheduleSave(next);
     },
     [scheduleSave],
@@ -330,6 +406,7 @@ export default function SketchView({ fileId, text }: Props) {
   useEffect(
     () => () => {
       if (saveTimer.current) window.clearTimeout(saveTimer.current);
+      if (retryTimer.current) window.clearTimeout(retryTimer.current);
       // Timers only, not `clearReveal`: there is no component left to un-hide
       // anything in.
       dropRevealTimers();
@@ -343,14 +420,18 @@ export default function SketchView({ fileId, text }: Props) {
 
   // ------------------------------------------------- the agent drawing here
   const applyAgent = useCallback((theirs: Sketch, added: string[], removed: string[]) => {
-    const { doc: merged, unsavedKept } = mergeAgentDoc(docRef.current, theirs, removed);
-    setDoc(merged);
-    if (unsavedKept.length) {
-      // The user's own unsaved work survived the merge, but it is NOT in the
-      // file the agent wrote — so it has to be written back or the next reload
-      // loses it.
-      scheduleSave(merged);
-    }
+    const before = docRef.current;
+    const { doc: merged } = mergeAgentDoc(before, theirs, removed);
+    // The agent's edit is one step of its own in the undo stack. Without this,
+    // ⌘Z after a diagram landed stepped over the user's last stroke and THROUGH
+    // the agent's work — the whole diagram gone, and autosaved gone.
+    setHistory((h) => pushHistory(h, before));
+    advance(merged);
+    // Always, not only when the merge carried unsaved work over. A save armed
+    // by an earlier edit is holding the PRE-merge document; letting it fire
+    // untouched writes the agent's shapes straight back out of the file, with
+    // nothing on screen to show it happened.
+    scheduleSave(merged);
     if (!added.length) return;
 
     // A second drawing arriving mid-reveal must not leave the first one's
@@ -486,7 +567,11 @@ export default function SketchView({ fileId, text }: Props) {
       return !!el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA");
     };
     const down = (e: KeyboardEvent) => {
-      if (e.code === "Space" && !isTyping()) {
+      // Scoped like the shortcut handler below, and for a harder reason: this
+      // arm swallows the key. Unscoped, an open drawing took Space away from
+      // the whole room — the button under the keyboard anywhere else on screen
+      // stopped answering it, and the page under it stopped scrolling.
+      if (e.code === "Space" && !isTyping() && keysAreForThePage(pageRef.current)) {
         e.preventDefault();
         setSpaceHeld(true);
       }
@@ -520,10 +605,41 @@ export default function SketchView({ fileId, text }: Props) {
     ];
   };
 
+  /** Where a canvas point lands inside the stage, in pixels — the inverse of
+   * `toCanvas`, for the one thing on this page drawn in HTML rather than SVG.
+   *
+   * The note field used to be placed at a percentage of the DOCUMENT, which is
+   * only ever right at 100% with the page exactly filling its box: zoom, pan
+   * and the letterboxing of `preserveAspectRatio` all sit between the two.
+   * `getScreenCTM` is the one mapping that already accounts for all three.
+   * Falls back to the old percentage if the layout cannot be measured, so the
+   * field still appears. */
+  const stagePosition = (p: Point): { left: string; top: string } => {
+    const m = svgRef.current?.getScreenCTM();
+    const box = stageRef.current?.getBoundingClientRect();
+    if (!m || !box) {
+      return {
+        left: `${(p[0] / doc.width) * 100}%`,
+        top: `${(p[1] / doc.height) * 100}%`,
+      };
+    }
+    const at = new DOMPoint(p[0], p[1]).matrixTransform(m);
+    return { left: `${at.x - box.left}px`, top: `${at.y - box.top}px` };
+  };
+
   /** Rub out whatever is under the pointer. One undo entry per swipe, not
    * one per shape — an eraser stroke is a single act to the person doing it. */
   const eraseAt = (p: Point, first: boolean) => {
-    const hit = hitTest(docRef.current, p[0], p[1]);
+    // Locked is background: the click path passes over it and the delete key
+    // refuses it, so the eraser has to as well — one swipe used to take out a
+    // locked backdrop the user had pinned down precisely so it could not be.
+    // Tested against the loose elements only, so the eraser still reaches what
+    // is UNDER a locked shape.
+    const hit = hitTest(
+      { ...docRef.current, elements: docRef.current.elements.filter((e) => !e.locked) },
+      p[0],
+      p[1],
+    );
     if (!hit) return;
     const next = {
       ...docRef.current,
@@ -579,7 +695,13 @@ export default function SketchView({ fileId, text }: Props) {
       // shape underneath would make the corner of a selected box un-grabbable.
       const grip = gripUnder(p);
       if (grip) {
-        const els = docRef.current.elements.filter((e) => selected.includes(e.id));
+        // Locked elements are not resized. The grips are already withheld from
+        // a selection holding one, but `gripUnder` is geometry — it answers
+        // from the selection box, not from what was drawn — so the refusal has
+        // to be here too, or an invisible grip still stretched a pinned shape.
+        const els = docRef.current.elements.filter(
+          (e) => selected.includes(e.id) && !e.locked,
+        );
         const box = bboxOfMany(els);
         if (box) {
           resizing.current = { handle: grip, box, from: p, els };
@@ -976,8 +1098,11 @@ export default function SketchView({ fileId, text }: Props) {
       commit(
         reflow({
           ...docRef.current,
+          // "Lock in place" means the arrow keys too. A locked shape reaches a
+          // selection only through the object strip, and it rides along there
+          // rather than being the target — so it must sit still.
           elements: docRef.current.elements.map((e) =>
-            picked.has(e.id) ? translate(e, dx, dy) : e,
+            picked.has(e.id) && !e.locked ? translate(e, dx, dy) : e,
           ),
         }),
       );
@@ -1010,13 +1135,41 @@ export default function SketchView({ fileId, text }: Props) {
     });
   }, [chosenEls]);
 
+  /** Renaming a shape is ONE act, however many characters it took.
+   *
+   * Every keystroke used to push a whole-document snapshot, so the toolbar's
+   * Undo removed one letter at a time and an eighty-character label pushed
+   * every real drawing edit out of the 80-deep history. The document as it was
+   * before the first keystroke is parked here and pushed once, when the field
+   * gives up the keyboard.
+   *
+   * Keyed by the element, not just held: React fires no blur when the field
+   * UNMOUNTS, and the agent removing the shape being renamed does exactly that.
+   * A doc parked under one element and banked under the next would push a
+   * document from before that removal onto the history, so one ⌘Z would jump
+   * FORWARD over everything drawn since. */
+  const labelBefore = useRef<{ id: string; doc: Sketch } | null>(null);
+
   const relabel = (id: string, label: string) => {
-    commit({
-      ...docRef.current,
-      elements: docRef.current.elements.map((e) =>
-        e.id !== id ? e : e.type === "text" ? { ...e, text: label } : { ...e, label },
-      ),
-    });
+    if (labelBefore.current?.id !== id) labelBefore.current = { id, doc: docRef.current };
+    commit(
+      {
+        ...docRef.current,
+        elements: docRef.current.elements.map((e) =>
+          e.id !== id ? e : e.type === "text" ? { ...e, text: label } : { ...e, label },
+        ),
+      },
+      { undoable: false },
+    );
+  };
+
+  /** The rename is finished — bank it as a single undo step. */
+  const endRelabel = () => {
+    const parked = labelBefore.current;
+    labelBefore.current = null;
+    if (parked && parked.doc !== docRef.current) {
+      setHistory((h) => pushHistory(h, parked.doc));
+    }
   };
 
   /** Three linked boxes: something to rename and rearrange rather than a
@@ -1094,6 +1247,11 @@ export default function SketchView({ fileId, text }: Props) {
       // A text field owns its own Escape (cancel the edit) — and the shell
       // already declines to close a file while someone is typing.
       if (el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA")) return;
+      // This listener is on the CAPTURE phase, so it beats the shell's — which
+      // makes an unscoped version worse than the others: Escape pressed on a
+      // sidebar row or an assistant button, with a shape selected here, was
+      // eaten to clear a selection in a pane the person was not working in.
+      if (!keysAreForThePage(pageRef.current)) return;
       if (menuRef.current) {
         e.preventDefault();
         e.stopPropagation();
@@ -1171,10 +1329,18 @@ export default function SketchView({ fileId, text }: Props) {
     });
   }, [selected]);
 
+  /** THE DRAWING'S SHORTCUTS, AND ONLY WHILE THE DRAWING IS BEING WORKED IN.
+   *
+   * The listener has to be on `window` — the canvas is an SVG and cannot hold
+   * focus — but the sketch is the CENTRE pane, with the sidebar and the
+   * assistant on screen beside it and focusable buttons in both. Unscoped,
+   * Delete pressed on an assistant button deleted the selected shapes, and `t`
+   * pressed on a sidebar file row changed the drawing's tool. */
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const el = document.activeElement;
       if (el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA")) return;
+      if (!keysAreForThePage(pageRef.current)) return;
       const meta = e.metaKey || e.ctrlKey;
       if (meta && (e.key === "=" || e.key === "+")) {
         e.preventDefault();
@@ -1278,15 +1444,31 @@ export default function SketchView({ fileId, text }: Props) {
   const saveWord =
     saveState === "saved" ? "Saved" : saveState === "saving" ? "Saving…" : "Not saved";
 
+  /** Which object chip holds the strip's single tab stop. */
+  const chipStop = Math.max(
+    0,
+    doc.elements.findIndex((e) => selected.includes(e.id)),
+  );
+
   return (
-    <div className="sk-page">
-      <div className="sk-tools" role="toolbar" aria-label="Drawing tools">
+    <div className="sk-page" ref={pageRef}>
+      {/* A GROUP, not a `toolbar`: `role="toolbar"` promises arrow-key
+          navigation between its controls, and these are plain tab stops.
+          Claiming the role without the behaviour is a lie to assistive tech. */}
+      <div className="sk-tools" role="group" aria-label="Drawing tools">
         {TOOLS.map((tl) => (
           <button
             key={tl.key}
             type="button"
             className={`sk-tool${sticky && tool === tl.key ? " sk-locked-tool" : ""}`}
-            title={`${tl.hint}${tl.key === tool && sticky ? " · staying on" : ""}`}
+            // The gesture that arms this mode has to be NAMED somewhere, and a
+            // 2px inset underline is not a name. Unconditional, so it reads
+            // before you have discovered it, not only after.
+            title={
+              tl.key === tool && sticky
+                ? `${tl.hint} · staying on — click any tool or press Escape to stop`
+                : `${tl.hint} · double-click to keep it on`
+            }
             aria-label={tl.label}
             aria-pressed={tool === tl.key}
             onClick={() => {
@@ -1603,20 +1785,25 @@ export default function SketchView({ fileId, text }: Props) {
 
       </div>
 
-      <div className="sk-stage">
+      <div className="sk-stage" ref={stageRef}>
         <svg
           ref={svgRef}
           className={`sk-canvas${spaceHeld || panning.current ? " sk-panning" : ""}`}
           viewBox={`${view.x} ${view.y} ${doc.width / view.k} ${doc.height / view.k}`}
           preserveAspectRatio="xMidYMid meet"
-          role="application"
+          // `img`, not `application`. `application` asks assistive tech to stop
+          // intercepting keys and hand them to the element, which only happens
+          // once focus is INSIDE it — and this element is not focusable, so all
+          // the role ever did was suppress the reader's own navigation over a
+          // region it could not enter. The canvas is a picture; its interactive
+          // equivalent is the objects listbox below.
+          role="img"
           aria-label={canvasSummary}
           onPointerDown={onPointerDown}
           onPointerMove={onPointerMove}
           onPointerUp={endGesture}
           onPointerCancel={endGesture}
         >
-          <title>{canvasSummary}</title>
           <defs>
             <pattern
               id="sk-dots"
@@ -1718,7 +1905,7 @@ export default function SketchView({ fileId, text }: Props) {
           ) : null}
         </svg>
 
-        {/* THREE WAYS IN, instead of one passive sentence.
+        {/* TWO WAYS IN, instead of one passive sentence.
             `pointer-events: none` on the layer with the buttons opted back in,
             so an empty canvas can still be drawn on THROUGH the offer — a hint
             that swallows the first click is worse than no hint. */}
@@ -1746,16 +1933,12 @@ export default function SketchView({ fileId, text }: Props) {
                   Three linked boxes to rename and rearrange.
                 </span>
               </button>
-              <button
-                type="button"
-                className="sk-empty-card"
-                onClick={() => setNote("Ask the assistant to draw from your room's files.")}
-              >
-                <span className="sk-empty-title">Turn room files into a diagram</span>
-                <span className="sk-empty-copy">
-                  Ask the assistant, with this sketch open.
-                </span>
-              </button>
+              {/* Two cards, not three. The third — "Turn room files into a
+                  diagram" — restated its own subtitle into the footer's save
+                  slot, so pressing it printed a sentence where "Saved" goes and
+                  the next autosave wiped it mid-read. The fact it carried is in
+                  the footer hint below, which says it without pretending to be
+                  a button that does something. */}
             </div>
           </div>
         ) : null}
@@ -1763,10 +1946,7 @@ export default function SketchView({ fileId, text }: Props) {
         {textAt ? (
           <input
             className="sk-text-input"
-            style={{
-              left: `${(textAt[0] / doc.width) * 100}%`,
-              top: `${(textAt[1] / doc.height) * 100}%`,
-            }}
+            style={stagePosition(textAt)}
             value={textValue}
             autoFocus
             aria-label="Note text"
@@ -1803,15 +1983,49 @@ export default function SketchView({ fileId, text }: Props) {
           >
             {doc.elements.length} object{doc.elements.length === 1 ? "" : "s"}
           </button>
+          {/* THE ARROWS BELONG TO THE LIST WHILE THE LIST HAS THE KEYBOARD.
+              A listbox tells a screen reader "arrow to move" — and the arrows
+              here reached the drawing's own window handler instead and NUDGED
+              the selected shape, silently, from the one control built so a
+              non-sighted user could work the canvas. Stopping the event is what
+              keeps the two apart; the canvas nudge is unchanged for the canvas.
+
+              Roving focus for the same reason the browser page list has it: one
+              tab stop for the strip instead of one per shape, so a forty-object
+              diagram is not forty presses between the canvas and the footer. */}
           <div
             className="sk-objects-row"
             role="listbox"
             aria-label="Objects on this page"
             aria-multiselectable="true"
+            onKeyDown={(ev) => {
+              const ids = doc.elements.map((x) => x.id);
+              const at = ids.indexOf((ev.target as HTMLElement).dataset.id ?? "");
+              if (at < 0) return;
+              const to =
+                ev.key === "ArrowRight" || ev.key === "ArrowDown"
+                  ? Math.min(ids.length - 1, at + 1)
+                  : ev.key === "ArrowLeft" || ev.key === "ArrowUp"
+                    ? Math.max(0, at - 1)
+                    : ev.key === "Home"
+                      ? 0
+                      : ev.key === "End"
+                        ? ids.length - 1
+                        : -1;
+              if (to < 0) return;
+              ev.preventDefault();
+              ev.stopPropagation();
+              setSelected([ids[to]]);
+              chipRefs.current.get(ids[to])?.focus();
+            }}
           >
             {doc.elements.map((e, i) => (
               <button
                 key={e.id}
+                data-id={e.id}
+                // Exactly one chip in the tab order: the first selected one, or
+                // the first chip when nothing is selected.
+                tabIndex={i === chipStop ? 0 : -1}
                 ref={(node) => {
                   if (node) chipRefs.current.set(e.id, node);
                   else chipRefs.current.delete(e.id);
@@ -1829,15 +2043,22 @@ export default function SketchView({ fileId, text }: Props) {
                   e.locked ? " sk-object-locked" : ""
                 }`}
                 title={describeElement(e)}
-                onClick={(ev) =>
+                onClick={(ev) => {
+                  // A locked element IS selectable from the strip, and only
+                  // from here: `toggleLock` drops the selection as it locks and
+                  // the canvas, the lasso and Select all all pass over locked
+                  // shapes, so this chip is the only way back to the popover's
+                  // Unlock. Selecting it moves nothing — `nudge` and the resize
+                  // grips below skip locked elements, which is what closes the
+                  // hole this chip used to open.
                   setSelected((cur) =>
                     ev.shiftKey
                       ? cur.includes(e.id)
                         ? cur.filter((id) => id !== e.id)
                         : [...cur, e.id]
                       : [e.id],
-                  )
-                }
+                  );
+                }}
               >
                 {e.locked ? (
                   <svg className="sk-object-lock" viewBox="0 0 24 24" aria-hidden="true">
@@ -1860,6 +2081,10 @@ export default function SketchView({ fileId, text }: Props) {
               value={chosen.type === "text" ? chosen.text : (chosen.label ?? "")}
               placeholder="give this a name"
               onChange={(e) => relabel(chosen.id, e.target.value)}
+              onBlur={endRelabel}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") endRelabel();
+              }}
             />
           </label>
         ) : picked.length > 1 ? (
@@ -1868,9 +2093,11 @@ export default function SketchView({ fileId, text }: Props) {
           </span>
         ) : (
           <span className="sk-hint">
-            {doc.elements.length === 0
-              ? "Pick a tool and draw — or ask the room's AI to draw it for you."
-              : "Click to select · drag a box around several · ⌘Z to undo"}
+            {sticky
+              ? `${TOOLS.find((t) => t.key === tool)?.label ?? "This tool"} stays on — Escape or another tool to stop`
+              : doc.elements.length === 0
+                ? "Pick a tool and draw — or ask the room's AI to draw it for you."
+                : "Click to select · drag a box around several · ⌘Z to undo"}
           </span>
         )}
         {/* Said here because a disabled button cannot say it: while a field
@@ -1901,12 +2128,6 @@ function Drawn({
 }) {
   const rand = seeded(el.id);
   const cls = `sk-el sk-ink-${el.ink}${fresh ? " sk-fresh" : ""}`;
-  const label =
-    el.type !== "text" && el.label ? (
-      <text className="sk-shape-label" x={0} y={0}>
-        {el.label}
-      </text>
-    ) : null;
 
   let body: ReactElement;
   switch (el.type) {
@@ -1972,15 +2193,54 @@ function Drawn({
       );
       break;
     }
-    default:
-      body = <path className="sk-line sk-stroke" d={strokePath(el.points)} />;
+    case "line": {
+      // A line's label used to be drawn at 0,0 — the top-left corner of the
+      // page, nowhere near the line it named. Same midpoint the arrow arm uses.
+      const a = el.points[0];
+      const b = el.points[el.points.length - 1];
+      body = (
+        <>
+          <path className="sk-line sk-stroke" d={strokePath(el.points)} />
+          {el.label ? (
+            <text
+              className="sk-shape-label"
+              x={(a[0] + b[0]) / 2}
+              y={(a[1] + b[1]) / 2 - 12}
+            >
+              {el.label}
+            </text>
+          ) : null}
+        </>
+      );
+      break;
+    }
+    default: {
+      // A pen stroke takes a label like every other shape — the strip and the
+      // accessible description both show it — and used to draw nothing, so the
+      // Label field silently swallowed the name. Centred on the stroke's box,
+      // the same place a box and an ellipse put theirs.
+      const at = bboxOf(el);
+      body = (
+        <>
+          <path className="sk-line sk-stroke" d={strokePath(el.points)} />
+          {el.label ? (
+            <text
+              className="sk-shape-label"
+              x={at.x + at.w / 2}
+              y={at.y + at.h / 2 + 9}
+            >
+              {el.label}
+            </text>
+          ) : null}
+        </>
+      );
+    }
   }
 
   const box = bboxOf(el);
   return (
     <g className={cls} data-id={el.id}>
       {body}
-      {el.type === "line" ? label : null}
       {selected ? (
         <rect
           className="sk-selection"

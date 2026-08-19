@@ -37,7 +37,13 @@ pub fn update_docx_text(
         let before = extracted.ok_or_else(|| {
             format!("\"{name}\" has no readable text, so there is nothing to edit.")
         })?;
-        let patched = apply_paragraph_edits(&bytes, &before, &content)?;
+        let Some(patched) = apply_paragraph_edits(&bytes, &before, &content)? else {
+            // The buffer says what the document already says. Nothing to
+            // write, and no version to record — but this is a save that
+            // succeeded, so the editor's dirty flag clears and the close the
+            // user asked for goes through.
+            return db::get_file_meta(&room.conn, &id);
+        };
         // The new searchable text is re-derived from the PATCHED FILE, never
         // taken from the editor's buffer: the two can legitimately differ (the
         // reader shows headers, footnotes and comments, which live in parts
@@ -59,11 +65,17 @@ fn paragraphs(text: &str) -> Vec<&str> {
 }
 
 /// The core, split out so it is testable without a room.
+///
+/// `Ok(None)` is "the edited text says exactly what the document already
+/// says". Reporting that as an error made a whitespace-only change impossible
+/// to close: Save answered "Could not save — Nothing changed.", and the
+/// unsaved-edits dialog reads a failed save as "your edit is still in the
+/// editor" and stays up, leaving Discard as the only way out.
 pub(crate) fn apply_paragraph_edits(
     bytes: &[u8],
     before: &str,
     after: &str,
-) -> Result<Vec<u8>, String> {
+) -> Result<Option<Vec<u8>>, String> {
     let old_paras = paragraphs(before);
     let new_paras = paragraphs(after);
     if old_paras.len() != new_paras.len() {
@@ -108,9 +120,9 @@ pub(crate) fn apply_paragraph_edits(
         changed += 1;
     }
     if changed == 0 {
-        return Err("Nothing changed.".into());
+        return Ok(None);
     }
-    Ok(patched)
+    Ok(Some(patched))
 }
 
 fn snippet(s: &str) -> String {
@@ -138,7 +150,9 @@ mod tests {
         let bytes = doc(&["The fee is 5%.", "Payable monthly.", "Signed in Tel Aviv."]);
         let before = crate::extraction::extract_text("c.docx", &bytes).unwrap();
         let after = before.replace("The fee is 5%.", "The fee is 7%.");
-        let patched = apply_paragraph_edits(&bytes, &before, &after).expect("edit refused");
+        let patched = apply_paragraph_edits(&bytes, &before, &after)
+            .expect("edit refused")
+            .expect("an edited paragraph produced no new bytes");
         let text = crate::extraction::extract_text("c.docx", &patched).unwrap();
         assert!(text.contains("The fee is 7%."), "the edit did not land: {text}");
         assert!(text.contains("Payable monthly."), "an untouched paragraph was lost");
@@ -151,7 +165,7 @@ mod tests {
         let bytes = doc(&["Alpha", "Beta", "Gamma"]);
         let before = crate::extraction::extract_text("c.docx", &bytes).unwrap();
         let after = before.replace("Alpha", "Alpha!").replace("Gamma", "Gamma!");
-        let patched = apply_paragraph_edits(&bytes, &before, &after).unwrap();
+        let patched = apply_paragraph_edits(&bytes, &before, &after).unwrap().unwrap();
         let text = crate::extraction::extract_text("c.docx", &patched).unwrap();
         assert!(text.contains("Alpha!") && text.contains("Gamma!"), "{text}");
         assert!(text.contains("Beta"), "the middle paragraph was disturbed: {text}");
@@ -182,11 +196,25 @@ mod tests {
     }
 
     #[test]
-    fn an_unchanged_save_is_not_treated_as_an_edit() {
+    fn an_unchanged_save_writes_nothing_and_is_not_a_failure() {
+        // It used to be an Err, which the viewer showed as "Could not save"
+        // and the unsaved-edits dialog read as "your edit is still here" —
+        // so a stray space made the file unclosable except by discarding.
         let bytes = doc(&["Same", "Same again"]);
         let before = crate::extraction::extract_text("c.docx", &bytes).unwrap();
-        let err = apply_paragraph_edits(&bytes, &before, &before).expect_err("no-op accepted");
-        assert_eq!(err, "Nothing changed.");
+        let out = apply_paragraph_edits(&bytes, &before, &before).expect("a no-op is not an error");
+        assert!(out.is_none(), "a no-op must not produce bytes to write");
+    }
+
+    #[test]
+    fn a_whitespace_only_change_is_a_no_op_not_a_failed_save() {
+        // The reported repro: a trailing space and a blank line, nothing else.
+        let bytes = doc(&["Alpha", "Beta"]);
+        let before = crate::extraction::extract_text("c.docx", &bytes).unwrap();
+        let after = format!("{before}   \n\n");
+        let out = apply_paragraph_edits(&bytes, &before, &after)
+            .expect("whitespace alone must not fail the save");
+        assert!(out.is_none(), "whitespace alone must not rewrite the document");
     }
 
     #[test]
@@ -196,7 +224,7 @@ mod tests {
         let bytes = doc(&["Alpha", "Beta"]);
         let before = crate::extraction::extract_text("c.docx", &bytes).unwrap();
         let after = format!("{}   \n\n", before.replace("Beta", "Beta!"));
-        let patched = apply_paragraph_edits(&bytes, &before, &after).unwrap();
+        let patched = apply_paragraph_edits(&bytes, &before, &after).unwrap().unwrap();
         let text = crate::extraction::extract_text("c.docx", &patched).unwrap();
         assert!(text.contains("Beta!"), "{text}");
     }

@@ -14,6 +14,7 @@ import {
   WorkflowsIcon,
 } from "../icons";
 import LayoutMenu from "./LayoutMenu";
+import { saveDetail } from "./RecordingsPage";
 import { WorkflowGlyph } from "./workflows/workflowGlyph";
 import { isCloudRoute, isExternalEngine, isModelReady, trustState } from "./markup";
 import { WSState } from "./state";
@@ -190,7 +191,22 @@ export default function TopBar({
         {s.recLive && (
           <button
             className={`rec-indicator ${s.recLive.status}`}
-            title="A live recording is running — click to open it"
+            /* One sentence per phase, because the chip has three. While the
+               save drains, "a live recording is running" is not what is
+               happening and "Saving…" alone reads as "your recording is not
+               safe yet" — the audio is on disk from the first event; the
+               Recordings page already says which stage this is in the room's
+               own words, so the chip borrows that sentence rather than
+               inventing a second one. Paused is the same lie the other way
+               round: the label says paused and the microphone is closed, so the
+               hover must not answer that a recording is running. */
+            title={
+              s.recLive.status === "saving"
+                ? `${saveDetail(s.recSave)} — click to open it`
+                : s.recLive.status === "paused"
+                  ? "Recording paused — the microphone is closed. Nothing is lost; click to open it and resume."
+                  : "A live recording is running — click to open it"
+            }
             onClick={() => void a.viewFile(s.recLive!.fileId)}
           >
             <span className={`rec-dot ${s.recLive.status === "recording" ? "pulsing" : ""}`} />
@@ -408,16 +424,6 @@ export default function TopBar({
                   }}
                 >
                   Theme
-                </button>
-                <button
-                  className="pop-item"
-                  role="menuitem"
-                  onClick={() => {
-                    layout.resetLayout();
-                    setOpenMenu(null);
-                  }}
-                >
-                  Reset the three-pane layout
                 </button>
                 {/* Idea 9: one-click "commit" — a named checkpoint (default
                     name "Checkpoint — {date}") with a toast that names it.

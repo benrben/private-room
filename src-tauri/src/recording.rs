@@ -601,7 +601,14 @@ pub fn inside_cut(cuts: &[RecCut], t: i64) -> bool {
 /// sub-sample phase reset at each boundary is far below anything Whisper (or
 /// an ear) notices — not worth carrying fractional state across chunks.
 pub fn resample_to_16k(input: &[f32], from: u32) -> Vec<f32> {
-    if from == SAMPLE_RATE as u32 || input.is_empty() {
+    // `from` arrives from the IPC boundary (`rec_push_audio`, `dict_push_audio`
+    // hand the caller's number straight through), and zero here is an integer
+    // division that panics the engine thread. That failure is invisible: the
+    // channel receiver goes with the thread, every later push is dropped by a
+    // `let _ = tx.send(…)`, no state event is emitted — so the UI keeps showing
+    // REC until Stop reports the engine gone and everything since the last
+    // checkpoint is lost. A rate nobody stated is passed through untouched.
+    if from == 0 || from == SAMPLE_RATE as u32 || input.is_empty() {
         return input.to_vec();
     }
     let n_out = ((input.len() as u64) * SAMPLE_RATE as u64 / from as u64) as usize;
@@ -616,6 +623,103 @@ pub fn resample_to_16k(input: &[f32], from: u32) -> Vec<f32> {
         out.push(a + (b - a) * frac);
     }
     out
+}
+
+/// What a save is asked to make durable.
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+enum Save {
+    /// Periodic: append the audio recorded since the last save as a checkpoint.
+    Checkpoint,
+    /// Pause/stop: assemble and write the real WAV, and drop the checkpoints.
+    Full,
+    /// The transcript and the meta only.
+    ///
+    /// The pause follow-up: the sentence Pause force-closed lands a moment
+    /// after Pause's own save, and re-running a [`Save::Full`] for it re-encoded
+    /// and re-encrypted the WHOLE recording a second time, with the room mutex
+    /// held — hundreds of MB of write amplification per pause on a long
+    /// meeting, and a visible freeze of everything else the room does. The
+    /// audio was made durable by the first write and cannot have grown: the
+    /// engine is paused.
+    Transcript,
+}
+
+/// How long a failing save waits before it says so again. The retry itself is
+/// driven by the ingest trigger, which is true for every batch once the dirty
+/// tail is past a minute.
+const FLUSH_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How far up the mixed timeline a checkpoint may carry the audio, given the
+/// lowest position either capture lane can still write to (`lanes_at`, the
+/// smaller of the two [`Lane::write_floor`]s), the timeline's head and the last
+/// checkpoint.
+///
+/// NOT the head. The two lanes write at their own positions — a quarter-second
+/// batch apart is the normal case — so the trailing one still owes samples
+/// BELOW the head. Checkpointing to the head marked those flushed, and they
+/// were never written to the room at all: in a crash-recovered recording the
+/// meeting lane dropped out for a fraction of a second at every one-minute
+/// boundary, while the leading lane was intact.
+///
+/// A lane that stopped delivering mid-session must not stall the checkpoints,
+/// though: its position is frozen wherever it died, and waiting on it would
+/// lose a whole recording instead of a fifth of a second. [`LANE_RESYNC_GAP`]
+/// is the bar — below it the honest watermark wins, past it the head does. (A
+/// lane that never started at all is not this case; [`Lane::write_floor`]
+/// answers the head for it, because it will be re-anchored before it writes.)
+fn checkpoint_mark(lanes_at: usize, head: usize, flushed: usize) -> usize {
+    lanes_at
+        .max(head.saturating_sub(LANE_RESYNC_GAP))
+        .min(head)
+        .max(flushed)
+}
+
+/// What the meeting lane is doing — the fact a message about the OTHER lane
+/// dying has to be built on.
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+enum SysLane {
+    /// A tap is up and delivering the Mac's audio.
+    Recording,
+    /// Asked for, still coming up. ScreenCaptureKit takes seconds (permission
+    /// round-trip + capture start), and that window is exactly when a first
+    /// run's microphone trouble shows itself.
+    Starting,
+    /// Not asked for, or the tap failed.
+    Off,
+}
+
+/// What to say about a microphone that has gone quiet.
+///
+/// THE DEFECT: this promised "the Mac's audio keeps recording" unconditionally.
+/// With "Include the Mac's audio" unticked — or with the tap refused by macOS —
+/// a dead microphone means NOTHING is being captured, and the banner and toast
+/// invited the user to let an empty recording run. `recordingActions.ts` says
+/// the same thing at the other end of the same session, and says it honestly.
+fn mic_failure_message(sys: SysLane, ever_pushed: bool) -> String {
+    let lead = if ever_pushed {
+        "The microphone stopped sending audio"
+    } else {
+        "No microphone audio has arrived"
+    };
+    // A microphone that never connected at all (no device, blocked in System
+    // Settings) must not be told to "reconnect" — pausing and resuming cannot
+    // reattach something that was never attached.
+    let advice = if ever_pushed {
+        "Pause and resume to reconnect the microphone."
+    } else {
+        "Check that a microphone is connected and that Arcelle is allowed to use it \
+         in System Settings → Privacy & Security → Microphone."
+    };
+    match sys {
+        SysLane::Recording => format!("{lead} — the Mac's audio keeps recording. {advice}"),
+        SysLane::Starting => {
+            format!("{lead} — the Mac's audio is still starting up. {advice}")
+        }
+        SysLane::Off => format!(
+            "{lead}, and the Mac's audio is not being recorded — nothing at all is being \
+             captured. {advice} If that cannot be fixed, press Stop."
+        ),
+    }
 }
 
 // ---------------------------------------------------------------- VAD lane
@@ -744,6 +848,23 @@ impl Lane {
             level: 0.0,
             vad: NeuralVad::new(),
             resync: true,
+        }
+    }
+
+    /// The lowest position on the mixed timeline this lane can still write to.
+    ///
+    /// Normally that is where it has written to (`ingested`): a lane a batch
+    /// behind the head still owes the samples in between. But a lane waiting to
+    /// (re)start owes nothing below the head once the gap is wide enough to
+    /// re-anchor it — [`Lane::push`] calls [`Lane::resync_to`] before its first
+    /// sample is mixed. A microphone-only recording's meeting lane sits at its
+    /// base position for the whole session and would otherwise hold every
+    /// checkpoint half a second short of the head, for ever.
+    fn write_floor(&self, head: usize) -> usize {
+        if self.resync && head.saturating_sub(self.ingested) >= LANE_RESYNC_GAP {
+            head
+        } else {
+            self.ingested
         }
     }
 
@@ -1543,6 +1664,10 @@ struct Engine<R: tauri::Runtime> {
     /// Mixed-timeline length at the last flush — the time-based flush trigger
     /// (audio must persist even when no segments land to count).
     flushed_samples: usize,
+    /// When the last save failed, so a persistent failure is retried — and
+    /// reported — at a human rate rather than four times a second.
+    /// `None` once a save lands.
+    flush_failed_at: Option<std::time::Instant>,
     last_level_emit: std::time::Instant,
     /// Watchdog: when the last microphone batch arrived. The WebView tap can
     /// die without a sound — worklet error, throttled page, revoked device —
@@ -1621,6 +1746,7 @@ impl<R: tauri::Runtime> Engine<R> {
             // Resumed base audio is already durable in the stored WAV —
             // checkpoints must cover only samples recorded after resume.
             flushed_samples: base,
+            flush_failed_at: None,
             last_level_emit: std::time::Instant::now(),
             last_mic_push: std::time::Instant::now(),
             mic_flagged: false,
@@ -1656,11 +1782,13 @@ impl<R: tauri::Runtime> Engine<R> {
             // A pause force-closes the sentence in progress, and that final is
             // still in the decoder when Pause's own save runs. Save again once
             // it lands, so quitting the app while paused can't lose the last
-            // thing that was said.
+            // thing that was said — the WORDS only: Pause's own save already
+            // wrote the WAV, and nothing has been ingested since (see
+            // [`Save::Transcript`]).
             if self.pause_pending && self.paused && !self.decode_busy && self.final_queue.is_empty()
             {
                 self.pause_pending = false;
-                let _ = self.flush(true);
+                let _ = self.flush(Save::Transcript);
             }
         }
     }
@@ -1716,7 +1844,7 @@ impl<R: tauri::Runtime> Engine<R> {
                 // The sentence Pause just closed is still decoding; the run
                 // loop saves again when it lands (see `pause_pending`).
                 self.pause_pending = self.decode_busy || !self.final_queue.is_empty();
-                let _ = self.flush(true);
+                let _ = self.flush(Save::Full);
                 *self.shared.status.lock().unwrap() = "paused".into();
                 self.emit_state();
             }
@@ -1744,7 +1872,7 @@ impl<R: tauri::Runtime> Engine<R> {
             EngineMsg::EditMeta { apply, done } => {
                 let applied = apply(&mut self.meta);
                 let _ = done.send(applied.map(|()| {
-                    self.flush(false);
+                    self.flush(Save::Checkpoint);
                     self.meta.clone()
                 }));
             }
@@ -1783,7 +1911,7 @@ impl<R: tauri::Runtime> Engine<R> {
         // finishes decoding: a checkpoint append is cheap, and it lets
         // the UI truthfully say "your audio is saved" the moment Stop
         // is pressed instead of after a possibly-long decode drain.
-        let _ = self.flush(false);
+        let _ = self.flush(Save::Checkpoint);
         self.emit_save_progress("transcribing");
     }
 
@@ -1851,9 +1979,38 @@ impl<R: tauri::Runtime> Engine<R> {
         // Crash safety cannot depend on segments existing: with live STT off
         // (or a silent room) no segment ever lands, and the segment-count
         // flush would leave hours of audio only in memory.
-        if self.mixed.len().saturating_sub(self.flushed_samples) >= SAMPLE_RATE * 60 {
-            let _ = self.flush(false);
+        //
+        // Once the dirty tail is past a minute this is true for EVERY batch, so
+        // a save that keeps failing — a full disk — would otherwise be retried
+        // four times a second for the rest of the session, each attempt
+        // re-encrypting the whole growing tail.
+        let backing_off = self
+            .flush_failed_at
+            .is_some_and(|at| at.elapsed() < FLUSH_RETRY_BACKOFF);
+        if !backing_off && self.mixed.len().saturating_sub(self.flushed_samples) >= SAMPLE_RATE * 60
+        {
+            let _ = self.flush(Save::Checkpoint);
         }
+    }
+
+    /// Is the Mac's audio actually being captured right now? Read from the tap
+    /// itself rather than from the setting, because "asked for" and "running"
+    /// come apart for the seconds a tap needs to start and for good after one
+    /// macOS refuses.
+    fn sys_lane(&self) -> SysLane {
+        if !self.cfg.system_audio {
+            return SysLane::Off;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            if self.sys_tap.is_some() {
+                return SysLane::Recording;
+            }
+            if self.sys_tap_starting {
+                return SysLane::Starting;
+            }
+        }
+        SysLane::Off
     }
 
     fn tick(&mut self) {
@@ -1865,18 +2022,8 @@ impl<R: tauri::Runtime> Engine<R> {
         // means the tap is dead, not quiet.
         if !self.mic_flagged && self.last_mic_push.elapsed().as_secs() >= 6 {
             self.mic_flagged = true;
-            // A microphone that never connected at all (no device, blocked in
-            // System Settings) must not be told to "reconnect" — pausing and
-            // resuming cannot reattach something that was never attached.
-            let message = if self.mic_ever_pushed {
-                "The microphone stopped sending audio — the Mac's audio keeps recording. \
-                 Pause and resume to reconnect the microphone."
-            } else {
-                "No microphone audio has arrived — the Mac's audio keeps recording. \
-                 Check that a microphone is connected and that Arcelle is allowed to use it \
-                 in System Settings → Privacy & Security → Microphone."
-            };
-            self.emit_source("mic", "error", message);
+            let message = mic_failure_message(self.sys_lane(), self.mic_ever_pushed);
+            self.emit_source("mic", "error", &message);
         }
         if self.live_stt {
             for source in [Source::Mic, Source::Sys] {
@@ -2079,9 +2226,18 @@ impl<R: tauri::Runtime> Engine<R> {
                     self.win_cache.insert(seg.id.clone(), out.wins);
                 }
                 self.meta.segments.insert(at, seg.clone());
+                // WITHOUT THE VOICEPRINT. It is 192 floats — around 3.8 KB of
+                // JSON per phrase — kept so the meeting can be re-clustered as
+                // it grows, and nothing outside this process has any use for
+                // it: the frontend's own `RecSegment` declares no `voice`
+                // field, so every byte of it was decoded by the webview and
+                // dropped. The authoritative copy above keeps its print.
                 let _ = self.app.emit(
                     "rec-segment",
-                    serde_json::json!({ "fileId": self.cfg.file_id, "segment": seg }),
+                    serde_json::json!({
+                        "fileId": self.cfg.file_id,
+                        "segment": RecSegment { voice: None, ..seg.clone() },
+                    }),
                 );
                 if let Some(lang) = self.live_translate.clone() {
                     // Never blocking: the engine thread also carries the audio,
@@ -2100,7 +2256,7 @@ impl<R: tauri::Runtime> Engine<R> {
                     self.relabel_speakers();
                 }
                 if self.segments_since_flush >= FLUSH_EVERY_SEGMENTS {
-                    let _ = self.flush(false);
+                    let _ = self.flush(Save::Checkpoint);
                 }
             }
         }
@@ -2166,8 +2322,8 @@ impl<R: tauri::Runtime> Engine<R> {
         );
     }
 
-    /// Persist into the room. `full` (pause/stop) assembles and writes the
-    /// real WAV and clears the audio checkpoints; a periodic save instead
+    /// Persist into the room. [`Save::Full`] (pause/stop) assembles and writes
+    /// the real WAV and clears the audio checkpoints; [`Save::Checkpoint`]
     /// APPENDS only the samples since the last save as a raw-PCM checkpoint
     /// (`rec_chunks`) — rewriting an hour-long recording's whole WAV every
     /// minute meant ~115 MB re-encrypted per flush. A crash between full
@@ -2175,30 +2331,33 @@ impl<R: tauri::Runtime> Engine<R> {
     /// Auto-flushes skip the version snapshot — versioning every few seconds
     /// of a live recording would balloon the room; explicit edits still
     /// snapshot (recording_cmds).
-    fn flush(&mut self, full: bool) -> bool {
+    fn flush(&mut self, save: Save) -> bool {
         use tauri::Manager;
         // The transcript about to be written must carry the best labels the
         // recording can support, not the provisional live ones. Stop/pause
         // additionally run the split pass: the full mixed timeline is in
         // hand, so phrases holding two voices become two labeled turns
         // (ADD-28) — a periodic save sticks to the cheap phrase relabel.
-        if full {
-            self.split_speakers();
-        } else {
+        if save == Save::Checkpoint {
             self.relabel_speakers();
+        } else {
+            self.split_speakers();
         }
         self.meta.duration_cs = cs_of_samples(self.mixed.len());
         let text = transcript_text(&self.meta);
         let meta_json = serde_json::to_string(&self.meta).unwrap_or_default();
+        let head = self.mixed.len();
+        let mark = checkpoint_mark(
+            self.mic.write_floor(head).min(self.sys.write_floor(head)),
+            head,
+            self.flushed_samples,
+        );
         let wrote = {
             let state = self.app.state::<crate::commands::AppState>();
             let guard = state.room.lock().unwrap();
             match guard.as_ref() {
-                Some(room) if room.path == self.cfg.room_path => {
-                    // Audio first, then transcript, then meta: a failure
-                    // between steps leaves a previous consistent pair
-                    // readable, and the next flush retries the whole tail.
-                    let audio = if full {
+                Some(room) if room.path == self.cfg.room_path => match save {
+                    Save::Full => {
                         let wav = encode_wav(&self.mixed);
                         // ONE transaction: a complete WAV whose checkpoints
                         // survived would be spliced onto itself by the next
@@ -2210,24 +2369,40 @@ impl<R: tauri::Runtime> Engine<R> {
                             &wav,
                             Some(&text),
                         )
-                    } else {
-                        crate::db::append_rec_chunk(
-                            &room.conn,
-                            &self.cfg.file_id,
-                            &self.mixed[self.flushed_samples..],
-                        )
-                        .and_then(|_| {
-                            crate::db::set_file_extracted_text(
+                        .and_then(|()| {
+                            crate::db::set_rec_meta(&room.conn, &self.cfg.file_id, &meta_json)
+                        })
+                        .map_err(Some)
+                    }
+                    // ONE transaction, for the same reason the full write is
+                    // one. `append_rec_chunk` is not idempotent, and the retry
+                    // this failure path promises re-appends the whole dirty
+                    // tail: a checkpoint that got its audio in and then failed
+                    // on the transcript or the meta left a chunk row behind,
+                    // and every later attempt added another copy of the same
+                    // samples. Crash recovery concatenates them all, so the
+                    // recording physically repeated that stretch and ran longer
+                    // than its own transcript.
+                    Save::Checkpoint => crate::db::in_transaction(&room.conn, || {
+                        if mark > self.flushed_samples {
+                            crate::db::append_rec_chunk(
                                 &room.conn,
                                 &self.cfg.file_id,
-                                &text,
-                            )
-                        })
-                    };
-                    audio
-                        .and_then(|_| crate::db::set_rec_meta(&room.conn, &self.cfg.file_id, &meta_json))
-                        .map_err(Some)
-                }
+                                &self.mixed[self.flushed_samples..mark],
+                            )?;
+                        }
+                        crate::db::set_file_extracted_text(&room.conn, &self.cfg.file_id, &text)?;
+                        crate::db::set_rec_meta(&room.conn, &self.cfg.file_id, &meta_json)
+                    })
+                    .map_err(Some),
+                    // The audio is already durable and cannot have grown — the
+                    // engine is paused. Only the words moved.
+                    Save::Transcript => crate::db::in_transaction(&room.conn, || {
+                        crate::db::set_file_extracted_text(&room.conn, &self.cfg.file_id, &text)?;
+                        crate::db::set_rec_meta(&room.conn, &self.cfg.file_id, &meta_json)
+                    })
+                    .map_err(Some),
+                },
                 // The room closed/switched under a live recording: stop
                 // quietly, nothing may be written into a locked room.
                 _ => Err(None),
@@ -2242,13 +2417,29 @@ impl<R: tauri::Runtime> Engine<R> {
                 // retries the whole tail, and keep recording in memory.
                 // There is no next flush during the FINAL write, so that case
                 // must not promise a retry that will never happen.
-                self.emit_error(&if self.stopping.is_some() {
-                    format!("Saving the recording failed ({db_err}). {SAVE_FAILED}")
-                } else {
-                    format!(
-                        "Saving the recording failed ({db_err}) — retrying; do not close the room."
-                    )
-                });
+                //
+                // ONCE PER OUTAGE, NOT ONCE PER BATCH — but only for the
+                // automatic save. Past the first minute of dirty audio the
+                // ingest trigger is true for every 250 ms batch that arrives,
+                // so a failure that persists (a full disk) emitted four of
+                // these a second and effects.ts turned each one into its own
+                // toast. A save someone ASKED for — pause, stop — always
+                // answers, whatever the checkpoints have been doing.
+                let automatic = save == Save::Checkpoint && self.stopping.is_none();
+                let first = !automatic
+                    || self
+                        .flush_failed_at
+                        .is_none_or(|at| at.elapsed() >= FLUSH_RETRY_BACKOFF);
+                self.flush_failed_at = Some(std::time::Instant::now());
+                if first {
+                    self.emit_error(&if self.stopping.is_some() {
+                        format!("Saving the recording failed ({db_err}). {SAVE_FAILED}")
+                    } else {
+                        format!(
+                            "Saving the recording failed ({db_err}) — retrying; do not close the room."
+                        )
+                    });
+                }
                 return false;
             }
             Err(None) => {
@@ -2259,9 +2450,15 @@ impl<R: tauri::Runtime> Engine<R> {
                 return false;
             }
         }
+        self.flush_failed_at = None;
         self.segments_since_flush = 0;
-        self.flushed_samples = self.mixed.len();
-        if full {
+        match save {
+            Save::Full => self.flushed_samples = self.mixed.len(),
+            Save::Checkpoint => self.flushed_samples = mark,
+            // Nothing was written to the audio, so nothing became durable.
+            Save::Transcript => {}
+        }
+        if save == Save::Full {
             let _ = self.app.emit("room-files-changed", ());
         }
         true
@@ -2274,7 +2471,7 @@ impl<R: tauri::Runtime> Engine<R> {
     /// a lie.
     fn finish(&mut self) {
         self.emit_save_progress("writing");
-        let saved = self.flush(true);
+        let saved = self.flush(Save::Full);
         // The result is kept here too: an engine that stopped itself (the
         // 3-hour ceiling) has already answered a dummy channel, and a Stop
         // arriving afterwards would otherwise see a dead engine and report a
@@ -2316,7 +2513,19 @@ impl<R: tauri::Runtime> Engine<R> {
                         samples: samples.to_vec(),
                     });
                 }));
-                let _ = engine_tx.send(EngineMsg::SysTap(result));
+                // Stop pressed while the tap was still coming up — very likely
+                // on a first run, with the Screen Recording sheet open — and
+                // the engine is already gone. Dropping the tap here does NOT
+                // stop the stream: the capture goes on running, the macOS
+                // recording indicator stays lit, and the callback keeps firing
+                // into a dead channel. The SysTap arm tears down a tap that
+                // arrives too late; this is the same duty for one that arrives
+                // after there is nobody left to tell.
+                if let Err(undelivered) = engine_tx.send(EngineMsg::SysTap(result)) {
+                    if let EngineMsg::SysTap(Ok(tap)) = undelivered.0 {
+                        tap.stop();
+                    }
+                }
             });
         }
     }
@@ -2928,6 +3137,22 @@ mod tests {
         assert_eq!(out[0], 0.0);
         assert!((out[1] - 3.0).abs() < 1e-4);
         assert_eq!(resample_to_16k(&input, 16000).len(), input.len());
+    }
+
+    /// A rate of zero comes off the IPC seam, not off the tap: `rec_push_audio`
+    /// takes `rate: u32` from the caller and passes it through. Divided by, it
+    /// panicked the engine thread — and a dead engine looks exactly like a live
+    /// one until Stop, which is when the tail of the recording is lost.
+    #[test]
+    fn a_zero_rate_is_passed_through_instead_of_dividing_by_it() {
+        let input: Vec<f32> = (0..8).map(|i| i as f32).collect();
+        assert_eq!(resample_to_16k(&input, 0), input);
+        // The empty batch, at the same rate, is still empty.
+        assert!(resample_to_16k(&[], 0).is_empty());
+        // One sample, at a rate that really does resample: the loop must not
+        // index past the end of a single-element input.
+        assert_eq!(resample_to_16k(&[0.5], 48000).len(), 0);
+        assert_eq!(resample_to_16k(&[0.5], 8000), vec![0.5, 0.5]);
     }
 
     /// The downloaded Whisper model, else the one bundled in the repo.
@@ -3916,6 +4141,127 @@ mod tests {
         assert!(died.1.contains("Pause and resume"), "{}", died.1);
     }
 
+    /// A dead microphone means very different things depending on the OTHER
+    /// lane, and the banner used to assert the comforting one unconditionally:
+    /// "the Mac's audio keeps recording" over a session in which nothing at all
+    /// was being captured, so the user let an empty recording run.
+    #[test]
+    fn the_mic_banner_only_promises_the_meeting_lane_when_it_is_really_running() {
+        let live = mic_failure_message(SysLane::Recording, true);
+        assert!(live.contains("the Mac's audio keeps recording"), "{live}");
+        assert!(!live.contains("nothing at all"), "{live}");
+
+        // Off, or refused by macOS: nothing is being captured, and the way out
+        // is Stop.
+        for ever_pushed in [true, false] {
+            let dead = mic_failure_message(SysLane::Off, ever_pushed);
+            assert!(dead.contains("nothing at all is being captured"), "{dead}");
+            assert!(!dead.contains("keeps recording"), "{dead}");
+            assert!(dead.contains("press Stop"), "{dead}");
+        }
+
+        // Coming up is neither: claiming it is recording would be a promise,
+        // claiming nothing is captured would scare the user off a session that
+        // is about to be fine.
+        let starting = mic_failure_message(SysLane::Starting, true);
+        assert!(starting.contains("still starting up"), "{starting}");
+        assert!(!starting.contains("nothing at all"), "{starting}");
+
+        // The advice each lane state carries is still the advice the mic's own
+        // history earns.
+        assert!(mic_failure_message(SysLane::Off, true).contains("Pause and resume"));
+        assert!(mic_failure_message(SysLane::Off, false).contains("System Settings"));
+        assert!(!mic_failure_message(SysLane::Off, false).contains("reconnect"));
+    }
+
+    /// …and the watchdog actually reads the lane, rather than the setting.
+    #[test]
+    fn a_dead_mic_with_the_meeting_lane_off_says_nothing_is_being_captured() {
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let (job_tx, _job_rx) = mpsc::channel::<DecodeJob>();
+        let mut eng = test_engine(app.handle(), job_tx);
+        // "Include the Mac's audio" unticked: the microphone is the whole
+        // recording.
+        eng.cfg.system_audio = false;
+        assert_eq!(eng.sys_lane(), SysLane::Off);
+
+        eng.mic_ever_pushed = true;
+        eng.last_mic_push = std::time::Instant::now() - std::time::Duration::from_secs(7);
+        eng.tick();
+        let flagged = eng.shared.sources.lock().unwrap()[0].clone();
+        assert_eq!(flagged.0, "error");
+        assert!(
+            flagged.1.contains("nothing at all is being captured"),
+            "the banner still promises a lane that is off: {}",
+            flagged.1,
+        );
+    }
+
+    /// The checkpoint watermark. A lane that is merely a batch behind still
+    /// owes samples below the head of the timeline; a lane that never started
+    /// owes nothing and must not hold the whole recording hostage.
+    #[test]
+    fn a_checkpoint_stops_at_the_trailing_lane_but_never_stalls_on_a_silent_one() {
+        let head = SAMPLE_RATE * 61;
+        // Both lanes in step: everything recorded is durable.
+        assert_eq!(checkpoint_mark(head, head, 0), head);
+        // The meeting lane is 0.4 s behind — under the resync bar, so it is
+        // still going to write into that stretch. The checkpoint stops short.
+        let behind = head - SAMPLE_RATE * 2 / 5;
+        assert_eq!(checkpoint_mark(behind, head, 0), behind);
+        // A lane that stopped delivering mid-session: its position is frozen
+        // where it died, far past the bar. The head, less the bar, is what gets
+        // written — never nothing.
+        assert_eq!(checkpoint_mark(0, head, 0), head - LANE_RESYNC_GAP);
+        // Nothing new since the last checkpoint: nothing to append, and the
+        // mark can never go backwards over audio already written.
+        assert_eq!(checkpoint_mark(head, head, head), head);
+        assert_eq!(checkpoint_mark(0, head, head), head);
+        // The first beats of a session, before the bar is even a whole
+        // timeline long.
+        assert_eq!(checkpoint_mark(0, 10, 0), 0);
+        assert_eq!(checkpoint_mark(0, 0, 0), 0);
+    }
+
+    /// What each lane is allowed to hold the checkpoint back to.
+    ///
+    /// THE REGRESSION this guards: feeding `checkpoint_mark` the raw
+    /// `ingested` of both lanes made a lane that has NEVER pushed — the
+    /// meeting lane of every microphone-only recording, and every recording
+    /// whose tap macOS refused — sit at its base position for the whole
+    /// session, so every checkpoint stopped [`LANE_RESYNC_GAP`] short of the
+    /// head instead of at it. Nothing was lost (the next checkpoint carried
+    /// it), but a crash-recovered recording ended half a second before its own
+    /// transcript did, and both DB-backed checkpoint tests failed.
+    #[test]
+    fn a_lane_that_never_started_owes_nothing_below_the_head() {
+        let head = SAMPLE_RATE * 61;
+        // Never pushed, so still waiting to be re-anchored: `resync_to(head)`
+        // runs before its first sample is mixed, and it cannot write below it.
+        let idle = Lane::new(0);
+        assert!(idle.resync, "a fresh lane must start out waiting to re-anchor");
+        assert_eq!(idle.write_floor(head), head);
+
+        // Delivering, one batch behind: that gap is real audio it still owes.
+        let mut live = Lane::new(0);
+        live.resync = false;
+        live.ingested = head - SAMPLE_RATE / 5;
+        assert_eq!(live.write_floor(head), head - SAMPLE_RATE / 5);
+
+        // A lane waiting to start but not yet a resync gap behind gets mixed
+        // where it stands, so its position is still the honest floor.
+        let fresh = Lane::new(0);
+        assert_eq!(fresh.write_floor(LANE_RESYNC_GAP - 1), 0);
+        assert_eq!(fresh.write_floor(LANE_RESYNC_GAP), LANE_RESYNC_GAP);
+
+        // A resumed session: base is the floor, not zero.
+        let resumed = Lane::new(SAMPLE_RATE * 5);
+        assert_eq!(resumed.write_floor(SAMPLE_RATE * 5), SAMPLE_RATE * 5);
+        assert_eq!(resumed.write_floor(head), head);
+    }
+
     /// Re-clustering is the engine thread's only heavy step, and that thread
     /// also mixes the incoming audio: a pass that runs long has to buy itself
     /// proportionally more quiet, or a long meeting freezes the level meter.
@@ -4235,6 +4581,223 @@ mod tests {
         let (done_tx, done_rx) = mpsc::channel();
         handle.tx.send(EngineMsg::Stop { done: done_tx }).unwrap();
         let _ = done_rx.recv_timeout(std::time::Duration::from_secs(30));
+        let _ = std::fs::remove_file(&room_path);
+    }
+
+    /// A room on disk holding one recording whose stored WAV is `stored`, and
+    /// an app whose `AppState` has it open — what a flush needs to reach.
+    fn room_with_recording(
+        tag: &str,
+        stored: &[f32],
+    ) -> (String, String, tauri::App<tauri::test::MockRuntime>) {
+        use tauri::Manager;
+        let room_path = std::env::temp_dir()
+            .join(format!("pr-{tag}-{}.roomai", uuid::Uuid::new_v4()))
+            .to_string_lossy()
+            .into_owned();
+        let conn = crate::db::create_room(&room_path, "qa-room-pw", "QA").unwrap();
+        let file = crate::db::insert_file(
+            &conn,
+            "Long.wav",
+            "audio/wav",
+            &encode_wav(stored),
+            Some("(live recording)\n"),
+            "recording",
+        )
+        .unwrap();
+        crate::db::set_rec_meta(
+            &conn,
+            &file.id,
+            &serde_json::to_string(&RecMeta::default()).unwrap(),
+        )
+        .unwrap();
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let state = crate::commands::AppState::default();
+        *state.room.lock().unwrap() = Some(crate::commands::Room {
+            conn,
+            path: room_path.clone(),
+            name: "QA".into(),
+            password: "qa-room-pw".into(),
+        });
+        app.manage(state);
+        (room_path, file.id, app)
+    }
+
+    /// An engine bound to that room, driven by hand rather than by its thread.
+    fn engine_in_room(
+        app: &tauri::AppHandle<tauri::test::MockRuntime>,
+        room_path: &str,
+        file_id: &str,
+        base: Vec<f32>,
+        job_tx: mpsc::Sender<DecodeJob>,
+    ) -> Engine<tauri::test::MockRuntime> {
+        let (tx, rx) = mpsc::channel();
+        let shared = Arc::new(RecShared {
+            status: Mutex::new("recording".into()),
+            duration_cs: AtomicI64::new(0),
+            sources: Mutex::new([("on".into(), String::new()), ("off".into(), String::new())]),
+            outcome: Mutex::new(None),
+        });
+        Engine::new(
+            app.clone(),
+            EngineConfig {
+                file_id: file_id.into(),
+                room_path: room_path.into(),
+                model_path: PathBuf::from("/nonexistent-model.bin"),
+                base_samples: base,
+                meta: RecMeta::default(),
+                system_audio: false,
+                live_translate: None,
+                known_voices: Vec::new(),
+            },
+            tx,
+            job_tx,
+            shared,
+            rx,
+        )
+    }
+
+    fn chunk_rows(app: &tauri::AppHandle<tauri::test::MockRuntime>, file_id: &str) -> i64 {
+        use tauri::Manager;
+        let state = app.state::<crate::commands::AppState>();
+        let guard = state.room.lock().unwrap();
+        let room = guard.as_ref().unwrap();
+        room.conn
+            .query_row(
+                "SELECT count(*) FROM rec_chunks WHERE file_id = ?1",
+                [file_id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    /// A checkpoint that gets its AUDIO in and then fails on the transcript or
+    /// the meta must leave nothing behind.
+    ///
+    /// THE DEFECT: the three writes were independent, and the failure path
+    /// deliberately keeps the range dirty "so the next flush retries the whole
+    /// tail" — but `append_rec_chunk` is not idempotent. Every retry inserted
+    /// another chunk row covering the same samples, and crash recovery
+    /// concatenates them all in seq order: the recovered recording physically
+    /// repeated that stretch of audio and ran longer than its own transcript.
+    /// Past the first minute the retry fires on every ingested batch, so that
+    /// is roughly four more copies a second, for as long as the failure lasts.
+    #[test]
+    fn a_checkpoint_that_fails_part_way_leaves_no_audio_behind() {
+        use tauri::Manager;
+        let (room_path, file_id, app) = room_with_recording("rec-halffail", &[]);
+        {
+            // Fail the LAST step of the checkpoint, with the append already
+            // done — a full disk hitting the meta UPDATE after the blob INSERT
+            // landed.
+            let state = app.state::<crate::commands::AppState>();
+            let guard = state.room.lock().unwrap();
+            guard
+                .as_ref()
+                .unwrap()
+                .conn
+                .execute_batch(
+                    "CREATE TRIGGER meta_write_fails BEFORE UPDATE ON recordings
+                     BEGIN SELECT RAISE(ABORT, 'injected: the meta write failed'); END;",
+                )
+                .unwrap();
+        }
+        let (job_tx, _job_rx) = mpsc::channel::<DecodeJob>();
+        let mut eng = engine_in_room(app.handle(), &room_path, &file_id, Vec::new(), job_tx);
+        // A minute of audio on both lanes, without paying for the VAD.
+        eng.mixed = vec![0.25f32; SAMPLE_RATE * 61];
+        eng.mic.ingested = eng.mixed.len();
+        eng.sys.ingested = eng.mixed.len();
+
+        assert!(!eng.flush(Save::Checkpoint), "the injected failure was not reported");
+        assert_eq!(
+            chunk_rows(app.handle(), &file_id),
+            0,
+            "a half-failed checkpoint left its audio in the room",
+        );
+        assert_eq!(eng.flushed_samples, 0, "the failed range was marked durable");
+
+        // The retry the failure path promises must not double it either.
+        assert!(!eng.flush(Save::Checkpoint));
+        assert_eq!(
+            chunk_rows(app.handle(), &file_id),
+            0,
+            "the retry appended a second copy of the same samples",
+        );
+
+        // With the injection gone, the very same retry lands — once.
+        {
+            let state = app.state::<crate::commands::AppState>();
+            let guard = state.room.lock().unwrap();
+            guard
+                .as_ref()
+                .unwrap()
+                .conn
+                .execute_batch("DROP TRIGGER meta_write_fails;")
+                .unwrap();
+        }
+        assert!(eng.flush(Save::Checkpoint), "the recovered flush failed");
+        assert_eq!(chunk_rows(app.handle(), &file_id), 1);
+        assert_eq!(eng.flushed_samples, eng.mixed.len());
+        drop(app);
+        let _ = std::fs::remove_file(&room_path);
+    }
+
+    /// The pause follow-up saves the WORDS. It used to re-encode and
+    /// re-encrypt the whole recording a second time, with the room mutex held,
+    /// seconds after Pause's own full write — hundreds of MB of write
+    /// amplification per pause on a long meeting, for audio that cannot have
+    /// grown because the engine is paused.
+    #[test]
+    fn the_pause_follow_up_saves_the_words_and_leaves_the_audio_alone() {
+        use tauri::Manager;
+        // The stored WAV carries a signal; the live timeline is silence. A
+        // save that rewrote the audio would flatten it.
+        let stored = vec![0.25f32; SAMPLE_RATE];
+        let (room_path, file_id, app) = room_with_recording("rec-pause", &stored);
+        let (job_tx, _job_rx) = mpsc::channel::<DecodeJob>();
+        let mut eng = engine_in_room(
+            app.handle(),
+            &room_path,
+            &file_id,
+            vec![0.0f32; SAMPLE_RATE],
+            job_tx,
+        );
+        eng.meta.segments.push(RecSegment {
+            id: "s1".into(),
+            source: "mic".into(),
+            speaker: "You".into(),
+            t0: 0,
+            t1: 100,
+            text: "the last thing that was said".into(),
+            words: Vec::new(),
+            lang: None,
+            voice: None,
+        });
+
+        assert!(eng.flush(Save::Transcript), "the pause follow-up did not save");
+
+        let state = app.state::<crate::commands::AppState>();
+        let guard = state.room.lock().unwrap();
+        let room = guard.as_ref().unwrap();
+        let audio = decode_wav(&crate::db::get_file_bytes(&room.conn, &file_id).unwrap().unwrap())
+            .unwrap();
+        assert_eq!(audio.len(), stored.len(), "the whole WAV was written again");
+        assert!(
+            audio[0] > 0.2,
+            "the follow-up overwrote durable audio with the live timeline",
+        );
+        // The words — the entire point of the second save — did land.
+        let meta = crate::db::get_rec_meta(&room.conn, &file_id).unwrap();
+        assert!(meta.contains("the last thing that was said"), "{meta}");
+        let text = crate::db::get_file_extracted_text(&room.conn, &file_id).unwrap_or_default();
+        assert!(text.contains("the last thing that was said"), "{text}");
+        // And no checkpoint was appended, so recovery has nothing to splice.
+        drop(guard);
+        assert_eq!(chunk_rows(app.handle(), &file_id), 0);
+        drop(app);
         let _ = std::fs::remove_file(&room_path);
     }
 

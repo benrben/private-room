@@ -12,16 +12,30 @@
  * FAILS (exit 1) on drift, which is always a genuine defect:
  *   - the frontend invokes a command the Rust host does not register
  *   - the mock fakes a command the Rust host no longer has
+ *   - the host registers a command NOTHING reaches: no caller in src/, no
+ *     mention in the agent's tool catalog, and not on the written allow-list
+ *     below. This is the direction nothing checked, which is how a feature can
+ *     be deleted from the UI while its wrapper, its handler and all their tests
+ *     stay green — see KNOWN_ORPHANS.
  * REPORTS (exit 0) the fixture gap: commands the app invokes that the mock does
  * not fake. Those return a bare `[]`/null at runtime, which is why the mock also
- * records them live on `window.__qaUnhandled`. The gap is large by design today
- * — most of it is mutations, which QA does not need faked — so it is a number to
- * watch, not a build break. */
+ * records them live on `window.__qaUnhandled`. It is reported in two figures,
+ * because the two halves are not worth the same: an unfaked MUTATION is a
+ * control the harness never presses, which is the gap this repo accepts; an
+ * unfaked READ is a pane drawing from nothing while looking perfectly healthy,
+ * which is the only half that can turn a screen check green on an empty screen.
+ * Neither is a build break yet — the read list is short but not empty, and a
+ * gate that is red the day it lands is a gate someone switches off. */
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+// The repo, unless a test points this at a fixture tree. A drift checker that
+// has no way to be run against a KNOWN-drifting tree cannot be proven to still
+// fire, and this one is now a build gate — see e2e/page-script/mockCoverage.test.mjs.
+const root = process.env.MOCK_COVERAGE_ROOT
+  ? path.resolve(process.env.MOCK_COVERAGE_ROOT)
+  : path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const LIST = process.argv.includes("--list");
 
 /** Everything between the outermost brackets of `generate_handler![ … ]`. */
@@ -113,6 +127,101 @@ const extraReads = new Set(
   ].map((m) => m[1]),
 );
 
+// Loaders whose NAME does not say so, so the fixture report can separate the
+// half that fakes a screen full of content from the half that only skips a
+// button. Hand-written for the same reason EXTRA_READS is, and silent in the
+// same way when it rots: a loader added to the app and not added here counts as
+// a mutation, which makes the read figure look better than it is.
+const READ_LIKE = new Set([
+  "office_html",
+  "slide_preview",
+  "stage_preview_html",
+  "mcp_runtime_for_command",
+  "suggest_file_meta",
+]);
+const isRead = (c) => /^(list|get|read|load|fetch)_/.test(c) || READ_LIKE.has(c);
+
+// Registered commands nothing in the app reaches TODAY, each with the reason it
+// is tolerated. Every one of them was found by the 2026-08-16 audit, and the
+// honest reason is the same for all of them: the command, its wrapper and its
+// handler are alive and tested, and no screen calls them. A wrapper whose UI was
+// never built reads exactly like one whose UI was deleted, so this list records
+// the fact and nothing more — it is not a verdict that any of them should stay.
+const KNOWN_ORPHANS = {
+  browser_close: "the browser UI closes tabs (browser_close_tab); nothing closes the browser itself",
+  engine_capabilities: "wrapper engineCapabilities; qa-mock fakes it, no screen asks",
+  get_script_manifest: "no wrapper in api.ts",
+  get_workflow: "no wrapper in api.ts (get_workflow_schedule / get_workflow_runs are separate commands)",
+  import_youtube_video: "no wrapper in api.ts",
+  rec_chapter_set: "wrapper recChapterSet; no caller renames a chapter",
+  rec_note_set: "wrapper recNoteSet; no caller edits a note",
+  restore_memory: "no wrapper in api.ts; forgetting a memory has no undo on screen",
+  story_delete_list: "wrapper storyDeleteList; no caller deletes a shot list",
+  story_reorder_shots: "wrapper storyReorderShots; no caller reorders shots",
+  transcribe_audio: "no wrapper in api.ts; the recorder streams instead",
+};
+
+/** Every command name quoted in the agent's own tool surface. A command the
+ * assistant calls is live even though no screen invokes it — that is a caller,
+ * just not a React one. */
+const agentSide = ["src-tauri/src/room_mcp.rs", "src-tauri/src/commands/agent.rs"]
+  .map((p) => fs.readFileSync(path.join(root, p), "utf8"))
+  .join("\n");
+
+// api.ts wraps nearly every command, so "is it invoked from src/" is answered
+// INSIDE api.ts even for a command whose last real caller was deleted. Attribute
+// each invoke to the declaration it sits under — `export const x = () =>` or an
+// `x:` member — so the question can be asked of the wrapper instead.
+//
+// A member only counts as a wrapper if what follows the colon OPENS A FUNCTION.
+// Half these wrappers take a multi-line options object, so `name:` alone also
+// matched its LAST PARAMETER FIELD — `startStudioJob` was read as `kind`,
+// `recStart` as `systemAudio` — and since a word like `kind` or `enabled` is
+// everywhere in src/, those 21 commands were reachable no matter what called
+// them. The gate was silently blind for exactly the commands with the biggest
+// argument lists.
+const wrapperOf = new Map();
+{
+  const apiSrc = fs.readFileSync(path.join(root, "src/api.ts"), "utf8");
+  const decls = [
+    ...apiSrc.matchAll(
+      /export\s+(?:const|function)\s+(\w+)|^[ \t]*(\w+)\s*:\s*(?:async\s*)?(?:\(|function\b|<)/gm,
+    ),
+  ].map((m) => ({ at: m.index, name: m[1] ?? m[2] }));
+  for (const m of apiSrc.matchAll(/invoke(?:<[^>]*>)?\(\s*"([a-z0-9_]+)"/g)) {
+    let name = null;
+    for (const d of decls) {
+      if (d.at > m.index) break;
+      name = d.name;
+    }
+    if (name && !wrapperOf.has(m[1])) wrapperOf.set(m[1], name);
+  }
+}
+
+// What the rest of the app says, with comments removed: a wrapper named only in
+// prose is not a caller, and this checker's whole point is that a name surviving
+// somewhere is not the same as a feature surviving.
+const outsideApi = walk(path.join(root, "src"))
+  .filter((f) => f !== path.join(root, "src/api.ts"))
+  .map((f) => fs.readFileSync(f, "utf8"))
+  .join("\n")
+  .replace(/\/\*[\s\S]*?\*\//g, " ")
+  .replace(/\/\/[^\n]*/g, " ");
+
+const reachable = new Set();
+for (const m of outsideApi.matchAll(/invoke(?:<[^>]*>)?\(\s*"([a-z0-9_]+)"/g)) reachable.add(m[1]);
+for (const [command, wrapper] of wrapperOf) {
+  if (new RegExp(`\\b${wrapper}\\b`).test(outsideApi)) reachable.add(command);
+}
+
+const orphans = [...rust]
+  .filter((c) => !reachable.has(c) && !agentSide.includes(`"${c}"`))
+  .sort();
+const newOrphans = orphans.filter((c) => !(c in KNOWN_ORPHANS));
+const healedOrphans = Object.keys(KNOWN_ORPHANS)
+  .filter((c) => !orphans.includes(c))
+  .sort();
+
 const sorted = (set) => [...set].sort();
 const missingInRust = sorted(frontend).filter((c) => !rust.has(c));
 const staleInMock = sorted(mocked).filter((c) => !rust.has(c));
@@ -120,13 +229,33 @@ const staleInMock = sorted(mocked).filter((c) => !rust.has(c));
 // registered-but-uncalled name is just as dead a rule as an invented one.
 const staleReadRule = sorted(extraReads).filter((c) => !rust.has(c) || !frontend.has(c));
 const uncovered = sorted(frontend).filter((c) => !mocked.has(c));
+const uncoveredReads = uncovered.filter(isRead);
+const uncoveredWrites = uncovered.filter((c) => !isRead(c));
 
 const pct = ((frontend.size - uncovered.length) / frontend.size) * 100;
 console.log(`Rust commands registered : ${rust.size}`);
 console.log(`invoked by the frontend  : ${frontend.size}`);
 console.log(`faked by qa-mock.js      : ${frontend.size - uncovered.length} (${pct.toFixed(0)}%)`);
-console.log(`no fixture               : ${uncovered.length}`);
-if (LIST && uncovered.length) console.log(`\nNo fixture:\n  ${uncovered.join("\n  ")}`);
+console.log(`no fixture, reads        : ${uncoveredReads.length}`);
+console.log(`no fixture, mutations    : ${uncoveredWrites.length}`);
+console.log(`reached by nothing       : ${orphans.length} (allow-listed: ${orphans.length - newOrphans.length})`);
+// Reads are named without --list. There are few enough to act on, and a figure
+// nobody can act on is how this number went decorative in the first place.
+if (uncoveredReads.length) {
+  console.log(
+    `\nReads with no fixture (the pane draws from nothing):\n  ${uncoveredReads.join("\n  ")}`,
+  );
+}
+if (LIST && uncoveredWrites.length) {
+  console.log(`\nMutations with no fixture:\n  ${uncoveredWrites.join("\n  ")}`);
+}
+if (LIST && orphans.length) {
+  console.log(
+    `\nReached by nothing:\n  ${orphans
+      .map((c) => `${c} — ${KNOWN_ORPHANS[c] ?? "NOT allow-listed"}`)
+      .join("\n  ")}`,
+  );
+}
 
 let failed = false;
 if (missingInRust.length) {
@@ -154,8 +283,26 @@ if (staleReadRule.length) {
     `\nDRIFT — qa-mock.js EXTRA_READS names ${staleReadRule.length} command(s) the app never invokes, so the rule can never fire:\n  ${staleReadRule.join("\n  ")}`,
   );
 }
+if (newOrphans.length) {
+  failed = true;
+  console.error(
+    `\nDRIFT — the host registers ${newOrphans.length} command(s) nothing reaches: no caller ` +
+      `outside src/api.ts, no mention in the agent's tools, not on KNOWN_ORPHANS:\n  ${newOrphans.join("\n  ")}\n` +
+      `Either wire it up, delete it, or add it to KNOWN_ORPHANS in this file with the reason.`,
+  );
+}
+// Not a failure: an allow-listed name that has been wired up, or taken out of
+// the host altogether, is the debt being paid. It still has to be said, or the
+// list rots into cover for the next orphan.
+if (healedOrphans.length) {
+  console.log(
+    `\nKNOWN_ORPHANS is stale — ${healedOrphans.length} entr(y/ies) are no longer orphans ` +
+      `(reached again, or no longer registered); drop them from the list:\n  ${healedOrphans.join("\n  ")}`,
+  );
+}
 if (failed) process.exit(1);
 console.log(
   `\nNo drift: every invoked command exists, every fixture names a real command, ` +
-    `all ${extraReads.size} EXTRA_READS rules can fire.`,
+    `all ${extraReads.size} EXTRA_READS rules can fire, and the ${orphans.length} command(s) ` +
+    `nothing reaches are all written down.`,
 );

@@ -52,7 +52,10 @@ test("every line of an episode goes through the same door one sentence does", ()
   );
   // The ONLY sidecar call in the recording path is the synthesis one, and the
   // text it sends is what came back OUT of the door.
-  const sidecarCalls = AUDIO.match(/sidecar_json\(/g) || [];
+  // Any of the `sidecar_json*` family — the synthesis call is the cancellable
+  // one now (Stop must reach it mid-episode), and counting only the plain name
+  // would have gone quiet on exactly the line it is here to watch.
+  const sidecarCalls = AUDIO.match(/sidecar_json\w*\(/g) || [];
   assert.equal(sidecarCalls.length, 1, "one outbound call, and it is the audited one");
   assert.match(AUDIO, /"\/tts\/podcast"/);
   // The per-host Preview is the same act on a smaller scale and rides the same
@@ -152,4 +155,42 @@ test("every podcast command is registered, invoked and faked", () => {
   assert.ok(a !== -1 && b !== -1, "the fixture has a two-host cast");
   const voiceOf = (at) => MOCK.slice(at).match(/voice: "([^"]*)"/)[1];
   assert.notEqual(voiceOf(a), voiceOf(b), "the fixture's hosts differ in voice");
+});
+
+test("the cast a host is saved under is trimmed, or their lines fall to the default voice", () => {
+  // The recorder joins a turn to its host by the host's name as stored — only
+  // the TURN's speaker is trimmed — while `set_podcast_cast` re-folds the turns
+  // onto the trimmed spelling. A cast saved as "Ada " therefore matches none of
+  // Ada's own lines, and the whole episode reads her in the default voice,
+  // discovered after a multi-minute cloud render. The panel is the only writer
+  // of a typed name, so it trims on the way in.
+  assert.match(AUDIO, /h\.name\.eq_ignore_ascii_case\(t\.speaker\.trim\(\)\)/);
+  const sent = PANEL.match(/setPodcastCast\(fileId,\s*([A-Za-z_]\w*)\)/);
+  assert.ok(sent, "the panel saves the cast through setPodcastCast");
+  assert.match(
+    PANEL,
+    new RegExp(`const ${sent[1]} = [\\s\\S]{0,120}name: [^;]*\\.trim\\(\\)`),
+    "the cast the panel sends must carry trimmed host names",
+  );
+});
+
+test("only one voice preview can be playing, and its blob is let go", () => {
+  // Two hosts may share a name, so a preview keyed by name lit Stop on the
+  // wrong row and stopped a host nobody had pressed.
+  assert.ok(
+    !/previewing === host\.name/.test(PANEL),
+    "preview state must not be keyed by a name two hosts can share",
+  );
+  // Synthesis is a cloud round trip: a second Preview during it used to play
+  // on top of the first and orphan whichever element the ref no longer held.
+  assert.match(PANEL, /previewEpoch\.current/);
+  assert.ok(
+    /const b64 = await api\.previewPodcastVoice\([\s\S]{0,700}?previewEpoch\.current\) return;/.test(
+      PANEL,
+    ),
+    "a preview that comes back superseded must drop its clip",
+  );
+  // …and the WAV behind each preview is released rather than held for the life
+  // of the window.
+  assert.match(PANEL, /URL\.revokeObjectURL/);
 });
