@@ -3,6 +3,76 @@
 All notable, user-facing changes to Arcelle. Versions follow
 [semver](https://semver.org); dates are the GitHub release dates.
 
+## 0.24.1 — 2026-08-19
+
+A full review of every page and both surfaces — what you click and what the
+assistant does — and the fixes it produced. Then a hand-run of the whole test
+plan on the installed app, which found five more.
+
+### The privacy door was open on a whole class of cloud model
+
+If you asked a question of an Ollama hosted model whose name ends `-cloud`
+rather than `:cloud` — `gpt-oss:120b-cloud`, `qwen3-vl:235b-cloud` — the door
+read it as running on your Mac and let the question leave unredacted, images
+and all. The same hole was there for a model that only *sounds* local: point
+Ollama at another computer and `qwen3.5:4b` is a name, not a promise. The app
+now knows the difference, because the name cannot tell it.
+
+If you have used a `-cloud` model with cloud privacy on, treat what you asked
+it as having left this Mac in full.
+
+### Quit no longer throws away an unsaved note
+
+⌘Q, and Quit from the Apple menu, closed Arcelle without a word and took any
+unsaved edit with it. There was a guard; macOS never gave it the chance to
+run. Both now ask, and Cancel means "not this time" rather than "never again" —
+a second ⌘Q asks again.
+
+Quit from the Dock icon, and a logout or restart, still cannot be held. A live
+recording is still written out in those cases; an unsaved note is not.
+
+### Downloading a model with a capital letter no longer breaks it forever
+
+Typing `Gpt-oss:120b-cloud` in the download field — one stray capital, which
+macOS's own auto-capitalisation is happy to add for you — downloaded a model
+that appeared in the list and failed on every single question with
+`model not found`. Names are normalised now, except where they belong to a
+registry that is case-sensitive.
+
+### The privacy scan works on Macs with a tagged build of the default model
+
+If the model you have installed is a build of the default rather than the
+default exactly — `qwen3.5:4b-mlx`, say — the app was asking for a model that
+was not there. The scan of your files for private details failed on all of
+them, every time, without saying why. Anything else that falls back to the
+local model was failing the same way.
+
+### Background jobs after a recording
+
+Reading a recording never released the app's single work slot, so the next
+job — a summary, a download, a file pass — sat at "queued" until you restarted
+Arcelle.
+
+### Notes
+
+Preview no longer eats what you have written. The editor is kept alive behind
+the preview, so your unsaved text, ⌘S and the unsaved-edits prompt all survive
+a look at the page — and coming back to Source shows it laid out properly
+rather than every line on top of every other.
+
+Escape in a note now does what it does everywhere else in the app: closes the
+file, and asks first if there is anything to lose. It used to do nothing at
+all.
+
+### Asked and answered honestly
+
+A question the room cannot answer says so, instead of coming back with the six
+least-unrelated passages under a heading calling them context from your files.
+Stopping an answer before it starts says it was stopped, rather than blaming
+the app for losing it and inviting a retry that can run the same job twice.
+Saving or downloading a link whose address carries a name you have protected is
+refused, as fetching one already was.
+
 ## 0.24.0 — 2026-08-16
 
 ### Tracker blocking actually works
