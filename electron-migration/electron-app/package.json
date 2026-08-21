@@ -1,0 +1,31 @@
+{
+  "name": "arcelle-electron",
+  "private": true,
+  "version": "0.0.1",
+  "type": "module",
+  "description": "Migration workspace: Electron main process + dbHost, built and tested standalone against the shared/ contract before cutover. See electron-migration/PLAN.md.",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc -b --noEmit"
+  },
+  "dependencies": {
+    "better-sqlite3-multiple-ciphers": "^12.4.1",
+    "@ghostery/adblocker-electron": "^2.11.0",
+    "@mozilla/readability": "^0.5.0",
+    "linkedom": "^0.18.5",
+    "@modelcontextprotocol/sdk": "^1.15.0",
+    "libsodium-wrappers": "^0.7.15",
+    "sharp": "^0.34.2",
+    "undici": "^7.10.0",
+    "koffi": "^2.9.0"
+  },
+  "devDependencies": {
+    "electron": "^43.4.1",
+    "electron-builder": "^26.0.12",
+    "typescript": "~5.8.3",
+    "vitest": "^3.2.4",
+    "@types/node": "^22.10.2",
+    "@types/better-sqlite3": "^7.6.13"
+  }
+}

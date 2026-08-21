@@ -48,6 +48,7 @@ dependencies = [
     # that PyInstaller bundles without system libs.
     "requests>=2.32",
     "beautifulsoup4>=4.12",
+    "numpy>=2.4.6",
 ]
 
 [project.optional-dependencies]
