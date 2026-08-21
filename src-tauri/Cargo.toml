@@ -34,7 +34,7 @@ tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"] }
+rusqlite = { version = "0.40", features = ["bundled-sqlcipher-vendored-openssl"] }
 uuid = { version = "1", features = ["v4"] }
 reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"] }
 # Charset-aware decoding of fetched pages (legacy Hebrew sites serve
@@ -42,8 +42,8 @@ reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"] }
 encoding_rs = "0.8"
 tokio = { version = "1", features = ["process", "io-util", "time", "sync", "rt", "net", "macros"] }
 futures-util = "0.3"
-base64 = "0.22"
-sha2 = "0.10"
+base64 = "0.23"
+sha2 = "0.11"
 # PRIV-1: fast multi-pattern find/replace for the privacy gatekeeper's
 # mechanical door (already in the lock as a transitive dep of regex).
 aho-corasick = "1"
@@ -52,10 +52,10 @@ aho-corasick = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 # ADD-19: recovery-key sidecar crypto (AES-256-GCM + PBKDF2). base64/sha2
 # above are reused; these three are the only new crypto deps.
-aes-gcm = "0.10"
-pbkdf2 = "0.12"
-rand = "0.8"
-sysinfo = "0.33"
+aes-gcm = "0.11"
+pbkdf2 = "0.13"
+rand = "0.10"
+sysinfo = "0.39"
 # Owner replacement #1: the host's own event log (`src/obs.rs`). The sidecar's
 # stderr was already mirrored to a file; the HOST's decisions — which tools were
 # served to which engine, which model a turn picked, whether a Stop was accepted
@@ -69,10 +69,10 @@ sysinfo = "0.33"
 # pulls a regex engine for syntax `filter::Targets` already parses.
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt", "registry"] }
-zip = { version = "2", default-features = false, features = ["deflate"] }
-pdf-extract = "0.7"
+zip = { version = "8", default-features = false, features = ["deflate"] }
+pdf-extract = "0.12"
 mime_guess = "2"
-imagesize = "0.13"
+imagesize = "0.15"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff"] }
 umya-spreadsheet = { version = "3.0.0", default-features = false }
 # ADD-18: on-device speech-to-text — whisper.cpp compiled into the app (Metal
@@ -272,7 +272,7 @@ strip = "symbols"
 overflow-checks = true
 
 [dev-dependencies]
-rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"] }
+rusqlite = { version = "0.40", features = ["bundled-sqlcipher-vendored-openssl"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 # ADD-27: mock-app harness for the live-recording engine integration test.
 tauri = { version = "2", features = ["test"] }
