@@ -420,6 +420,30 @@ describe("migrate", () => {
     expect(() => migrate(db)).not.toThrow();
   });
 
+  it("dedupeParkedJobs does not collide two different (kind,title) pairs that concatenate to the same string", () => {
+    // workIdentity's fields must be joined with a separator, not plain
+    // concatenation: kind="ab"/title="cd" and kind="a"/title="bcd" concatenate
+    // to the identical string "abcd" for the same plan, so a join without a
+    // delimiter would make dedupeParkedJobs treat two UNRELATED parked jobs as
+    // duplicate attempts at the same unit of work and silently delete one.
+    const db = openWithFullSchema();
+    db.prepare(
+      `INSERT INTO jobs(id, kind, title, plan, status, created_at)
+       VALUES ('j1', 'ab', 'cd', '{}', 'paused', '2020-01-01T00:00:00Z')`,
+    ).run();
+    db.prepare(
+      `INSERT INTO jobs(id, kind, title, plan, status, created_at)
+       VALUES ('j2', 'a', 'bcd', '{}', 'paused', '2020-01-02T00:00:00Z')`,
+    ).run();
+
+    migrate(db);
+
+    const remaining = (db.prepare("SELECT id FROM jobs WHERE id IN ('j1','j2')").all() as Array<{ id: string }>)
+      .map((r) => r.id)
+      .sort();
+    expect(remaining, "two distinct jobs must not collapse into one identity").toEqual(["j1", "j2"]);
+  });
+
   it("a reindex repair that fails halfway keeps the room's old search index", () => {
     // Same property as schema.rs's `a_reindex_that_fails_halfway_keeps_the_old_index`,
     // exercised through the public migrate() entry point (reindexOneFile is

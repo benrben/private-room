@@ -795,12 +795,24 @@ function rebuildMarkedHebrewChunks(db: Database.Database): void {
 // best-effort, is a single UPDATE and is inlined rather than pulled in via a
 // cross-module import that does not exist yet.
 
-/** The identity two job rows share when they are the SAME unit of work. */
+/**
+ * The identity two job rows share when they are the SAME unit of work.
+ *
+ * Fields are joined with the ASCII unit separator (U+001F), matching the
+ * Rust `work_identity` exactly (`format!("{kind}\u{1f}{title}\u{1f}{plan}")`).
+ * This is load-bearing, not cosmetic: plain concatenation lets two genuinely
+ * different jobs collide onto the same identity string (kind="ab", title="cd"
+ * and kind="a", title="bcd" both concatenate to "abcd" for the same plan),
+ * which would make `dedupeParkedJobs` silently delete an unrelated parked job
+ * as though it were a duplicate of another.
+ */
+const WORK_IDENTITY_SEP = "";
+
 function workIdentity(kind: string, title: string, plan: unknown): string {
   if (kind === "workflow") {
     const wf = plan && typeof plan === "object" ? (plan as Record<string, unknown>)["workflow_id"] : undefined;
     if (typeof wf === "string" && wf !== "") {
-      return `workflow${wf}`;
+      return `workflow${WORK_IDENTITY_SEP}${wf}`;
     }
   }
   if (
@@ -809,9 +821,9 @@ function workIdentity(kind: string, title: string, plan: unknown): string {
     typeof plan === "object" &&
     (plan as Record<string, unknown>)["auto"] === true
   ) {
-    return "deep_summaryauto";
+    return `deep_summary${WORK_IDENTITY_SEP}auto`;
   }
-  return `${kind}${title}${JSON.stringify(plan)}`;
+  return `${kind}${WORK_IDENTITY_SEP}${title}${WORK_IDENTITY_SEP}${JSON.stringify(plan)}`;
 }
 
 /** Every PARKED top-level job row, oldest first, paired with its identity. */
