@@ -8,8 +8,11 @@ use super::*;
 ///
 /// The yt-dlp binary is NOT bundled: it downloads on first use to the app's
 /// data dir (the Whisper-model doctrine — nothing else to install, nothing
-/// GPL-linked rides in the DMG) and can be re-fetched any time YouTube breaks
-/// old extractors. Both the binary fetch and the video download are labeled
+/// GPL-linked rides in the DMG) and keeps ITSELF fresh: YouTube rotates its
+/// player scheme every few weeks and a stale yt-dlp starts failing every
+/// download with `HTTP Error 403` (seen 2026-08-21, binary from July), so a
+/// copy older than [`YTDLP_STALE_AFTER`] runs its own `-U` before the next
+/// download. Both the binary fetch and the video download are labeled
 /// outbound network moments, kicked off only by an explicit user action.
 const YTDLP_URL: &str =
     "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_macos";
@@ -54,6 +57,16 @@ const MIN_YTDLP_BYTES: u64 = 1024 * 1024;
 
 /// How long the whole downloader fetch may take.
 const YTDLP_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// After this long the installed downloader is treated as stale and asked to
+/// update itself. YouTube's player rotation breaks old extractors on roughly
+/// a monthly cadence; well under that keeps downloads working between waves.
+const YTDLP_STALE_AFTER: std::time::Duration =
+    std::time::Duration::from_secs(14 * 24 * 60 * 60);
+
+/// How long the self-update may take before the download proceeds with the
+/// old binary anyway (an update is ~38 MB from GitHub).
+const YTDLP_UPDATE_BUDGET: std::time::Duration = std::time::Duration::from_secs(180);
 
 /// Is this the head of a macOS executable?
 ///
@@ -109,6 +122,7 @@ async fn ensure_ytdlp(
     use futures_util::StreamExt;
     let dest = ytdlp_path(app)?;
     if dest.exists() {
+        refresh_ytdlp_if_stale(&dest, progress).await;
         return Ok(dest);
     }
     if YTDLP_DOWNLOADING.swap(true, Ordering::SeqCst) {
@@ -198,6 +212,46 @@ pub(crate) fn parse_ytdlp_percent(line: &str) -> Option<f64> {
         .and_then(|tok| tok.trim_end_matches('%').parse::<f64>().ok())
 }
 
+/// The download's TOTAL size out of the same progress line — `42.7% of
+/// 871.20MiB` (or `of ~ 871.20MiB`, HLS totals are estimates). The first
+/// progress line announces where the download is headed, so a video the room
+/// will refuse anyway ([`web::MAX_DOWNLOAD_BYTES`], owner-confirmed at 800 MB
+/// 2026-08-22) is stopped in its first second, not after the hour it takes to
+/// arrive.
+pub(crate) fn parse_ytdlp_total_bytes(line: &str) -> Option<u64> {
+    let line = line.trim();
+    if !line.starts_with("[download]") {
+        return None;
+    }
+    let mut toks = line.split_whitespace().peekable();
+    while let Some(tok) = toks.next() {
+        if tok != "of" {
+            continue;
+        }
+        // `of ~ 871.20MiB` and `of ~871.20MiB` both occur.
+        let size = match toks.peek() {
+            Some(&"~") => {
+                toks.next();
+                toks.next()?
+            }
+            Some(_) => toks.next()?,
+            None => return None,
+        };
+        let size = size.trim_start_matches('~');
+        let unit_at = size.find(|c: char| c.is_ascii_alphabetic())?;
+        let (num, unit) = size.split_at(unit_at);
+        let scale: u64 = match unit {
+            "B" => 1,
+            "KiB" => 1024,
+            "MiB" => 1024 * 1024,
+            "GiB" => 1024 * 1024 * 1024,
+            _ => return None,
+        };
+        return num.parse::<f64>().ok().map(|n| (n * scale as f64) as u64);
+    }
+    None
+}
+
 /// How often Stop and the overall budget are checked while the downloader is
 /// silent. Short enough that Stop feels immediate, long enough to cost nothing.
 const CANCEL_POLL: std::time::Duration = std::time::Duration::from_millis(250);
@@ -208,8 +262,98 @@ const CANCEL_POLL: std::time::Duration = std::time::Duration::from_millis(250);
 /// never noticed.
 const MEDIA_DOWNLOAD_BUDGET: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
+/// Let a downloader older than [`YTDLP_STALE_AFTER`] update itself before it
+/// is used. Best-effort on purpose: offline, GitHub down, or over budget all
+/// leave the old binary in place — it is still worth trying, and the download
+/// that follows will say so truthfully if it isn't.
+async fn refresh_ytdlp_if_stale(dest: &std::path::Path, progress: MediaProgress<'_>) {
+    let stale = std::fs::metadata(dest)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age > YTDLP_STALE_AFTER);
+    if !stale {
+        return;
+    }
+    // The first-install guard doubles as the update guard; contended means
+    // someone else is already refreshing, and the current binary still works.
+    if YTDLP_DOWNLOADING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    progress("Updating the video downloader…", None);
+    // kill_on_drop: an over-budget update is abandoned, not left running —
+    // yt-dlp replaces itself atomically at the end, so a kill mid-fetch just
+    // keeps the old binary.
+    let update = tokio::process::Command::new(dest)
+        .arg("-U")
+        .kill_on_drop(true)
+        .output();
+    if let Ok(Ok(out)) = tokio::time::timeout(YTDLP_UPDATE_BUDGET, update).await {
+        if out.status.success() {
+            // "Already up to date" leaves the file (and its mtime) untouched,
+            // which would re-run this check on every download for the rest of
+            // the release gap — mark the check done either way.
+            let _ = std::fs::File::options()
+                .write(true)
+                .open(dest)
+                .and_then(|f| f.set_modified(std::time::SystemTime::now()));
+        }
+    }
+    YTDLP_DOWNLOADING.store(false, Ordering::SeqCst);
+}
+
 /// How many trailing stderr lines are kept to explain a failure.
 const STDERR_TAIL_LINES: usize = 3;
+
+/// A system ffmpeg, if this Mac has one. The app's no-ffmpeg doctrine is about
+/// BUNDLING (nothing to sign or notarize, media_probe.rs) — it has never
+/// forbidden using an ffmpeg the owner already installed. The explicit paths
+/// come first because a GUI app's PATH is the bare system one: Homebrew,
+/// Intel-Homebrew and MacPorts don't appear in it.
+fn find_ffmpeg() -> Option<std::path::PathBuf> {
+    let mut candidates: Vec<std::path::PathBuf> = vec![
+        "/opt/homebrew/bin/ffmpeg".into(),
+        "/usr/local/bin/ffmpeg".into(),
+        "/opt/local/bin/ffmpeg".into(),
+    ];
+    if let Some(path) = std::env::var_os("PATH") {
+        candidates.extend(std::env::split_paths(&path).map(|dir| dir.join("ffmpeg")));
+    }
+    candidates.into_iter().find(|p| p.is_file())
+}
+
+/// Which formats to ask yt-dlp for. YouTube increasingly serves ONLY separate
+/// video and audio streams (no pre-muxed file at all — first seen 2026-08-21),
+/// and joining them needs ffmpeg. Without one, the merge branches must not be
+/// OFFERED: yt-dlp would pick them anyway and leave two unmerged files behind.
+///
+/// The merge branches prefer h264 (`avc1`): AVFoundation — the app's playback
+/// and probe stack — does not decode the VP9 that yt-dlp's plain "best" picks,
+/// so best-by-bitrate would import a video the room can't play. No size
+/// preference on purpose (owner call, 2026-08-22): quality is never traded
+/// away to fit a limit.
+fn format_selector(has_ffmpeg: bool) -> &'static str {
+    if has_ffmpeg {
+        "b[ext=mp4]/bv*[vcodec^=avc1]+ba[ext=m4a]/bv*[ext=mp4]+ba[ext=m4a]/b/bv*+ba"
+    } else {
+        "b[ext=mp4]/b"
+    }
+}
+
+/// The user-facing failure. The one failure shape the user can actually do
+/// something about — split-stream-only media on a machine with no ffmpeg —
+/// says what to do; everything else surfaces yt-dlp's own words.
+fn explain_download_failure(stderr_tail: &str, has_ffmpeg: bool) -> String {
+    let mut msg = format!("The download failed: {stderr_tail}");
+    if !has_ffmpeg && stderr_tail.contains("Requested format is not available") {
+        msg.push_str(
+            " This video is only offered as separate picture and sound streams, \
+             and joining them needs ffmpeg — install it (brew install ffmpeg) \
+             and try again.",
+        );
+    }
+    msg
+}
 
 /// A media file staged by yt-dlp: the work dir to sweep and the file inside it.
 pub(crate) struct MediaDownload {
@@ -218,7 +362,8 @@ pub(crate) struct MediaDownload {
 }
 
 /// BROWSE-2: download the media at any yt-dlp-supported URL into a temp work
-/// dir. Best pre-muxed MP4, else best single file — no ffmpeg needed.
+/// dir. Format choice is [`format_selector`]'s: pre-muxed first, split
+/// streams joined by a system ffmpeg when the machine has one.
 ///
 /// D16: yt-dlp is a subprocess doing its own networking, so the SSRF guard
 /// cannot pin its connections — it gets a pre-flight instead (literal check +
@@ -245,17 +390,21 @@ pub(crate) async fn download_media_to_temp(
     std::fs::create_dir_all(&work_dir).map_err(|e| e.to_string())?;
     progress("Downloading the video…", Some(0.0));
 
-    // Best pre-muxed MP4 (no ffmpeg needed), else best single file. Title is
-    // byte-clamped so the filename can't overflow macOS limits.
+    // Title is byte-clamped so the filename can't overflow macOS limits.
     let output = work_dir.join("%(title).100B.%(ext)s");
-    let mut child = tokio::process::Command::new(&bin)
-        .arg("--no-playlist")
+    let ffmpeg = find_ffmpeg();
+    let mut cmd = tokio::process::Command::new(&bin);
+    cmd.arg("--no-playlist")
         .arg("--newline")
         .arg("--no-warnings")
         .arg("-f")
-        .arg("b[ext=mp4]/b")
+        .arg(format_selector(ffmpeg.is_some()))
         .arg("-o")
-        .arg(&output)
+        .arg(&output);
+    if let Some(ff) = &ffmpeg {
+        cmd.arg("--ffmpeg-location").arg(ff);
+    }
+    let mut child = cmd
         .arg(url)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -294,6 +443,20 @@ pub(crate) async fn download_media_to_temp(
             tokio::select! {
                 next = lines.next_line() => match next {
                     Ok(Some(line)) => {
+                        // A file the room will refuse is abandoned on the
+                        // FIRST progress line, not after it fully arrives —
+                        // same truthful refusal, an hour earlier.
+                        if let Some(total) = parse_ytdlp_total_bytes(&line) {
+                            if total > crate::web::MAX_DOWNLOAD_BYTES {
+                                abandoned = Some(format!(
+                                    "This video is about {} MB — larger than the {} MB \
+                                     limit for a room file. Stopped before downloading it.",
+                                    total / (1024 * 1024),
+                                    crate::web::MAX_DOWNLOAD_BYTES / (1024 * 1024)
+                                ));
+                                break;
+                            }
+                        }
                         if let Some(pct) = parse_ytdlp_percent(&line) {
                             progress("Downloading the video…", Some(pct));
                         }
@@ -332,7 +495,7 @@ pub(crate) async fn download_media_to_temp(
             None => String::new(),
         };
         let _ = std::fs::remove_dir_all(&work_dir);
-        return Err(format!("The download failed: {tail}"));
+        return Err(explain_download_failure(&tail, ffmpeg.is_some()));
     }
 
     // The finished file is whatever yt-dlp left behind (partials are cleaned
@@ -358,7 +521,7 @@ pub(crate) async fn download_media_to_temp(
 }
 
 /// Download a YouTube video into the room. Fetches yt-dlp on first use, saves
-/// the best single-file MP4 to a private temp folder, imports it through the
+/// the best MP4 it can get to a private temp folder, imports it through the
 /// download funnel (so preview + background transcription just happen, and the
 /// file keeps its origin URL), then removes the temp copy.
 #[tauri::command]
@@ -473,5 +636,82 @@ mod tests {
         );
         assert!(CANCEL_POLL < MEDIA_DOWNLOAD_BUDGET);
         assert!(MIN_YTDLP_BYTES < MAX_YTDLP_BYTES);
+    }
+
+    /// YouTube serves many videos ONLY as separate picture and sound streams
+    /// now. Joining them needs ffmpeg, so the merge branches may be offered
+    /// exactly when one exists — offered without one, yt-dlp picks them anyway
+    /// and leaves two half-files behind; withheld with one, "Requested format
+    /// is not available" comes back for a video we could have downloaded.
+    #[test]
+    fn merge_formats_are_offered_exactly_when_ffmpeg_exists() {
+        assert!(!format_selector(false).contains('+'), "no ffmpeg, no merging");
+        assert!(format_selector(true).contains('+'), "ffmpeg unlocks split streams");
+        for selector in [format_selector(false), format_selector(true)] {
+            assert!(
+                selector.starts_with("b[ext=mp4]/"),
+                "a pre-muxed MP4 needs no merge work and must stay first: {selector}"
+            );
+        }
+    }
+
+    /// The one failure the user can fix themselves must say how; every other
+    /// failure keeps yt-dlp's own words, unembellished.
+    #[test]
+    fn a_split_stream_failure_without_ffmpeg_says_what_to_install() {
+        let format_err = "ERROR: [youtube] abc: Requested format is not available.";
+        assert!(explain_download_failure(format_err, false).contains("brew install ffmpeg"));
+        // With ffmpeg present that error means something else — don't prescribe.
+        assert!(!explain_download_failure(format_err, true).contains("ffmpeg"));
+        let other = "ERROR: unable to download video data: HTTP Error 403: Forbidden";
+        let explained = explain_download_failure(other, false);
+        assert!(explained.contains(other) && !explained.contains("brew"));
+    }
+
+    /// The size a download is headed for rides its progress lines; a video
+    /// over the room-file limit must be recognized there so it is refused in
+    /// its first second, not after it fully arrives. Lines that merely
+    /// contain "of" (fragment counters, retry counters) must never parse as
+    /// a size — a false positive aborts a legitimate download.
+    #[test]
+    fn the_total_size_is_read_from_progress_lines_and_noise_never_aborts() {
+        let mib = 1024 * 1024;
+        assert_eq!(
+            parse_ytdlp_total_bytes("[download]  42.7% of 12.3MiB at 1.2MiB/s"),
+            Some((12.3f64 * mib as f64) as u64)
+        );
+        // HLS totals arrive as estimates, both spellings.
+        assert_eq!(
+            parse_ytdlp_total_bytes("[download]   0.1% of ~ 871.20MiB at 11.33MiB/s"),
+            Some((871.2f64 * mib as f64) as u64)
+        );
+        assert_eq!(
+            parse_ytdlp_total_bytes("[download]   0.1% of ~4.71GiB at 1MiB/s"),
+            Some((4.71f64 * 1024.0 * mib as f64) as u64)
+        );
+        assert_eq!(
+            parse_ytdlp_total_bytes("[download] 100% of 246.27KiB in 00:00:00"),
+            Some((246.27f64 * 1024.0) as u64)
+        );
+        assert_eq!(
+            parse_ytdlp_total_bytes("[download] Downloading fragment 1 of 100"),
+            None
+        );
+        assert_eq!(
+            parse_ytdlp_total_bytes("[download] Got error. Retrying (attempt 1 of 3)..."),
+            None
+        );
+        assert_eq!(parse_ytdlp_total_bytes("[youtube] abc: Downloading webpage"), None);
+        assert_eq!(parse_ytdlp_total_bytes(""), None);
+    }
+
+    /// The self-update exists because a July binary met August's YouTube with
+    /// a 403 on every video. Stale must come WELL before the observed monthly
+    /// breakage cadence, and the update budget must stay a pause, not a hang.
+    #[test]
+    fn the_downloader_goes_stale_before_youtube_breaks_it() {
+        assert!(YTDLP_STALE_AFTER <= std::time::Duration::from_secs(21 * 24 * 60 * 60));
+        assert!(YTDLP_STALE_AFTER >= std::time::Duration::from_secs(24 * 60 * 60));
+        assert!(YTDLP_UPDATE_BUDGET < MEDIA_DOWNLOAD_BUDGET);
     }
 }
