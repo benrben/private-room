@@ -2,7 +2,7 @@
   "name": "arcelle",
   "private": true,
   "license": "UNLICENSED",
-  "version": "0.24.1",
+  "version": "0.25.0",
   "type": "module",
   "scripts": {
     "dev": "vite",

@@ -3,6 +3,42 @@
 All notable, user-facing changes to Arcelle. Versions follow
 [semver](https://semver.org); dates are the GitHub release dates.
 
+## 0.25.0 — 2026-08-22
+
+YouTube downloads had quietly died, twice over. This release brings them back
+and gives you a say in what "the video" means.
+
+### Video downloads work again — and keep themselves working
+
+The app's video downloader was installed once and never updated, and last
+month's YouTube changes broke it: every download failed with a bare
+"HTTP Error 403: Forbidden". The downloader now updates itself when it is more
+than two weeks old, so it keeps up with the sites it downloads from.
+
+Behind that first failure hid a second: YouTube now offers many videos only as
+separate picture and sound tracks, and the app only knew how to save a single
+combined file. If your Mac has ffmpeg (Homebrew's is found automatically), the
+app now downloads both tracks and joins them — preferring a format your Mac
+can actually play. Without ffmpeg, the failure finally says the useful thing:
+what to install.
+
+### Pick the quality before the download, not after
+
+Choosing "Video + transcript" in the Add-link sheet now shows which qualities
+that video actually comes in — 1080p, 720p, 480p, whatever it truly offers,
+with the site's own size estimate next to each. Pick one, or leave it on Best.
+A quality too large for a room file says so up front and can't be picked; if
+the best quality is over the limit, the sheet starts you on the largest one
+that fits.
+
+### A too-big video is refused in a second, not after an hour
+
+The room-file ceiling rises from 800 MB to 900 MB — the true storage limit is
+just under a gigabyte, and an 832 MB video had been turned away for no good
+reason. And when a download *is* headed past the limit, the app now reads the
+size off the first progress report and stops right there, instead of letting
+you watch a progress bar for an hour and then refusing the result.
+
 ## 0.24.1 — 2026-08-19
 
 A full review of every page and both surfaces — what you click and what the
