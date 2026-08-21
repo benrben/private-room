@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { api, RoomInfo } from "../api";
+import { api, MediaQualityOption, RoomInfo } from "../api";
 import { CloseIcon, LinkIcon, LockIcon } from "../icons";
 import Settings from "../Settings";
 import { WSState } from "./state";
@@ -111,6 +111,14 @@ export default function SettingsModals({
 /** The ADD-12 add-link modal, plus the ADD-26 "also save the video" path for
  * YouTube links. Mounted only while open, so the checkbox/progress state
  * resets each time. */
+/** A byte estimate the way a person sizes a download. */
+function fmtSize(bytes: number): string {
+  const gib = 1024 ** 3;
+  return bytes >= gib
+    ? `${(bytes / gib).toFixed(1)} GB`
+    : `${Math.round(bytes / 1024 ** 2)} MB`;
+}
+
 function AddLinkModal({ s, a }: { s: WSState; a: WSActions }) {
   const [saveVideo, setSaveVideo] = useState(false);
   const [downloading, setDownloading] = useState(false);
@@ -118,6 +126,11 @@ function AddLinkModal({ s, a }: { s: WSState; a: WSActions }) {
     status: string;
     percent: number | null;
   } | null>(null);
+  // The quality picker: what THIS video offers (probed, never assumed),
+  // which resolution the user chose, and null while "Best" is the choice.
+  const [qualities, setQualities] = useState<MediaQualityOption[] | null>(null);
+  const [probing, setProbing] = useState(false);
+  const [maxHeight, setMaxHeight] = useState<number | null>(null);
   const isYoutube = isYoutubeUrl(s.linkUrl);
 
   // ADD-26: follow yt-dlp while the modal is open.
@@ -128,6 +141,44 @@ function AddLinkModal({ s, a }: { s: WSState; a: WSActions }) {
     };
   }, []);
 
+  // Ask the site which qualities the video comes in, debounced while the URL
+  // is being typed. A probe that fails (not a video page, unsupported site)
+  // just hides the picker — the download itself still reports truthfully.
+  useEffect(() => {
+    if (!saveVideo) return;
+    const url = s.linkUrl.trim();
+    setQualities(null);
+    setMaxHeight(null);
+    if (!url) return;
+    let stale = false;
+    setProbing(true);
+    const t = setTimeout(() => {
+      api
+        .listMediaFormats(url)
+        .then((q) => {
+          if (stale) return;
+          setQualities(q);
+          // "Best" is only a sane default when the best actually fits the
+          // room — otherwise start on the largest quality that does.
+          if (q.length > 0 && !q[0].fits) {
+            const fitting = q.find((o) => o.fits);
+            if (fitting) setMaxHeight(fitting.height);
+          }
+        })
+        .catch(() => {
+          if (!stale) setQualities(null);
+        })
+        .finally(() => {
+          if (!stale) setProbing(false);
+        });
+    }, 600);
+    return () => {
+      stale = true;
+      clearTimeout(t);
+      setProbing(false);
+    };
+  }, [saveVideo, s.linkUrl]);
+
   /** ADD-26 → BROWSE-2: download the video and let the room transcribe it
    * on-device. Shared by the explicit video option (any yt-dlp-supported
    * site, not just YouTube) and the automatic no-captions fallback. The
@@ -136,7 +187,7 @@ function AddLinkModal({ s, a }: { s: WSState; a: WSActions }) {
   async function downloadAndTranscribe(url: string): Promise<boolean> {
     setDownloading(true);
     try {
-      const report = await api.importMediaUrl(url);
+      const report = await api.importMediaUrl(url, maxHeight ?? undefined);
       s.setFiles(await api.listFiles());
       if (report.errors.length > 0) {
         s.pushToast("error", report.errors.join("\n"));
@@ -324,6 +375,59 @@ function AddLinkModal({ s, a }: { s: WSState; a: WSActions }) {
               </span>
             </button>
           </div>
+          {/* The quality row: only what THIS video actually offers, probed
+              live — never a hardcoded ladder. Sizes are the site's own
+              estimates; a quality too big for a room file says so instead
+              of failing after the download. */}
+          {saveVideo && (probing || (qualities?.length ?? 0) > 0) && (
+            <div className="yt-quality" role="radiogroup" aria-label="Video quality">
+              {probing ? (
+                <span className="yt-quality-hint">
+                  Checking which qualities this video offers…
+                </span>
+              ) : (
+                <>
+                  <button
+                    className={`yt-quality-opt${maxHeight === null ? " active" : ""}`}
+                    role="radio"
+                    aria-checked={maxHeight === null}
+                    disabled={
+                      s.importingLink ||
+                      downloading ||
+                      (qualities!.length > 0 && !qualities![0].fits)
+                    }
+                    title={
+                      qualities!.length > 0 && !qualities![0].fits
+                        ? "The best quality is too big for a room file"
+                        : undefined
+                    }
+                    onClick={() => setMaxHeight(null)}
+                  >
+                    Best
+                  </button>
+                  {qualities!.map((q) => (
+                    <button
+                      key={q.height}
+                      className={`yt-quality-opt${maxHeight === q.height ? " active" : ""}`}
+                      role="radio"
+                      aria-checked={maxHeight === q.height}
+                      disabled={s.importingLink || downloading || !q.fits}
+                      title={q.fits ? undefined : "Too big for a room file"}
+                      onClick={() => setMaxHeight(q.height)}
+                    >
+                      {q.height}p
+                      {q.approxBytes != null && (
+                        <span className="yt-quality-size">
+                          {" "}
+                          · ~{fmtSize(q.approxBytes)}
+                        </span>
+                      )}
+                    </button>
+                  ))}
+                </>
+              )}
+            </div>
+          )}
           {downloading && (
             <span className="banner-pull">
               <span className="banner-pull-label">

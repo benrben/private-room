@@ -273,6 +273,40 @@
   line-height: var(--lh-body);
 }
 
+/* The video-quality chips: same radio grammar as .yt-mode-opt (edge in
+   --rule-strong, the chosen one circled by the accent) at chip scale, wrapping
+   because the list is the VIDEO's — 8K footage offers more rows than a
+   webinar. */
+.yt-quality {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0 0 4px;
+}
+.yt-quality-opt {
+  padding: 4px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--rule-strong);
+  background: transparent;
+  font-size: var(--fs-micro);
+  cursor: pointer;
+}
+.yt-quality-opt.active {
+  border-color: var(--accent);
+  background: var(--accent-ghost);
+}
+.yt-quality-opt:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.yt-quality-size {
+  color: var(--muted);
+}
+.yt-quality-hint {
+  font-size: var(--fs-micro);
+  color: var(--muted);
+}
+
 /* A tally beside a heading: an outlined capsule, drawn rather than filled, so
    it never competes with the marker badges that actually mean something. */
 .count {

@@ -180,7 +180,8 @@ async fn run_download(
             let done = pct.unwrap_or(0.0).clamp(0.0, 100.0) as usize;
             emit_progress(window, job_id, status, done, 100);
         };
-        let media = download_media_to_temp(app, url, Some(cancel), &progress).await?;
+        // The background job has no picker in front of it — best quality.
+        let media = download_media_to_temp(app, url, None, Some(cancel), &progress).await?;
         let name = media
             .path
             .file_name()

@@ -260,9 +260,11 @@ pub async fn fetch_readable(url: &str) -> Result<(String, String, Vec<u8>), Stri
 // ---------------------------------------------------------------- binary downloads (BROWSE-2)
 
 /// D15: hard per-file cap for anything downloaded into the room. A room file is
-/// one SQLite blob with a practical ceiling of ~1 GB — refuse before storage
-/// does, with a message that names the real limit.
-pub const MAX_DOWNLOAD_BYTES: u64 = 800 * 1024 * 1024;
+/// one SQLite blob with a hard ceiling of ~953 MB (SQLite's 10^9-byte blob
+/// limit) — refuse before storage does, with a message that names the real
+/// limit. 800 → 900 MB on the owner's call (2026-08-22, an 832 MB video was
+/// refused); the remaining ~50 MB is the storage ceiling's headroom, not taste.
+pub const MAX_DOWNLOAD_BYTES: u64 = 900 * 1024 * 1024;
 
 /// D18: how much `download_url` fetches inline (within one tool call). Anything
 /// bigger belongs on the durable-job tier, not in a chat round.

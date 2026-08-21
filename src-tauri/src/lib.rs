@@ -389,6 +389,7 @@ pub fn run() {
             commands::resolve_agent_ui,
             commands::import_youtube_video,
             commands::import_media_url,
+            commands::list_media_formats,
             commands::cancel_media_download,
             commands::start_download_job,
             // The Create page: which models can make a picture, and the job

@@ -220,6 +220,16 @@ export interface ImportReport {
   errors: string[];
 }
 
+/** One quality a video offers, for the download modal's picker. `approxBytes`
+ *  is the estimated finished size when the site states one — absent means
+ *  "size unknown", never a made-up number. `fits` says whether that estimate
+ *  fits the room-file cap. */
+export interface MediaQualityOption {
+  height: number;
+  approxBytes: number | null;
+  fits: boolean;
+}
+
 /** A single AI action definition surfaced in the file/room "AI actions" menu.
  *  `scope` decides where it appears (file context menu vs whole-room area);
  *  `needsQuestion` is true only for "research", which shows an extra field. */

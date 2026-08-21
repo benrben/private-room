@@ -32,6 +32,7 @@ import type {
   SavedVoice,
   RoomInfo,
   ImportReport,
+  MediaQualityOption,
   FileMeta,
   TrashedFile,
   BulkReport,
@@ -1417,9 +1418,16 @@ export const api = {
   syncViewMenu: (view: ViewMenuState) => invoke<void>("menu_sync", { view }),
 
   /** ADD-26 / BROWSE-2: download a video or audio page into the room via
-   *  yt-dlp (fetched on first use), YouTube included. Emits ytdlp-progress. */
-  importMediaUrl: (url: string) =>
-    invoke<ImportReport>("import_media_url", { url }),
+   *  yt-dlp (fetched on first use), YouTube included. Emits ytdlp-progress.
+   *  `maxHeight` caps the resolution (the modal's quality pick); omitted =
+   *  best available. */
+  importMediaUrl: (url: string, maxHeight?: number) =>
+    invoke<ImportReport>("import_media_url", { url, maxHeight }),
+  /** The qualities a video actually offers, best first — feeds the modal's
+   *  picker. A metadata-only probe, but still an outbound reach (same web
+   *  gating as the download). */
+  listMediaFormats: (url: string) =>
+    invoke<MediaQualityOption[]>("list_media_formats", { url }),
   /** Abandon the video download running now. The command itself then rejects
    *  with "Stopped." — a download you started by mistake used to have no way
    *  out short of quitting the app. */

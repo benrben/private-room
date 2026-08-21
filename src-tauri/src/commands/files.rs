@@ -1160,7 +1160,7 @@ pub(crate) async fn import_link_and_index(
 /// - a YouTube link saves its captions (no video download),
 /// - an ordinary readable page saves a Markdown copy,
 /// - anything that isn't text (a PDF, an image, a media file) goes through the
-///   binary funnel — [`import_download`] — so it gets the 800 MB cap, MarkItDown
+///   binary funnel — [`import_download`] — so it gets the room-file cap, MarkItDown
 ///   extraction and the OCR/STT lanes for free.
 ///
 /// The text branches deliberately go through [`save_web_markdown`], which

@@ -295,7 +295,7 @@ fn data_url(mime: &str, bytes: &[u8]) -> String {
 /// The ＋ button. One funnel with three branches, all of them existing
 /// machinery: a YouTube link saves its captions, an ordinary page saves a
 /// readable Markdown copy, and anything that isn't text (a PDF, a media file)
-/// goes through the binary download funnel with its 800 MB cap. Every branch
+/// goes through the binary download funnel with its room-file cap. Every branch
 /// records `origin_url`, so the room remembers where the source came from.
 #[tauri::command]
 pub async fn import_search_result(

@@ -215,9 +215,8 @@ pub(crate) fn parse_ytdlp_percent(line: &str) -> Option<f64> {
 /// The download's TOTAL size out of the same progress line — `42.7% of
 /// 871.20MiB` (or `of ~ 871.20MiB`, HLS totals are estimates). The first
 /// progress line announces where the download is headed, so a video the room
-/// will refuse anyway ([`web::MAX_DOWNLOAD_BYTES`], owner-confirmed at 800 MB
-/// 2026-08-22) is stopped in its first second, not after the hour it takes to
-/// arrive.
+/// will refuse anyway ([`web::MAX_DOWNLOAD_BYTES`]) is stopped in its first
+/// second, not after the hour it takes to arrive.
 pub(crate) fn parse_ytdlp_total_bytes(line: &str) -> Option<u64> {
     let line = line.trim();
     if !line.starts_with("[download]") {
@@ -329,15 +328,177 @@ fn find_ffmpeg() -> Option<std::path::PathBuf> {
 ///
 /// The merge branches prefer h264 (`avc1`): AVFoundation — the app's playback
 /// and probe stack — does not decode the VP9 that yt-dlp's plain "best" picks,
-/// so best-by-bitrate would import a video the room can't play. No size
-/// preference on purpose (owner call, 2026-08-22): quality is never traded
-/// away to fit a limit.
-fn format_selector(has_ffmpeg: bool) -> &'static str {
-    if has_ffmpeg {
-        "b[ext=mp4]/bv*[vcodec^=avc1]+ba[ext=m4a]/bv*[ext=mp4]+ba[ext=m4a]/b/bv*+ba"
+/// so best-by-bitrate would import a video the room can't play. No automatic
+/// size preference on purpose (owner call, 2026-08-22): quality is never
+/// traded away to fit a limit — the RESOLUTION is the user's to pick
+/// (`max_height`, from the modal's quality chips), and their pick leads the
+/// chain with unconstrained fallbacks behind it, so a stale choice degrades
+/// to "best available" instead of failing.
+fn format_selector(has_ffmpeg: bool, max_height: Option<u32>) -> String {
+    let free: String = if has_ffmpeg {
+        "b[ext=mp4]/bv*[vcodec^=avc1]+ba[ext=m4a]/bv*[ext=mp4]+ba[ext=m4a]/b/bv*+ba".into()
     } else {
-        "b[ext=mp4]/b"
+        "b[ext=mp4]/b".into()
+    };
+    let Some(h) = max_height else {
+        return free;
+    };
+    let capped = if has_ffmpeg {
+        format!(
+            "b[ext=mp4][height<={h}]\
+             /bv*[vcodec^=avc1][height<={h}]+ba[ext=m4a]\
+             /bv*[ext=mp4][height<={h}]+ba[ext=m4a]\
+             /b[height<={h}]/bv*[height<={h}]+ba"
+        )
+    } else {
+        format!("b[ext=mp4][height<={h}]/b[height<={h}]")
+    };
+    format!("{capped}/{free}")
+}
+
+/// How long the quality probe (`-j`, metadata only) may take.
+const FORMAT_PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// One quality the user can pick before a video download: a resolution, what
+/// it roughly costs on disk, and whether the room can store it.
+#[derive(serde::Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct QualityOption {
+    pub height: u32,
+    /// Estimated finished size (video + audio) when the site states one —
+    /// None is shown as "size unknown", never a made-up number.
+    pub approx_bytes: Option<u64>,
+    /// Whether that estimate fits the room-file cap. An UNKNOWN size is
+    /// offered as fitting: refusing on a guess would be a false claim, and
+    /// the download itself still enforces the real limit.
+    pub fits: bool,
+}
+
+/// The qualities a video actually offers, for the modal's picker. Same web
+/// gating and SSRF pre-flight as the download itself — a metadata probe is
+/// still an outbound reach.
+#[tauri::command]
+pub async fn list_media_formats(
+    app: tauri::AppHandle,
+    window: tauri::Window,
+    state: State<'_, AppState>,
+    url: String,
+) -> Result<Vec<QualityOption>, String> {
+    crate::commands::require_web_access(state.inner())?;
+    let url = url.trim().to_string();
+    let parsed = crate::web::check_public_http_url(&url)?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "Invalid URL: no host.".to_string())?
+        .to_string();
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    crate::web::resolve_public_addr(&host, port).await?;
+
+    let progress = |status: &str, pct: Option<f64>| emit_progress(&window, status, pct);
+    let bin = ensure_ytdlp(&app, &progress).await?;
+    // `-j`: the video's whole info dict as one JSON line, nothing downloaded.
+    let probe = tokio::process::Command::new(&bin)
+        .arg("--no-playlist")
+        .arg("--no-warnings")
+        .arg("-j")
+        .arg(&url)
+        .kill_on_drop(true)
+        .output();
+    let out = tokio::time::timeout(FORMAT_PROBE_BUDGET, probe)
+        .await
+        .map_err(|_| "Looking up this video's qualities took too long.".to_string())?
+        .map_err(|e| format!("couldn't start the video downloader: {e}"))?;
+    if !out.status.success() {
+        let tail = String::from_utf8_lossy(&out.stderr);
+        let tail = tail.lines().rev().take(STDERR_TAIL_LINES).collect::<Vec<_>>();
+        return Err(format!(
+            "Couldn't look up this video's qualities: {}",
+            tail.into_iter().rev().collect::<Vec<_>>().join(" ")
+        ));
     }
+    let info: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .map_err(|_| "The site's answer about this video made no sense.".to_string())?;
+    Ok(quality_options(&info, find_ffmpeg().is_some()))
+}
+
+/// Fold yt-dlp's `formats` array into the height choices the picker offers,
+/// best first. Without ffmpeg only pre-muxed formats are downloadable, so
+/// only their heights are offered — a choice the downloader can't honor is
+/// worse than a short list. Sizes mirror what the downloader will pick at
+/// that height (best h264 video plus the audio track).
+fn quality_options(info: &serde_json::Value, has_ffmpeg: bool) -> Vec<QualityOption> {
+    let Some(formats) = info.get("formats").and_then(|f| f.as_array()) else {
+        return Vec::new();
+    };
+    let size_of = |f: &serde_json::Value| -> Option<u64> {
+        f.get("filesize")
+            .and_then(|v| v.as_u64())
+            .or_else(|| f.get("filesize_approx").and_then(|v| v.as_u64()))
+    };
+    let has = |f: &serde_json::Value, key: &str| -> bool {
+        f.get(key).and_then(|v| v.as_str()).is_some_and(|v| v != "none")
+    };
+    // The audio that rides along with a merged pick: the largest stated
+    // audio-only size, so the estimate errs honest (never under).
+    let audio_bytes = formats
+        .iter()
+        .filter(|f| !has(f, "vcodec") && has(f, "acodec"))
+        .filter_map(size_of)
+        .max();
+    // height → (pre-muxed size, avc1 video-only size, any video-only size).
+    // A pre-muxed file already CARRIES its audio; only a video-only pick
+    // pays for the audio track on top.
+    #[derive(Default)]
+    struct Heights {
+        premuxed: Option<u64>,
+        avc_only: Option<u64>,
+        any_only: Option<u64>,
+    }
+    let mut by_height: std::collections::BTreeMap<u32, Heights> = std::collections::BTreeMap::new();
+    for f in formats {
+        if !has(f, "vcodec") {
+            continue;
+        }
+        let premuxed = has(f, "acodec");
+        if !has_ffmpeg && !premuxed {
+            continue;
+        }
+        let Some(height) = f.get("height").and_then(|v| v.as_u64()).filter(|h| *h > 0) else {
+            continue;
+        };
+        let entry = by_height.entry(height as u32).or_default();
+        let size = size_of(f);
+        let is_avc = f
+            .get("vcodec")
+            .and_then(|v| v.as_str())
+            .is_some_and(|v| v.starts_with("avc"));
+        if premuxed {
+            entry.premuxed = entry.premuxed.max(size);
+        } else if is_avc {
+            entry.avc_only = entry.avc_only.max(size);
+        } else {
+            entry.any_only = entry.any_only.max(size);
+        }
+    }
+    by_height
+        .into_iter()
+        .rev()
+        .map(|(height, h)| {
+            let approx = h
+                .premuxed
+                .or_else(|| {
+                    h.avc_only
+                        .or(h.any_only)
+                        .map(|v| v + audio_bytes.unwrap_or(0))
+                })
+                .filter(|b| *b > 0);
+            QualityOption {
+                height,
+                approx_bytes: approx,
+                fits: approx.is_none_or(|b| b <= crate::web::MAX_DOWNLOAD_BYTES),
+            }
+        })
+        .collect()
 }
 
 /// The user-facing failure. The one failure shape the user can actually do
@@ -374,6 +535,7 @@ pub(crate) struct MediaDownload {
 pub(crate) async fn download_media_to_temp(
     app: &tauri::AppHandle,
     url: &str,
+    max_height: Option<u32>,
     cancel: Option<&AtomicBool>,
     progress: MediaProgress<'_>,
 ) -> Result<MediaDownload, String> {
@@ -398,7 +560,7 @@ pub(crate) async fn download_media_to_temp(
         .arg("--newline")
         .arg("--no-warnings")
         .arg("-f")
-        .arg(format_selector(ffmpeg.is_some()))
+        .arg(format_selector(ffmpeg.is_some(), max_height))
         .arg("-o")
         .arg(&output);
     if let Some(ff) = &ffmpeg {
@@ -530,12 +692,13 @@ pub async fn import_youtube_video(
     window: tauri::Window,
     state: State<'_, AppState>,
     url: String,
+    max_height: Option<u32>,
 ) -> Result<ImportReport, String> {
     let url = url.trim().to_string();
     if web::youtube_video_id(&url).is_none() {
         return Err("That doesn't look like a YouTube video link.".into());
     }
-    import_media_url(app, window, state, url).await
+    import_media_url(app, window, state, url, max_height).await
 }
 
 /// BROWSE-2: the same download for ANY yt-dlp-supported site — what the
@@ -547,6 +710,7 @@ pub async fn import_media_url(
     window: tauri::Window,
     state: State<'_, AppState>,
     url: String,
+    max_height: Option<u32>,
 ) -> Result<ImportReport, String> {
     let url = url.trim().to_string();
     // Fail fast (and don't fetch anything) when no room is open — or when the
@@ -557,7 +721,8 @@ pub async fn import_media_url(
     // not cancel the next one before it has fetched a byte.
     arm_media_cancel();
     let progress = |status: &str, pct: Option<f64>| emit_progress(&window, status, pct);
-    let media = download_media_to_temp(&app, &url, Some(&MEDIA_CANCEL), &progress).await?;
+    let media =
+        download_media_to_temp(&app, &url, max_height, Some(&MEDIA_CANCEL), &progress).await?;
 
     emit_progress(&window, "Sealing the video into the room…", None);
     let name = media
@@ -645,14 +810,81 @@ mod tests {
     /// is not available" comes back for a video we could have downloaded.
     #[test]
     fn merge_formats_are_offered_exactly_when_ffmpeg_exists() {
-        assert!(!format_selector(false).contains('+'), "no ffmpeg, no merging");
-        assert!(format_selector(true).contains('+'), "ffmpeg unlocks split streams");
-        for selector in [format_selector(false), format_selector(true)] {
+        for height in [None, Some(720)] {
+            assert!(
+                !format_selector(false, height).contains('+'),
+                "no ffmpeg, no merging"
+            );
+            assert!(
+                format_selector(true, height).contains('+'),
+                "ffmpeg unlocks split streams"
+            );
+        }
+        for selector in [format_selector(false, None), format_selector(true, None)] {
             assert!(
                 selector.starts_with("b[ext=mp4]/"),
                 "a pre-muxed MP4 needs no merge work and must stay first: {selector}"
             );
         }
+    }
+
+    /// The user's chosen resolution must LEAD the chain — and must not be able
+    /// to fail a download the old chain could do: unconstrained fallbacks
+    /// follow, so a quality that vanished between probe and download degrades
+    /// to best-available instead of erroring.
+    #[test]
+    fn a_chosen_height_leads_and_never_strands_the_download() {
+        for has_ffmpeg in [true, false] {
+            let capped = format_selector(has_ffmpeg, Some(480));
+            let free = format_selector(has_ffmpeg, None);
+            assert!(capped.starts_with("b[ext=mp4][height<=480]"), "{capped}");
+            assert!(
+                capped.ends_with(&free),
+                "the uncapped chain must remain as fallback: {capped}"
+            );
+        }
+    }
+
+    /// The picker's list is built from yt-dlp's formats array. Heights fold
+    /// together across protocols, sizes mirror the h264 pick the downloader
+    /// will make (plus audio), and without ffmpeg only pre-muxed entries are
+    /// offered — a chip the downloader can't honor is a lie.
+    #[test]
+    fn quality_options_fold_heights_honestly() {
+        let info = serde_json::json!({ "formats": [
+            { "format_id": "140", "vcodec": "none", "acodec": "mp4a.40.2",
+              "filesize": 50_000_000u64 },
+            { "format_id": "136", "vcodec": "avc1.64001f", "acodec": "none",
+              "height": 720, "filesize": 400_000_000u64 },
+            { "format_id": "247", "vcodec": "vp9", "acodec": "none",
+              "height": 720, "filesize": 300_000_000u64 },
+            { "format_id": "137", "vcodec": "avc1.640028", "acodec": "none",
+              "height": 1080, "filesize_approx": 900_000_000u64 },
+            { "format_id": "18", "vcodec": "avc1.42001E", "acodec": "mp4a.40.2",
+              "height": 360, "filesize": 80_000_000u64 },
+            { "format_id": "sb0", "vcodec": "none", "acodec": "none" },
+        ]});
+        let with_ffmpeg = quality_options(&info, true);
+        assert_eq!(
+            with_ffmpeg.iter().map(|q| q.height).collect::<Vec<_>>(),
+            vec![1080, 720, 360],
+            "best first, heights deduped"
+        );
+        // 1080p: 900 MB video + 50 MB audio = 950 MB — over the 900 MB cap.
+        assert_eq!(with_ffmpeg[0].approx_bytes, Some(950_000_000));
+        assert!(!with_ffmpeg[0].fits);
+        // 720p: the h264 size (400 MB), not vp9's smaller 300 MB — the
+        // downloader will pick h264, and the estimate must match its pick.
+        assert_eq!(with_ffmpeg[1].approx_bytes, Some(450_000_000));
+        assert!(with_ffmpeg[1].fits);
+        // 360p is pre-muxed: its size already carries the audio — no add.
+        assert_eq!(with_ffmpeg[2].approx_bytes, Some(80_000_000));
+        // Without ffmpeg only the pre-muxed 360p is downloadable.
+        let without = quality_options(&info, false);
+        assert_eq!(without.iter().map(|q| q.height).collect::<Vec<_>>(), vec![360]);
+        assert_eq!(without[0].approx_bytes, Some(80_000_000));
+        // No formats at all → an empty list, not a panic.
+        assert!(quality_options(&serde_json::json!({}), true).is_empty());
     }
 
     /// The one failure the user can fix themselves must say how; every other

@@ -156,7 +156,7 @@ export function BrowserSearch({
         onAdded(meta);
       } catch (e) {
         setAdds((m) => ({ ...m, [hit.url]: "error" }));
-        // Named on the page, not in a toast that can be missed — the 800 MB
+        // Named on the page, not in a toast that can be missed — the size-cap
         // refusal and "web access is off" both have to be readable here.
         setAddError(String(e));
       }
