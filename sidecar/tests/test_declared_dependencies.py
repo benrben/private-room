@@ -30,6 +30,17 @@ IMPORT_TO_DISTRIBUTION = {
     "yaml": "pyyaml",
     # The compiled C-extension module name, not a separate PyPI package.
     "_pywhispercpp": "pywhispercpp",
+    # PyObjC: each framework's Python import name differs from its
+    # "pyobjc-framework-*" distribution name; AppKit/Foundation/objc are all
+    # provided by the two base packages (pyobjc-core, pyobjc-framework-cocoa).
+    "objc": "pyobjc-core",
+    "AppKit": "pyobjc-framework-cocoa",
+    "Foundation": "pyobjc-framework-cocoa",
+    "Vision": "pyobjc-framework-vision",
+    "Quartz": "pyobjc-framework-quartz",
+    "AVFoundation": "pyobjc-framework-avfoundation",
+    "CoreMedia": "pyobjc-framework-coremedia",
+    "QuickLookThumbnailing": "pyobjc-framework-quicklookthumbnailing",
 }
 
 

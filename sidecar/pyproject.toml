@@ -57,6 +57,8 @@ dependencies = [
     "pyobjc-framework-coremedia>=12.2.2",
     "pyobjc-framework-quicklookthumbnailing>=12.2.2",
     "pymupdf>=1.28.2",
+    "pyobjc-core>=12.2.2",
+    "pyobjc-framework-cocoa>=12.2.2",
 ]
 
 [project.optional-dependencies]
