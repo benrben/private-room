@@ -40,6 +40,15 @@ SEARCH_HOSTS = {
     "www.mojeek.com",
 }
 
+#: The other module allowed a literal outbound URL: the Whisper model
+#: downloader. Its ONE fetch is user-initiated (Settings → "download the
+#: dictation model"), not a background phone-home, and the exact host is
+#: pinned below the same way the search engines are.
+MODEL_DOWNLOAD_MODULE = "models.py"
+
+#: The single host stt/models.py may fetch the model weights from.
+MODEL_DOWNLOAD_HOSTS = {"huggingface.co"}
+
 
 def test_tracing_env_vars_are_cleared_at_import() -> None:
     for key in os.environ:
@@ -178,12 +187,13 @@ def test_the_only_outbound_hosts_are_ollama_the_bridge_and_web_search() -> None:
     """No telemetry, no analytics, no third-party endpoint anywhere in the source.
 
     Every literal URL in the package must be loopback — the Ollama base URL and
-    the MCP bridge URL both arrive per-run from the Rust host — with exactly one
-    exception, the search seam, checked against its own host list below.
+    the MCP bridge URL both arrive per-run from the Rust host — with exactly two
+    exceptions, the search seam and the model downloader, each checked against
+    its own host list below.
     """
     url_re = re.compile(r"https?://[^\s\"'\)]+")
     for path in PKG_DIR.rglob("*.py"):
-        if path.name == WEB_SEARCH_MODULE:
+        if path.name in (WEB_SEARCH_MODULE, MODEL_DOWNLOAD_MODULE):
             continue
         for match in url_re.findall(path.read_text()):
             url = match.rstrip(".,")
@@ -199,6 +209,15 @@ def test_web_search_reaches_only_its_declared_engines() -> None:
     # The one non-engine URL is the app's own homepage, inside the descriptive
     # User-Agent that Wikimedia's policy requires. Nothing is ever fetched from it.
     assert hosts - {"github.com"} == SEARCH_HOSTS
+
+
+def test_model_downloader_reaches_only_huggingface() -> None:
+    """stt/models.py's URLs must all be the pinned model host — so a stray
+    mirror or a copy-pasted CDN link can't arrive as a side effect of an edit."""
+    url_re = re.compile(r"https?://[^\s\"'\)]+")
+    source = (PKG_DIR / "stt" / MODEL_DOWNLOAD_MODULE).read_text()
+    hosts = {urlparse(url.rstrip(".,")).hostname for url in url_re.findall(source)}
+    assert hosts == MODEL_DOWNLOAD_HOSTS
 
 
 def test_no_analytics_or_tracing_imports() -> None:

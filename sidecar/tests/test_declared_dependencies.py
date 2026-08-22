@@ -28,6 +28,8 @@ IMPORT_TO_DISTRIBUTION = {
     "langchain_ollama": "langchain-ollama",
     "langgraph": "langgraph",
     "yaml": "pyyaml",
+    # The compiled C-extension module name, not a separate PyPI package.
+    "_pywhispercpp": "pywhispercpp",
 }
 
 

@@ -107,14 +107,7 @@ from arcelle_sidecar.stt.hallucination import (
     is_junk_segment,
     is_stock_hallucination,
 )
-
-# Whisper large-v3-turbo, 5-bit quantized: the Hebrew-capable sweet spot
-# (~574 MB download, ~1 GB working set, fast on Metal).
-MODEL_FILE: str = "ggml-large-v3-turbo-q5_0.bin"
-MODEL_URL: str = (
-    "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin"
-)
-MODEL_SIZE_MB: int = 574
+from arcelle_sidecar.stt.models import MODEL_FILE, MODEL_SIZE_MB, MODEL_URL
 
 
 def format_stamp(cs: int) -> str:
