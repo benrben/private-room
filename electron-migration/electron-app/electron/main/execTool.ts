@@ -35,10 +35,18 @@
  *   are real; only the subprocess is an injected seam.
  * - the connector route — real dispatch STRUCTURE with both of Rust's doors
  *   (outbound masking, SEC-1b consent) required rather than skipped.
+ * - files, read side — `list_room_files` / `search_room` / `open_file` /
+ *   `annotate_file`, against the now-committed `db-host/files.ts` and
+ *   `db-host/retrieval.ts`; the arms themselves live in `fileTools.ts`.
+ *   `search_room` degrades to keyword-only retrieval, because `embed_question`
+ *   has no Electron port yet — see that file's own module doc for why that is
+ *   the Rust arm's own no-embed-model path rather than a stand-in.
  *
- * `db-host/files.ts` and `retrieval.ts` exist in the working tree as UNCOMMITTED
- * work from a concurrent session. Nothing here depends on them: the file and
- * retrieval arms stay stubbed for Batch D, which owns wiring them once they land.
+ * The eight names that once shared the file arms' stub — `mark_image`,
+ * `create_file`, `rename_file`, `move_file`, `set_in_library`,
+ * `organize_files`, `trash_files`, `merge_files` — depend on
+ * `commands/organize.rs` plus `db/folders.rs`/`artifacts.rs`, which a
+ * different batch owns, and stay `NOT_IMPLEMENTED` below.
  */
 
 import type Database from "better-sqlite3-multiple-ciphers";
@@ -61,6 +69,12 @@ import {
   updateSkill as updateSkillDb,
   upsertSkillResource as upsertSkillResourceDb,
 } from "./db-host/skills.js";
+import {
+  execAnnotateFile,
+  execListRoomFiles,
+  execOpenFile,
+  execSearchRoom,
+} from "./fileTools.js";
 import { clampBytes, clampBytesMarked, normalizeForMatch } from "./textClamp.js";
 import {
   BUILTIN_TOOL_NAMES,
@@ -1012,11 +1026,25 @@ export async function execTool(
     case "delete_skill_resource":
       return execDeleteSkillResource(deps, args);
 
-    // ------------------------------------------------- files/retrieval (Batch D)
-    case "list_room_files":
-    case "search_room":
-    case "open_file":
-    case "annotate_file":
+    // ------------------------------------------------------------- REAL: files
+    case "list_room_files": {
+      const room = requireRoom(deps);
+      return room.ok ? execListRoomFiles(room.db) : fail(room.error);
+    }
+    case "search_room": {
+      const room = requireRoom(deps);
+      return room.ok ? execSearchRoom(room.db, args) : fail(room.error);
+    }
+    case "open_file": {
+      const room = requireRoom(deps);
+      return room.ok ? execOpenFile(room.db, args, deps.emit) : fail(room.error);
+    }
+    case "annotate_file": {
+      const room = requireRoom(deps);
+      return room.ok ? execAnnotateFile(room.db, args, effects, deps.emit) : fail(room.error);
+    }
+
+    // ----------------------------------------------------- organize.rs (Batch D)
     case "mark_image":
     case "create_file":
     case "rename_file":
@@ -1026,7 +1054,7 @@ export async function execTool(
     case "trash_files":
     case "merge_files":
       return notImplemented(
-        "db-host/files.ts + retrieval.ts (the room's file-content DB layer) are not committed yet — Batch D"
+        "the room's file WRITE/organize layer (commands/organize.rs, db/folders.rs, db/artifacts.rs) — and, for mark_image, the vision grounding pass — is not ported yet — Batch D"
       );
 
     // ---------------------------------------------------------- edit_match gap

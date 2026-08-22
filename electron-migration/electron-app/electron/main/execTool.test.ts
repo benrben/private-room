@@ -15,6 +15,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type Database from "better-sqlite3-multiple-ciphers";
 import { createRoom } from "./db-host/open.js";
+import { insertFile } from "./db-host/files.js";
 import { addMemory } from "./db-host/memories.js";
 import { findSkill, listSkillResources, listSkills } from "./db-host/skills.js";
 import { BUILTIN_TOOL_NAMES, type McpRoute } from "./toolSpecs.js";
@@ -159,6 +160,10 @@ describe("exhaustive tool-arm coverage — the single most valuable test in this
       "save_skill",
       "write_skill_resource",
       "delete_skill_resource",
+      "list_room_files",
+      "search_room",
+      "open_file",
+      "annotate_file",
     ];
     const stubbedNames = NAMED_ARM_TOOL_NAMES.filter((n) => !REAL_ARMS.includes(n));
     for (const name of stubbedNames) {
@@ -398,6 +403,127 @@ describe("update_memory / delete_memory (real)", () => {
     await execTool("update_memory", { find: "preference note", content: "an updated preference note" }, effects(), deps({ db }));
     const listing = await execTool("list_memories", {}, effects(), deps({ db }));
     expect(listing.ok && listing.text).toBe("- [preference] an updated preference note");
+  });
+});
+
+// ------------------------------------------------------------------------ files
+//
+// The per-function behavior of these four arms — `closest_snippet` anchoring,
+// A1 parsing, the >100-file overflow line, the two approximate-match notes —
+// is exercised exhaustively against real fixture rooms in `fileTools.test.ts`.
+// What is proved HERE is the DISPATCH side, which is what this edit to
+// `execTool.ts` is: each name reaches the real arm (never `NOT_IMPLEMENTED`,
+// never the `Unknown tool` fallthrough), the room is resolved once through
+// `requireRoom`, `deps.emit` and `effects` really arrive, and with no room
+// open each still refuses with the one sentence every other real arm uses.
+
+describe("list_room_files / search_room / open_file / annotate_file (real, through execTool)", () => {
+  it("list_room_files reaches the real arm: the empty-room notice, then a real listing", async () => {
+    const db = freshRoom();
+    expect(await execTool("list_room_files", {}, effects(), deps({ db }))).toEqual({
+      ok: true,
+      text: "The room has no files.",
+    });
+    insertFile(db, "notes.txt", "text/plain", Buffer.from("hello"), "hello", "user");
+    expect(await execTool("list_room_files", {}, effects(), deps({ db }))).toEqual({
+      ok: true,
+      text: "- notes.txt (text/plain, 5 bytes)",
+    });
+  });
+
+  it("search_room reaches the real retrieval layer and excerpts a real hit", async () => {
+    const db = freshRoom();
+    insertFile(
+      db,
+      "lease.pdf",
+      "application/pdf",
+      Buffer.from("x"),
+      "The tenant shall pay a security deposit before moving in.",
+      "user"
+    );
+    const outcome = await execTool("search_room", { query: "security deposit" }, effects(), deps({ db }));
+    expect(outcome.ok).toBe(true);
+    if (outcome.ok) {
+      expect(outcome.text).toContain("[lease.pdf]");
+      expect(outcome.text.toLowerCase()).toContain("security deposit");
+    }
+  });
+
+  it("open_file reaches the real arm and its agent-open-file event carries deps.emit", async () => {
+    const db = freshRoom();
+    insertFile(db, "notes.txt", "text/plain", Buffer.from("hello world"), "hello world", "user");
+    const emitted: Array<[string, unknown]> = [];
+    const outcome = await execTool(
+      "open_file",
+      { name: "notes" },
+      effects(),
+      deps({ db, emit: (e, p) => emitted.push([e, p]) })
+    );
+    expect(outcome).toEqual({
+      ok: true,
+      text: 'Opened "notes.txt" in the viewer.\nIt begins:\nhello world',
+    });
+    expect(emitted).toEqual([
+      ["agent-open-file", { id: expect.any(String), page: null, cell: null, find: null }],
+    ]);
+  });
+
+  it("annotate_file reaches the real arm, writes THIS turn's effects.annotation, and emits", async () => {
+    const db = freshRoom();
+    insertFile(db, "lease.pdf", "application/pdf", Buffer.from("x"), "No pets are allowed here.", "user");
+    const eff = effects();
+    const emitted: Array<[string, unknown]> = [];
+    const outcome = await execTool(
+      "annotate_file",
+      { name: "lease", text: "no pets are allowed" },
+      eff,
+      deps({ db, emit: (e, p) => emitted.push([e, p]) })
+    );
+    expect(outcome).toEqual({
+      ok: true,
+      text: 'Sent the viewer to "no pets are allowed" in "lease.pdf".',
+    });
+    // ADD-23 reads this back out of the same struct — a fake success that
+    // never set it would still print the sentence above.
+    expect(effectsJson(eff)).toEqual({ annotation: eff.annotation });
+    expect(emitted).toEqual([["agent-annotate", eff.annotation]]);
+  });
+
+  it("all four resolve to a real answer, never NOT_IMPLEMENTED and never Unknown tool", async () => {
+    const db = freshRoom();
+    insertFile(
+      db,
+      "lease.pdf",
+      "application/pdf",
+      Buffer.from("x"),
+      "No pets are allowed on the premises.",
+      "user"
+    );
+    const calls: Array<[string, Record<string, unknown>]> = [
+      ["list_room_files", {}],
+      ["search_room", { query: "pets" }],
+      ["open_file", { name: "lease" }],
+      ["annotate_file", { name: "lease", text: "no pets are allowed" }],
+    ];
+    for (const [name, args] of calls) {
+      const outcome = await execTool(name, args, effects(), deps({ db }));
+      const text = outcome.ok ? outcome.text : outcome.error;
+      expect(outcome.ok, `${name}: ${text}`).toBe(true);
+      expect(text).not.toContain("NOT_IMPLEMENTED");
+      expect(text).not.toContain("Unknown tool");
+    }
+  });
+
+  it("every one of the four refuses honestly with no room open — not a stub, not a crash", async () => {
+    for (const [name, args] of [
+      ["list_room_files", {}],
+      ["search_room", { query: "x" }],
+      ["open_file", { name: "x" }],
+      ["annotate_file", { name: "x", text: "x" }],
+    ] as const) {
+      const outcome = await execTool(name, args, effects(), deps({ db: null }));
+      expect(outcome, name).toEqual({ ok: false, error: "No room is open." });
+    }
   });
 });
 
