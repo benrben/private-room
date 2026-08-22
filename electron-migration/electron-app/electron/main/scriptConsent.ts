@@ -5,8 +5,10 @@
  *
  * Ported from `src-tauri/src/commands/scripts.rs` (876 lines, read in full,
  * including its `#[cfg(test)] mod tests`), plus the two helpers scripts.rs
- * only CALLS: `stamp_script_consents` (`jobs/workflow.rs`) and
- * `resolve_script_file`/`script_fingerprint` (`jobs/script_run.rs`).
+ * only CALLS: `stamp_script_consents` (`jobs/workflow.rs`, still stubbed) and
+ * `resolve_script_file`/`script_fingerprint` (`jobs/script_run.rs`, now landed
+ * as `scriptRun.ts` — this file imports and re-exports both rather than
+ * keeping its own copy; see the import block below).
  *
  * ============================================================================
  * THE SEC-1 DOCTRINE, AND THE ONE PROPERTY THIS FILE EXISTS TO GUARANTEE
@@ -35,8 +37,8 @@
  * ============================================================================
  *   - The approval store: {@link scriptApprovalsFile} /
  *     {@link readScriptApprovals} / {@link addScriptApproval}.
- *   - {@link scriptFingerprint} and {@link resolveScriptFile} — see FUTURE
- *     CONSOLIDATION below.
+ *   - {@link scriptFingerprint} and {@link resolveScriptFile} — imported and
+ *     re-exported from `scriptRun.ts`, not redefined here (see below).
  *   - {@link wfIsForScript} / {@link ensureScriptWorkflow} — the auto-workflow
  *     find-or-create. These LOOK `WorkflowDef`-shaped but are not: a
  *     `db::Workflow`'s `definition` is a `serde_json::Value` (this port's
@@ -70,38 +72,27 @@
  * belongs to a later integration batch.
  *
  * ============================================================================
- * WHAT IS STUBBED, AND BY WHAT — TWO unported dependencies, not one
+ * WHAT IS STILL STUBBED — ONE unported dependency
  * ============================================================================
- *   1. `jobs/workflow.rs` (5855 lines) — `WorkflowDef`/`NodeKind`, the
- *      definition compiler, `start_workflow_run`.
- *   2. `jobs/script_run.rs` — `ScriptManifest`/`ScriptLang`/`Shortcut`/
- *      `Runner`, `script_lang_of`, `parse_script_manifest`,
- *      `resolve_interpreter`, `referenced_room_files`, and the sandboxed
- *      executor. (A sibling batch is porting it; at the time this file was
- *      merged no unsuffixed `scriptRun.ts` existed under `electron/main/`.)
+ * `jobs/workflow.rs` (5855 lines) — `WorkflowDef`/`NodeKind`, the definition
+ * compiler, `start_workflow_run`. `jobs/script_run.rs` has since landed as
+ * `scriptRun.ts` (`ScriptManifest`/`ScriptLang`/`Shortcut`/`Runner`,
+ * `script_lang_of`, `parse_script_manifest`, `resolve_interpreter`,
+ * `referenced_room_files`, the sandboxed executor) and is no longer stubbed
+ * here — {@link scriptFingerprint}/{@link resolveScriptFile} are imported
+ * from it directly.
  *
- * Each stub below follows this codebase's established shape (`autoIndex.ts`'s
- * `START_REC_READ_NOT_IMPLEMENTED`, `jobScheduler.ts`'s
+ * The `jobs/workflow.rs` stub below follows this codebase's established shape
+ * (`autoIndex.ts`'s `START_REC_READ_NOT_IMPLEMENTED`, `jobScheduler.ts`'s
  * `startWorkflowRunNotImplemented`): an exported message constant naming the
  * real blocker, and a function that fails loudly rather than fabricating a
  * result.
- *
- * FUTURE CONSOLIDATION. {@link scriptFingerprint} and
- * {@link resolveScriptFile} belong to `jobs/script_run.rs`, and the batch
- * porting that file exports its own copies. They are duplicated here (12 lines
- * total, no dependency of their own) because this file's entire security
- * property rests on them and it must not wait on that batch. When
- * `scriptRun.ts` lands unsuffixed, delete the two definitions below and
- * re-export them from there instead — one hash function, one resolver, so the
- * consent card, the stamper and the executor can never disagree about which
- * file is being approved.
  */
 
-import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import type Database from "better-sqlite3-multiple-ciphers";
-import { findFileLike, getFileBytesNamed } from "./db-host/files.js";
+import { getFileBytesNamed } from "./db-host/files.js";
 import { getJobArtifact } from "./db-host/jobs.js";
 import {
   createWorkflow,
@@ -113,7 +104,10 @@ import {
   type WorkflowRun,
 } from "./db-host/workflows.js";
 import { nextRunFromNow } from "./jobScheduler.js";
+import { resolveScriptFile, scriptFingerprint, type ResolvedScriptFile } from "./scriptRun.js";
 import { clampBytes } from "./textClamp.js";
+
+export { resolveScriptFile, scriptFingerprint, type ResolvedScriptFile };
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
@@ -181,50 +175,11 @@ export function addScriptApproval(userDataDir: string, fingerprint: string): voi
   writeFileSync(scriptApprovalsFile(userDataDir), JSON.stringify(list, null, 2));
 }
 
-/**
- * SHA-256 (hex) of the script's raw bytes — the content-addressed consent key.
- * Any edit changes the hash → the old approval no longer counts, so a changed
- * script re-prompts for free. Ported from `script_fingerprint`
- * (`jobs/script_run.rs`); see FUTURE CONSOLIDATION in this file's header.
- *
- * Takes BYTES, never a string: hashing decoded text would make two different
- * files with the same lossy decoding share one approval.
- */
-export function scriptFingerprint(bytes: Uint8Array): string {
-  return createHash("sha256").update(bytes).digest("hex");
-}
-
-// ============================================================================
-// The ONE file resolver — ported from `resolve_script_file`
-// (`jobs/script_run.rs`). The consent card, the stamper and (once it lands)
-// the executor all go through it, so they cannot disagree about which file a
-// `script_run` node's `file` names.
-// ============================================================================
-
-export interface ResolvedScriptFile {
-  id: string;
-  name: string;
-  bytes: Buffer;
-}
-
-/**
- * Resolve a node's `file` — a stored file id, OR a name (the agent never
- * handles ids) — to (id, real name, current bytes). An exact id is tried
- * first, then a fuzzy name match, matching the Rust source's two-lookup shape
- * (an existence probe, then the real read). Throws when nothing matches, as
- * Rust's `?` propagates.
- */
-export function resolveScriptFile(db: Database.Database, file: string): ResolvedScriptFile {
-  let id: string;
-  try {
-    getFileBytesNamed(db, file);
-    id = file;
-  } catch {
-    id = findFileLike(db, file)[0];
-  }
-  const [name, bytes] = getFileBytesNamed(db, id);
-  return { id, name, bytes: bytes ?? Buffer.alloc(0) };
-}
+// FUTURE CONSOLIDATION, done: `scriptFingerprint` and `resolveScriptFile` now
+// land unsuffixed in `scriptRun.ts`; this file imports and re-exports them
+// (see the top of this file) rather than keeping its own copy, so the
+// consent card, the stamper and the executor can never disagree about which
+// file is being approved.
 
 // ============================================================================
 // The manual-run gate — the pure fragments of the consent card.
