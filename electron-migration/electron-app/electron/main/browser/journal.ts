@@ -18,6 +18,17 @@ import type Database from "better-sqlite3-multiple-ciphers";
 import type { BrowseJournalRow } from "../../shared/apiTypes.js";
 import { nowIso } from "./tabs.js";
 
+/**
+ * How many journal lines a room keeps.
+ *
+ * The trail has no bound of its own: one row per page opened, read, clicked,
+ * blocked or downloaded, kept forever, with only the Clear button ever
+ * shrinking it. The Journal view reads the newest few hundred, so anything past
+ * this is storage nobody will look at — trimmed on write so the cost is one
+ * cheap `DELETE` per append rather than a sweep nobody schedules.
+ */
+export const JOURNAL_CAP = 5_000;
+
 /** Insert one journal row and read it back with its real DB-assigned id — the
  *  shape `BrowseJournalRow` promises the renderer over the `browser-journal`
  *  event and the `browser_journal` query alike. */
@@ -31,11 +42,24 @@ export function insertBrowseJournal(
   const info = db
     .prepare(`INSERT INTO browse_journal (kind, url, detail, session) VALUES (?, ?, ?, ?)`)
     .run(kind, url, detail, session);
-  return db
+  const row = db
     .prepare(
       `SELECT id, kind, url, detail, session, created_at AS at FROM browse_journal WHERE id = ?`,
     )
     .get(info.lastInsertRowid) as BrowseJournalRow;
+  // `id` is AUTOINCREMENT, so it only ever climbs: everything at or below
+  // (newest − cap) is older than the cap's worth of lines we keep. Ignored on
+  // failure exactly as Rust ignores it — a trim that will not run must not cost
+  // the caller the line it just wrote.
+  try {
+    db.prepare(
+      `DELETE FROM browse_journal
+       WHERE id <= (SELECT MAX(id) FROM browse_journal) - ?`,
+    ).run(JOURNAL_CAP);
+  } catch {
+    // best-effort — see above
+  }
+  return row;
 }
 
 /** Where a journal entry is written to and announced. This module knows nothing

@@ -1768,7 +1768,22 @@ export interface BrowserInfo {
   blank?: boolean;
   url?: string | null;
   title?: string | null;
-  ready?: string | null;
+  /**
+   * The page's own `document.readyState` ("loading" / "interactive" /
+   * "complete") — EXCEPT while a navigation is in flight, where the poll
+   * substitutes the literal `false`.
+   *
+   * That boolean is not a widening for convenience: it is what the wire has
+   * always carried. `reportable_page_state` (Rust) and `reportablePageState`
+   * (browseCommands.ts) both answer `false` for a page whose round trip was
+   * lost to a commit, because neither the success ("complete", describing the
+   * document being navigated AWAY from) nor the failure ("not answering",
+   * describing the interrupted round trip) is true of the page the user asked
+   * for. This type said `string | null`, so the one value the poll invents was
+   * the one value it could not describe. Readers compare against `"complete"`,
+   * which `false` correctly fails.
+   */
+  ready?: string | boolean | null;
   takeover?: boolean;
   /** Item #18: the page latched a double Escape — the user is asking for the
    *  keyboard back. True on exactly one poll; the page clears it as it reports
