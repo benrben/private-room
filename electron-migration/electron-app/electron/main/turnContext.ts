@@ -86,14 +86,28 @@ export function handoffBudgetBytes(maxContext: number): number {
 
 /** `external.rs::split_external_model` — splits a picked cloud selection
  * (`"codex-cli::gpt-5.6-sol::high"`) into `[engineId, model?, effort?]`; a
- * plain local Ollama tag passes through as `[model, undefined, undefined]`. */
+ * plain local Ollama tag passes through as `[model, undefined, undefined]`.
+ *
+ * The tail split is Rust's `splitn(3, "::")`, not JS's `split("::")`: anything
+ * past the SECOND separator stays INSIDE the effort part rather than being
+ * dropped. That matters because the effort is a room-file-controlled value on
+ * its way to becoming a `zsh -ilc` word — `externalAdvisor.ts`'s `checkCliSlug`
+ * refuses a malformed one outright, and it can only refuse what it is handed.
+ * Dropping the tail would silently run `--effort high` for a room that says
+ * `high::something-else`, which is precisely the unevidenced success the Rust
+ * source refuses. */
 export function splitExternalModel(model: string): [string, string | undefined, string | undefined] {
-  const parts = model.split("::");
-  const engine = parts[0] ?? model;
+  const first = model.indexOf("::");
+  const engine = first === -1 ? model : model.slice(0, first);
   if (engine !== "claude-cli" && engine !== "codex-cli" && engine !== "openrouter") {
     return [model, undefined, undefined];
   }
-  return [engine, parts[1], parts[2]];
+  if (first === -1) {
+    return [engine, undefined, undefined];
+  }
+  const rest = model.slice(first + 2);
+  const second = rest.indexOf("::");
+  return second === -1 ? [engine, rest, undefined] : [engine, rest.slice(0, second), rest.slice(second + 2)];
 }
 
 /** `external.rs::is_external_engine` — any non-local engine. */
