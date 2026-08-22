@@ -85,6 +85,7 @@ from .mcp_client import McpClient
 from .messages import compact_json
 from .provider_api import OpenAICompatibleChatModel
 from .rec.session_ws import register_rec_routes
+from .stt.dictation import register_dict_routes
 
 log = logging.getLogger("arcelle_sidecar")
 
@@ -371,6 +372,11 @@ def create_app(
     # here, and it needs no token of its own — the WS routes are guarded by the
     # `?token=` branch of TokenAuthMiddleware above.
     register_rec_routes(app)
+    # The dictation surface: WS /dict/session and the single-live-session slot
+    # behind it (on `app.state.dict_manager`). Same deal as the recording
+    # routes above — its own module owns every decision, and it needs no token
+    # of its own.
+    register_dict_routes(app)
     registry = RunRegistry()
     app.state.registry = registry
 
