@@ -10,10 +10,13 @@
  *
  * MOST ARMS ARE STUBS, and that is the honest state of the port rather than an
  * oversight. `exec_tool` dispatches into whole subsystems this rewrite has not
- * reached — `edit_match.rs`, `web.rs`, the AgentUi screen-driving bridge, the
- * private browser's command surface, the Scripts/Studio/sketch/STT/
+ * reached — `edit_match.rs`, the AgentUi screen-driving bridge, the private
+ * browser's command surface, the Scripts/Studio/sketch/STT/
  * jobs-workflows/local-generate lanes, and the external-CLI advisor
- * subprocess.
+ * subprocess. `web.rs` (and its `fetch`/`guard`/`search` submodules) is now
+ * REAL — see `web_search`/`fetch_page` below — but `save_link`/`download_url`,
+ * whose OWN arms reach further pieces of it plus `files.rs`'s
+ * `import_link_and_index`, are not.
  *
  * THE INVARIANT THIS FILE EXISTS TO HOLD: every name the tool catalog or an
  * `McpRoute` can produce reaches a NAMED arm. A stub returns a labeled
@@ -68,9 +71,25 @@
  *   (statuses, reconnects) has no app-wide container yet, and the per-Mac
  *   connector-grants file needs the app's `userDataDir`, which an `exec_tool`
  *   arm has no access to — each degrades through its own named dep below.
+ * - the web tools — `web_search` (against `web.ts`'s search-fusion wrapper,
+ *   `db-host/webCache.ts`'s 15-minute cache, and `browser/webAccess.ts`'s
+ *   internet switch) and `fetch_page` (same cache/switch, against `web.ts`'s
+ *   guarded HTTP client — `web/fetch.rs`'s per-hop SSRF re-check, DNS pinning
+ *   and streaming byte caps, over `web/guard.rs`'s SSRF guard, already ported
+ *   and committed as `browser/guard.ts` by an earlier batch). Both hold their
+ *   PRIV-4 door open as an injected seam — {@link ExecToolDeps.maskOutboundWeb}
+ *   for `web_search`'s outbound QUERY, {@link ExecToolDeps.outboundUrlRefusal}
+ *   (shared with `download_media`) for `fetch_page`'s URL — and REFUSE while
+ *   it is unwired rather than ever sending real names to the network unmasked.
+ *   {@link withRealPrivacyGates} is the one-line way to fill both with
+ *   `privacy.ts`'s real, committed port. `download_media` is the only OTHER
+ *   web/download arm that is real; `save_link`/`download_url` still reach
+ *   pieces of `web.ts` that back THEM specifically (the YouTube-transcript and
+ *   binary-download engines) but are not wired to a tool arm here.
  */
 
 import type Database from "better-sqlite3-multiple-ciphers";
+import { webAccessEnabled } from "./browser/webAccess.js";
 import {
   addMemory,
   deleteMemory,
@@ -90,6 +109,7 @@ import {
   updateSkill as updateSkillDb,
   upsertSkillResource as upsertSkillResourceDb,
 } from "./db-host/skills.js";
+import { agentDeleteSkill } from "./skillsCmds.js";
 import {
   execAnnotateFile,
   execListRoomFiles,
@@ -113,6 +133,16 @@ import {
   execSetInLibrary,
   execTrashFiles,
 } from "./organizeTools.js";
+import {
+  DOWNLOAD_ENGINE_MEDIA,
+  startDownloadJobInner,
+  type DownloadJobDeps,
+} from "./jobDownload.js";
+import { makeRunAdvisorCli, realRunAdvisorCli, type RunExternalOptions } from "./externalAdvisor.js";
+import { getFreshWebPage, getFreshWebSearch, putWebSearch, saveWebPage } from "./db-host/webCache.js";
+import { blockedNote, fetchPage, joinNames, renderHits, searchWeb, type FetchedPage, type SearchPage } from "./web.js";
+import { fetchPageReply } from "./fetchPageWindow.js";
+import { maskOutboundWeb as privacyMaskOutboundWeb, outboundUrlHides, webMaskNote } from "./privacy.js";
 import { clampBytes, clampBytesMarked, normalizeForMatch } from "./textClamp.js";
 import {
   BUILTIN_TOOL_NAMES,
@@ -339,9 +369,16 @@ export interface ExecToolDeps {
   connectorApproved?: (route: McpRoute, sentArgs: Record<string, unknown>) => Promise<boolean>;
   /**
    * ADD-21: actually run the chosen advisor CLI (`run_external` spawning
-   * `claude -p` / `codex exec`) and return its answer. `undefined` while no
-   * CLI-process integration is ported — `consult_advisor` then refuses rather
-   * than fabricating an advisor's reply.
+   * `claude -p` / `codex exec`) and return its answer. `undefined` means no
+   * caller filled the seam in, and `consult_advisor` then refuses rather than
+   * fabricating an advisor's reply.
+   *
+   * The subprocess itself IS ported — `externalAdvisor.ts`'s `runExternalCli`,
+   * with its shell-safety gate, privacy door, image staging and
+   * kill-on-cancel. {@link withRealAdvisorCli} is the one-line way to install
+   * it. What is still missing is only a HOST BOOTSTRAP that builds the deps
+   * through that helper; until one exists this stays `undefined` in every real
+   * app path, which is why the refusal below is still the honest answer.
    */
   runAdvisorCli?: (engine: "claude-cli" | "codex-cli", question: string) => Promise<string>;
   /**
@@ -386,6 +423,67 @@ export interface ExecToolDeps {
    * either way.
    */
   mcpReconnect?: (servers: ReadonlyArray<[string, ServerConfig]>) => void;
+  /**
+   * `outbound_url_refusal` (agent.rs) — `privacy::outbound_url_hides` behind a
+   * refusal sentence. Every fetch/download/save tool checks a URL against the
+   * room's protected-name block list before it ever reaches the network, so
+   * that a URL built to exfiltrate a hidden name (e.g. embedded in a query
+   * string) cannot leave this Mac while Cloud privacy is on. Returns the
+   * refusal SENTENCE (never throws), or `null` when the URL is clean.
+   *
+   * `undefined` means NOTHING HAS INSTALLED the check on this deps object, and
+   * every arm that needs it then REFUSES rather than skipping it. The check
+   * itself is NOT missing: `privacy.ts` is committed and exports
+   * `outboundUrlHides`/`percentDecode`, and {@link withRealPrivacyGates} fills
+   * this field with the real thing in one line. What is still absent is only a
+   * host bootstrap that builds its deps through that helper.
+   */
+  outboundUrlRefusal?: (url: string) => string | null;
+  /**
+   * PRIV-4 (`privacy.rs`'s `mask_outbound_web`/`web_mask_note`): mask the
+   * room's protected names out of a `web_search` QUERY before it leaves this
+   * Mac for seven search engines, and report the fact in the tool result.
+   * The door restores placeholders in a cloud model's tool arguments so ROOM
+   * tools see real values — but this argument does not stay on the Mac, so
+   * it has to be masked back out at exactly this seam.
+   *
+   * `undefined` is the same "nothing installed it" gap
+   * {@link ExecToolDeps.outboundUrlRefusal} documents, answered the same way:
+   * `web_search` REFUSES (a `NOT_IMPLEMENTED` result) rather than silently
+   * sending an unmasked query, and {@link withRealPrivacyGates} installs
+   * `privacy.ts`'s real `maskOutboundWeb`/`webMaskNote`.
+   *
+   * A URL cannot take the analogous seam — a masked placeholder in a path or
+   * query string just 404s — which is why `fetch_page` reuses
+   * {@link ExecToolDeps.outboundUrlRefusal} instead, exactly as
+   * `download_media` does and for the reason the Rust arm gives.
+   *
+   * Returns the masked query and its user-facing disclosure note, or `null`
+   * when nothing needed masking (no note to add).
+   */
+  maskOutboundWeb?: (query: string) => { query: string; note: string } | null;
+  /**
+   * The real job-queue wiring `download_media` dispatches through —
+   * `jobDownload.ts`'s `DownloadJobDeps`: the shared job-queue slot/room/sink/
+   * cancel registry plus yt-dlp's data dir and the room's import funnel. The
+   * room the job is written to and pinned against is read from that bundle's
+   * own `rooms` source at creation time, exactly as Rust's
+   * `state.with_room(…)` does — never a separately-supplied path that could
+   * disagree with the room actually open. `undefined` (every test but its own)
+   * means no host bootstrap has wired an app-wide job queue into execTool
+   * yet — the same gap every other unwired seam in this file
+   * (`callConnectorTool`, `remoteSeam`, …) documents.
+   *
+   * WIRING HAZARD for whichever host bootstrap fills this in: the bundle's
+   * `starters` map MUST carry `["download", downloadRowStarter(engineDeps)]`.
+   * `startDownloadJobInner` starts the runner ITSELF only when the single
+   * heavy-work slot is free; when it is busy the row is left 'queued', and the
+   * later `pump` resolves it through that map. With no "download" entry
+   * `jobQueue.ts` falls back to `notImplementedRowStarter`, which poisons the
+   * row — so a download would work when the app is idle and fail when it is
+   * busy, which is the worst possible shape for the bug to take.
+   */
+  downloadJob?: DownloadJobDeps;
 }
 
 /** What an injected connector call returns: the tool's text plus any images it
@@ -870,10 +968,11 @@ function execDeleteSkillResource(deps: ExecToolDeps, args: Record<string, unknow
  * double-spend, and a CLI that fails comes back as `Ok` — the local model then
  * recovers by answering itself instead of showing the user a raw tool error.
  *
- * {@link ExecToolDeps.runAdvisorCli} is the injected seam: `run_external`
- * spawning `claude -p` / `codex exec` has no port yet. Without it this REFUSES
- * rather than inventing an advisor's answer — the one thing a tool whose whole
- * output is "what a second model said" must never do.
+ * {@link ExecToolDeps.runAdvisorCli} is the injected seam. The subprocess
+ * behind it IS ported (`externalAdvisor.ts`); what no code path does yet is
+ * INSTALL it, which {@link withRealAdvisorCli} exists to do. Without it this
+ * REFUSES rather than inventing an advisor's answer — the one thing a tool
+ * whose whole output is "what a second model said" must never do.
  */
 async function execConsultAdvisor(
   deps: ExecToolDeps,
@@ -897,8 +996,10 @@ async function execConsultAdvisor(
   const engine = want === "codex" ? "codex-cli" : "claude-cli";
   if (deps.runAdvisorCli === undefined) {
     return notImplemented(
-      "external CLI advisor invocation (run_external spawning claude-cli/codex-cli) — Batch D. " +
-        "The advisor SELECTION and both budget caps are implemented for real; only the subprocess is missing"
+      "nothing has installed the advisor seam on this deps object. The advisor SELECTION, both " +
+        "budget caps AND the CLI subprocess itself (externalAdvisor.ts's runExternalCli) are all " +
+        "implemented for real — the only missing piece is a host bootstrap that builds its deps " +
+        "through execTool.ts's withRealAdvisorCli(). Do NOT re-port run_external"
     );
   }
   // Spend the budget before the slow call so a mid-flight retry can't
@@ -915,6 +1016,373 @@ async function execConsultAdvisor(
       `The advisor could not be reached (${errMessage(e)}). Answer the user from what you ` +
         `already have.`
     );
+  }
+}
+
+/**
+ * ADD-21 wiring: fills {@link ExecToolDeps.runAdvisorCli} with the real
+ * `claude -p` / `codex exec` subprocess (`externalAdvisor.ts`'s port of
+ * `run_external`) whenever a caller has not already supplied its own —
+ * purely additive, and it never touches {@link execConsultAdvisor} above:
+ * every existing test that builds its own bare `ExecToolDeps` object literal
+ * (this file's own `deps()` test helper included) still exercises the
+ * injected-seam behavior exactly as before, because nothing calls this
+ * function on their behalf. A REAL caller constructing the deps a running app
+ * hands to {@link execTool} should build its object THROUGH this
+ * (`execTool("consult_advisor", args, effects, withRealAdvisorCli(deps))`) so
+ * `consult_advisor` gets a real advisor instead of `NOT_IMPLEMENTED`.
+ *
+ * The PRIVACY DOOR needs nothing from here: `externalAdvisor.ts` looks
+ * `privacy.ts`'s active policy up in the leaf itself, exactly as
+ * `run_external` calls `active_policy()`, so a caller cannot forget to pass
+ * it. `options` is for the two pieces that must be handed DOWN because they
+ * belong to one ask rather than to the process — a per-ask MCP bridge and the
+ * run's cancel flag. Neither has a live instance anywhere in this migration
+ * yet (no ported per-ask bridge lifecycle; no ported chat loop that hands
+ * `execTool` a run-scoped flag), so the default passes neither.
+ *
+ * THE BRIDGE IS CLAUDE-ONLY, and this function — not the leaf — is where that
+ * rule lives, because it is a property of the `consult_advisor` CALL SITE:
+ * agent.rs line 4642 is `let bridge = if engine == "claude-cli" {
+ * advisor_bridge } else { None };`, with the reason in its own comment ("the
+ * per-ask advisor bridge … is claude-only; codex gets a plain pipe").
+ * `runExternalCli` itself supports the bridge on BOTH engines on purpose —
+ * `jobs/workflow.rs` really does hand a codex chat turn one — so restricting
+ * it there would break the other caller. Binding `options` before the engine
+ * is known is exactly how a codex advisor would have quietly acquired the
+ * room's file tools, so the seam below picks per call instead.
+ *
+ * WIRING HAZARD for whichever host bootstrap fills this in: pass `cancel`.
+ * Rust's own arm passes `cancel.clone()` on every consult, and it is the ONLY
+ * kill path either port has — there is no wall-clock timeout in `run_external`
+ * or in `runExternalCli`. Without it a wedged `claude -p` leaves this
+ * `await` pending for the life of the process, holding the turn open with no
+ * way for Stop to end it.
+ */
+export function withRealAdvisorCli(deps: ExecToolDeps, options?: RunExternalOptions): ExecToolDeps {
+  if (deps.runAdvisorCli !== undefined) {
+    return deps;
+  }
+  if (options === undefined) {
+    return { ...deps, runAdvisorCli: realRunAdvisorCli };
+  }
+  const withBridge = makeRunAdvisorCli(options);
+  if (options.bridge === undefined) {
+    return { ...deps, runAdvisorCli: withBridge };
+  }
+  const withoutBridge = makeRunAdvisorCli({ ...options, bridge: undefined });
+  return {
+    ...deps,
+    runAdvisorCli: (engine, question) =>
+      engine === "claude-cli" ? withBridge(engine, question) : withoutBridge(engine, question),
+  };
+}
+
+/**
+ * PRIV-4 wiring, the counterpart to {@link withRealAdvisorCli}: fills
+ * {@link ExecToolDeps.maskOutboundWeb} and
+ * {@link ExecToolDeps.outboundUrlRefusal} with `privacy.ts`'s real, committed
+ * port of `privacy::mask_outbound_web` / `privacy::web_mask_note` /
+ * `privacy::outbound_url_hides`, for any caller that has not supplied its own.
+ *
+ * THIS FUNCTION EXISTS BECAUSE THE CHECKS ARE NOT MISSING. Both seams read as
+ * "privacy has no port yet" if you only look at the arms, and BOTH candidate
+ * ports of the web tools wrote that in their refusal text — but `privacy.ts` is
+ * committed, tested, and already read directly by `externalAdvisor.ts`'s leaf
+ * (`activePolicy()`, exactly as `run_external` calls it). The only thing still
+ * absent is a host bootstrap that builds the deps object a running app hands to
+ * {@link execTool}; that bootstrap should build it through here
+ * (`execTool(name, args, effects, withRealPrivacyGates(deps))`) so `web_search`
+ * masks and `fetch_page`/`download_media` refuse for real instead of coming
+ * back `NOT_IMPLEMENTED`.
+ *
+ * Purely additive, and deliberately NOT applied inside the arms: every existing
+ * test that builds a bare `ExecToolDeps` literal still exercises the
+ * injected-seam behavior unchanged, because nothing calls this on its behalf.
+ *
+ * NO ROOM/POLICY ARGUMENT, on purpose. `privacy.ts` holds the active policy in
+ * a module-level cell that `refreshPolicy` installs and room teardown clears —
+ * the direct analogue of Rust's `active_policy()` global. When no policy is
+ * installed (or the Cloud-privacy switch is off) both functions return "nothing
+ * to do", which is precisely what the Rust arms do in the same situation: the
+ * door is a switch the user owns, not a check this seam can forget.
+ */
+export function withRealPrivacyGates(deps: ExecToolDeps): ExecToolDeps {
+  const filled: ExecToolDeps = { ...deps };
+  if (filled.maskOutboundWeb === undefined) {
+    filled.maskOutboundWeb = realMaskOutboundWeb;
+  }
+  if (filled.outboundUrlRefusal === undefined) {
+    filled.outboundUrlRefusal = realOutboundUrlRefusal;
+  }
+  return filled;
+}
+
+/** `privacy.ts`'s `maskOutboundWeb` reshaped to this file's seam: the masked
+ * query plus the disclosure line `web_mask_note` writes, or `null` when nothing
+ * needed masking. Mirrors the Rust arm's own two-line
+ * `mask_outbound_web(...)` + `web_mask_note(hidden)`. */
+function realMaskOutboundWeb(query: string): { query: string; note: string } | null {
+  const masked = privacyMaskOutboundWeb(query);
+  return masked === null ? null : { query: masked.masked, note: webMaskNote(masked.hidden) };
+}
+
+/** Ported verbatim from agent.rs's `outbound_url_refusal`: `outbound_url_hides`
+ * behind the sentence the model reads. */
+function realOutboundUrlRefusal(url: string): string | null {
+  const hidden = outboundUrlHides(url);
+  if (hidden === null) {
+    return null;
+  }
+  return (
+    `Not fetched: this URL carries ${hidden} protected name(s) from this room's block list, and ` +
+    "Cloud privacy is on, so it must not leave this Mac (Settings → Cloud privacy). Tell the user " +
+    "rather than retrying."
+  );
+}
+
+// -------------------------------------------------------------- REAL: web_search
+
+/**
+ * BROWSE-3: free multi-engine web search with no account or API key. Ported
+ * from `exec_tool`'s own `"web_search"` arm (agent.rs lines ~3591-3683).
+ *
+ * PRIV-4 GATE FIRST, mirroring the Rust arm's own order: the query is masked
+ * (or the call refused outright while the seam is unwired — see
+ * {@link ExecToolDeps.maskOutboundWeb}'s own doc) before anything else runs,
+ * including before the room's own internet switch is read.
+ *
+ * CHG-33's two caches: an exact-or-normalized repeat within 15 minutes is
+ * served from `db-host/webCache.ts` with no network touched at all; once a
+ * live search fails outright this turn ({@link ToolEffects.webSearchThrottled}),
+ * the model is steered to stop calling this tool rather than deepening
+ * whatever blocked it. An empty fusion is reported as EITHER "no results"
+ * (the web really had nothing) OR "the search did not run" (every engine
+ * was blocked/rate-limited/too slow) — conflating the two would tell a model
+ * a subject does not exist online because a scraper hit a 429.
+ */
+async function execWebSearch(
+  deps: ExecToolDeps,
+  effects: ToolEffects,
+  args: Record<string, unknown>
+): Promise<ToolOutcome> {
+  const asked = asString(args.query);
+  if (deps.maskOutboundWeb === undefined) {
+    return notImplemented(
+      "nothing has installed the PRIV-4 outbound-query mask on this deps object, so this refused " +
+        "rather than sending an unmasked query to seven search engines. Both halves ARE " +
+        "implemented for real — privacy.ts's maskOutboundWeb/webMaskNote and web.ts's search " +
+        "fusion — and execTool.ts's withRealPrivacyGates() installs the mask in one line. Do NOT " +
+        "re-port privacy.rs or web/search.rs"
+    );
+  }
+  const masked = deps.maskOutboundWeb(asked);
+  const query = masked?.query ?? asked;
+  const maskNote = masked?.note ?? "";
+
+  const room = requireRoom(deps);
+  if (!room.ok) {
+    return fail(room.error);
+  }
+  if (!webAccessEnabled(room.db)) {
+    return ok("Web access is turned off in Settings → Online features.");
+  }
+
+  // CHG-33: serve a recent (<15m) cached result list without touching the
+  // network. Catches exact repeats and case/spacing variants, and avoids
+  // deepening any ban.
+  const cached = getFreshWebSearch(room.db, query);
+  if (cached !== null) {
+    // BROWSE-3: the cache holds hits now, not rendered text, and the
+    // browser's results page shares this row. A search the user ran in the
+    // address bar lands here as a free hit — same web, same ranking,
+    // whichever of the two asked first.
+    return ok(`${renderHits(cached)}${maskNote}`);
+  }
+
+  // CHG-33: once the search path has failed outright this turn, don't keep
+  // calling it — steer the model to salvage the answer from what it already
+  // has.
+  if (effects.webSearchThrottled) {
+    return ok(
+      "Web search is unavailable right now; answer from what you already have or from fetched " +
+        "pages — do not search again this turn."
+    );
+  }
+
+  let page: SearchPage;
+  try {
+    page = await searchWeb(query);
+  } catch (e) {
+    effects.webSearchThrottled = true;
+    return fail(errMessage(e));
+  }
+
+  const hits = page.hits;
+  if (hits.length === 0) {
+    // "No results found." is a claim about the WEB. When every engine was
+    // blocked or rate limited it is a claim about our scrapers, and the
+    // model has no way to tell the two apart — so say which happened, and
+    // never cache a blocked search as an empty one.
+    if (page.failed.length === 0) {
+      return ok(`No results found.${maskNote}`);
+    }
+    return ok(
+      `The search did not run: ${joinNames(page.failed)} could not be reached (blocked, rate ` +
+        "limited or too slow). This is NOT evidence that nothing exists for this query — tell the " +
+        "user the search was blocked rather than reporting no results, and answer from a fetched " +
+        "page or what you already have."
+    );
+  }
+
+  try {
+    putWebSearch(room.db, query, hits);
+  } catch {
+    // Best-effort, matching Rust's `let _ = db::put_web_search(...)`.
+  }
+
+  const note = blockedNote(page);
+  const rendered = note !== null ? `${renderHits(hits)}\n\n${note}` : renderHits(hits);
+  return ok(`${rendered}${maskNote}`);
+}
+
+// -------------------------------------------------------------- REAL: fetch_page
+
+/**
+ * Read one web page's text. Ported from `exec_tool`'s own `"fetch_page"` arm
+ * (agent.rs lines ~3684-3731).
+ *
+ * PRIV-4 GATE FIRST, mirroring the Rust arm's own order and its own reasoning
+ * for reusing `outbound_url_refusal` (the same seam `download_media` needs)
+ * rather than `web_search`'s masking seam: a URL is ENCODED, so a masked
+ * placeholder in a path or query string just 404s — this REFUSES instead of
+ * fetching, and refuses outright (a `NOT_IMPLEMENTED` result) while the seam
+ * itself is unwired, exactly like `download_media`.
+ *
+ * RM-2's cache: a fetch within the last 24h is served from
+ * `db-host/webCache.ts` with no network touched, and (because a cache hit
+ * carries no live redirect info) the redirect note only ever appears on a
+ * fresh fetch that actually landed somewhere other than the requested URL.
+ */
+async function execFetchPage(deps: ExecToolDeps, args: Record<string, unknown>): Promise<ToolOutcome> {
+  const url = asString(args.url);
+  if (deps.outboundUrlRefusal === undefined) {
+    return notImplemented(
+      "nothing has installed the PRIV-4 outbound-URL check on this deps object, so this refused " +
+        "rather than skipping it. Both halves ARE implemented for real — privacy.ts's " +
+        "outboundUrlHides and web.ts's guarded HTTP client (per-hop SSRF re-check, DNS pinning, " +
+        "streamed byte caps) — and execTool.ts's withRealPrivacyGates() installs the check in one " +
+        "line. Do NOT re-port privacy.rs or web/fetch.rs"
+    );
+  }
+  const refusal = deps.outboundUrlRefusal(url);
+  if (refusal !== null) {
+    return ok(refusal);
+  }
+  // CHG-5/CHG-28: continue reading a long page from a char offset.
+  const rawStart = args.start;
+  const start = typeof rawStart === "number" && Number.isFinite(rawStart) && rawStart >= 0 ? Math.trunc(rawStart) : 0;
+
+  const room = requireRoom(deps);
+  if (!room.ok) {
+    return fail(room.error);
+  }
+  if (!webAccessEnabled(room.db)) {
+    return ok("Web access is turned off in Settings → Online features.");
+  }
+
+  // RM-2: serve a fresh (<24h) cached copy without touching the network.
+  const cached = getFreshWebPage(room.db, url);
+  let title: string;
+  let text: string;
+  // D2 (2026-08-04): a cache hit has no live redirect info; a fresh fetch's
+  // `finalUrl` is only worth mentioning when it actually differs from what
+  // was asked for — otherwise every ordinary fetch would carry a pointless
+  // "redirected to the same URL" line.
+  let redirectedTo: string | null = null;
+  if (cached !== null) {
+    title = cached.title;
+    text = cached.text;
+  } else {
+    let fetched: FetchedPage;
+    try {
+      fetched = await fetchPage(url);
+    } catch (e) {
+      return fail(errMessage(e));
+    }
+    title = fetched.title;
+    text = fetched.text;
+    try {
+      saveWebPage(room.db, url, title, text);
+    } catch {
+      // Best-effort, matching Rust's `let _ = db::save_web_page(...)`.
+    }
+    redirectedTo = fetched.finalUrl !== url ? fetched.finalUrl : null;
+  }
+  return ok(fetchPageReply(title, url, text, start, redirectedTo));
+}
+
+// ------------------------------------------------------------ REAL: download_media
+
+/**
+ * BROWSE-2 (D18): download the media at a yt-dlp-supported URL as a durable
+ * background job. Ported from `exec_tool`'s own `"download_media"` arm
+ * (agent.rs lines ~3817-3836).
+ *
+ * TWO GATES RUN BEFORE THE JOB IS EVEN CREATED, mirrored from the Rust arm in
+ * the same order:
+ *   1. `outbound_url_refusal` (privacy.rs's `outbound_url_hides`) — refused
+ *      (never silently skipped) while {@link ExecToolDeps.outboundUrlRefusal}
+ *      is unwired; see that field's own doc. Needs no open room, so it runs
+ *      BEFORE "No room is open." can even be asked — exactly the Rust arm's
+ *      own order.
+ *   2. The room's own internet switch, answered with a friendly `ok()`
+ *      sentence rather than a tool FAILURE — exactly the Rust arm's own
+ *      `Ok("Web access is turned off...")`, not an error a model would need
+ *      to recover from.
+ *
+ * Only once both pass does {@link ExecToolDeps.downloadJob} — the real
+ * job-queue wiring ({@link startDownloadJobInner} from `jobDownload.ts`) —
+ * actually create, and (if the slot is free) start, the job.
+ */
+async function execDownloadMedia(
+  deps: ExecToolDeps,
+  args: Record<string, unknown>
+): Promise<ToolOutcome> {
+  const url = asString(args.url).trim();
+  if (deps.outboundUrlRefusal === undefined) {
+    return notImplemented(
+      "privacy.rs's outbound_url_hides check (the cloud-privacy protected-name guard every " +
+        "download/save tool runs before reaching the network) has no Electron port yet — refused " +
+        "rather than skipping it. jobDownload.ts's yt-dlp job-queue wrapper is fully implemented " +
+        "and tested; it is ready to wire in once that check lands"
+    );
+  }
+  const refusal = deps.outboundUrlRefusal(url);
+  if (refusal !== null) {
+    return ok(refusal);
+  }
+  const room = requireRoom(deps);
+  if (!room.ok) {
+    return fail(room.error);
+  }
+  if (!webAccessEnabled(room.db)) {
+    return ok("Web access is turned off in Settings → Online features.");
+  }
+  if (deps.downloadJob === undefined) {
+    return notImplemented(
+      "the download-job queue wiring (an app-wide JobQueueDeps + yt-dlp's data dir + the room's " +
+        "import funnel) is not connected to execTool yet — Batch D"
+    );
+  }
+  try {
+    const jobId = startDownloadJobInner(deps.downloadJob, url, DOWNLOAD_ENGINE_MEDIA);
+    return ok(
+      `Downloading the media as background job ${jobId} — track it with job_status. The file will ` +
+        "be transcribed automatically after it arrives."
+    );
+  } catch (e) {
+    return fail(errMessage(e));
   }
 }
 
@@ -1204,19 +1672,40 @@ export async function execTool(
 
     // ------------------------------------------------------------- web/download
     case "web_search":
+      return execWebSearch(deps, effects, args);
     case "fetch_page":
-      return notImplemented("the web-search/page-fetch subsystem — Batch D");
+      return execFetchPage(deps, args);
     case "save_link":
-    case "download_url":
-    case "download_media":
-      // NOT `commands/organize.rs`, which this batch ported: these three arms
-      // reach `commands/web.rs` (`outbound_url_refusal`, `download_to_temp`),
-      // `commands/files.rs` (`import_link_and_index`, `import_download`) and
-      // the background download-job engine. Naming the wrong module here would
-      // send Batch D to a file that is already done.
+      // NOT `commands/organize.rs` (ported) and NOT `web/fetch.rs` (ported —
+      // `web.ts`'s `fetchReadable`/`youtubeTranscript` ARE the two engines this
+      // arm reads with). What is missing is the INGESTION half:
+      // `commands/files.rs`'s `import_link_and_index`, which turns either
+      // reading into a Markdown room file and indexes it. Naming the wrong
+      // module here would send Batch D to files that are already done.
       return notImplemented(
-        "the download/save subsystem (commands/web.rs + files.rs's link/download import + the download-job engine) — Batch D"
+        "commands/files.rs's import_link_and_index (the save-as-Markdown / YouTube-transcript " +
+          "ingestion funnel behind save_link) — Batch D. Its two READ engines are already ported " +
+          "and tested as web.ts's fetchReadable/youtubeTranscript; do not re-port web/fetch.rs"
       );
+    case "download_url":
+      // Unlike download_media (wired for real just below), this arm needs
+      // `files.rs`'s `import_download` — the staged-file → room-file import —
+      // which has no Electron port. The FETCH half is done: `web.ts`'s
+      // `downloadToTemp` ports `web/fetch.rs`'s guarded, streaming,
+      // size-capped download (per-hop SSRF re-check, DNS pinning) including
+      // `INLINE_DOWNLOAD_BYTES`/`MAX_DOWNLOAD_BYTES`. Wiring the fetch without
+      // the import would stage a temp file nobody ever collects, so this stays
+      // an honest stub until its other half lands.
+      return notImplemented(
+        "commands/files.rs's import_download (staged temp file → room file), plus the " +
+          "outbound_url_hides cloud-privacy gate every download/save tool checks first — Batch D. " +
+          "The guarded download engine itself IS ported and tested (web/fetch.rs's " +
+          "download_to_temp is web.ts's downloadToTemp), as is the privacy check (privacy.ts, " +
+          "installed via withRealPrivacyGates); do not re-port either. download_media (yt-dlp's " +
+          "media engine) is wired for real; see that arm"
+      );
+    case "download_media":
+      return execDownloadMedia(deps, args);
 
     // ------------------------------------------------------------------ scripts
     case "list_scripts":
@@ -1241,12 +1730,31 @@ export async function execTool(
       return notImplemented("rec/engine.py's on-device STT surface — Batch C/D");
 
     // --------------------------------------------- skills: the two gated verbs
-    case "delete_skill":
-      // Rust routes this through `confirm_destructive` — a user-facing consent
-      // dialog. Deleting a skill behind a refusal the user never saw is the
-      // one failure mode worth more than the feature, so this stays stubbed
-      // until that dialog exists rather than calling `deleteSkill` directly.
-      return notImplemented("the confirm_destructive consent dialog for a skill deletion — Batch D");
+    case "delete_skill": {
+      // Rust routes this through `confirm_destructive` — a user-facing
+      // consent dialog. `ExecToolDeps.confirmDestructive` now exists
+      // (`delete_mcp` below already uses it), so this mirrors that arm's
+      // exact pattern: refuse unconditionally while no consent surface is
+      // wired, otherwise resolve, confirm, then delete via
+      // `skillsCmds.ts`'s `agentDeleteSkill` (`agent_delete_skill`).
+      // Checked before `requireRoom`, matching `delete_mcp`: a missing
+      // consent surface is refused unconditionally, not only once a room
+      // happens to be open.
+      if (deps.confirmDestructive === undefined) {
+        return notImplemented(
+          "the confirm_destructive consent dialog for a skill deletion is not wired up — Batch D"
+        );
+      }
+      const room = requireRoom(deps);
+      if (!room.ok) return fail(room.error);
+      try {
+        const text = await agentDeleteSkill(room.db, args, deps.confirmDestructive);
+        emitSafely(deps, "skills-changed", undefined);
+        return ok(text);
+      } catch (e) {
+        return fail(errMessage(e));
+      }
+    }
     case "run_skill_script":
       return notImplemented("skill script execution (fingerprint consent + the script runner) — Batch D");
 
