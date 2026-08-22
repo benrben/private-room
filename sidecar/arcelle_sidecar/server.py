@@ -23,6 +23,7 @@ import hmac
 import logging
 import os
 from typing import Any, AsyncIterator, Awaitable, Callable, TypeVar
+from urllib.parse import parse_qsl
 
 import httpx
 from fastapi import FastAPI, Request
@@ -83,6 +84,7 @@ from .graph import CancelToken, Deps, Emit, stream_events
 from .mcp_client import McpClient
 from .messages import compact_json
 from .provider_api import OpenAICompatibleChatModel
+from .rec.session_ws import register_rec_routes
 
 log = logging.getLogger("arcelle_sidecar")
 
@@ -230,6 +232,23 @@ class TokenAuthMiddleware:
             )
             await send({"type": "http.response.body", "body": body})
             return
+        # MIGRATION (rec/session_ws.py): the recording WebSocket routes
+        # (/rec/session, /rec/host) are reached by a renderer WebSocket client,
+        # which cannot set an Authorization header on the handshake — so the
+        # same token rides a `?token=` query parameter instead (the plan's own
+        # owner decision Q3: "accept with a WS-only token scope check in
+        # TokenMiddleware"). Here rather than per-route so this class stays the
+        # single answer to "who may drive this sidecar" and a WS route added
+        # later inherits the guard instead of having to remember it. The
+        # header-based branch above is untouched for every HTTP route.
+        #
+        # Rejected before `self.app`, and therefore before the route, ever sees
+        # the connection: answering `websocket.close` instead of
+        # `websocket.accept` fails the handshake outright.
+        if scope.get("type") == "websocket" and not self._ws_allowed(scope):
+            await receive()
+            await send({"type": "websocket.close", "code": 4401})
+            return
         await self.app(scope, receive, send)
 
     def _allowed(self, scope: Any) -> bool:
@@ -240,6 +259,15 @@ class TokenAuthMiddleware:
                 # compare_digest, not ==: the reply timing of a loopback socket
                 # is a poor oracle, but this costs nothing.
                 return hmac.compare_digest(value, self._expected)
+        return False
+
+    def _ws_allowed(self, scope: Any) -> bool:
+        """The same secret, off the query string instead of a header — see the
+        websocket branch in :meth:`__call__`."""
+        query = parse_qsl((scope.get("query_string") or b"").decode("utf-8", "replace"))
+        for key, value in query:
+            if key == "token":
+                return hmac.compare_digest(value.encode(), self.token.encode())
         return False
 
 
@@ -337,6 +365,12 @@ def create_app(
     token = os.environ.get(TOKEN_ENV, "") if token is None else token
     if token:
         app.add_middleware(TokenAuthMiddleware, token=token)
+    # The recording surface: POST /rec/* + WS /rec/session + WS /rec/host, and
+    # the single-live-session slot behind them (on `app.state.rec_manager`).
+    # Its own module owns every decision; this is the whole of its footprint
+    # here, and it needs no token of its own — the WS routes are guarded by the
+    # `?token=` branch of TokenAuthMiddleware above.
+    register_rec_routes(app)
     registry = RunRegistry()
     app.state.registry = registry
 

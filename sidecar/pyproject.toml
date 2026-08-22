@@ -84,6 +84,7 @@ dependencies = [
     # so this is the closest actively-maintained, Apache-2.0, lxml-based port
     # of the Mozilla Readability algorithm. Imported as `readability`.
     "readability-lxml>=0.8.4.1",
+    "cryptography>=50.0.0",
 ]
 
 [project.optional-dependencies]
