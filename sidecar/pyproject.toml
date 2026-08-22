@@ -51,6 +51,12 @@ dependencies = [
     "numpy>=2.4.6",
     "pywhispercpp>=1.5.0",
     "onnxruntime>=1.29.0",
+    "pyobjc-framework-vision>=12.2.2",
+    "pyobjc-framework-quartz>=12.2.2",
+    "pyobjc-framework-avfoundation>=12.2.2",
+    "pyobjc-framework-coremedia>=12.2.2",
+    "pyobjc-framework-quicklookthumbnailing>=12.2.2",
+    "pymupdf>=1.28.2",
 ]
 
 [project.optional-dependencies]
