@@ -73,6 +73,12 @@ dependencies = [
     # with a small hand-rolled CFB writer, or with dev-only xlwt/odfpy writers
     # for .xls/.ods).
     "olefile>=0.47",
+    # docs/text_decode.py (port of src-tauri/src/extraction.rs's encoding
+    # cascade): the ambiguous-single-byte-encoding GUESS step needs a real
+    # detector. It was only ever present transitively (requests/httpx pull
+    # it in for their own response-charset sniffing); we now import it
+    # directly, so declare what we import.
+    "charset-normalizer>=3.4.9",
 ]
 
 [project.optional-dependencies]

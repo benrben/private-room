@@ -43,6 +43,7 @@ IMPORT_TO_DISTRIBUTION = {
     "QuickLookThumbnailing": "pyobjc-framework-quicklookthumbnailing",
     # odfpy's own top-level package is literally named "odf".
     "odf": "odfpy",
+    "charset_normalizer": "charset-normalizer",
 }
 
 
