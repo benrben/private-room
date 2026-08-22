@@ -18,6 +18,7 @@ import { createRoom } from "./db-host/open.js";
 import { insertFile } from "./db-host/files.js";
 import { addMemory } from "./db-host/memories.js";
 import { findSkill, listSkillResources, listSkills } from "./db-host/skills.js";
+import { loadTokens, saveTokens } from "./mcpOauth.js";
 import { BUILTIN_TOOL_NAMES, type McpRoute } from "./toolSpecs.js";
 import { builtinParamSchemas } from "./toolSchema.js";
 import { scopedSpecs } from "./bridgeDispatcher.js";
@@ -164,6 +165,27 @@ describe("exhaustive tool-arm coverage — the single most valuable test in this
       "search_room",
       "open_file",
       "annotate_file",
+      // The organize box (organizeTools.ts). `mark_image` belongs here too
+      // even though its grounding pass is still NOT_IMPLEMENTED: the arm is
+      // wired, so with no room open it answers "No room is open." like every
+      // other real arm, which is the shape this test discriminates on. Its
+      // partial-ness is pinned in organizeTools.test.ts instead.
+      "mark_image",
+      "create_file",
+      "rename_file",
+      "move_file",
+      "set_in_library",
+      "organize_files",
+      "trash_files",
+      "merge_files",
+      // MCP connector management (mcpConfig.ts). `delete_mcp` is NOT here on
+      // purpose: it is wired, but it refuses up front while
+      // `ExecToolDeps.confirmDestructive` is unwired — which `deps()` leaves
+      // undefined — so under this test's own deps it really does answer
+      // NOT_IMPLEMENTED, and asserting that is the honest check.
+      "list_mcps",
+      "read_mcp",
+      "save_mcp",
     ];
     const stubbedNames = NAMED_ARM_TOOL_NAMES.filter((n) => !REAL_ARMS.includes(n));
     for (const name of stubbedNames) {
@@ -659,6 +681,189 @@ describe("the default arm (connector routes)", () => {
   it("an unmatched name that is also not a route is a real Unknown-tool error", async () => {
     const outcome = await execTool("not_a_route_either", {}, effects(), deps({ routes: [route] }));
     expect(outcome).toEqual({ ok: false, error: "Unknown tool: not_a_route_either" });
+  });
+});
+
+// ====================================== REAL MCP-management arms (this batch)
+
+/**
+ * The four connector-management arms, driven through the REAL `execTool` switch
+ * against a REAL room.
+ *
+ * The exhaustive coverage test above only proves these names do not fall
+ * through to the connector default, and the stub test proves the opposite for
+ * the names it lists — neither notices an arm wired to the WRONG function of
+ * `mcpConfig.ts`, which is the mistake a four-arm block of near-identical case
+ * bodies actually invites. These pin each arm to its own behaviour.
+ */
+describe("list_mcps / read_mcp / save_mcp / delete_mcp (real, through execTool)", () => {
+  const CONFIG = `{"mcpServers":{"web":{"command":"uvx","args":["ddg","--api-key","sk-live-4kQm2p8Z1x7BvT0nRw"]}}}`;
+  function roomWithConfig(): Database.Database {
+    const room = freshRoom();
+    room
+      .prepare(
+        `INSERT INTO settings(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`
+      )
+      .run("mcp_config", CONFIG);
+    return room;
+  }
+
+  it("list_mcps inventories the room, masking a key typed onto the command line", async () => {
+    const room = roomWithConfig();
+    const outcome = await execTool("list_mcps", {}, effects(), deps({ db: room }));
+    expect(outcome.ok).toBe(true);
+    const text = outcome.ok ? outcome.text : "";
+    expect(text).toContain("- web [configured] — local: uvx ddg --api-key [redacted]");
+    expect(text).not.toContain("sk-live-4kQm2p8Z1x7BvT0nRw");
+  });
+
+  it("list_mcps reports a live status when the manager seam supplies one", async () => {
+    const room = roomWithConfig();
+    const outcome = await execTool(
+      "list_mcps",
+      {},
+      effects(),
+      deps({ db: room, mcpStatuses: new Map([["web", "connected"]]) })
+    );
+    expect(outcome.ok ? outcome.text : "").toContain("- web [connected]");
+  });
+
+  it("read_mcp reads the NAMED connector and refuses an unknown one", async () => {
+    const room = roomWithConfig();
+    const outcome = await execTool("read_mcp", { name: "web" }, effects(), deps({ db: room }));
+    expect(outcome.ok).toBe(true);
+    expect(outcome.ok ? outcome.text : "").toContain("Connector web (credentials redacted)");
+    expect(outcome.ok ? outcome.text : "").not.toContain("sk-live-4kQm2p8Z1x7BvT0nRw");
+    // The arm passes the model's `name` through — a wiring that ignored it, or
+    // called list_mcps instead, would answer for the whole room.
+    const missing = await execTool("read_mcp", { name: "nope" }, effects(), deps({ db: room }));
+    expect(missing).toEqual({ ok: false, error: 'No connector named "nope" exists.' });
+  });
+
+  it("save_mcp stores the connector DISABLED even when the model asks for enabled — SEC-1, end to end — and a retarget clears the sign-in and the grants", async () => {
+    const room = freshRoom();
+    const first = await execTool(
+      "save_mcp",
+      { name: "gh", config: { type: "http", url: "https://a.test/mcp", disabled: false } },
+      effects(),
+      deps({ db: room })
+    );
+    expect(first.ok).toBe(true);
+    expect(first.ok ? first.text : "").toContain('Saved connector "gh" as disabled.');
+    const read = (): Record<string, unknown> => {
+      const row = room.prepare(`SELECT value FROM settings WHERE key = 'mcp_config'`).get() as {
+        value: string;
+      };
+      const servers = JSON.parse(row.value)["mcpServers"] as Record<string, unknown>;
+      return servers["gh"] as Record<string, unknown>;
+    };
+    expect(read()["disabled"]).toBe(true);
+
+    saveTokens(room, "gh", {
+      accessToken: "at",
+      refreshToken: "rt",
+      expiresAt: 0,
+      clientId: "c",
+      tokenEndpoint: "https://a.test/token",
+      refreshRejected: false,
+    });
+    const forgotten: string[] = [];
+    const reconnected: string[] = [];
+    const outcome = await execTool(
+      "save_mcp",
+      { name: "gh", config: { type: "http", url: "https://evil.test/mcp" } },
+      effects(),
+      deps({
+        db: room,
+        mcpForgetConnectorGrants: (s) => {
+          forgotten.push(s);
+          return { cleared: true };
+        },
+        mcpReconnect: (servers) => reconnected.push(...servers.map(([n]) => n)),
+      })
+    );
+    expect(outcome.ok).toBe(true);
+    expect(outcome.ok ? outcome.text : "").toContain("NOT carried over");
+    // The injected per-Mac seams are actually reached by the arm.
+    expect(forgotten).toEqual(["gh"]);
+    expect(reconnected).toEqual(["gh"]);
+    // The retarget bug class, through the wired arm: the sign-in does not
+    // survive to greet the new endpoint under the old name.
+    expect(loadTokens(room, "gh")).toBeNull();
+    expect(read()["url"]).toBe("https://evil.test/mcp");
+  });
+
+  it("save_mcp reports the room's own error rather than throwing out of the arm", async () => {
+    const room = freshRoom();
+    // A non-empty `config`, so `missingRequiredArg` is satisfied and the arm's
+    // OWN validation is what answers.
+    const outcome = await execTool(
+      "save_mcp",
+      { name: "has space", config: { command: "uvx" } },
+      effects(),
+      deps({ db: room })
+    );
+    expect(outcome.ok).toBe(false);
+    expect(outcome.ok ? "" : outcome.error).toContain("Connector names use 1-64");
+    expect(outcome.ok ? "" : outcome.error).not.toContain("NOT_IMPLEMENTED");
+  });
+
+  it("delete_mcp REFUSES while no consent dialog is wired, and touches nothing", async () => {
+    const room = roomWithConfig();
+    const outcome = await execTool("delete_mcp", { name: "web" }, effects(), deps({ db: room }));
+    expect(outcome.ok).toBe(false);
+    expect(outcome.ok ? "" : outcome.error).toMatch(/^NOT_IMPLEMENTED: /);
+    expect(outcome.ok ? "" : outcome.error).toContain("confirm_destructive");
+    expect(
+      (room.prepare(`SELECT value FROM settings WHERE key = 'mcp_config'`).get() as { value: string }).value
+    ).toBe(CONFIG);
+  });
+
+  it("delete_mcp refuses for a MISSING consent dialog before it even asks whether a room is open", async () => {
+    // Order matters: a missing consent surface is refused unconditionally, not
+    // only once a room happens to be open — otherwise the first thing a wired
+    // app would see is "No room is open." and the real reason would be hidden.
+    const outcome = await execTool("delete_mcp", { name: "web" }, effects(), deps({ db: null }));
+    expect(outcome.ok ? "" : outcome.error).toContain("confirm_destructive");
+  });
+
+  it("delete_mcp with a real consent dialog deletes the connector and its token, and a decline changes nothing", async () => {
+    const room = roomWithConfig();
+    saveTokens(room, "web", {
+      accessToken: "at",
+      refreshToken: null,
+      expiresAt: 0,
+      clientId: null,
+      tokenEndpoint: null,
+      refreshRejected: false,
+    });
+    const declined = await execTool(
+      "delete_mcp",
+      { name: "web" },
+      effects(),
+      deps({ db: room, confirmDestructive: async () => false })
+    );
+    expect(declined.ok).toBe(false);
+    expect(declined.ok ? "" : declined.error).toContain("Not deleted");
+    expect(loadTokens(room, "web")).not.toBeNull();
+
+    let asked = "";
+    const done = await execTool(
+      "delete_mcp",
+      { name: "web" },
+      effects(),
+      deps({
+        db: room,
+        confirmDestructive: async (what, name, detail) => {
+          asked = `${what}:${name}:${detail}`;
+          return true;
+        },
+      })
+    );
+    expect(done.ok).toBe(true);
+    expect(asked).toContain("connector:web:");
+    expect(done.ok ? done.text : "").toContain('Deleted connector "web"');
+    expect(loadTokens(room, "web")).toBeNull();
   });
 });
 

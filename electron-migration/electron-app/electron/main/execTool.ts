@@ -10,10 +10,10 @@
  *
  * MOST ARMS ARE STUBS, and that is the honest state of the port rather than an
  * oversight. `exec_tool` dispatches into whole subsystems this rewrite has not
- * reached — `commands/organize.rs`, `edit_match.rs`, `web.rs`, the AgentUi
- * screen-driving bridge, the private browser's command surface, the Scripts/
- * Studio/sketch/STT/MCP-management/jobs-workflows/local-generate lanes, and the
- * external-CLI advisor subprocess.
+ * reached — `edit_match.rs`, `web.rs`, the AgentUi screen-driving bridge, the
+ * private browser's command surface, the Scripts/Studio/sketch/STT/
+ * jobs-workflows/local-generate lanes, and the external-CLI advisor
+ * subprocess.
  *
  * THE INVARIANT THIS FILE EXISTS TO HOLD: every name the tool catalog or an
  * `McpRoute` can produce reaches a NAMED arm. A stub returns a labeled
@@ -41,12 +41,33 @@
  *   `search_room` degrades to keyword-only retrieval, because `embed_question`
  *   has no Electron port yet — see that file's own module doc for why that is
  *   the Rust arm's own no-embed-model path rather than a stand-in.
- *
- * The eight names that once shared the file arms' stub — `mark_image`,
- * `create_file`, `rename_file`, `move_file`, `set_in_library`,
- * `organize_files`, `trash_files`, `merge_files` — depend on
- * `commands/organize.rs` plus `db/folders.rs`/`artifacts.rs`, which a
- * different batch owns, and stay `NOT_IMPLEMENTED` below.
+ * - the organize box — `mark_image` / `create_file` / `rename_file` /
+ *   `move_file` / `set_in_library` / `organize_files` / `trash_files` /
+ *   `merge_files`, against the already-committed `organize.ts` and
+ *   `db-host/{files,folders,versions,artifacts}.ts`, plus `bulkReport.ts`
+ *   (the `BulkReport::changed_anything`/`::sentence` helpers `organize.ts`'s
+ *   own doc flags as the one piece of `commands/bulk.rs` still missing) and
+ *   `docsHtml.ts` (the scratch-pad and HTML-first slice of
+ *   `commands/docs_html.rs` `create_file` needs, carrying the app's real
+ *   inlined design system rather than a look-alike); the arms themselves live
+ *   in `organizeTools.ts`. Seven are fully real, `create_file` included — the
+ *   ART-1 staged-artifact commit is replicated by hand against
+ *   `db-host/artifacts.ts`, since `commands/artifact.rs`'s fluent `Artifact`
+ *   builder has no port of its own yet. `mark_image` is the one honestly
+ *   PARTIAL arm: it resolves the image and answers a repeat-mark for real,
+ *   but the vision grounding pass (`ollama.rs`'s model listing and vision
+ *   pick, the privacy-door check, `ground_prepared_image`) is wholly unported
+ *   and still comes back `NOT_IMPLEMENTED` — see `organizeTools.ts`'s own
+ *   module doc for why that refusal deliberately does NOT borrow Rust's "no
+ *   vision model installed on this Mac" wording.
+ * - MCP connector management — `list_mcps` / `read_mcp` / `save_mcp` against
+ *   `mcpConfig.ts`. `delete_mcp` is wired to the same module but REFUSES
+ *   while {@link ExecToolDeps.confirmDestructive} is unwired, for the reason
+ *   `delete_skill` gives: a deletion that erases a saved OAuth token must not
+ *   happen behind a confirmation the user never saw. The live `McpManager`
+ *   (statuses, reconnects) has no app-wide container yet, and the per-Mac
+ *   connector-grants file needs the app's `userDataDir`, which an `exec_tool`
+ *   arm has no access to — each degrades through its own named dep below.
  */
 
 import type Database from "better-sqlite3-multiple-ciphers";
@@ -75,6 +96,23 @@ import {
   execOpenFile,
   execSearchRoom,
 } from "./fileTools.js";
+import {
+  agentDeleteMcp,
+  agentListMcps,
+  agentReadMcp,
+  agentSaveMcp,
+} from "./mcpConfig.js";
+import type { ServerConfig } from "./mcpClient.js";
+import {
+  execCreateFile,
+  execMarkImage,
+  execMergeFiles,
+  execMoveFile,
+  execOrganizeFiles,
+  execRenameFile,
+  execSetInLibrary,
+  execTrashFiles,
+} from "./organizeTools.js";
 import { clampBytes, clampBytesMarked, normalizeForMatch } from "./textClamp.js";
 import {
   BUILTIN_TOOL_NAMES,
@@ -222,14 +260,31 @@ export interface ExecToolDeps {
   /**
    * The Stop flag `tool_cancel_for` resolved for this call (`bridgeDispatcher.ts`
    * always computes and threads this through, matching the Rust source's
-   * `exec_tool(..., cancel: Option<Arc<AtomicBool>>, ...)` parameter). No
-   * arm in THIS batch reads it yet — every write-side effect that would
-   * (`gated_write`'s commit gate, `run_script`'s wait) lives in a subsystem
-   * still stubbed as `NOT_IMPLEMENTED` — but it is threaded through now so a
+   * `exec_tool(..., cancel: Option<Arc<AtomicBool>>, ...)` parameter).
+   *
+   * `create_file` is the one arm reading it today — the ART-1 staging funnel
+   * reads the flag BETWEEN staging and committing, so the live object is what
+   * gets handed over, never a boolean snapshot taken here. The other
+   * write-side effects that would read it (`gated_write`'s commit gate,
+   * `run_script`'s wait) still live in subsystems stubbed as
+   * `NOT_IMPLEMENTED`; the seam is threaded through for all of them so a
    * future batch's real arm has it already wired rather than needing every
    * call site touched again.
    */
   cancel?: { load(): boolean } | null;
+  /**
+   * `turn.map(|t| t.run_id())` — the run this call belongs to, recorded in the
+   * provenance of anything it writes so History can say which answer produced
+   * a file. `create_file` is its only reader so far.
+   *
+   * `undefined`/`null` are NOT a gap this port introduces: they are Rust's own
+   * `turn: None` path, which is what a tool dispatched by the persistent room
+   * bridge (the one caller wired today, `bridgeDispatcher.ts`) genuinely has.
+   * The seam is threaded now for the same reason {@link ExecToolDeps.cancel}
+   * was, so the chat/turn path can supply it without every call site being
+   * touched again.
+   */
+  runId?: string | null;
   /** Best-effort UI notification for a room mutation the user may be looking
    * at (`window.emit("memories-changed", ())`). Optional and swallowed on
    * failure, exactly like the Rust source's `let _ = window.emit(...)`. */
@@ -289,6 +344,48 @@ export interface ExecToolDeps {
    * than fabricating an advisor's reply.
    */
   runAdvisorCli?: (engine: "claude-cli" | "codex-cli", question: string) => Promise<string>;
+  /**
+   * `confirm_destructive` — ask the user before the agent destroys something
+   * with no undo (a connector deletion erases its saved OAuth token with
+   * it). `undefined` means no consent dialog is wired yet, so `delete_mcp`
+   * refuses rather than deleting behind a confirmation the user never saw
+   * (`delete_skill`, just above it in the dispatch below, is stubbed for the
+   * exact same missing seam). Shaped after `mcp_cmds.rs`'s own
+   * `confirm_destructive(state, window, what, name, detail)`.
+   */
+  confirmDestructive?: (what: string, name: string, detail: string) => Promise<boolean>;
+  /**
+   * `state.mcp.lock().unwrap().statuses()`, reduced to what `agent_list_mcps`
+   * reads: a connector NAME -> live status string (e.g. "connected",
+   * "failed"). `undefined`/a name missing from the map degrades exactly like
+   * Rust's own fallback — every enabled connector reads "configured" rather
+   * than a live state — because no persistent, app-wide `McpManager`
+   * (`mcpClient.ts`) is wired into a running app yet in this migration.
+   */
+  mcpStatuses?: ReadonlyMap<string, string>;
+  /**
+   * `forget_connector_grants` — clears this Mac's per-connector standing
+   * permissions ("run without asking" / "send real values") for one
+   * connector after `save_mcp` retargets it or `delete_mcp` removes it. Per-
+   * Mac file I/O (`mcp_connector_powers.json`) outside any room: the store
+   * itself IS ported (`mcpConfig.ts`'s `forgetConnectorGrants`), but it needs
+   * the app's `userDataDir` and the process's session-grant set, which an
+   * `exec_tool` arm has neither of — hence the seam. `undefined` silently
+   * skips the extra sentence a real store would add to the reply — harmless,
+   * since nothing in this migration can yet have granted such a permission
+   * for it to clear.
+   */
+  mcpForgetConnectorGrants?: (server: string) => { cleared: boolean };
+  /**
+   * `start_mcp_connections` — kick off a live reconnect off the servers
+   * `save_mcp`/`delete_mcp` just wrote. `undefined` means no live Manager to
+   * refresh yet (same gap as {@link ExecToolDeps.mcpStatuses}); harmless
+   * here because every connector `save_mcp` writes is saved DISABLED
+   * regardless (`mcpConfig.ts`'s own SEC-1 property), so nothing runs or
+   * reaches the network until a human reviews and enables it in Connectors
+   * either way.
+   */
+  mcpReconnect?: (servers: ReadonlyArray<[string, ServerConfig]>) => void;
 }
 
 /** What an injected connector call returns: the tool's text plus any images it
@@ -1044,18 +1141,50 @@ export async function execTool(
       return room.ok ? execAnnotateFile(room.db, args, effects, deps.emit) : fail(room.error);
     }
 
-    // ----------------------------------------------------- organize.rs (Batch D)
-    case "mark_image":
-    case "create_file":
-    case "rename_file":
-    case "move_file":
-    case "set_in_library":
-    case "organize_files":
-    case "trash_files":
-    case "merge_files":
-      return notImplemented(
-        "the room's file WRITE/organize layer (commands/organize.rs, db/folders.rs, db/artifacts.rs) — and, for mark_image, the vision grounding pass — is not ported yet — Batch D"
-      );
+    // -------------------------------------------------- REAL: the organize box
+    case "mark_image": {
+      const room = requireRoom(deps);
+      return room.ok ? execMarkImage(room.db, args, effects) : fail(room.error);
+    }
+    case "create_file": {
+      const room = requireRoom(deps);
+      // The cancel FLAG is handed over, never a boolean snapshot of it: Rust
+      // reads it inside `Artifact::commit`, between staging and committing,
+      // and reading it out here instead would miss a Stop pressed while the
+      // bytes were being staged — "a window in which a Stop is honoured
+      // everywhere except the write", as that funnel's own comment puts it.
+      return room.ok
+        ? execCreateFile(room.db, args, effects, {
+            runId: deps.runId,
+            cancel: deps.cancel,
+            emit: deps.emit,
+          })
+        : fail(room.error);
+    }
+    case "rename_file": {
+      const room = requireRoom(deps);
+      return room.ok ? execRenameFile(room.db, args, effects, deps.emit) : fail(room.error);
+    }
+    case "move_file": {
+      const room = requireRoom(deps);
+      return room.ok ? execMoveFile(room.db, args, effects, deps.emit) : fail(room.error);
+    }
+    case "set_in_library": {
+      const room = requireRoom(deps);
+      return room.ok ? execSetInLibrary(room.db, args, effects, deps.emit) : fail(room.error);
+    }
+    case "organize_files": {
+      const room = requireRoom(deps);
+      return room.ok ? execOrganizeFiles(room.db, args, effects, deps.emit) : fail(room.error);
+    }
+    case "trash_files": {
+      const room = requireRoom(deps);
+      return room.ok ? execTrashFiles(room.db, args, effects, deps.emit) : fail(room.error);
+    }
+    case "merge_files": {
+      const room = requireRoom(deps);
+      return room.ok ? execMergeFiles(room.db, args, effects, deps.emit) : fail(room.error);
+    }
 
     // ---------------------------------------------------------- edit_match gap
     case "edit_file":
@@ -1080,7 +1209,14 @@ export async function execTool(
     case "save_link":
     case "download_url":
     case "download_media":
-      return notImplemented("the download/save subsystem (commands/organize.rs + browser downloads) — Batch D");
+      // NOT `commands/organize.rs`, which this batch ported: these three arms
+      // reach `commands/web.rs` (`outbound_url_refusal`, `download_to_temp`),
+      // `commands/files.rs` (`import_link_and_index`, `import_download`) and
+      // the background download-job engine. Naming the wrong module here would
+      // send Batch D to a file that is already done.
+      return notImplemented(
+        "the download/save subsystem (commands/web.rs + files.rs's link/download import + the download-job engine) — Batch D"
+      );
 
     // ------------------------------------------------------------------ scripts
     case "list_scripts":
@@ -1114,12 +1250,68 @@ export async function execTool(
     case "run_skill_script":
       return notImplemented("skill script execution (fingerprint consent + the script runner) — Batch D");
 
-    // --------------------------------------------------------------- MCP mgmt
-    case "list_mcps":
-    case "read_mcp":
-    case "save_mcp":
-    case "delete_mcp":
-      return notImplemented("MCP connector management (no db-host/mcp.ts yet) — Batch D");
+    // ----------------------------------------------------------- REAL: MCP mgmt
+    case "list_mcps": {
+      const room = requireRoom(deps);
+      if (!room.ok) return fail(room.error);
+      try {
+        return ok(agentListMcps(room.db, deps.mcpStatuses ?? new Map()));
+      } catch (e) {
+        return fail(errMessage(e));
+      }
+    }
+    case "read_mcp": {
+      const room = requireRoom(deps);
+      if (!room.ok) return fail(room.error);
+      try {
+        return ok(agentReadMcp(room.db, asString(args["name"])));
+      } catch (e) {
+        return fail(errMessage(e));
+      }
+    }
+    case "save_mcp": {
+      const room = requireRoom(deps);
+      if (!room.ok) return fail(room.error);
+      try {
+        // Always saved disabled (agentSaveMcp force-sets it) — a human must
+        // still review and approve it in Connectors before it can run.
+        return ok(
+          agentSaveMcp(room.db, args, {
+            forgetConnectorGrants: deps.mcpForgetConnectorGrants,
+            reconnect: deps.mcpReconnect,
+          })
+        );
+      } catch (e) {
+        return fail(errMessage(e));
+      }
+    }
+    case "delete_mcp": {
+      // Unrecoverable (the saved OAuth token goes with it) and reachable
+      // from anything the agent READ, so — same reasoning as `delete_skill`
+      // just above, and matching Rust's own `agent_delete_mcp`, which asks
+      // BEFORE it ever touches `state.room` — this stays refused until a
+      // real consent dialog is wired, rather than deleting behind a
+      // confirmation the user never saw. Checked before `requireRoom` on
+      // purpose: a missing consent surface is refused unconditionally, not
+      // only once a room happens to be open.
+      if (deps.confirmDestructive === undefined) {
+        return notImplemented(
+          "the confirm_destructive consent dialog for a connector deletion is not wired up — Batch D"
+        );
+      }
+      const room = requireRoom(deps);
+      if (!room.ok) return fail(room.error);
+      try {
+        const text = await agentDeleteMcp(room.db, args, {
+          confirmDestructive: deps.confirmDestructive,
+          forgetConnectorGrants: deps.mcpForgetConnectorGrants,
+          reconnect: deps.mcpReconnect,
+        });
+        return ok(text);
+      } catch (e) {
+        return fail(errMessage(e));
+      }
+    }
 
     // -------------------------------------------------------- jobs/workflows
     case "start_file_pass":
