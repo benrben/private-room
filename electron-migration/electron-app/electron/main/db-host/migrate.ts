@@ -10,10 +10,13 @@
  * table or column that exists ONLY here would be missing from every room
  * that already exists until this function adds it.
  *
- * Two supporting call chains are ported alongside `migrate` because it calls
- * them directly and unconditionally, even though they are declared in other
- * Rust modules (db/jobs.rs, db/artifacts.rs, extraction/{pdf,chunking}.rs):
- *   - `dedupeParkedJobs` / `sweepStagedArtifacts` (db/jobs.rs, db/artifacts.rs)
+ * Two supporting call chains are reached from `migrate` because it calls them
+ * directly and unconditionally, even though they are declared in other Rust
+ * modules (db/jobs.rs, db/artifacts.rs, extraction/{pdf,chunking}.rs):
+ *   - `dedupeParkedJobs` (db/jobs.rs) is IMPORTED from `./jobs.js`, the one
+ *     port of that module, exactly as Rust's `migrate` calls
+ *     `crate::db::dedupe_parked_jobs`; `sweepStagedArtifacts`
+ *     (db/artifacts.rs) is still a local one-line DELETE.
  *   - `stripHebrewMarks` / `chunkText` (extraction/{pdf,chunking}.rs), needed
  *     by `insertChunks` or the two content-rebuild repairs. These belong to
  *     the future `dbHostExtraction` port; the copies here are complete and
@@ -29,6 +32,7 @@
 
 import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3-multiple-ciphers";
+import { dedupeParkedJobs } from "./jobs.js";
 
 /**
  * The schema revision a room created TODAY is already at, so `migrate` runs
@@ -789,108 +793,18 @@ function rebuildMarkedHebrewChunks(db: Database.Database): void {
 }
 
 // ------------------------------------------------- duplicate Activity rows
-// Ported from db/jobs.rs (dedupe_parked_jobs and its call chain) and
-// db/artifacts.rs (sweep_staged_artifacts) — `migrate` calls both directly.
-// `finish_workflow_run_by_job` (db/workflows.rs), which `deleteJob` calls
-// best-effort, is a single UPDATE and is inlined rather than pulled in via a
-// cross-module import that does not exist yet.
-
-/**
- * The identity two job rows share when they are the SAME unit of work.
- *
- * Fields are joined with the ASCII unit separator (U+001F), matching the
- * Rust `work_identity` exactly (`format!("{kind}\u{1f}{title}\u{1f}{plan}")`).
- * This is load-bearing, not cosmetic: plain concatenation lets two genuinely
- * different jobs collide onto the same identity string (kind="ab", title="cd"
- * and kind="a", title="bcd" both concatenate to "abcd" for the same plan),
- * which would make `dedupeParkedJobs` silently delete an unrelated parked job
- * as though it were a duplicate of another.
- */
-const WORK_IDENTITY_SEP = "";
-
-function workIdentity(kind: string, title: string, plan: unknown): string {
-  if (kind === "workflow") {
-    const wf = plan && typeof plan === "object" ? (plan as Record<string, unknown>)["workflow_id"] : undefined;
-    if (typeof wf === "string" && wf !== "") {
-      return `workflow${WORK_IDENTITY_SEP}${wf}`;
-    }
-  }
-  if (
-    kind === "deep_summary" &&
-    plan &&
-    typeof plan === "object" &&
-    (plan as Record<string, unknown>)["auto"] === true
-  ) {
-    return `deep_summary${WORK_IDENTITY_SEP}auto`;
-  }
-  return `${kind}${WORK_IDENTITY_SEP}${title}${WORK_IDENTITY_SEP}${JSON.stringify(plan)}`;
-}
-
-/** Every PARKED top-level job row, oldest first, paired with its identity. */
-function parkedIdentities(db: Database.Database): Array<[string, string]> {
-  const rows = db
-    .prepare(
-      `SELECT id, kind, title, plan FROM jobs
-       WHERE parent_job_id IS NULL AND status IN ('paused','error')
-       ORDER BY created_at ASC, rowid ASC`,
-    )
-    .all() as Array<{ id: string; kind: string; title: string; plan: string }>;
-  const result: Array<[string, string]> = [];
-  for (const r of rows) {
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(r.plan);
-    } catch {
-      continue; // an unparseable plan is not evidence of sameness
-    }
-    result.push([r.id, workIdentity(r.kind, r.title, parsed)]);
-  }
-  return result;
-}
-
-/** Delete a job and the children it owns. */
-function deleteJob(db: Database.Database, id: string): void {
-  try {
-    db.prepare(
-      `UPDATE workflow_runs SET status = ?, error = ?, finished_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
-       WHERE job_id = ? AND finished_at IS NULL`,
-    ).run("paused", null, id);
-  } catch {
-    // best-effort, mirrors the Rust `let _ = finish_workflow_run_by_job(...)`
-  }
-  db.prepare("DELETE FROM job_artifacts WHERE job_id = ?").run(id);
-  db.prepare("DELETE FROM jobs WHERE id = ?").run(id);
-}
-
-function deleteJobTree(db: Database.Database, id: string): void {
-  const kids = db.prepare("SELECT id FROM jobs WHERE parent_job_id = ?").all(id) as Array<{ id: string }>;
-  for (const kid of kids) {
-    deleteJob(db, kid.id);
-  }
-  deleteJob(db, id);
-}
-
-/**
- * Collapse Activity rows that piled up before the write path enforced one
- * parked entry per unit of work: for each identity with more than one parked
- * row, the NEWEST survives and the older attempts go. Idempotent.
- */
-function dedupeParkedJobs(db: Database.Database): number {
-  const seen = new Set<string>();
-  // Oldest-first from parkedIdentities; reverse for newest-first so the
-  // first row of each identity encountered is the keeper.
-  const rows = parkedIdentities(db).reverse();
-  let removed = 0;
-  for (const [id, identity] of rows) {
-    if (!seen.has(identity)) {
-      seen.add(identity);
-      continue;
-    }
-    deleteJobTree(db, id);
-    removed += 1;
-  }
-  return removed;
-}
+// `dedupeParkedJobs` is IMPORTED from `./jobs.js`, not re-implemented here.
+// Rust's `migrate` calls `crate::db::dedupe_parked_jobs` — the same function
+// `db/jobs.rs` exposes to the runner — so the rule for "these two parked rows
+// are the same unit of work" exists exactly once. This file carried a private
+// copy while `db-host/jobs.ts` did not exist yet, and the two immediately
+// disagreed once it did: the copy embedded the plan as `JSON.stringify` (which
+// keeps INSERTION order), where `jobs.ts` canonicalizes the keys to match
+// `serde_json::Value`'s BTreeMap `Display`. Two call sites building the same
+// plan in a different field order therefore read as two units of work here and
+// one there — a divergence a room open could show, and the kind of "one fact
+// written down twice" that this whole port keeps paying for. One
+// implementation, one answer.
 
 /** Drop every staged artifact left over from a previous session. */
 function sweepStagedArtifacts(db: Database.Database): number {
