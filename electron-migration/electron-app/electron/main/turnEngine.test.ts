@@ -1061,6 +1061,53 @@ describe("handoffUsageValue", () => {
       "files",
     ]);
   });
+
+  // ------------------------------------------------ adversarial: Rust parity
+
+  it("charges the recap in UTF-8 BYTES, as `recap.len()` does — not UTF-16 units", () => {
+    // `token_usage.rs`'s `recap.len() as u64 / CHARS_PER_TOKEN` is a BYTE
+    // length. A Hebrew recap is 2 bytes per character, an emoji 4, so a port
+    // that used `recap.length` would report less than half the tokens and the
+    // budget bar would understate a nearly-full window right after a handoff —
+    // the one moment the bar exists to be honest about.
+    expect(handoffUsageValue("שלום", 8192).total_tokens).toBe(2); // 8 bytes / 3
+    expect("שלום".length).toBe(4); // what the wrong answer would have divided
+    expect(handoffUsageValue("😀", 8192).total_tokens).toBe(1); // 4 bytes / 3
+  });
+
+  it("floors the division, exactly as Rust's integer division does", () => {
+    expect(handoffUsageValue("ab", 8192).total_tokens).toBe(0); // 2/3 -> 0, not 0.67
+    expect(handoffUsageValue("abcde", 8192).total_tokens).toBe(1); // 5/3 -> 1, not 1.67
+    expect(Number.isInteger(handoffUsageValue("abcde", 8192).total_tokens)).toBe(true);
+  });
+
+  it("keeps history and total in step, and every other bucket honestly zero", () => {
+    const v = handoffUsageValue("x".repeat(3000), 128_000);
+    const breakdown = v.breakdown as Record<string, { tokens: number; estimated: boolean }>;
+    expect(v.total_tokens).toBe(1000);
+    expect(breakdown.history!.tokens).toBe(v.total_tokens);
+    const others = ["system", "tools", "skills", "files"].map((c) => breakdown[c]!.tokens);
+    expect(others).toEqual([0, 0, 0, 0]);
+  });
+
+  it("builds a breakdown with no inherited keys, whatever the recap says", () => {
+    // Rule 2 of this migration: a `{}` literal keyed by anything the room or a
+    // model can influence has already shipped a `__proto__` bug four times
+    // here. The keys are fixed constants, so this pins that they stay fixed
+    // (and that the object carries nothing from the prototype chain into the
+    // serialized event).
+    const v = handoffUsageValue("__proto__", 8192);
+    const breakdown = v.breakdown as Record<string, unknown>;
+    expect(Object.getOwnPropertyNames(breakdown)).toEqual([
+      "system",
+      "history",
+      "tools",
+      "skills",
+      "files",
+    ]);
+    expect(Object.prototype.hasOwnProperty.call(breakdown, "__proto__")).toBe(false);
+    expect(JSON.parse(JSON.stringify(v.breakdown))).toEqual(breakdown);
+  });
 });
 
 // ============================================================== handoffChat

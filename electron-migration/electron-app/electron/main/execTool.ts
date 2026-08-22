@@ -1666,8 +1666,17 @@ export async function execTool(
     case "ui_act":
     case "view_screenshot":
     case "view_media_frame":
+      // The raw native-capture primitive (`snapshot.rs`'s `capture_png`) IS
+      // now ported and tested as `snapshotUtil.ts`'s `captureWebviewPng` — do
+      // not re-port it. What is still missing for these four arms is the
+      // AgentUi screen-driving bridge (request_ui/UI state that `ui_snapshot`/
+      // `ui_act` need, and the driver-composite fallback `view_screenshot`
+      // falls back to), plus `downscale_png_b64` and `perceive_image` that
+      // `view_screenshot` wraps the capture with, and the video frame-grab
+      // path `view_media_frame` needs. All still Batch D.
       return notImplemented(
-        "the AgentUi screen-driving bridge and native window/webview snapshot capture — Batch D"
+        "the AgentUi screen-driving bridge, downscale_png_b64/perceive_image, and the video " +
+          "frame-grab path — Batch D"
       );
 
     // ------------------------------------------------------------- web/download
