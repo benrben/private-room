@@ -44,6 +44,7 @@ IMPORT_TO_DISTRIBUTION = {
     # odfpy's own top-level package is literally named "odf".
     "odf": "odfpy",
     "charset_normalizer": "charset-normalizer",
+    "readability": "readability-lxml",
 }
 
 
