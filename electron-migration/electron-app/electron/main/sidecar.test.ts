@@ -27,13 +27,22 @@ import {
   previousStderrLogPath,
   probeOnce,
   shouldReplace,
+  runViaSidecar,
   spawnAndWait,
   stderrLogPath,
   stopIfOurs,
   type Probe,
 } from "./sidecar.js";
+import { TurnId } from "./turn.js";
 
 // Port of src-tauri/src/sidecar_lifecycle.rs's #[cfg(test)] module.
+//
+// This file covers ONLY the process-lifecycle half of `sidecar.ts`. Its
+// `/run` NDJSON streaming client (ported from `src-tauri/src/sidecar.rs`)
+// is covered by `sidecarRun.test.ts` + `sidecarRun.wire.test.ts` — see the
+// first of those for why they are separate files and not more `describe`
+// blocks here (short version: the `vi.mock("node:child_process")` above is
+// file-wide, and the wire test has to really spawn a Python sidecar).
 //
 // Skipped verbatim (per the porting brief, both grep Rust source files or
 // assume a Cargo-relative path that do not apply to this workspace):
@@ -411,4 +420,137 @@ describe("stderr drain past the log budget", () => {
 
     writeSpy.mockRestore();
   }, 10_000);
+});
+
+describe("runViaSidecar: the busy guard around a whole streaming answer", () => {
+  // ADVERSARIAL-PASS ADDITION (2026-08-22). `runViaSidecar` is the PUBLIC
+  // entry point of the `/run` client and had no test of any kind: nothing in
+  // the workspace referenced it, so its whole body — ensureUp, take the guard,
+  // stream, release in a `finally` — could have been deleted with every suite
+  // still green.
+  //
+  // The guard is the point, and it fails in two opposite and equally silent
+  // ways. Never TAKEN, and a concurrent `ensureUp()` on another task sees an
+  // idle sidecar and SIGTERMs the process mid-reply — the exact thing
+  // `sidecar.ts`'s own header calls "the one thing that stops another task's
+  // health probe SIGTERMing the process mid-reply". Never RELEASED, and
+  // `inflightCount()` never returns to zero, so `shouldReplace("busy", n)` is
+  // false forever and a genuinely wedged sidecar can never be replaced again
+  // for the life of the app.
+  //
+  // It lives in THIS file rather than beside the other `/run` tests because
+  // reaching `runViaSidecar` at all means going through `ensureUp()`'s spawn
+  // lifecycle, which needs the file-wide `vi.mock("node:child_process")` above
+  // and the real-HTTP-server harness the single-flight test established.
+  const savedPython = process.env.ARCELLE_SIDECAR_PYTHON;
+  const savedDir = process.env.ARCELLE_SIDECAR_DIR;
+  let server: http.Server | null = null;
+
+  beforeEach(() => {
+    stopIfOurs();
+  });
+
+  afterEach(async () => {
+    if (savedPython === undefined) {
+      delete process.env.ARCELLE_SIDECAR_PYTHON;
+    } else {
+      process.env.ARCELLE_SIDECAR_PYTHON = savedPython;
+    }
+    if (savedDir === undefined) {
+      delete process.env.ARCELLE_SIDECAR_DIR;
+    } else {
+      process.env.ARCELLE_SIDECAR_DIR = savedDir;
+    }
+    vi.mocked(spawn).mockReset();
+    stopIfOurs();
+    if (server !== null) {
+      await new Promise<void>((resolve) => server!.close(() => resolve()));
+      server = null;
+    }
+  });
+
+  /** Stand up a real loopback server answering `/health` plus a `/run` the
+   * caller shapes, and point the (mocked) spawn at it — the same harness the
+   * single-flight test uses, so `runViaSidecar` runs its REAL `ensureUp()`
+   * path rather than a stubbed one. */
+  async function sidecarServing(run: (res: http.ServerResponse) => void): Promise<void> {
+    server = http.createServer((req, res) => {
+      if (req.url === "/health") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+        return;
+      }
+      if (req.url === "/run") {
+        run(res);
+        return;
+      }
+      res.writeHead(404).end();
+    });
+    await new Promise<void>((resolve) => server!.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (address === null || typeof address === "string") {
+      throw new Error("expected an AddressInfo from a TCP listener");
+    }
+    process.env.ARCELLE_SIDECAR_PYTHON = process.execPath;
+    delete process.env.ARCELLE_SIDECAR_DIR;
+    vi.mocked(spawn).mockImplementation(() => {
+      const child = new EventEmitter() as unknown as ChildProcess;
+      const stdout = new PassThrough();
+      const stderr = new PassThrough();
+      Object.assign(child, { stdout, stderr, pid: 987_654 });
+      queueMicrotask(() => stdout.write(`SIDECAR_PORT=${address.port}\n`));
+      return child;
+    });
+  }
+
+  const request = {
+    model: "qwen3.5:9b",
+    question: "what is the rent",
+    runId: "ask-guard",
+    mcp: { url: "http://127.0.0.1:1/mcp", token: "tok" },
+  };
+
+  it("HOLDS the guard for the whole answer and releases it once the run is done", async () => {
+    await sidecarServing((res) => {
+      res.writeHead(200, { "content-type": "application/x-ndjson" });
+      res.write(`${JSON.stringify({ t: "delta", v: "streaming", run_id: "ask-guard" })}\n`);
+      setTimeout(() => {
+        res.write(`${JSON.stringify({ t: "final", v: "the answer", run_id: "ask-guard" })}\n`);
+        res.end();
+      }, 20);
+    });
+
+    const baseline = inflightCount();
+    // Sampled from INSIDE the stream, which is the only moment the claim is
+    // checkable at all: a guard taken and released around nothing would leave
+    // the before/after readings identical and prove nothing.
+    let heldDuringStream = -1;
+    const outcome = await runViaSidecar(request, {
+      turn: new TurnId("ask-guard", "chat-guard"),
+      onEvent: () => {
+        heldDuringStream = inflightCount();
+      },
+    });
+
+    expect(outcome).toEqual({ kind: "done", text: "the answer", usage: null, plan: null });
+    expect(heldDuringStream).toBe(baseline + 1);
+    expect(inflightCount()).toBe(baseline);
+  }, 15_000);
+
+  it("releases the guard even when the run FAILS, so a wedged sidecar stays replaceable", async () => {
+    // The leak that matters: a run that ends badly is exactly when the next
+    // `ensureUp()` most needs to be free to replace the process.
+    await sidecarServing((res) => {
+      res.writeHead(500, { "content-type": "application/json" });
+      res.end(JSON.stringify({ detail: "boom" }));
+    });
+
+    const baseline = inflightCount();
+    const outcome = await runViaSidecar(request, { turn: null, onEvent: () => undefined });
+
+    expect(outcome.kind).toBe("failed");
+    expect(inflightCount()).toBe(baseline);
+    // ...and the counter really is back at a value that permits replacement.
+    expect(shouldReplace("busy", inflightCount())).toBe(true);
+  }, 15_000);
 });
