@@ -32,6 +32,7 @@ import type Database from "better-sqlite3-multiple-ciphers";
 import sharp from "sharp";
 import { createRoom } from "./db-host/open.js";
 import { MAX_FOUND } from "./castparse.js";
+import { ensureMediaLimits, resetMediaLimitsStateForTests } from "./mediaLimits.js";
 
 vi.mock("./sidecar.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./sidecar.js")>();
@@ -639,12 +640,58 @@ describe("storyPlanSplit", () => {
 });
 
 describe("snapSeconds", () => {
-  it("passes its input through — the documented always-taken degradation", () => {
-    // `media_limits.rs` is unported, so every model reads as "no duration
-    // data", which is the branch Rust takes for an unrecognized model AND for
-    // every model until the catalogue has been fetched once.
+  beforeEach(() => {
+    resetMediaLimitsStateForTests();
+  });
+
+  /** Populates `mediaLimits.ts`'s cache with one video model's durations,
+   * through the same `ensureMediaLimits` fetch seam `mediaLimits.test.ts`
+   * uses — never by reaching into its module state directly. */
+  async function primeDurations(slug: string, durations: number[]): Promise<void> {
+    await ensureMediaLimits("test-key", {
+      fetchJson: async (url) =>
+        url.endsWith("/videos/models")
+          ? { ok: true, status: 200, json: async () => ({ data: [{ id: slug, supported_durations: durations }] }) }
+          : { ok: true, status: 200, json: async () => ({ data: [] }) },
+    });
+  }
+
+  it("passes its input through for a model the catalogue has no entry for", () => {
+    // Nothing has been fetched in this test, so every model reads as "no
+    // duration data" — the same real branch Rust's own `snap_seconds` takes
+    // for an unrecognized model, or for any model before `ensureMediaLimits`
+    // has fetched the catalogue at least once.
     expect(snapSeconds(10, "veo-3")).toBe(10);
     expect(snapSeconds(7, "")).toBe(7);
+  });
+
+  it("snaps an illegal duration to the nearest legal one, matching snap_seconds", async () => {
+    await primeDurations("vendor/veo", [4, 6, 8]);
+    expect(snapSeconds(6, "openrouter::vendor/veo"), "already legal — passes through").toBe(6);
+    expect(snapSeconds(10, "openrouter::vendor/veo"), "closest to 8").toBe(8);
+    expect(snapSeconds(1, "openrouter::vendor/veo"), "closest to 4").toBe(4);
+  });
+
+  it("a tie goes to the FIRST duration, matching Iterator::min_by_key", () => {
+    // 5 is equally 1 away from both 4 and 6 — `min_by_key` documents "first
+    // element on a tie", so 4 (not 6) is correct.
+    return primeDurations("vendor/tiebreak", [4, 6, 8]).then(() => {
+      expect(snapSeconds(5, "openrouter::vendor/tiebreak")).toBe(4);
+    });
+  });
+
+  it("a bare slug with no engine prefix never matches a cached (composite) lookup", async () => {
+    await primeDurations("vendor/veo", [4, 6, 8]);
+    // `model.split("::").nth(1).unwrap_or(model)` on a string with no "::" at
+    // all yields the WHOLE string, not the cached slug — so this looks up
+    // "vendor/veo" (the model arg here, with no engine prefix) verbatim.
+    expect(snapSeconds(5, "vendor/veo"), "no composite prefix to strip").toBe(4);
+    expect(snapSeconds(5, "some-other-model")).toBe(5);
+  });
+
+  it("a model the catalogue knows but that publishes no durations passes through", async () => {
+    await primeDurations("vendor/silent", []);
+    expect(snapSeconds(7, "openrouter::vendor/silent")).toBe(7);
   });
 });
 

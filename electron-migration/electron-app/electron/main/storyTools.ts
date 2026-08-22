@@ -45,15 +45,14 @@
  *      it directly.
  *
  *   3. `commands::media_limits` (453 lines: the per-model legal-duration
- *      catalogue) — NOT ported, and {@link snapSeconds} is therefore a
- *      DOCUMENTED, ALWAYS-TAKEN degradation rather than a refusal: without the
- *      catalogue every model reads as "no duration data", which is the exact
- *      branch Rust's own `snap_seconds` takes for an unrecognized model — and
- *      the branch it takes for EVERY model until `ensure_media_limits` has
- *      fetched the catalogue at least once. Nothing is fabricated: the value
- *      handed back is never claimed to be a legal length, only the caller's
- *      own clamped input passed through. See {@link snapSeconds} for the
- *      practical consequence.
+ *      catalogue) — PORTED as `mediaLimits.ts` in a later batch, so
+ *      {@link snapSeconds} now does the real lookup rather than the
+ *      documented always-taken pass-through this file shipped with
+ *      originally. A model the catalogue has never reported on (nothing
+ *      fetched yet, or an unrecognized slug) still reads as "no duration
+ *      data" — that is the real Rust branch too, not a gap — but a KNOWN
+ *      model's illegal duration is now actually snapped to its nearest legal
+ *      length, matching `snap_seconds` exactly. See {@link snapSeconds}.
  *
  *   4. `image` (the Rust crate behind `shrink`) — `sharp` stands in. It is
  *      already an `electron-app/package.json` dependency (`^0.34.2`), just not
@@ -100,6 +99,7 @@ import {
 import { queryRows } from "./db-host/util.js";
 import { resolvedBaseUrl } from "./engineRouting.js";
 import { modelSetting } from "./gatherContext.js";
+import { allowsSeconds, limitsFor } from "./mediaLimits.js";
 import { sidecarJsonCancellable } from "./sidecarJsonCancellable.js";
 import type { OpenRoom } from "./turnEngine.js";
 // Every frontend-facing shape this file returns is NOT redeclared here. All six
@@ -720,28 +720,45 @@ export function storyPlanSplit(_script: string, _minutes: number, _secondsEach: 
 const MAX_PARTS = 80;
 
 /**
- * The nearest length this model will actually film — DEGRADED, not refused.
- * Ported from `snap_seconds`.
+ * The nearest length this model will actually film. Ported from
+ * `snap_seconds`.
  *
- * Rust snaps a shot's length to the nearest duration a video model actually
- * supports, via `commands::media_limits::limits_for`'s per-model catalogue (453
- * lines, not ported — see the module doc). Without that catalogue every model
- * here reads as "no duration data", which is the SAME real branch Rust's own
- * function takes for an unrecognized model, for a model whose limits carry no
- * `durations`, and for EVERY model until `ensure_media_limits` has fetched the
- * catalogue at least once in the process. So this is a deliberate,
- * always-taken degradation of a genuine Rust code path, not a fabricated one:
- * the value handed back is never claimed to be "the nearest legal length", only
- * the caller's own clamped input passed straight through.
+ * A script's own timings are the author's, not the provider's: a 10-second
+ * beat is perfectly reasonable and Veo will only make 4, 6 or 8. Snapping to
+ * the nearest legal value keeps the pacing as close as the model allows,
+ * where sending 10 would simply be refused after the wait.
  *
- * PRACTICAL CONSEQUENCE, stated plainly: a duration genuinely illegal for a
- * known model (10s asked of a model that only shoots 4/6/8s) is written here
- * as-is, where Rust with a loaded catalogue would have corrected it before a
- * paid generation ran. Anyone wiring this up to real video generation needs
- * `media_limits.rs` ported first.
+ * Reads `mediaLimits.ts`'s `limitsFor`, exactly as the Rust source reads
+ * `commands::media_limits::limits_for`. A model the catalogue has no entry
+ * for — nothing fetched yet this process, or a slug it never named — passes
+ * `seconds` straight through unchanged, matching Rust's own behavior for the
+ * same case: the catalogue is populated by `ensureMediaLimits`, called from
+ * the Create page (not yet ported), so a room that has never opened it still
+ * gets an honest pass-through rather than a guessed correction.
  */
-export function snapSeconds(seconds: number, _videoModel: string): number {
-  return seconds;
+export function snapSeconds(seconds: number, videoModel: string): number {
+  // `model.split("::").nth(1).unwrap_or(model)` — the bare slug out of a
+  // composite "<engine>::<slug>" selection, or the whole string when there is
+  // no "::" at all.
+  const parts = videoModel.split("::");
+  const slug = parts.length > 1 ? parts[1]! : videoModel;
+  const limits = limitsFor(slug);
+  if (limits === undefined) return seconds;
+  if (limits.durations.length === 0 || allowsSeconds(limits, seconds)) return seconds;
+  // `durations.iter().copied().min_by_key(|d| d.abs_diff(seconds))`: the
+  // first duration with the smallest distance to the asked-for length wins a
+  // tie, matching `Iterator::min_by_key`'s documented "first element on a
+  // tie" — a strict `<` below (never `<=`) is what keeps that.
+  let best = limits.durations[0]!;
+  let bestDiff = Math.abs(best - seconds);
+  for (const d of limits.durations.slice(1)) {
+    const diff = Math.abs(d - seconds);
+    if (diff < bestDiff) {
+      best = d;
+      bestDiff = diff;
+    }
+  }
+  return best;
 }
 
 /** `u32::clamp` for the one call site below. */
@@ -879,8 +896,9 @@ export function assignCast(
  * Callable independently of {@link storyPlanSplit} (which is `NOT_IMPLEMENTED`
  * this batch): any caller that already has a `PlannedShot[]` — a hand-built
  * plan, or a future real `storyPlanSplit`'s output — can apply it through here.
- * The one degraded step is {@link snapSeconds}; read its doc before wiring this
- * to a paid generation.
+ * Each shot's length is snapped to a legal one via {@link snapSeconds}, which
+ * reads whatever `mediaLimits.ts` has cached for `videoModel` — read its doc
+ * for what "no duration data" still means for a model never fetched.
  */
 export function storyApplySplit(
   db: Database.Database,

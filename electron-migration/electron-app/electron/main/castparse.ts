@@ -6,11 +6,12 @@
  *
  * PULLED IN AS A DEPENDENCY OF `storyTools.ts` — `commands/story.rs`'s
  * `story_read_cast_file` (both fallback branches) and `story_add_cast_many`
- * need `ParsedMember`/`MAX_FOUND`/`parse_cast`. Unlike `shotsplit.rs` and
- * `media_limits.rs` (the two dependencies `storyTools.ts` genuinely leaves
- * unported — see its module doc), this one is small, entirely self-contained
- * pure string logic with no dependency of its own, so it is ported here in
- * full rather than left as a second honest gap.
+ * need `ParsedMember`/`MAX_FOUND`/`parse_cast`. Unlike `shotsplit.rs` (the one
+ * dependency `storyTools.ts` genuinely leaves unported — see its module doc;
+ * `media_limits.rs` was the other but has since been ported as
+ * `mediaLimits.ts`), this one is small, entirely self-contained pure string
+ * logic with no dependency of its own, so it is ported here in full rather
+ * than left as a second honest gap.
  *
  * The complaint this answers is a fair one: the room is built on files, the
  * heroes are already written down in one, and the Story tab was asking for all

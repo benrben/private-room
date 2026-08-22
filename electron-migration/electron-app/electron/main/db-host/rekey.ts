@@ -1,7 +1,14 @@
 /**
  * Password verification and re-keying — ported from
  * `src-tauri/src/db/versions.rs` lines 155-185 (`verify_password`, `rekey`,
- * `rekey_copy`).
+ * `rekey_copy`), PLUS (as of the `commands/safety.rs` batch) that same file's
+ * neighbouring "password / maintenance" trio lines 399-433: `reclaimable_bytes`,
+ * `vacuum`, `vacuum_into` — SEC-7 compaction and ADD-4 room duplication. Added
+ * here rather than a new file: `versions.ts`'s own module doc already claimed
+ * these three were "ALREADY PORTED as `rekey.ts`" (they were not — that line
+ * was written ahead of the port actually landing), so this fulfills that
+ * claim rather than leaving it stale, and keeps every "password / maintenance"
+ * function named in that doc in the one file it points at.
  *
  * `verifyPassword` and `rekeyCopy` each open a FRESH, THROWAWAY connection to
  * `path` — never the app's live one. That is the whole point of the two
@@ -106,4 +113,39 @@ export function rekeyCopy(
       // already closed / nothing to do
     }
   }
+}
+
+/**
+ * Bytes sitting in the database's free pages — space a VACUUM would reclaim.
+ * Ported verbatim from `db::reclaimable_bytes` (`freelist_count * page_size`).
+ * SEC-7's "Compact room" reads this to decide whether a VACUUM is even worth
+ * running (see `compactRoomCore` in `safetyTools.ts`).
+ */
+export function reclaimableBytes(db: Database.Database): number {
+  const freelist = db.pragma("freelist_count", { simple: true }) as number;
+  const pageSize = db.pragma("page_size", { simple: true }) as number;
+  return freelist * pageSize;
+}
+
+/** Compact the database in place (SEC-7). Ported verbatim from `db::vacuum`. */
+export function vacuum(db: Database.Database): void {
+  db.exec("VACUUM");
+}
+
+/**
+ * A consistent copy of the live, encrypted database at `dest` — keeps the
+ * current key (ADD-4). `dest` is single-quote-escaped into the statement
+ * since `VACUUM INTO` does not accept bound parameters — the same escaping
+ * `rekey`'s own PRAGMA text uses. Ported verbatim from `db::vacuum_into`.
+ *
+ * NOT the same helper `checkpoints.ts`'s `writeCheckpoint` uses internally:
+ * that one stages into a `.tmp` path and renames over it (crash safety for an
+ * unattended auto-checkpoint). `duplicateRoomCore` writes directly to a
+ * caller-chosen destination the user picked and confirmed doesn't exist yet
+ * (see its own guard), matching the Rust command's own one-shot `VACUUM INTO`
+ * with no rename dance.
+ */
+export function vacuumInto(db: Database.Database, dest: string): void {
+  const escaped = dest.replace(/'/g, "''");
+  db.exec(`VACUUM INTO '${escaped}'`);
 }

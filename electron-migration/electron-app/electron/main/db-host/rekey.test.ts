@@ -16,6 +16,10 @@
  * Rust-produced fixture (`rekeyed.roomai`, mirroring `s1_spike.mjs` check
  * #4), and that a throwaway connection is always closed — proven by
  * retrying immediately after a failure rather than hitting a stale lock.
+ *
+ * As of the `commands/safety.rs` batch, this file also covers
+ * `reclaimableBytes`/`vacuum`/`vacuumInto` (`db/versions.rs` lines 399-433) —
+ * see this file's own module doc on why they landed here.
  */
 
 import Database from "better-sqlite3-multiple-ciphers";
@@ -25,7 +29,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { createRoom, openRoom } from "./open.js";
-import { rekey, rekeyCopy, verifyPassword } from "./rekey.js";
+import { insertFile, deleteFile } from "./files.js";
+import { reclaimableBytes, rekey, rekeyCopy, vacuum, vacuumInto, verifyPassword } from "./rekey.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const fixturesDir = path.resolve(here, "../../../../spikes/s1-db-compat/fixtures");
@@ -249,6 +254,73 @@ describe("rekeyCopy", () => {
 
       const reopenedOriginal = openRoom(original, "the-live-password");
       reopenedOriginal.close();
+    });
+  });
+});
+
+describe("reclaimableBytes / vacuum", () => {
+  it("a freshly created room has nothing worth reclaiming", () => {
+    withFreshTmpDir(() => {
+      const p = tempRoomPath();
+      const db = createRoom(p, "the-password", "Room");
+      expect(reclaimableBytes(db)).toBe(0);
+      db.close();
+    });
+  });
+
+  it("deleting a large blob frees pages that vacuum reclaims", () => {
+    withFreshTmpDir(() => {
+      const p = tempRoomPath();
+      const db = createRoom(p, "the-password", "Room");
+      const big = Buffer.alloc(2 * 1024 * 1024, 7);
+      const id = insertFile(db, "big.bin", "application/octet-stream", big, null, "upload").id;
+      deleteFile(db, id);
+
+      const reclaimable = reclaimableBytes(db);
+      expect(reclaimable).toBeGreaterThan(0);
+
+      const sizeBefore = db.pragma("page_count", { simple: true }) as number;
+      vacuum(db);
+      const sizeAfter = db.pragma("page_count", { simple: true }) as number;
+      expect(sizeAfter).toBeLessThan(sizeBefore);
+      expect(reclaimableBytes(db)).toBe(0);
+      db.close();
+    });
+  });
+});
+
+describe("vacuumInto", () => {
+  it("writes a consistent copy at the SAME key, leaving the original untouched", () => {
+    withFreshTmpDir(() => {
+      const p = tempRoomPath();
+      const db = createRoom(p, "the-password", "Pinned");
+      insertFile(db, "a.txt", "text/plain", Buffer.from("hi", "utf8"), "hi", "upload");
+
+      const dest = `${p}.dup`;
+      vacuumInto(db, dest);
+      db.close();
+
+      expect(existsSync(dest)).toBe(true);
+      const copy = openRoom(dest, "the-password");
+      const row = copy.prepare("SELECT value FROM meta WHERE key = 'name'").get() as
+        | { value: string }
+        | undefined;
+      expect(row?.value).toBe("Pinned");
+      copy.close();
+
+      // The original still opens with its own password, unaffected.
+      expect(() => openRoom(p, "the-password").close()).not.toThrow();
+    });
+  });
+
+  it("single-quote-escapes the destination path, matching the rekey pragma's own escaping", () => {
+    withFreshTmpDir(() => {
+      const p = tempRoomPath();
+      const db = createRoom(p, "the-password", "Room");
+      const dest = path.join(tmpDir, "it's a room.roomai");
+      expect(() => vacuumInto(db, dest)).not.toThrow();
+      expect(existsSync(dest)).toBe(true);
+      db.close();
     });
   });
 });
