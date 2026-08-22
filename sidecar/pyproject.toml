@@ -59,6 +59,20 @@ dependencies = [
     "pymupdf>=1.28.2",
     "pyobjc-core>=12.2.2",
     "pyobjc-framework-cocoa>=12.2.2",
+    # docs/xlsx.py: modern .xlsx workbooks (docs/legacy.py covers the pre-2007
+    # .xls/.ods pair below). read_only mode is what lets a sparse sheet cost
+    # its actual cell count rather than its bounding rectangle.
+    "openpyxl>=3.1.5",
+    # docs/legacy.py: pre-2007 .xls (BIFF) only — xlrd 2.x dropped .xlsx
+    # support entirely, which is exactly the split this module wants.
+    "xlrd>=2.0.2",
+    # docs/legacy.py: OpenDocument .ods spreadsheets.
+    "odfpy>=1.4.1",
+    # docs/legacy.py: reads the OLE2/CFB "WordDocument"/"PowerPoint Document"
+    # streams inside a legacy .doc/.ppt (read-only; test fixtures are written
+    # with a small hand-rolled CFB writer, or with dev-only xlwt/odfpy writers
+    # for .xls/.ods).
+    "olefile>=0.47",
 ]
 
 [project.optional-dependencies]
@@ -96,3 +110,8 @@ select = ["E4", "E7", "E9", "F"]
 # Tests import a symbol to prove it is exported, and use one-letter loop names
 # in throwaway comprehensions. Both are noise there, not in the package.
 "tests/**" = ["F401", "E741"]
+
+[dependency-groups]
+dev = [
+    "xlwt>=1.3.0",
+]

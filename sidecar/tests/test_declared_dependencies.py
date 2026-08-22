@@ -41,6 +41,8 @@ IMPORT_TO_DISTRIBUTION = {
     "AVFoundation": "pyobjc-framework-avfoundation",
     "CoreMedia": "pyobjc-framework-coremedia",
     "QuickLookThumbnailing": "pyobjc-framework-quicklookthumbnailing",
+    # odfpy's own top-level package is literally named "odf".
+    "odf": "odfpy",
 }
 
 
