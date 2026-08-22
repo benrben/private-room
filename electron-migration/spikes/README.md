@@ -38,16 +38,25 @@ at the ephemeral pip build temp dir, not `@loader_path` — must run `delocate-w
 equivalent `install_name_tool` repair) as part of vendoring the wheel, or it dlopen-fails the
 moment the temp dir is gone.
 
-## S2 — Touch ID keychain survival — **BLOCKED on owner hardware/production install**
+## S2 — Touch ID keychain survival — **PARTIALLY VERIFIED; the hard part still needs the owner**
 
-No `"PrivateRoom"` keychain item exists on this dev machine (`security find-generic-password
--s PrivateRoom` → not found) — there's no real enrolled room here to test survival against.
-This spike inherently needs: (a) a Mac with a real enrolled Touch ID room today, (b) the
-actual re-signing scheme releases will use (Developer ID vs ad-hoc, Q2), and (c) a physical
-Touch ID prompt — none of which can be produced or clicked through headlessly. The koffi
-Security.framework path and the safeStorage+re-enroll fallback both get built during the
-Phase 2 `keychain.ts` build step; this line will be updated with the real spike result once
-the owner runs it on a real enrolled Mac.
+`electron/main/keychain.ts` now exists (koffi FFI to Security.framework/CoreFoundation, plus
+the safeStorage fallback) and its non-biometric path is genuinely proven against the real
+Keychain on this machine: add/find/delete of a real generic-password item round-trips
+correctly (byte-exact UTF-8, including multi-byte characters), cross-checked with the
+`security` CLI as an independent OS process at every step, and no test-created item is ever
+left behind (verified: `security find-generic-password -s ArcelleKeychainPortTest` → not
+found after the suite runs).
+
+**What's still blocked**: the actual biometryCurrentSet / data-protection-keychain path — the
+one this spike exists to answer — fails with `errSecMissingEntitlement` (-34018) in this dev
+sandbox, because the data-protection keychain's access group derives from the code-signing
+Team ID, which an ad-hoc-signed, no-Team-ID process doesn't have. This is expected and doesn't
+tell us anything new; it's exactly why this spike needs (a) a Mac with a real enrolled Touch ID
+room today, (b) the actual release signing scheme (Developer ID vs ad-hoc, Q2), and (c) a
+physical Touch ID prompt. The code path is ready — `keychain.ts`'s `has()`/`store()`/`read()`/
+`deleteEntry()` — for the owner to run against a real enrolled Mac once a properly signed build
+exists; this line will be updated with that real result.
 
 ## S4 — loopback system-audio capture — **needs a human click for the TCC grant**
 
