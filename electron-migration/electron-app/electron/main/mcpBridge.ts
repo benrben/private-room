@@ -151,8 +151,16 @@ export interface ToolSpec {
 }
 
 /** One content block of a `tools/call` result — exactly the two shapes
- * `mcp_client.py`'s `_parse_tool_result` recognizes. */
-export type ToolContent = { type: "text"; text: string } | { type: "image"; data: string };
+ * `mcp_client.py`'s `_parse_tool_result` recognizes.
+ *
+ * `mimeType` is optional here and ignored by `_parse_tool_result`, but the
+ * Rust `tool_result` always emits `"image/png"` on an image block and the MCP
+ * spec (`2024-11-05`) REQUIRES it — this bridge also serves `claude -p` and
+ * `codex exec`, which do read it. Declared so `bridgeDispatcher.ts` can emit a
+ * spec-correct block without an assertion; see its `toolResult`. */
+export type ToolContent =
+  | { type: "text"; text: string }
+  | { type: "image"; data: string; mimeType?: string };
 
 /** One `tools/call` outcome — the ENTIRE wire shape nested under JSON-RPC's
  * `result` for a real tool call. `isError: true` is not a protocol failure; it
