@@ -8,6 +8,17 @@
  *
  *   node qa/check-mock-coverage.mjs           # summary; exits 1 on real drift
  *   node qa/check-mock-coverage.mjs --list    # also name every uncovered command
+ *   node qa/check-mock-coverage.mjs --bridge=electron   # the same fixture table,
+ *                                             # measured against the Electron
+ *                                             # migration's own command contract
+ *
+ * TWO BRIDGES, ONE FIXTURE TABLE. `qa/qa-mock.js` now installs both
+ * `window.__TAURI_INTERNALS__` and the Electron preload's `window.arcelle`,
+ * and answers a command through the same `commands` table either way. So this
+ * checker asks the same question of two different "what the host registers"
+ * lists: `src-tauri/src/lib.rs`'s `generate_handler!` (the default), and
+ * `electron/shared/ipc-contract.ts`'s `Commands` (`--bridge=electron`). What
+ * it must NEVER do is invent a third list of its own.
  *
  * FAILS (exit 1) on drift, which is always a genuine defect:
  *   - the frontend invokes a command the Rust host does not register
@@ -37,6 +48,19 @@ const root = process.env.MOCK_COVERAGE_ROOT
   ? path.resolve(process.env.MOCK_COVERAGE_ROOT)
   : path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const LIST = process.argv.includes("--list");
+
+// Which bridge's command list to measure qa-mock.js's fixture table against.
+// The default, "tauri", is everything below this block, byte-for-byte as it
+// was before the flag existed: a caller that passes no `--bridge` — the build
+// gate, e2e/page-script/mock-coverage.test.mjs, every existing habit — sees
+// identical output and the identical exit code.
+const BRIDGE = (process.argv.find((a) => a.startsWith("--bridge=")) ?? "--bridge=tauri").slice(
+  "--bridge=".length,
+);
+if (BRIDGE !== "tauri" && BRIDGE !== "electron") {
+  console.error(`Unknown --bridge=${BRIDGE} (expected "tauri" or "electron")`);
+  process.exit(1);
+}
 
 /** Everything between the outermost brackets of `generate_handler![ … ]`. */
 function handlerBody(src) {
@@ -70,6 +94,133 @@ function mockBody(src) {
   throw new Error("unterminated commands object");
 }
 
+/** The `Commands` interface body in the Electron migration's
+ * `ipc-contract.ts`, by the same brace matching `handlerBody`/`mockBody` use. */
+function contractBody(src) {
+  const open = src.indexOf("export interface Commands {");
+  if (open < 0) throw new Error("no `export interface Commands {` in ipc-contract.ts");
+  let i = open + "export interface Commands {".length;
+  const start = i;
+  for (let depth = 0; i < src.length; i++) {
+    if (src[i] === "{") depth++;
+    else if (src[i] === "}") {
+      if (depth === 0) return src.slice(start, i);
+      depth--;
+    }
+  }
+  throw new Error("unterminated Commands interface");
+}
+
+/** Every command name qa-mock.js answers, however it was reached. Shared by
+ * both bridges because the mock shares it: `commands` and the `ask` streaming
+ * branch both sit behind qa-mock.js's one `dispatchCommand`, which is what
+ * `window.__TAURI_INTERNALS__.invoke` AND `window.arcelle.invoke` call. If a
+ * future change gives either bridge its own fixture table, this function is
+ * the place that has to learn about it — and the figures below would be the
+ * first thing to go quietly wrong if it did not. */
+function mockedCommands(mockSrc) {
+  const mocked = new Set(
+    [...mockBody(mockSrc).matchAll(/^ {4}([A-Za-z_][A-Za-z0-9_]*):/gm)].map((m) => m[1]),
+  );
+  // `ask` and `run_command` are answered by the streaming branch, not by an
+  // entry in the table.
+  for (const extra of ["ask", "run_command"]) {
+    if (mockSrc.includes(`cmd === "${extra}"`)) mocked.add(extra);
+  }
+  return mocked;
+}
+
+// Loaders whose NAME does not say so, so the fixture report can separate the
+// half that fakes a screen full of content from the half that only skips a
+// button. Hand-written for the same reason EXTRA_READS is, and silent in the
+// same way when it rots: a loader added to the app and not added here counts as
+// a mutation, which makes the read figure look better than it is.
+const READ_LIKE = new Set([
+  "office_html",
+  "slide_preview",
+  "stage_preview_html",
+  "mcp_runtime_for_command",
+  "suggest_file_meta",
+]);
+const isRead = (c) => /^(list|get|read|load|fetch)_/.test(c) || READ_LIKE.has(c);
+
+/* ============================================================================
+ * --bridge=electron
+ * ============================================================================
+ * `electron/shared/ipc-contract.ts`'s `Commands` interface is the migration's
+ * authoritative command list, and on that side it plays BOTH roles the Tauri
+ * check keeps apart — "what the host registers" and "what the frontend
+ * invokes" — because it was extracted byte-faithfully from `src/api.ts`'s own
+ * invoke call sites. So the only question worth asking here is the coverage
+ * one: which of those commands does qa-mock.js actually have a fixture for.
+ *
+ * Report-only, exit 0, deliberately. The Tauri DRIFT checks below compare two
+ * lists that are written down INDEPENDENTLY (Rust's `generate_handler!` and
+ * the frontend's invoke calls), which is what makes a mismatch mean something.
+ * There is no second, independently-drifting Electron list yet — no live
+ * renderer calls these channels — so a mismatch here would only be this file
+ * disagreeing with itself, and a gate that is red the day it lands is a gate
+ * someone switches off (the same reasoning the fixture-gap figures below
+ * already carry).
+ *
+ * Runs BEFORE the Tauri-only file reads below on purpose: it must keep working
+ * in a tree where `src-tauri/` has been deleted, which is where the migration
+ * is going. */
+function electronReport() {
+  const contract = path.join(root, "electron-migration/electron-app/electron/shared/ipc-contract.ts");
+  if (!fs.existsSync(contract)) {
+    console.error(
+      `--bridge=electron needs the Electron command contract, and\n  ${path.relative(root, contract)}\n` +
+        "does not exist under this root. This checker never invents command names to compare " +
+        "against — run it against a tree with the migration's electron-migration/ directory in it.",
+    );
+    process.exit(1);
+  }
+  const registered = new Set(
+    [...contractBody(fs.readFileSync(contract, "utf8")).matchAll(/^ {2}([A-Za-z_][A-Za-z0-9_]*):/gm)].map(
+      (m) => m[1],
+    ),
+  );
+  const mocked = mockedCommands(fs.readFileSync(path.join(root, "qa/qa-mock.js"), "utf8"));
+  const sorted = (set) => [...set].sort();
+  const uncovered = sorted(registered).filter((c) => !mocked.has(c));
+  const uncoveredReads = uncovered.filter(isRead);
+  const uncoveredWrites = uncovered.filter((c) => !isRead(c));
+  // NOT drift: a name qa-mock.js fakes that the contract lacks is still a real
+  // command on the Tauri side, answered by the same shared table. Said out
+  // loud under --list only, so the two bridges' figures stay legible together.
+  const notInContract = sorted(mocked).filter((c) => !registered.has(c));
+
+  const pct = registered.size ? ((registered.size - uncovered.length) / registered.size) * 100 : 100;
+  console.log(`ipc-contract.ts commands : ${registered.size}`);
+  console.log(`faked by qa-mock.js      : ${registered.size - uncovered.length} (${pct.toFixed(0)}%)`);
+  console.log(`no fixture, reads        : ${uncoveredReads.length}`);
+  console.log(`no fixture, mutations    : ${uncoveredWrites.length}`);
+  if (uncoveredReads.length) {
+    console.log(
+      `\nReads with no fixture (the pane draws from nothing):\n  ${uncoveredReads.join("\n  ")}`,
+    );
+  }
+  if (LIST && uncoveredWrites.length) {
+    console.log(`\nMutations with no fixture:\n  ${uncoveredWrites.join("\n  ")}`);
+  }
+  if (LIST && notInContract.length) {
+    console.log(
+      `\nFaked here, not in ipc-contract.ts's Commands (not drift — see the note ` +
+        `above):\n  ${notInContract.join("\n  ")}`,
+    );
+  }
+  console.log(
+    "\nElectron coverage is informational: nothing on that side invokes these channels yet, " +
+      "so there is no second list for a wrong name to drift against.",
+  );
+}
+
+if (BRIDGE === "electron") {
+  electronReport();
+  process.exit(0);
+}
+
 function walk(dir, out = []) {
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
     const p = path.join(dir, entry.name);
@@ -96,6 +247,13 @@ const rust = new Set(
   ].map((m) => m[1]),
 );
 
+// Bridge-agnostic by construction, not by luck: there is no `^` or word
+// boundary before "invoke(", so this matches today's bare `invoke("cmd")`
+// (@tauri-apps/api/core, imported by src/api.ts) and an eventual
+// `arcelle.invoke("cmd", …)` identically, as a substring. Do not "fix" it into
+// something anchored: src/ calls the Tauri surface exclusively today, so an
+// anchor that excluded the Electron form would go unnoticed until the day this
+// file is finally wrong.
 const frontend = new Set();
 for (const file of walk(path.join(root, "src"))) {
   const text = fs.readFileSync(file, "utf8");
@@ -103,14 +261,12 @@ for (const file of walk(path.join(root, "src"))) {
 }
 
 const mockSrc = fs.readFileSync(path.join(root, "qa/qa-mock.js"), "utf8");
-const mocked = new Set(
-  [...mockBody(mockSrc).matchAll(/^ {4}([A-Za-z_][A-Za-z0-9_]*):/gm)].map((m) => m[1]),
-);
-// `ask` and `run_command` are answered by the streaming branch of `invoke`,
-// not by an entry in the table.
-for (const extra of ["ask", "run_command"]) {
-  if (mockSrc.includes(`cmd === "${extra}"`)) mocked.add(extra);
-}
+// The same reading `--bridge=electron` uses: one fixture table, both bridges.
+// The `plugin:*` commands qa-mock.js now fakes (dialog, window, opener,
+// updater, process, app) are correctly invisible here on either side — they
+// are the Tauri framework's own wire protocol, never in `generate_handler!`
+// and never in ipc-contract.ts, so there is no coverage question to ask.
+const mocked = mockedCommands(mockSrc);
 
 // `EXTRA_READS` in qa-mock.js is the hand-written list of loaders whose NAME
 // does not start with `list_`/`get_`/… — it is what makes `?qa_state=` reach
@@ -126,20 +282,6 @@ const extraReads = new Set(
     ),
   ].map((m) => m[1]),
 );
-
-// Loaders whose NAME does not say so, so the fixture report can separate the
-// half that fakes a screen full of content from the half that only skips a
-// button. Hand-written for the same reason EXTRA_READS is, and silent in the
-// same way when it rots: a loader added to the app and not added here counts as
-// a mutation, which makes the read figure look better than it is.
-const READ_LIKE = new Set([
-  "office_html",
-  "slide_preview",
-  "stage_preview_html",
-  "mcp_runtime_for_command",
-  "suggest_file_meta",
-]);
-const isRead = (c) => /^(list|get|read|load|fetch)_/.test(c) || READ_LIKE.has(c);
 
 // Registered commands nothing in the app reaches TODAY, each with the reason it
 // is tolerated. Every one of them was found by the 2026-08-16 audit, and the

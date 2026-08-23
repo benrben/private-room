@@ -31,6 +31,19 @@
    * visible where a user would see it: inside the pane, not instead of it. */
   const QA_STATE = new URLSearchParams(location.search).get("qa_state") || "full";
 
+  /* `?qa_update=1` — opt into an update being AVAILABLE from
+   * `plugin:updater|check`. Off by default, unlike every other `?qa_*` flag:
+   * `checkForUpdatesQuietly()` (src/updater.ts) runs unprompted on every load
+   * of qa.html, so "an update is available" as the default would put a
+   * confirmation dialog over every ordinary QA run and every screenshot. */
+  const QA_UPDATE_AVAILABLE = new URLSearchParams(location.search).get("qa_update") === "1";
+
+  /* The version the `app`/`updater` plugin fixtures report. Deliberately NOT
+   * the app's real version: a real number hardcoded here rots at every release
+   * and a QA screenshot then states a version this build is not. */
+  const QA_VERSION = "0.0.0-qa";
+  const QA_NEXT_VERSION = "0.0.1-qa";
+
   /* Reads whose NAME does not begin with one of the prefixes below. Guessing
    * from the name alone silently excluded Home, Settings, the recording pane,
    * the connectors pane and the browser — none of their loaders are called
@@ -552,7 +565,22 @@
     },
   };
 
-  const listeners = new Map(); // event name -> Map(handlerId -> cb)
+  /* event name -> Map(key -> wrapped(payload)). ONE registry for BOTH
+   * bridges: Tauri's `plugin:event|listen`/`|unlisten` and the Electron
+   * bridge's `arcelle.on()` (plus the unsubscribe it returns) read and write
+   * this same map. Each subscriber is wrapped, at registration time, into the
+   * shape ITS OWN caller expects — Tauri's `{event, id, payload}` envelope,
+   * arcelle's bare payload — so `window.__qaEmit` (dictation, the browser
+   * journal, the ask/run_command streaming sim) never has to know which bridge
+   * the loaded bundle is actually calling. */
+  const listeners = new Map();
+  const registerListener = (event, key, wrapped) => {
+    if (!listeners.has(event)) listeners.set(event, new Map());
+    listeners.get(event).set(key, wrapped);
+  };
+  const dropListener = (event, key) => {
+    listeners.get(event)?.delete(key);
+  };
   let cbId = 1;
   const cbs = new Map();
 
@@ -1910,13 +1938,343 @@
     },
   };
 
-  window.__TAURI_EVENT_PLUGIN_INTERNALS__ = {
-    unregisterListener(event, id) {
-      listeners.get(event)?.delete(id);
-    },
+  /* ==========================================================================
+   * THE BRIDGE — Tauri today, `window.arcelle` after the Electron cutover
+   * ==========================================================================
+   * This file used to reach for exactly one patch point,
+   * `window.__TAURI_INTERNALS__`. The Electron rewrite replaces that with a
+   * preload-exposed `window.arcelle`, and on the day the frontend is cut over
+   * a mock that only patches the Tauri object would stop intercepting
+   * ANYTHING — silently, with every screen still rendering, which is the one
+   * failure mode a test harness must never have. So both are installed.
+   *
+   * The arcelle shape is not guessed: both preload candidates
+   * (electron-migration/electron-app/electron/preload/index_a.ts and
+   * index_b.ts) independently converged on
+   * `window.arcelle.invoke(channel, args): Promise<unknown>` plus
+   * `window.arcelle.on(channel, cb): () => void`, where `cb` receives the bare
+   * payload and never a wrapped event object, and both deliberately expose
+   * NOTHING else — no `dialog`/`shell`/`app` namespace (see their own module
+   * docs). `electron/shared/ipc-contract.ts`'s `Commands` interface is the
+   * same 296 command names, with the same args, that `commands` above already
+   * fakes for Tauri — it is a byte-faithful port of `src/api.ts`'s invoke call
+   * sites, not a second surface — so ONE dispatcher answers for both bridges
+   * and there is no second fixture table to drift.
+   *
+   * Nothing in this repo creates `window.arcelle` yet; installing it today
+   * costs one unused global and means this file does not have to change again
+   * on cutover day.
+   */
+
+  /** Every domain command — the `commands` table above, `?qa_state=`, the
+   * `list_*` fallback and the `ask`/`run_command` streaming simulation —
+   * shared verbatim by both bridges. Tauri's `plugin:*` namespace is NOT
+   * dispatched here: it is the framework's own wire protocol, not an app
+   * command, and it is handled by the Tauri bridge alone (see below). */
+  async function dispatchCommand(cmd, args) {
+    const fn = commands[cmd];
+    if (fn) {
+      if (QA_STATE !== "full" && isRead(cmd)) {
+        if (QA_STATE === "empty") return emptied(await fn(args));
+        // A promise that never settles is what "still loading" actually is;
+        // a slow timeout would race the screenshot instead of pinning it.
+        if (QA_STATE === "loading") return new Promise(() => {});
+        if (QA_STATE === "error") throw new Error(`${cmd} failed: room unavailable`);
+      }
+      return fn(args);
+    }
+    if (cmd.startsWith("list_")) return noteUnhandled(cmd, []);
+    if (cmd === "ask" || cmd === "run_command") {
+      window.__qaAsks = (window.__qaAsks || 0) + 1;
+      // Owner replacement #4: the host wraps every ask-* event in
+      // { runId, chatId, v } so a conversation can reject events that are not
+      // its own. The mock has to speak the same wire — with bare payloads the
+      // composer treats them as belonging to nobody, and a QA run that
+      // switched chats would show exactly the bug this replaced.
+      const turn = { runId: args?.askId ?? null, chatId: args?.chatId ?? null };
+      const askEmit = (event, v) => window.__qaEmit(event, { ...turn, v });
+      (window.__qaAskLog = window.__qaAskLog || []).push(args?.question ?? args?.text ?? "?");
+      // Dispatch-first agent visibility: roster + active-agent walk, so the
+      // agent strip (done/active/queued chips) is exercised in browser QA.
+      // Hub v3: the roster GROWS as the Main agent delegates.
+      // Dispatch-first agent visibility, hub v3 with PARALLEL delegation:
+      // every `ask-plan` is a complete snapshot in which each entry carries
+      // its own status, its dispatch `batch` and a unique `key`. This script
+      // reproduces the case a flat strip cannot draw — three children live at
+      // once, finishing out of order — plus a second batch afterwards, so the
+      // band grouping and the "then" sequencing are both on screen.
+      const N = (agent, label, instruction, status, batch, key) =>
+        ({ agent, label, instruction, status, batch, key });
+      const MAIN = (status) =>
+        N("chat.answer", "Main agent", "answer the user from the specialists' reports", status, null, "main");
+      const KIDS = [
+        N("files.read", "File agent", "read the lease and pull the rent clause", "running", 0, "files.read#0"),
+        N("chat.web", "Web agent", "check the current market rate for the area", "running", 0, "chat.web#1"),
+        N("jobs.run", "Jobs agent", "how is the translation pass going", "running", 0, "jobs.run#2"),
+      ];
+      const snap = (statuses, extra = []) => {
+        const kids = KIDS.map((k, i) => ({ ...k, status: statuses[i] }));
+        const all = [...kids, ...extra];
+        const running = all.map((e, i) => (e.status === "running" ? i + 1 : 0)).filter(Boolean);
+        const plan = [...all, MAIN(running.length ? "pending" : "running")];
+        askEmit("ask-plan", plan);
+        const step = running[0] ?? plan.length;
+        askEmit("ask-agent", {
+          id: plan[step - 1].agent, label: plan[step - 1].label,
+          step, total: plan.length, active_steps: running.length ? running : [step],
+        });
+      };
+      const at = (ms, fn) => setTimeout(fn, ms);
+      // window.__qaSolo drives the OTHER shape a turn can take: the Main
+      // agent answers alone, delegating nothing. That turn has no graph to
+      // draw and must still render the plain one-chip strip it always did.
+      if (window.__qaSolo) {
+        at(80, () => {
+          askEmit("ask-plan", [MAIN("running")]);
+          askEmit("ask-agent", { id: "chat.answer", label: "Main agent", step: 1, total: 1, active_steps: [1] });
+        });
+        at(150, () => askEmit("ask-delta", "Answering directly. "));
+        return new Promise((resolve) =>
+          setTimeout(() => resolve({ id: "msg-solo", role: "assistant", content: "Answering directly.", sources: [], createdAt: new Date().toISOString(), effects: null }), Number(window.__qaTurnMs) || 4200));
+      }
+      at(80, () => {
+        askEmit("ask-plan", [MAIN("running")]);
+        askEmit("ask-agent", { id: "chat.answer", label: "Main agent", step: 1, total: 1, active_steps: [1] });
+      });
+      // The batch is dispatched: three children light up together.
+      at(500, () => {
+        snap(["running", "running", "running"]);
+        for (const k of KIDS) askEmit("ask-step", { label: `Asked the ${k.label}`, node: "main" });
+      });
+      // Their tool traffic interleaves — each step names the node that ran it.
+      at(700, () => askEmit("ask-step", { label: "Searched the room", node: "files.read#0" }));
+      at(820, () => askEmit("ask-step", { label: "Searched the web", node: "chat.web#1" }));
+      at(900, () => askEmit("ask-step-status", { ok: true, node: "files.read#0" }));
+      at(980, () => askEmit("ask-step", { label: "Checked job status", node: "jobs.run#2" }));
+      at(1100, () => askEmit("ask-step", { label: "Opened Lease.pdf", node: "files.read#0" }));
+      at(1200, () => askEmit("ask-step-status", { ok: false, node: "chat.web#1" }));
+      // Out-of-order completion: the Jobs agent finishes first, the Web agent
+      // fails, the File agent is still working. This frame is the feature.
+      at(1400, () => snap(["running", "running", "done"]));
+      at(1900, () => snap(["running", "failed", "done"]));
+      at(2400, () => snap(["done", "failed", "done"]));
+      // A SECOND round dispatches one more child: its own batch, its own band.
+      at(2900, () => {
+        const later = N("connectors.use", "Connector agent", "send the summary to Slack", "running", 1, "connectors.use#3");
+        snap(["done", "failed", "done"], [later]);
+        askEmit("ask-step", { label: "Asked the Connector agent", node: "main" });
+      });
+      at(3600, () =>
+        snap(["done", "failed", "done"], [
+          N("connectors.use", "Connector agent", "send the summary to Slack", "done", 1, "connectors.use#3"),
+        ]),
+      );
+      // Pretend a short streamed answer, so Send visibly works in QA.
+      setTimeout(() => askEmit("ask-delta", "Thinking about your sources… "), 150);
+      setTimeout(() => askEmit("ask-delta", "here is a grounded answer."), 450);
+      // Token-budget bar QA: a live per-turn snapshot, growing a bit each ask
+      // so repeated sends visibly fill the bar.
+      window.__qaTurns = (window.__qaTurns || 0) + 1;
+      const base = 4200 + window.__qaTurns * 900;
+      setTimeout(
+        () =>
+          askEmit("ask-token-usage", {
+            round: 0,
+            total_tokens: base,
+            max_context: 24576,
+            estimated: window.__qaTurns % 3 === 0,
+            breakdown: {
+              system: { tokens: 620, estimated: true },
+              history: { tokens: Math.round(base * 0.62), estimated: true },
+              tools: { tokens: Math.round(base * 0.18), estimated: true },
+              skills: { tokens: Math.round(base * 0.06), estimated: true },
+              files: { tokens: Math.round(base * 0.06), estimated: true },
+            },
+          }),
+        650,
+      );
+      return new Promise((resolve) =>
+        setTimeout(() => resolve({ id: "msg-live", role: "assistant", content: "Thinking about your sources… here is a grounded answer.", sources: ["Ideas.md"], createdAt: new Date().toISOString(), effects: null }), Number(window.__qaTurnMs) || 4200),
+      );
+    }
+    return noteUnhandled(cmd, null);
+  }
+
+  /* ==========================================================================
+   * THE TAURI PLUGIN SURFACE — dialog, window, opener ("shell"), updater,
+   * process, app: real fixtures, where there used to be a blanket `null`
+   * ==========================================================================
+   * None of these is an app command, so none of them appears in `commands`
+   * above, in `src-tauri`'s `generate_handler!`, or in the Electron
+   * migration's ipc-contract.ts. They are the wire protocol of the
+   * `@tauri-apps/plugin-*` packages themselves, which the frontend calls
+   * directly from 17 files outside api.ts: `chooseOpenPath`/`chooseSavePath`
+   * (api.ts), every `confirm()`/`message()` (App, Workspace, updater.ts,
+   * AiProvidersSection, RecoveryModal, SkillsView, WorkflowDetail),
+   * `openUrl()`/`revealItemInDir()` (TopBar, FeedbackModal, MarkdownView,
+   * RecordingView, recordingActions), `getCurrentWindow().setTitle()/.close()`
+   * (App, Workspace, effects), `check()`/`relaunch()`/`getVersion()`
+   * (updater.ts, AboutSection). Every command name and argument shape below is
+   * read off the INSTALLED package's own dist-js/index.js — nothing is
+   * invented — and none of it is mirrored onto `window.arcelle`, which has no
+   * equivalent channels: neither ipc-contract.ts nor either preload candidate
+   * defines one, and inventing names for a contract that does not exist yet is
+   * exactly what this repo's drift checker exists to prevent.
+   *
+   * Until now the whole `plugin:*` namespace answered `null`, and `null` is
+   * not a neutral answer: `confirm()`/`ask()` compare the reply against their
+   * own "Ok"/"Yes" label, so EVERY confirmation in the app read as declined,
+   * every file picker as cancelled, and nothing recorded that
+   * `openUrl()`/`setTitle()`/`relaunch()` had run at all — a button wired to
+   * the wrong handler looked exactly like one wired to the right one.
+   *
+   * `window.__qaPluginCalls` records every one of them, in order, so a spec
+   * can assert that a control fired at all; the narrower globals beside it
+   * (`__qaOpenedUrls`, `__qaWindowTitle`, …) are there so the common
+   * assertions stay one line. `window.__qaDialogAnswer` is the only steering
+   * lever — `{ open: "cancel" }` for the pickers, `{ confirm: "cancel" }` for
+   * the confirmations. Both default to the AFFIRMATIVE answer, because that is
+   * the branch a QA run has to be able to reach; every one of these dialogs
+   * sits behind a click, never a mount, so no existing screenshot moves. */
+  const notePlugin = (surface, cmd, args) => {
+    (window.__qaPluginCalls = window.__qaPluginCalls || []).push({ surface, cmd, args });
+  };
+  const dialogChoice = () => window.__qaDialogAnswer || {};
+
+  /** Reverses `buttonsToRust` (@tauri-apps/plugin-dialog's own transform) far
+   * enough to answer with the label `confirm()`/`ask()` compare against. By
+   * the time a call reaches here the JS `okLabel`/`cancelLabel` are gone:
+   * `buttons` is already Rust-shaped — a bare "OkCancel"/"YesNo", or one of
+   * `{OkCancelCustom:[ok,cancel]}` / `{YesNoCancelCustom:[yes,no,cancel]}` /
+   * `{OkCustom:ok}` — so this is the only place the labels can be recovered. */
+  const dialogAnswerFor = (buttons) => {
+    const declined = dialogChoice().confirm === "cancel";
+    // A plain message() sends no buttons at all and ignores what comes back.
+    if (buttons === undefined) return null;
+    if (buttons === "YesNo") return declined ? "No" : "Yes";
+    if (typeof buttons === "string") return declined ? "Cancel" : "Ok"; // "OkCancel"
+    if (buttons && typeof buttons === "object") {
+      if ("OkCancelCustom" in buttons)
+        return declined ? buttons.OkCancelCustom[1] : buttons.OkCancelCustom[0];
+      if ("YesNoCancelCustom" in buttons)
+        return declined ? buttons.YesNoCancelCustom[2] : buttons.YesNoCancelCustom[0];
+      if ("OkCustom" in buttons) return declined ? null : buttons.OkCustom;
+    }
+    return null;
   };
 
-  window.__TAURI_INTERNALS__ = {
+  /** `{ handled: false }` for anything outside this surface — never a bare
+   * `undefined`, because several of these legitimately answer `null` and that
+   * must not be read as "not handled". The `plugin:` catch-all in the Tauri
+   * bridge still answers everything else with `null`, exactly as before. */
+  const pluginCommand = (cmd, args) => {
+    if (cmd === "plugin:dialog|open") {
+      notePlugin("dialog", cmd, args);
+      const o = args?.options ?? {};
+      if (dialogChoice().open === "cancel") return { handled: true, value: null };
+      const ext = o.filters?.[0]?.extensions?.[0] ?? "md";
+      const pick = (n) =>
+        o.directory ? `/Users/qa/Desktop/QA folder ${n}` : `/Users/qa/Desktop/qa-pick-${n}.${ext}`;
+      return { handled: true, value: o.multiple ? [pick(1), pick(2)] : pick(1) };
+    }
+    if (cmd === "plugin:dialog|save") {
+      notePlugin("dialog", cmd, args);
+      const o = args?.options ?? {};
+      if (dialogChoice().open === "cancel") return { handled: true, value: null };
+      const ext = o.filters?.[0]?.extensions?.[0] ?? "txt";
+      // The suggested name, kept: `exportOne` passes the file's own name and a
+      // fixture that dropped it would hide a wrong `defaultPath` entirely. A
+      // path ending in a separator has no name to keep, hence the fallback.
+      const name = String(o.defaultPath ?? "").split("/").pop() || `qa-export.${ext}`;
+      return { handled: true, value: `/Users/qa/Desktop/${name}` };
+    }
+    if (cmd === "plugin:dialog|message") {
+      notePlugin("dialog", cmd, args);
+      return { handled: true, value: dialogAnswerFor(args?.buttons) };
+    }
+    if (cmd.startsWith("plugin:window|") || cmd.startsWith("plugin:webview|")) {
+      notePlugin("window", cmd, args);
+      if (cmd === "plugin:window|set_title") window.__qaWindowTitle = args?.title ?? null;
+      // Recorded, never acted on: really closing the window would tear down
+      // the QA tab from under the harness driving it — the same reason the
+      // synthetic mic below records a grant instead of opening a device.
+      if (cmd === "plugin:window|close" || cmd === "plugin:window|destroy")
+        window.__qaWindowClosed = (window.__qaWindowClosed || 0) + 1;
+      return { handled: true, value: null };
+    }
+    if (cmd === "plugin:opener|open_url" || cmd === "plugin:opener|open_path") {
+      notePlugin("shell", cmd, args);
+      (window.__qaOpenedUrls = window.__qaOpenedUrls || []).push(args?.url ?? args?.path ?? null);
+      return { handled: true, value: null };
+    }
+    if (cmd === "plugin:opener|reveal_item_in_dir") {
+      // `revealItemInDir(path)` always sends an ARRAY, even for one path.
+      notePlugin("shell", cmd, args);
+      (window.__qaRevealedPaths = window.__qaRevealedPaths || []).push(...(args?.paths ?? []));
+      return { handled: true, value: null };
+    }
+    if (cmd === "plugin:updater|check") {
+      notePlugin("updater", cmd, args);
+      // Default: nothing to install — `check()` reads a falsy answer as "no
+      // update" (`metadata ? new Update(metadata) : null`). `?qa_update=1`
+      // opts into the other half of the flow; the plugin builds a real
+      // `Update` from this, and `rid` is only ever handed back to
+      // `plugin:resources|close`, which the catch-all below already answers.
+      if (!QA_UPDATE_AVAILABLE) return { handled: true, value: null };
+      return {
+        handled: true,
+        value: {
+          rid: 9001,
+          currentVersion: QA_VERSION,
+          version: QA_NEXT_VERSION,
+          date: iso(0).slice(0, 10),
+          body: "QA fixture release notes.",
+          rawJson: {},
+        },
+      };
+    }
+    if (cmd === "plugin:updater|download_and_install") {
+      // `onEvent` arrives as the LIVE `Channel` — nothing serialises args in
+      // this mock — so its `onmessage` can be driven straight, without
+      // reproducing Tauri's transformCallback/index-ordering envelope.
+      notePlugin("updater", cmd, args);
+      const channel = args?.onEvent;
+      const total = 6_000_000;
+      const step = Math.round(total / 5);
+      return {
+        handled: true,
+        value: new Promise((resolve) => {
+          channel?.onmessage?.({ event: "Started", data: { contentLength: total } });
+          let got = 0;
+          const tick = () => {
+            got += step;
+            if (got >= total) {
+              channel?.onmessage?.({ event: "Finished" });
+              resolve(null);
+            } else {
+              channel?.onmessage?.({ event: "Progress", data: { chunkLength: step } });
+              setTimeout(tick, 60);
+            }
+          };
+          setTimeout(tick, 60);
+        }),
+      };
+    }
+    if (cmd === "plugin:process|exit" || cmd === "plugin:process|restart") {
+      // Recorded, never acted on, for the same reason as window|close: a spec
+      // can assert the update flow reached relaunch() without the page going.
+      notePlugin("process", cmd, args);
+      return { handled: true, value: null };
+    }
+    if (cmd === "plugin:app|version") {
+      notePlugin("app", cmd, args);
+      return { handled: true, value: QA_VERSION };
+    }
+    return { handled: false };
+  };
+
+  /* ---- the Tauri bridge: what `@tauri-apps/api/core`'s invoke() reads ---- */
+  const tauriBridge = {
     plugins: {},
     metadata: {
       currentWindow: { label: "main" },
@@ -1930,147 +2288,75 @@
     async invoke(cmd, args) {
       if (cmd === "plugin:event|listen") {
         const { event, handler } = args;
-        if (!listeners.has(event)) listeners.set(event, new Map());
-        listeners.get(event).set(handler, cbs.get(handler));
+        const cb = cbs.get(handler);
+        registerListener(event, handler, (payload) => cb?.({ event, id: 0, payload }));
         return handler;
       }
       if (cmd === "plugin:event|unlisten") {
         const { event, eventId } = args;
-        listeners.get(event)?.delete(eventId);
+        dropListener(event, eventId);
         return null;
       }
-      if (cmd.startsWith("plugin:window|") || cmd.startsWith("plugin:webview|")) return null;
-      if (cmd === "plugin:updater|check") return null;
-      if (cmd.startsWith("plugin:dialog|")) return null;
+      const plugin = pluginCommand(cmd, args);
+      if (plugin.handled) return plugin.value;
       if (cmd.startsWith("plugin:")) return null;
-      const fn = commands[cmd];
-      if (fn) {
-        if (QA_STATE !== "full" && isRead(cmd)) {
-          if (QA_STATE === "empty") return emptied(await fn(args));
-          // A promise that never settles is what "still loading" actually is;
-          // a slow timeout would race the screenshot instead of pinning it.
-          if (QA_STATE === "loading") return new Promise(() => {});
-          if (QA_STATE === "error") throw new Error(`${cmd} failed: room unavailable`);
-        }
-        return fn(args);
-      }
-      if (cmd.startsWith("list_")) return noteUnhandled(cmd, []);
-      if (cmd === "ask" || cmd === "run_command") {
-        window.__qaAsks = (window.__qaAsks || 0) + 1;
-        // Owner replacement #4: the host wraps every ask-* event in
-        // { runId, chatId, v } so a conversation can reject events that are not
-        // its own. The mock has to speak the same wire — with bare payloads the
-        // composer treats them as belonging to nobody, and a QA run that
-        // switched chats would show exactly the bug this replaced.
-        const turn = { runId: args?.askId ?? null, chatId: args?.chatId ?? null };
-        const askEmit = (event, v) => window.__qaEmit(event, { ...turn, v });
-        (window.__qaAskLog = window.__qaAskLog || []).push(args?.question ?? args?.text ?? "?");
-        // Dispatch-first agent visibility: roster + active-agent walk, so the
-        // agent strip (done/active/queued chips) is exercised in browser QA.
-        // Hub v3: the roster GROWS as the Main agent delegates.
-        // Dispatch-first agent visibility, hub v3 with PARALLEL delegation:
-        // every `ask-plan` is a complete snapshot in which each entry carries
-        // its own status, its dispatch `batch` and a unique `key`. This script
-        // reproduces the case a flat strip cannot draw — three children live at
-        // once, finishing out of order — plus a second batch afterwards, so the
-        // band grouping and the "then" sequencing are both on screen.
-        const N = (agent, label, instruction, status, batch, key) =>
-          ({ agent, label, instruction, status, batch, key });
-        const MAIN = (status) =>
-          N("chat.answer", "Main agent", "answer the user from the specialists' reports", status, null, "main");
-        const KIDS = [
-          N("files.read", "File agent", "read the lease and pull the rent clause", "running", 0, "files.read#0"),
-          N("chat.web", "Web agent", "check the current market rate for the area", "running", 0, "chat.web#1"),
-          N("jobs.run", "Jobs agent", "how is the translation pass going", "running", 0, "jobs.run#2"),
-        ];
-        const snap = (statuses, extra = []) => {
-          const kids = KIDS.map((k, i) => ({ ...k, status: statuses[i] }));
-          const all = [...kids, ...extra];
-          const running = all.map((e, i) => (e.status === "running" ? i + 1 : 0)).filter(Boolean);
-          const plan = [...all, MAIN(running.length ? "pending" : "running")];
-          askEmit("ask-plan", plan);
-          const step = running[0] ?? plan.length;
-          askEmit("ask-agent", {
-            id: plan[step - 1].agent, label: plan[step - 1].label,
-            step, total: plan.length, active_steps: running.length ? running : [step],
-          });
-        };
-        const at = (ms, fn) => setTimeout(fn, ms);
-        // window.__qaSolo drives the OTHER shape a turn can take: the Main
-        // agent answers alone, delegating nothing. That turn has no graph to
-        // draw and must still render the plain one-chip strip it always did.
-        if (window.__qaSolo) {
-          at(80, () => {
-            askEmit("ask-plan", [MAIN("running")]);
-            askEmit("ask-agent", { id: "chat.answer", label: "Main agent", step: 1, total: 1, active_steps: [1] });
-          });
-          at(150, () => askEmit("ask-delta", "Answering directly. "));
-          return new Promise((resolve) =>
-            setTimeout(() => resolve({ id: "msg-solo", role: "assistant", content: "Answering directly.", sources: [], createdAt: new Date().toISOString(), effects: null }), Number(window.__qaTurnMs) || 4200));
-        }
-        at(80, () => {
-          askEmit("ask-plan", [MAIN("running")]);
-          askEmit("ask-agent", { id: "chat.answer", label: "Main agent", step: 1, total: 1, active_steps: [1] });
-        });
-        // The batch is dispatched: three children light up together.
-        at(500, () => {
-          snap(["running", "running", "running"]);
-          for (const k of KIDS) askEmit("ask-step", { label: `Asked the ${k.label}`, node: "main" });
-        });
-        // Their tool traffic interleaves — each step names the node that ran it.
-        at(700, () => askEmit("ask-step", { label: "Searched the room", node: "files.read#0" }));
-        at(820, () => askEmit("ask-step", { label: "Searched the web", node: "chat.web#1" }));
-        at(900, () => askEmit("ask-step-status", { ok: true, node: "files.read#0" }));
-        at(980, () => askEmit("ask-step", { label: "Checked job status", node: "jobs.run#2" }));
-        at(1100, () => askEmit("ask-step", { label: "Opened Lease.pdf", node: "files.read#0" }));
-        at(1200, () => askEmit("ask-step-status", { ok: false, node: "chat.web#1" }));
-        // Out-of-order completion: the Jobs agent finishes first, the Web agent
-        // fails, the File agent is still working. This frame is the feature.
-        at(1400, () => snap(["running", "running", "done"]));
-        at(1900, () => snap(["running", "failed", "done"]));
-        at(2400, () => snap(["done", "failed", "done"]));
-        // A SECOND round dispatches one more child: its own batch, its own band.
-        at(2900, () => {
-          const later = N("connectors.use", "Connector agent", "send the summary to Slack", "running", 1, "connectors.use#3");
-          snap(["done", "failed", "done"], [later]);
-          askEmit("ask-step", { label: "Asked the Connector agent", node: "main" });
-        });
-        at(3600, () =>
-          snap(["done", "failed", "done"], [
-            N("connectors.use", "Connector agent", "send the summary to Slack", "done", 1, "connectors.use#3"),
-          ]),
-        );
-        // Pretend a short streamed answer, so Send visibly works in QA.
-        setTimeout(() => askEmit("ask-delta", "Thinking about your sources… "), 150);
-        setTimeout(() => askEmit("ask-delta", "here is a grounded answer."), 450);
-        // Token-budget bar QA: a live per-turn snapshot, growing a bit each ask
-        // so repeated sends visibly fill the bar.
-        window.__qaTurns = (window.__qaTurns || 0) + 1;
-        const base = 4200 + window.__qaTurns * 900;
-        setTimeout(
-          () =>
-            askEmit("ask-token-usage", {
-              round: 0,
-              total_tokens: base,
-              max_context: 24576,
-              estimated: window.__qaTurns % 3 === 0,
-              breakdown: {
-                system: { tokens: 620, estimated: true },
-                history: { tokens: Math.round(base * 0.62), estimated: true },
-                tools: { tokens: Math.round(base * 0.18), estimated: true },
-                skills: { tokens: Math.round(base * 0.06), estimated: true },
-                files: { tokens: Math.round(base * 0.06), estimated: true },
-              },
-            }),
-          650,
-        );
-        return new Promise((resolve) =>
-          setTimeout(() => resolve({ id: "msg-live", role: "assistant", content: "Thinking about your sources… here is a grounded answer.", sources: ["Ideas.md"], createdAt: new Date().toISOString(), effects: null }), Number(window.__qaTurnMs) || 4200),
-        );
-      }
-      return noteUnhandled(cmd, null);
+      return dispatchCommand(cmd, args);
     },
   };
+
+  /* ---- the Electron bridge: window.arcelle.{invoke, on} ---- */
+  const arcelleBridge = {
+    invoke(channel, args) {
+      return dispatchCommand(channel, args);
+    },
+    on(channel, callback) {
+      const key = Symbol(channel);
+      registerListener(channel, key, (payload) => callback(payload));
+      return () => dropListener(channel, key);
+    },
+  };
+
+  /** Patch whichever bridge is already there, provide whichever is not.
+   *
+   * Both matter. In the harness this file was written for (dist/qa.html under
+   * `vite preview`) NEITHER exists, so the mock has to CREATE the one the
+   * loaded bundle is going to call — that is the whole cutover case, and a
+   * mock that only patched a pre-existing `window.arcelle` would come up dead
+   * there. Inside a real app shell one of them exists already and must be
+   * REPLACED, or the fixtures never intercept anything. `key` is one of the
+   * three literals below, never anything a page could influence.
+   *
+   * A contextBridge-exposed `window.arcelle` is read-only and
+   * non-configurable, so neither route can take: that is reported loudly
+   * rather than swallowed, because the alternative is a QA run quietly
+   * photographing a real backend. */
+  const installBridge = (key, value) => {
+    try {
+      window[key] = value;
+      if (window[key] === value) return true;
+    } catch {
+      /* read-only property in strict mode — fall through to defineProperty */
+    }
+    try {
+      Object.defineProperty(window, key, { value, writable: true, configurable: true });
+      if (window[key] === value) return true;
+    } catch {
+      /* non-configurable — nothing more to try */
+    }
+    console.error(
+      `[qa-mock] window.${key} could NOT be patched: it is locked by a real ` +
+        "bridge. What you are looking at is that backend, not these fixtures.",
+    );
+    return false;
+  };
+
+  installBridge("__TAURI_EVENT_PLUGIN_INTERNALS__", {
+    unregisterListener(event, id) {
+      dropListener(event, id);
+    },
+  });
+  installBridge("__TAURI_INTERNALS__", tauriBridge);
+  installBridge("arcelle", arcelleBridge);
 
   // Hands-free QA: a synthetic mic (oscillator → MediaStream) so dictation
   // runs headless without fake-device launch flags.
@@ -2102,7 +2388,10 @@
   window.__qaEmit = (event, payload) => {
     const subs = listeners.get(event);
     if (!subs) return 0;
-    for (const cb of subs.values()) cb?.({ event, id: 0, payload });
+    // Each subscriber was wrapped, at registration, into the shape ITS bridge
+    // expects (Tauri: `{event, id, payload}`; arcelle: the bare payload), so
+    // one emit reaches whichever bridge the loaded bundle subscribed through.
+    for (const wrapped of subs.values()) wrapped?.(payload);
     return subs.size;
   };
   console.log("[qa-mock] installed");
