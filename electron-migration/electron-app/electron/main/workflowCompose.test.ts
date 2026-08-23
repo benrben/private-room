@@ -72,6 +72,7 @@ import {
   scheduleFromArgs,
   testRunTrailer,
   validateWorkflowInner,
+  withRealOllamaGenerate,
   workflowTemplates,
   type RoomSource,
 } from "./workflowCompose.js";
@@ -1111,5 +1112,38 @@ describe("generateTextAnyEngine's default CLI seam", () => {
       vi.doUnmock("./externalAdvisor.js");
       vi.resetModules();
     }
+  });
+});
+
+describe("withRealOllamaGenerate", () => {
+  it("fills an absent generateOllama with the real ollamaGenerate.ts port", async () => {
+    vi.resetModules();
+    const generate = vi.fn().mockResolvedValue("from the real client");
+    vi.doMock("./ollamaGenerate.js", async () => {
+      const real = await vi.importActual<typeof import("./ollamaGenerate.js")>("./ollamaGenerate.js");
+      return { ...real, generate };
+    });
+    try {
+      const mod = await import("./workflowCompose.js");
+      const filled = mod.withRealOllamaGenerate({});
+      expect(filled.generateOllama).toBeDefined();
+      const text = await mod.generateTextAnyEngine("qwen3.5:4b", "hi", filled);
+      expect(text).toBe("from the real client");
+      expect(generate).toHaveBeenCalledWith(
+        "qwen3.5:4b",
+        [{ role: "user", content: "hi" }],
+        mod.COMPOSE_TEMPERATURE,
+        KEEP_ALIVE_WARM
+      );
+    } finally {
+      vi.doUnmock("./ollamaGenerate.js");
+      vi.resetModules();
+    }
+  });
+
+  it("never overrides an already-supplied generateOllama", () => {
+    const generateOllama = vi.fn();
+    const filled = withRealOllamaGenerate({ generateOllama });
+    expect(filled.generateOllama).toBe(generateOllama);
   });
 });

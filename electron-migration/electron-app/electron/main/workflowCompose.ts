@@ -18,13 +18,15 @@
  * together here rather than keeping two.
  *
  * ============================================================================
- * WHAT IS REAL, AND THE ONE HONEST SEAM
+ * WHAT IS REAL — INCLUDING THE ONCE-HONEST SEAM, NOW CLOSEABLE
  * ============================================================================
- * Everything in `compose_workflow`'s body is real except a single leaf:
  * `ollama::generate` (`ollama.rs` lines 408-418 — the actual `/api/generate`
- * HTTP call) has NO Electron port anywhere in this migration. That is a
- * confirmed dependency gap, not a shortcut taken here; `skillsCmds.ts`'s own
- * module doc already flags the same gap for its unported `compose_skill`.
+ * HTTP call) has SINCE LANDED as `ollamaGenerate.ts`'s {@link realOllamaGenerate}.
+ * {@link withRealOllamaGenerate} installs it into {@link GenerateTextAnyEngineDeps}
+ * for any caller that hasn't supplied its own — a host bootstrap should build
+ * through it so `compose_workflow` composes through a local Ollama model, not
+ * only an external CLI. `skillsCmds.ts`'s own module doc flags the same gap for
+ * its unported `compose_skill`, and can now be closed the same way.
  *
  * Three things that LOOK like part of that gap are already real and are reused
  * rather than re-declared or re-flagged:
@@ -158,6 +160,7 @@ import {
 } from "./externalAdvisor.js";
 import { modelSetting } from "./gatherContext.js";
 import { nextRunFromNow } from "./jobScheduler.js";
+import { generate as realOllamaGenerate } from "./ollamaGenerate.js";
 import { KEEP_ALIVE_WARM } from "./ollamaModels.js";
 import type { SidecarChatMessage } from "./sidecar.js";
 import { isCliEngine, ROLLBACK_BUSY } from "./turnContext.js";
@@ -333,6 +336,29 @@ export const OLLAMA_GENERATE_NOT_IMPLEMENTED =
  */
 export const generateOllamaNotImplemented: GenerateOllamaFn = () =>
   Promise.reject(new Error(OLLAMA_GENERATE_NOT_IMPLEMENTED));
+
+/**
+ * Fills {@link GenerateTextAnyEngineDeps.generateOllama} with the real,
+ * committed `ollama.rs` port ({@link realOllamaGenerate} from
+ * `ollamaGenerate.ts`) for any caller that has not already supplied its own —
+ * the seam this module's doc said would be a drop-in once that batch landed,
+ * confirmed by that batch's own type-check against {@link GenerateOllamaFn}.
+ *
+ * Purely additive, mirroring `execTool.ts`'s `withRealAdvisorCli`/
+ * `withRealPrivacyGates`: every existing test that builds a bare
+ * {@link GenerateTextAnyEngineDeps} object literal still exercises the
+ * NOT_IMPLEMENTED seam unchanged, because nothing calls this on their behalf.
+ * A real caller should build its deps through this
+ * (`generateTextAnyEngine(model, prompt, withRealOllamaGenerate(deps))`) so
+ * `compose_workflow` can compose through a local Ollama model, not only an
+ * external CLI.
+ */
+export function withRealOllamaGenerate(deps: GenerateTextAnyEngineDeps): GenerateTextAnyEngineDeps {
+  if (deps.generateOllama !== undefined) {
+    return deps;
+  }
+  return { ...deps, generateOllama: realOllamaGenerate };
+}
 
 /**
  * `ollama::generate(model, msgs, Some(0.2), KEEP_ALIVE_WARM, None)` — the shape
