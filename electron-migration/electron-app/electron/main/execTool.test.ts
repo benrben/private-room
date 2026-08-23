@@ -186,6 +186,15 @@ describe("exhaustive tool-arm coverage — the single most valuable test in this
       "list_mcps",
       "read_mcp",
       "save_mcp",
+      // Workflows (workflowRuns.ts). These three touch only the room — wired
+      // for real, so with no room open they answer "No room is open." like
+      // every other real arm. `delete_workflow`/`run_workflow`/`test_workflow`
+      // are NOT here on purpose, for the same reason `delete_mcp` isn't: they
+      // refuse up front while their own consent/job-queue seams are unwired,
+      // which `deps()` leaves undefined.
+      "list_workflows",
+      "save_workflow",
+      "update_workflow",
     ];
     const stubbedNames = NAMED_ARM_TOOL_NAMES.filter((n) => !REAL_ARMS.includes(n));
     for (const name of stubbedNames) {

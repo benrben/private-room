@@ -139,6 +139,16 @@ import {
   type DownloadJobDeps,
 } from "./jobDownload.js";
 import { makeRunAdvisorCli, realRunAdvisorCli, type RunExternalOptions } from "./externalAdvisor.js";
+import {
+  agentDeleteWorkflow,
+  agentListWorkflows,
+  agentRunWorkflow,
+  agentSaveWorkflow,
+  agentTestWorkflow,
+  agentUpdateWorkflow,
+  type AgentTestWorkflowDeps,
+} from "./workflowRuns.js";
+import { DELETE_DECLINED } from "./mcpConfig.js";
 import { getFreshWebPage, getFreshWebSearch, putWebSearch, saveWebPage } from "./db-host/webCache.js";
 import { blockedNote, fetchPage, joinNames, renderHits, searchWeb, type FetchedPage, type SearchPage } from "./web.js";
 import { fetchPageReply } from "./fetchPageWindow.js";
@@ -484,6 +494,32 @@ export interface ExecToolDeps {
    * busy, which is the worst possible shape for the bug to take.
    */
   downloadJob?: DownloadJobDeps;
+  /**
+   * `workflowRuns.ts`'s run glue: the app-wide job queue + room script-approvals
+   * dir that `run_workflow` (`agent_run_workflow`) and `test_workflow`
+   * (`agent_test_workflow`) dispatch through, and whose `cancelState`
+   * `delete_workflow` uses to signal an in-flight job before its row goes.
+   * Mirrors {@link ExecToolDeps.downloadJob} exactly: `undefined` (every test
+   * but its own) means no host bootstrap has wired a job queue into execTool
+   * yet, so those two arms refuse with `NOT_IMPLEMENTED` rather than silently
+   * no-op'ing, and `delete_workflow` still deletes but cannot first signal a
+   * running job's runner to stop (the same best-effort posture
+   * `deleteWorkflowCmd` documents for a caller with no `cancelState` at all).
+   *
+   * `AgentTestWorkflowDeps` is `WorkflowRunDeps` plus `test_workflow`'s own
+   * poll cadence, so ONE bundle serves all three arms.
+   *
+   * WIRING HAZARD for whichever host bootstrap fills this in: the bundle's
+   * `starters` map should carry `["workflow", workflowRowStarter(engineDeps)]`
+   * — the same hazard {@link ExecToolDeps.downloadJob}'s doc names for the
+   * download kind. `startWorkflowRun` fills a MISSING entry in for the run it
+   * starts itself (`workflowQueueDeps`), but a `pump()` driven from anywhere
+   * else uses whatever map that caller built, and with no "workflow" entry
+   * `jobQueue.ts` falls back to `notImplementedRowStarter`, which poisons the
+   * row — so a workflow would work when the app is idle and fail when it is
+   * busy, the worst possible shape for the bug to take.
+   */
+  workflowRun?: AgentTestWorkflowDeps;
 }
 
 /** What an injected connector call returns: the tool's text plus any images it
@@ -1833,13 +1869,102 @@ export async function execTool(
     // -------------------------------------------------------- jobs/workflows
     case "start_file_pass":
     case "job_status":
-    case "list_workflows":
-    case "save_workflow":
-    case "update_workflow":
-    case "delete_workflow":
-    case "run_workflow":
-    case "test_workflow":
       return notImplemented("the jobs/workflows backend (no db-host/jobs.ts yet) — Batch C");
+
+    // ------------------------------------------------------- REAL: workflows
+    case "list_workflows": {
+      // A pure DB read (`agent_list_workflows`) — no job-queue wiring needed,
+      // unlike its `run_workflow`/`test_workflow` siblings below.
+      const room = requireRoom(deps);
+      if (!room.ok) return fail(room.error);
+      try {
+        const name = typeof args["name"] === "string" ? (args["name"] as string) : null;
+        return ok(agentListWorkflows(room.db, name));
+      } catch (e) {
+        return fail(errMessage(e));
+      }
+    }
+    case "save_workflow": {
+      // Authoring is a room write plus validation — no queue involved, so it
+      // needs no `workflowRun` bundle. `createdBy: "agent"` matches the Rust
+      // call site's own argument for this tool.
+      const room = requireRoom(deps);
+      if (!room.ok) return fail(room.error);
+      try {
+        return ok(await agentSaveWorkflow(room.db, args, "agent", {}, deps.emit));
+      } catch (e) {
+        return fail(errMessage(e));
+      }
+    }
+    case "update_workflow": {
+      const room = requireRoom(deps);
+      if (!room.ok) return fail(room.error);
+      try {
+        return ok(await agentUpdateWorkflow(room.db, args, {}, deps.emit));
+      } catch (e) {
+        return fail(errMessage(e));
+      }
+    }
+    case "test_workflow": {
+      // WAITS for a real run, so it needs the same queue bundle `run_workflow`
+      // does — see `ExecToolDeps.workflowRun`'s own doc.
+      if (deps.workflowRun === undefined) {
+        return notImplemented(
+          "the workflow job-queue wiring (an app-wide JobQueueDeps + the room's script-approvals " +
+            "dir) is not connected to execTool yet — Batch D"
+        );
+      }
+      try {
+        return ok(await agentTestWorkflow(deps.workflowRun, args));
+      } catch (e) {
+        return fail(errMessage(e));
+      }
+    }
+    case "delete_workflow": {
+      // Same gated-consent shape as `delete_skill`/`delete_mcp` just above:
+      // unrecoverable and reachable from anything the agent read, so it stays
+      // refused until a real consent dialog is wired, checked BEFORE
+      // `requireRoom` — a missing consent surface is refused unconditionally,
+      // not only once a room happens to be open.
+      if (deps.confirmDestructive === undefined) {
+        return notImplemented(
+          "the confirm_destructive consent dialog for a workflow deletion is not wired up — Batch D"
+        );
+      }
+      const room = requireRoom(deps);
+      if (!room.ok) return fail(room.error);
+      try {
+        const text = await agentDeleteWorkflow(
+          room.db,
+          args,
+          deps.confirmDestructive,
+          DELETE_DECLINED,
+          deps.workflowRun?.cancelState,
+          deps.emit
+        );
+        return ok(text);
+      } catch (e) {
+        return fail(errMessage(e));
+      }
+    }
+    case "run_workflow": {
+      // The real job-queue wiring (compile + mint the row + dispatch through
+      // the real queue) — see `ExecToolDeps.workflowRun`'s own doc for the
+      // WIRING HAZARD a host bootstrap must respect. Fire-and-forget, so unlike
+      // `test_workflow` it returns the moment the row is queued.
+      if (deps.workflowRun === undefined) {
+        return notImplemented(
+          "the workflow job-queue wiring (an app-wide JobQueueDeps + the room's script-approvals " +
+            "dir) is not connected to execTool yet — Batch D"
+        );
+      }
+      try {
+        const text = await agentRunWorkflow(deps.workflowRun, args);
+        return ok(text);
+      } catch (e) {
+        return fail(errMessage(e));
+      }
+    }
 
     // ------------------------------------------------------------ local_generate
     case "local_generate":
