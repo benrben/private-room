@@ -297,6 +297,22 @@ function currentBaseUrl(): string | null {
 }
 
 /**
+ * The recorded sidecar's base URL, WITHOUT starting one. Ported from
+ * `sidecar_lifecycle::base_url_if_running` — the one function of that Rust
+ * file this port had not yet carried over (everything else in it lives
+ * above, as this file's own module doc explains).
+ *
+ * {@link ensureUp} is the wrong door for teardown work: locking a room must
+ * never spawn the AI service just to tell it to forget something, and
+ * "there is no sidecar" is the same outcome as "it forgot". This is the
+ * accessor a fire-and-forget caller like `sidecar::forget_room_memory`
+ * (Rust) reaches for instead — read-only, no spawn, no probe.
+ */
+export function baseUrlIfRunning(): string | null {
+  return currentBaseUrl();
+}
+
+/**
  * Stop the sidecar WE spawned (if any) and forget what we knew about it.
  * Used both by {@link ensureUp}'s replace path and by {@link stopIfOurs}.
  */

@@ -20,6 +20,7 @@ import {
   TOKEN_ENV,
   authToken,
   authedHeaders,
+  baseUrlIfRunning,
   busy,
   ensureUp,
   inflightCount,
@@ -304,6 +305,142 @@ describe("ensureUp single-flight spawn guard", () => {
     expect(url2).toBe(fakeUrl);
     expect(spawnMock).toHaveBeenCalledTimes(1);
   });
+});
+
+describe("baseUrlIfRunning", () => {
+  // Port of `sidecar_lifecycle::base_url_if_running` -- the one function of
+  // that Rust file this port had not yet carried over (see the doc comment
+  // on the export). No Rust-side test exists for it either (it has no
+  // `#[cfg(test)]` case of its own in sidecar_lifecycle.rs), so this proves
+  // the property its own doc comment stakes out: read-only, no spawn.
+  const savedPython = process.env.ARCELLE_SIDECAR_PYTHON;
+  const savedDir = process.env.ARCELLE_SIDECAR_DIR;
+  let server: http.Server | null = null;
+
+  beforeEach(() => {
+    stopIfOurs();
+  });
+
+  afterEach(async () => {
+    if (savedPython === undefined) {
+      delete process.env.ARCELLE_SIDECAR_PYTHON;
+    } else {
+      process.env.ARCELLE_SIDECAR_PYTHON = savedPython;
+    }
+    if (savedDir === undefined) {
+      delete process.env.ARCELLE_SIDECAR_DIR;
+    } else {
+      process.env.ARCELLE_SIDECAR_DIR = savedDir;
+    }
+    vi.mocked(spawn).mockReset();
+    stopIfOurs();
+    if (server !== null) {
+      await new Promise<void>((resolve) => server!.close(() => resolve()));
+      server = null;
+    }
+  });
+
+  it("is null with nothing running, never spawns, and forgets the URL once stopIfOurs runs", async () => {
+    // Nothing recorded yet -- and critically, asking must not be the thing
+    // that starts a sidecar. A room lock calling this must never wake the AI
+    // service just to tell it something.
+    expect(baseUrlIfRunning()).toBeNull();
+    expect(spawn).not.toHaveBeenCalled();
+
+    server = http.createServer((req, res) => {
+      if (req.url === "/health") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+        return;
+      }
+      res.writeHead(404).end();
+    });
+    await new Promise<void>((resolve) => server!.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (address === null || typeof address === "string") {
+      throw new Error("expected an AddressInfo from a TCP listener");
+    }
+    const fakeUrl = `http://127.0.0.1:${address.port}`;
+
+    process.env.ARCELLE_SIDECAR_PYTHON = process.execPath;
+    delete process.env.ARCELLE_SIDECAR_DIR;
+    vi.mocked(spawn).mockImplementation(() => {
+      const child = new EventEmitter() as unknown as ChildProcess;
+      const stdout = new PassThrough();
+      const stderr = new PassThrough();
+      Object.assign(child, { stdout, stderr, pid: 555_111 });
+      queueMicrotask(() => stdout.write(`SIDECAR_PORT=${address.port}\n`));
+      return child;
+    });
+
+    const url = await ensureUp();
+    expect(url).toBe(fakeUrl);
+
+    // Reads back what ensureUp() just recorded, WITHOUT spawning again.
+    const spawnCallsAfterEnsure = vi.mocked(spawn).mock.calls.length;
+    expect(baseUrlIfRunning()).toBe(fakeUrl);
+    expect(vi.mocked(spawn).mock.calls.length).toBe(spawnCallsAfterEnsure);
+
+    stopIfOurs();
+    expect(baseUrlIfRunning()).toBeNull();
+  });
+
+  it("never hands back a STALE url after ensureUp gave up on the recorded sidecar", async () => {
+    // ADVERSARIAL ADDITION (verification pass). The accessor's entire reason
+    // to exist is that a fire-and-forget teardown caller (Rust's
+    // `sidecar::forget_room_memory`, reached while LOCKING a room) reads it
+    // and posts to whatever it says WITHOUT a health check — `ensure_up` is
+    // "the wrong door" precisely because it would spawn. So the one thing
+    // this accessor must never do is name a port that is no longer ours:
+    // loopback ports get recycled, and a room-lock message sent to whatever
+    // took the port over is worse than not sending it at all.
+    //
+    // The invariant is carried by `stopOurs()` clearing `recordedBaseUrl`
+    // BEFORE the respawn attempt, so a respawn that then fails leaves
+    // nothing recorded. Nothing tested that ordering: the existing case only
+    // walks the clean `stopIfOurs()` path.
+    server = http.createServer((req, res) => {
+      if (req.url === "/health") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+        return;
+      }
+      res.writeHead(404).end();
+    });
+    await new Promise<void>((resolve) => server!.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (address === null || typeof address === "string") {
+      throw new Error("expected an AddressInfo from a TCP listener");
+    }
+    const deadUrl = `http://127.0.0.1:${address.port}`;
+
+    process.env.ARCELLE_SIDECAR_PYTHON = process.execPath;
+    delete process.env.ARCELLE_SIDECAR_DIR;
+    vi.mocked(spawn).mockImplementation(() => {
+      const child = new EventEmitter() as unknown as ChildProcess;
+      const stdout = new PassThrough();
+      const stderr = new PassThrough();
+      Object.assign(child, { stdout, stderr, pid: 555_222 });
+      queueMicrotask(() => stdout.write(`SIDECAR_PORT=${address.port}\n`));
+      return child;
+    });
+    expect(await ensureUp()).toBe(deadUrl);
+    expect(baseUrlIfRunning()).toBe(deadUrl);
+
+    // The sidecar dies: the port stops answering AND stops accepting, which
+    // is what `probeOnce` classifies as "gone" (a dead port refuses
+    // instantly, unlike a wedged one that still completes the handshake).
+    await new Promise<void>((resolve) => server!.close(() => resolve()));
+    server = null;
+
+    // Nothing of ours is riding on it (inflight 0), so ensureUp replaces it —
+    // and with nothing left to launch, the replacement fails.
+    delete process.env.ARCELLE_SIDECAR_PYTHON;
+    await expect(ensureUp()).rejects.toThrow(/SIDECAR_UNAVAILABLE/);
+
+    // THE ASSERTION: not the dead URL, not a leftover — nothing.
+    expect(baseUrlIfRunning()).toBeNull();
+  }, 20_000);
 });
 
 describe("stderr drain past the log budget", () => {

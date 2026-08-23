@@ -91,9 +91,25 @@ const MIME_BY_EXT: Readonly<Record<string, string>> = {
 /** `docs_html.rs`'s `note_mime` — the mime a generated file gets from its
  * name. `create_file`'s own arm computes this same expression inline for its
  * non-pad branch; exported here so both branches (and any future caller)
- * share one table. */
+ * share one table.
+ *
+ * OWN-PROPERTY GUARD, not decoration (2026-08 verification pass, proven by
+ * `artifactBuilder.test.ts`'s "note() survives a file name whose extension is
+ * an Object.prototype key"): the extension is MODEL-CONTROLLED — `#minutes`/
+ * `#sketch`/`#to-sheet` hand a generated file name straight to
+ * `Artifact.note`, and `create_file` computes this same mime for a name the
+ * model chose — so a bare `MIME_BY_EXT[ext] ?? "text/plain"` read the
+ * PROTOTYPE for `"constructor"` (the `Object` function), `"__proto__"`
+ * (`Object.prototype`), `"toString"`, `"hasOwnProperty"`, … `??` never fires
+ * for those, so a non-string mime reached the DB layer and the whole write
+ * died with "SQLite3 can only bind numbers, strings, bigints, buffers, and
+ * null". `mime_guess::from_path` has no prototype chain to leak and answers
+ * `text/plain` for every one of them, which is what this now does. */
 export function noteMime(name: string): string {
-  return MIME_BY_EXT[extensionOf(name)] ?? "text/plain";
+  const ext = extensionOf(name);
+  return Object.prototype.hasOwnProperty.call(MIME_BY_EXT, ext)
+    ? (MIME_BY_EXT[ext] as string)
+    : "text/plain";
 }
 
 // -------------------------------------------------- the shared scratch pad
@@ -138,8 +154,15 @@ export function isFullHtmlDoc(s: string): boolean {
  *
  * Copied character-for-character from `docs_html.rs` lines 156-323 (the
  * `NOTEBOOK_CSS` raw string) — see this module's own header.
+ *
+ * EXPORTED (2026-08, the `studios/mindmap.rs` batch): `render_mindmap_html`
+ * inlines this same raw CSS into its OWN page template rather than going
+ * through {@link htmlDocument}'s hero+DOC_STYLE wrapper (a mind map draws its
+ * own tree chrome on top of the notebook, not a doc's hero/rule), so
+ * `studiosMindmap.ts` needs the bare string. Widening visibility only — every
+ * existing caller in this file still reads it as before.
  */
-const NOTEBOOK_CSS = `
+export const NOTEBOOK_CSS = `
 /* ===========================================================================
    THE NOTEBOOK — inlined from src/styles/tokens.css.
    src/styles/tokens.css IS THE SOURCE OF TRUTH. If a value changes there, it

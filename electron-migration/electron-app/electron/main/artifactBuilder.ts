@@ -112,9 +112,19 @@ export class Artifact {
   }
 
   /** The run this write belongs to (an ask id, a job id). Optional because a
-   * tool dispatched by the persistent room bridge runs behind no ask. */
+   * tool dispatched by the persistent room bridge runs behind no ask.
+   *
+   * `null` CLEARS rather than being ignored: Rust's `during_run` is an
+   * unconditional `self.prov.run_id = run_id.map(str::to_string)`, so passing
+   * `None` after a run id had been set removes it. Ignoring `null` instead
+   * left a file credited to a run it did not come from — the one kind of
+   * untruth this whole funnel exists to prevent. `delete` rather than
+   * `= undefined` so the serialized provenance omits the key entirely,
+   * matching `#[serde(skip_serializing_if = "Option::is_none")]`. */
   duringRun(runId: string | null): this {
-    if (runId !== null) {
+    if (runId === null) {
+      delete this.prov.runId;
+    } else {
       this.prov.runId = runId;
     }
     return this;
