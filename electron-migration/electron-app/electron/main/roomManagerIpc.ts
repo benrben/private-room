@@ -83,13 +83,16 @@ export function registerRoomManagerIpc(
   handle("take_rec_recovery_error", (): string | null => takeRecRecoveryError(state));
   handle("take_pending_open", (): string | null => takePendingOpen());
 
-  // Touch ID — biometrics.rs is not ported; every arm rejects with an honest
-  // NOT_IMPLEMENTED reason (see roomManager.ts). Registered anyway so a
-  // renderer that calls these channels gets a real, explained rejection rather
-  // than "no handler registered for touchid_has".
-  handle("touchid_has", (args: { path: string }): Promise<boolean> => touchIdHas(args.path));
-  handle("touchid_enable", (): Promise<void> => touchIdEnable(state));
-  handle("touchid_disable", (args: { path: string }): Promise<void> => touchIdDisable(args.path));
+  // Touch ID — ADD-11, wired onto the real keychain.ts (see roomManager.ts).
+  handle(
+    "touchid_has",
+    (args: { path: string }): Promise<boolean> => touchIdHas(args.path, deps)
+  );
+  handle("touchid_enable", (): Promise<void> => touchIdEnable(state, deps));
+  handle(
+    "touchid_disable",
+    (args: { path: string }): Promise<void> => touchIdDisable(args.path, deps)
+  );
   handle(
     "touchid_open",
     (args: { path: string }): Promise<RoomInfo> => touchIdOpen(state, deps, args.path)

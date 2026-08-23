@@ -77,10 +77,6 @@ import {
   teardownOpenRoom,
   toRoomPinSource,
   toRoomSource,
-  TOUCH_ID_DISABLE_NOT_IMPLEMENTED,
-  TOUCH_ID_ENABLE_NOT_IMPLEMENTED,
-  TOUCH_ID_HAS_NOT_IMPLEMENTED,
-  TOUCH_ID_OPEN_NOT_IMPLEMENTED,
   touchIdDisable,
   touchIdEnable,
   touchIdHas,
@@ -731,34 +727,277 @@ describe("recovery", () => {
 });
 
 // ============================================================================
-// Touch ID + the persistent room server — both stubbed (rule 3)
+// Touch ID (ADD-11, real via keychain.ts) + the persistent room server (still
+// stubbed, rule 3)
 // ============================================================================
 
-describe("touchid_* — NOT_IMPLEMENTED (biometrics.rs has no Electron port)", () => {
-  it("touchid_has rejects rather than fabricating a Keychain answer", async () => {
-    await expect(touchIdHas("/a.roomai")).rejects.toThrow(TOUCH_ID_HAS_NOT_IMPLEMENTED);
-  });
-  it("touchid_enable rejects", async () => {
-    await expect(touchIdEnable(createRoomManagerState())).rejects.toThrow(
-      TOUCH_ID_ENABLE_NOT_IMPLEMENTED
-    );
-  });
-  it("touchid_disable rejects", async () => {
-    await expect(touchIdDisable("/a.roomai")).rejects.toThrow(TOUCH_ID_DISABLE_NOT_IMPLEMENTED);
-  });
-  it("touchid_open rejects", async () => {
+/**
+ * An in-memory stand-in for keychain.ts's `has`/`store`/`read`/`deleteEntry`,
+ * injected via {@link RoomManagerDeps.keychain}. keychain.ts's OWN tests
+ * already prove the real Security.framework FFI round-trips correctly (and
+ * document exactly why `store`/`read`/`deleteEntry` cannot be exercised for
+ * real from this sandbox — errSecMissingEntitlement / -34018, no Team ID to
+ * derive a keychain access group from). This fake exists to prove
+ * roomManager.ts's OWN wiring — which function each `touchId*` calls, with
+ * which arguments, which errors propagate vs. get rewritten — independent of
+ * that sandbox limitation, the same seam shape as `chatCommandsKnowledge.ts`'s
+ * `CmdCtx.generate`.
+ */
+function fakeKeychain(): {
+  entries: Map<string, string>;
+  impl: NonNullable<RoomManagerDeps["keychain"]>;
+} {
+  const entries = new Map<string, string>();
+  return {
+    entries,
+    impl: {
+      has: (path: string) => entries.has(path),
+      store: (path: string, password: string) => {
+        entries.set(path, password);
+      },
+      read: (path: string) => {
+        const password = entries.get(path);
+        if (password === undefined) {
+          throw new Error("No Touch ID entry for this room.");
+        }
+        return password;
+      },
+      deleteEntry: (path: string) => {
+        entries.delete(path);
+      },
+    },
+  };
+}
+
+const TOUCH_ID_UNAVAILABLE_MESSAGE =
+  "Touch ID isn't available on this Mac right now. You can still unlock with your password.";
+
+describe("touchIdHas", () => {
+  it("is real by default (no override) -- hits keychain.ts's own has(), never throws", async () => {
+    // keychain.test.ts documents has() as real, unconditional coverage even in
+    // this sandbox (it never reaches the data-protection-keychain failure
+    // mode the store/read/deleteEntry tests have to route around).
     await expect(
-      touchIdOpen(createRoomManagerState(), baseDeps("/tmp"), "/a.roomai")
-    ).rejects.toThrow(TOUCH_ID_OPEN_NOT_IMPLEMENTED);
+      touchIdHas(`/never-stored-${randomUUID()}.roomai`, baseDeps("/tmp"))
+    ).resolves.toBe(false);
   });
-  it("every refusal names the real blocker", () => {
-    for (const message of [
-      TOUCH_ID_HAS_NOT_IMPLEMENTED,
-      TOUCH_ID_ENABLE_NOT_IMPLEMENTED,
-      TOUCH_ID_DISABLE_NOT_IMPLEMENTED,
-      TOUCH_ID_OPEN_NOT_IMPLEMENTED,
-    ]) {
-      expect(message).toContain("src-tauri/src/biometrics.rs");
+
+  it("reflects the injected keychain instead of the real one, once overridden", async () => {
+    const { impl, entries } = fakeKeychain();
+    const deps = baseDeps("/tmp", { keychain: impl });
+    const roomPath = "/fake-room.roomai";
+
+    await expect(touchIdHas(roomPath, deps)).resolves.toBe(false);
+    entries.set(roomPath, "irrelevant");
+    await expect(touchIdHas(roomPath, deps)).resolves.toBe(true);
+  });
+});
+
+describe("touchIdEnable", () => {
+  it("refuses with NO_ROOM_OPEN before ever touching the Keychain", async () => {
+    const { impl, entries } = fakeKeychain();
+    await expect(
+      touchIdEnable(createRoomManagerState(), baseDeps("/tmp", { keychain: impl }))
+    ).rejects.toThrow(NO_ROOM_OPEN);
+    expect(entries.size).toBe(0);
+  });
+
+  it("stores the OPEN room's own path and password, not anything passed some other way", async () => {
+    const dir = freshDir();
+    const state = createRoomManagerState();
+    const { impl, entries } = fakeKeychain();
+    const roomPath = roomPathIn(dir, "enable");
+    createRoom(state, baseDeps(dir), roomPath, PASSWORD, "R");
+
+    await touchIdEnable(state, baseDeps(dir, { keychain: impl }));
+
+    expect(entries.get(roomPath)).toBe(PASSWORD);
+    state.room!.conn.close();
+  });
+
+  it("wraps a storage-shaped Keychain failure through humanizeStorageError, exactly as with_room does", async () => {
+    const dir = freshDir();
+    const state = createRoomManagerState();
+    const roomPath = roomPathIn(dir, "enable-storage-fail");
+    createRoom(state, baseDeps(dir), roomPath, PASSWORD, "R");
+    const deps = baseDeps(dir, {
+      keychain: {
+        ...fakeKeychain().impl,
+        store: () => {
+          throw new Error("database or disk is full (os error 28)");
+        },
+      },
+    });
+
+    await expect(touchIdEnable(state, deps)).rejects.toThrow(/disk holding this room is full/);
+    state.room!.conn.close();
+  });
+
+  it("leaves a Touch-ID-shaped Keychain failure UNCHANGED -- humanizeStorageError only rewrites storage-shaped messages", async () => {
+    const dir = freshDir();
+    const state = createRoomManagerState();
+    const roomPath = roomPathIn(dir, "enable-touchid-fail");
+    createRoom(state, baseDeps(dir), roomPath, PASSWORD, "R");
+    const deps = baseDeps(dir, {
+      keychain: {
+        ...fakeKeychain().impl,
+        store: () => {
+          throw new Error(TOUCH_ID_UNAVAILABLE_MESSAGE);
+        },
+      },
+    });
+
+    await expect(touchIdEnable(state, deps)).rejects.toThrow(TOUCH_ID_UNAVAILABLE_MESSAGE);
+    state.room!.conn.close();
+  });
+});
+
+describe("touchIdDisable", () => {
+  it("does not require a room open and does not even take a RoomManagerState -- Rust's touchid_disable takes a bare path only", async () => {
+    const { impl, entries } = fakeKeychain();
+    entries.set("/some-room.roomai", "whatever");
+
+    await touchIdDisable("/some-room.roomai", baseDeps("/tmp", { keychain: impl }));
+
+    expect(entries.has("/some-room.roomai")).toBe(false);
+  });
+
+  it("propagates a Keychain failure UNCHANGED -- touchid_disable does not route through with_room, so nothing humanizes it", async () => {
+    const deps = baseDeps("/tmp", {
+      keychain: {
+        ...fakeKeychain().impl,
+        deleteEntry: () => {
+          throw new Error(TOUCH_ID_UNAVAILABLE_MESSAGE);
+        },
+      },
+    });
+
+    await expect(touchIdDisable("/x.roomai", deps)).rejects.toThrow(TOUCH_ID_UNAVAILABLE_MESSAGE);
+  });
+});
+
+describe("touchIdOpen", () => {
+  it("reads the stored password via the Keychain and unlocks through the REAL, guarded openRoom", async () => {
+    const dir = freshDir();
+    const state = createRoomManagerState();
+    const roomPath = roomPathIn(dir, "touchid-open");
+    createRoom(state, baseDeps(dir), roomPath, PASSWORD, "Fingerprint Room");
+    await closeRoom(state, baseDeps(dir));
+    expect(state.room).toBeNull();
+
+    const { impl, entries } = fakeKeychain();
+    entries.set(roomPath, PASSWORD);
+
+    const info = await touchIdOpen(state, baseDeps(dir, { keychain: impl }), roomPath);
+
+    expect(info).toMatchObject({ name: "Fingerprint Room", path: roomPath });
+    expect(state.room?.path).toBe(roomPath);
+    state.room!.conn.close();
+  });
+
+  it("propagates a read failure (no entry / cancel / no match) as-is, never opening the room", async () => {
+    const dir = freshDir();
+    const state = createRoomManagerState();
+    const { impl } = fakeKeychain(); // nothing stored -> read() throws "No Touch ID entry..."
+
+    await expect(
+      touchIdOpen(state, baseDeps(dir, { keychain: impl }), roomPathIn(dir, "never-enrolled"))
+    ).rejects.toThrow("No Touch ID entry for this room.");
+    expect(state.room).toBeNull();
+  });
+
+  it("a wrong stored password fails to unlock, same as a normal wrong-password open", async () => {
+    const dir = freshDir();
+    const state = createRoomManagerState();
+    const roomPath = roomPathIn(dir, "touchid-wrong-pw");
+    createRoom(state, baseDeps(dir), roomPath, PASSWORD, "R");
+    await closeRoom(state, baseDeps(dir));
+
+    const { impl, entries } = fakeKeychain();
+    entries.set(roomPath, "definitely not the password");
+
+    await expect(
+      touchIdOpen(state, baseDeps(dir, { keychain: impl }), roomPath)
+    ).rejects.toThrow();
+    expect(state.room).toBeNull();
+  });
+
+  it("still refuses mid-rollback -- proves it reuses the GUARDED openRoom, not the unguarded impl", async () => {
+    const dir = freshDir();
+    const state = createRoomManagerState();
+    const roomPath = roomPathIn(dir, "touchid-rollback");
+    createRoom(state, baseDeps(dir), roomPath, PASSWORD, "R");
+    await closeRoom(state, baseDeps(dir));
+
+    const { impl, entries } = fakeKeychain();
+    entries.set(roomPath, PASSWORD);
+    state.rollingBack = true;
+
+    await expect(
+      touchIdOpen(state, baseDeps(dir, { keychain: impl }), roomPath)
+    ).rejects.toThrow(ROLLBACK_BUSY);
+  });
+});
+
+describe("the uninjected keychain seam", () => {
+  /**
+   * Every test above overrides {@link RoomManagerDeps.keychain}, and the four
+   * `deps.keychain?.x ?? keychainX` fallbacks are this file's ONLY reference
+   * to keychain.ts's `store`/`read`/`deleteEntry` — so nothing else here would
+   * notice a default rebound to the wrong function, or dropped entirely for a
+   * required dependency. (`touchIdHas` above is the one exception: keychain.ts
+   * documents its real `has()` as unconditionally reachable even in this
+   * sandbox.) Re-importing roomManager.ts against a mocked keychain.ts pins
+   * all four defaults to keychain.ts's own module, and pins the ARGUMENTS —
+   * without needing a real Keychain the sandbox cannot reach.
+   */
+  it("routes all four to keychain.ts's own has/store/read/deleteEntry, with the room's own path and password", async () => {
+    const dir = freshDir();
+    const roomPath = roomPathIn(dir, "uninjected-seam");
+    const calls: string[] = [];
+    vi.resetModules();
+    vi.doMock("./keychain.js", () => ({
+      has: (p: string) => {
+        calls.push(`has ${p}`);
+        return true;
+      },
+      store: (p: string, password: string) => {
+        calls.push(`store ${p} ${password}`);
+      },
+      read: (p: string) => {
+        calls.push(`read ${p}`);
+        return PASSWORD;
+      },
+      deleteEntry: (p: string) => {
+        calls.push(`deleteEntry ${p}`);
+      },
+    }));
+    try {
+      const fresh = await import("./roomManager.js");
+      const state = fresh.createRoomManagerState();
+      const deps = baseDeps(dir);
+
+      expect(await fresh.touchIdHas(roomPath, deps)).toBe(true);
+
+      fresh.createRoom(state, deps, roomPath, PASSWORD, "Seam");
+      await fresh.touchIdEnable(state, deps);
+      await fresh.closeRoom(state, deps);
+
+      const info = await fresh.touchIdOpen(state, deps, roomPath);
+      expect(info).toMatchObject({ name: "Seam", path: roomPath });
+      state.room!.conn.close();
+
+      await fresh.touchIdDisable(roomPath, deps);
+
+      expect(calls).toEqual([
+        `has ${roomPath}`,
+        `store ${roomPath} ${PASSWORD}`,
+        `read ${roomPath}`,
+        `deleteEntry ${roomPath}`,
+      ]);
+    } finally {
+      vi.doUnmock("./keychain.js");
+      vi.resetModules();
     }
   });
 });
@@ -1451,17 +1690,29 @@ describe("registerRoomManagerIpc", () => {
     expect(handlers.get("take_rec_recovery_error")!()).toBeNull();
   });
 
-  it("every touchid_* channel rejects honestly rather than fabricating a result", async () => {
-    const handlers = register(createRoomManagerState(), baseDeps("/tmp"));
-    await expect(handlers.get("touchid_has")!({ path: "/x.roomai" })).rejects.toThrow(
-      TOUCH_ID_HAS_NOT_IMPLEMENTED
-    );
-    await expect(handlers.get("touchid_enable")!()).rejects.toThrow("NOT_IMPLEMENTED");
-    await expect(handlers.get("touchid_disable")!({ path: "/x.roomai" })).rejects.toThrow(
-      "NOT_IMPLEMENTED"
-    );
-    await expect(handlers.get("touchid_open")!({ path: "/x.roomai" })).rejects.toThrow(
-      "NOT_IMPLEMENTED"
-    );
+  it("every touchid_* channel reaches the real roomManager.ts logic, with args threaded correctly", async () => {
+    const dir = freshDir();
+    const state = createRoomManagerState();
+    const { impl, entries } = fakeKeychain();
+    const handlers = register(state, baseDeps(dir, { keychain: impl }));
+    const roomPath = roomPathIn(dir, "ipc-touchid");
+
+    handlers.get("create_room")!({ path: roomPath, password: PASSWORD, name: "IPC Touch ID" });
+
+    expect(await handlers.get("touchid_has")!({ path: roomPath })).toBe(false);
+
+    await handlers.get("touchid_enable")!();
+    expect(entries.get(roomPath)).toBe(PASSWORD);
+    expect(await handlers.get("touchid_has")!({ path: roomPath })).toBe(true);
+
+    await handlers.get("close_room")!();
+
+    const reopened = await handlers.get("touchid_open")!({ path: roomPath });
+    expect(reopened).toMatchObject({ name: "IPC Touch ID", path: roomPath });
+    state.room!.conn.close();
+
+    await handlers.get("touchid_disable")!({ path: roomPath });
+    expect(entries.has(roomPath)).toBe(false);
+    expect(await handlers.get("touchid_has")!({ path: roomPath })).toBe(false);
   });
 });

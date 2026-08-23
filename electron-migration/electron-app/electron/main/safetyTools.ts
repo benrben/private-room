@@ -33,13 +33,9 @@
  * `setRecMeta` (recordings.ts), `verifyPassword`/`rekey`/`rekeyCopy`
  * (rekey.ts), `hasRecovery`/`writeRecovery`/`removeRecovery` (recovery.ts),
  * `checkpointCkPaths` (checkpoints.ts), `has`/`store`/`deleteEntry`
- * (keychain.ts, the real Touch-ID Keychain FFI — NOT the `NOT_IMPLEMENTED`
- * stand-in `roomManager.ts`'s own `touchId*` commands still use, despite
- * `keychain.ts` already existing on disk; whether that is drift between two
- * batches or a deliberate "the primitive landed, the room-lifecycle command
- * that calls it is still a future batch" choice isn't this file's call to
- * make — re-wiring `roomManager.ts`'s `touchId*` commands is that file's own
- * job, not this one's) — was already ported and is reused as-is.
+ * (keychain.ts, the real Touch-ID Keychain FFI, now also wired into
+ * `roomManager.ts`'s `touchId*` commands) — was already ported and is
+ * reused as-is.
  *
  * ONE GENUINE FIDELITY GAP, documented rather than hidden (rule 3 — no
  * fabrication): `version_content`/`restore_version_into` re-derive a

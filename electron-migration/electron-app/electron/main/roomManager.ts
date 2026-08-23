@@ -68,16 +68,23 @@
  *   - `take_pending_open` is already fully ported in `pendingOpen.ts`;
  *     {@link takePendingOpen} is a one-line delegate to that process-global
  *     slot, not a second one.
+ *   - ADD-11 (Touch ID). `keychain.ts` already ports `src-tauri/src/
+ *     biometrics.rs`'s `has`/`store`/`read`/`delete` in full over real
+ *     Security.framework FFI; {@link touchIdHas}/{@link touchIdEnable}/
+ *     {@link touchIdDisable}/{@link touchIdOpen} are the four `rooms.rs`
+ *     command bodies wired onto it — `with_room`'s "No room is open." guard
+ *     plus `humanize_storage_error` for `touchid_enable` (the only one of the
+ *     four Rust routes through `state.with_room`), a direct pass-through for
+ *     `touchid_has`/`touchid_disable` (never gated on a room being open, in
+ *     Rust either), and `touchid_open` reusing the ALREADY-guarded
+ *     {@link openRoom} exactly as `touchid_open`'s Rust body does. See
+ *     {@link RoomManagerDeps.keychain} for how the Keychain calls themselves
+ *     are injected.
  *
  * ============================================================================
  * STUBBED PER RULE 3 — an honest NOT_IMPLEMENTED refusal, never a fabricated
  * result
  * ============================================================================
- *   - The four Touch ID arms. `src-tauri/src/biometrics.rs` has no Electron
- *     port (the migration plan flags Touch ID survival as an open spike), and
- *     these are the command's WHOLE POINT rather than an auxiliary side
- *     effect, so all four REJECT. `touchid_has` included: answering `false`
- *     would be a fabricated claim about Keychain state this port cannot see.
  *   - {@link spawnRoomServerIfEnabledNotImplemented} — D9/Wave-1a "the Leash",
  *     restarting the room's persistent MCP server on unlock. Confirmed
  *     unported: `room_mcp.rs` (3096 lines) plus `commands/moonshot/server.rs`'s
@@ -119,6 +126,20 @@
  * `clearPolicy` is neither: `privacy.ts` exports the real module-global
  * `clearPolicy()`, exactly as Rust's is, so it is called directly.
  *
+ * A THIRD, narrower kind lives only on {@link RoomManagerDeps.keychain}: a
+ * REAL ported subsystem (`keychain.ts`, ADD-11) that IS wired by default —
+ * unlike bucket 1, omitting it does not skip real logic, it runs the real
+ * `keychain.ts` functions. The field exists purely as a test seam, the same
+ * "real unless overridden" shape as `chatCommandsKnowledge.ts`'s
+ * `CmdCtx.generate` (`ctx.generate ?? generateReal`): `keychain.ts`'s own
+ * header comment explains why its `store`/`read`/`deleteEntry` cannot be
+ * exercised for real against the data-protection keychain from this dev
+ * sandbox (`errSecMissingEntitlement` / -34018 — no Team ID to derive a
+ * keychain access group from), so the Touch ID wiring tests inject a fake
+ * `keychain` to verify roomManager.ts's own logic (which call, with which
+ * arguments, which errors propagate vs. get humanized) independent of that
+ * sandbox limitation.
+ *
  * ============================================================================
  * DELIBERATE DEVIATIONS FROM THE RUST SOURCE
  * ============================================================================
@@ -142,8 +163,17 @@
  *     to reach the same observable outcome.
  *  3. `writeRecoveryKey`/`openRoomWithRecovery` are `async` where their Rust
  *     `#[tauri::command]` counterparts are synchronous, because
- *     `db-host/recovery.ts` is built on `fs/promises`. Confined to exactly the
- *     two commands that touch the recovery sidecar.
+ *     `db-host/recovery.ts` is built on `fs/promises`. Those are the only two
+ *     commands here that are async for a REAL reason — they genuinely await.
+ *     The four `touchId*` arms are also `async` against synchronous Rust
+ *     `pub fn`s, but only to keep the `Promise`-returning signatures the IPC
+ *     shim and the renderer contract already had: every `keychain.ts` call
+ *     they make is synchronous and none of them ever awaits, so each one still
+ *     runs start-to-finish on the main thread in one turn — which is what Rust
+ *     does too (a non-`async` `#[tauri::command]` runs on the main thread,
+ *     unlike the `pub async fn` ones such as `close_room`). In particular the
+ *     Touch ID prompt inside `touchIdOpen`'s `read` blocks the main process
+ *     exactly as `touchid_open`'s does.
  *  4. {@link reportRecRecoveryFailure}'s delay is a parameter (defaulting to
  *     Rust's fixed 2 s) and {@link shouldEmitRecRecovery} is split out, so both
  *     guards on the delayed emit can be exercised without a test waiting two
@@ -178,6 +208,12 @@ import {
   type SchedulerDeps,
   type SchedulerState,
 } from "./jobScheduler.js";
+import {
+  deleteEntry as keychainDeleteEntry,
+  has as keychainHas,
+  read as keychainRead,
+  store as keychainStore,
+} from "./keychain.js";
 import type { McpManager } from "./mcpClient.js";
 import {
   MCP_CONFIG_KEY,
@@ -370,6 +406,23 @@ export interface RoomManagerDeps {
   /** D9 (the Leash): restart the room's persistent MCP server if its toggle
    * was left on. REQUIRED — see {@link spawnRoomServerIfEnabledNotImplemented}. */
   spawnRoomServerIfEnabled: (room: Room) => void;
+
+  // ---- ADD-11: Touch ID's real Keychain backend (keychain.ts) — a third,
+  // "real by default" kind of dependency; see the module doc's "INJECTED
+  // DEPENDENCIES" section for how this differs from buckets 1 and 2. ----
+  /** The exact four `keychain.ts` calls {@link touchIdHas}/{@link
+   * touchIdEnable}/{@link touchIdDisable}/{@link touchIdOpen} make, real
+   * (`keychain.ts`'s own top-level exports) unless overridden — overridden
+   * only in tests, the same `ctx.generate ?? generateReal` shape as
+   * `chatCommandsKnowledge.ts`'s `CmdCtx.generate`. Never call
+   * `serviceOverride` here: that parameter exists solely for keychain.test.ts
+   * to avoid touching the real "PrivateRoom" service. */
+  keychain?: {
+    has: typeof keychainHas;
+    store: typeof keychainStore;
+    read: typeof keychainRead;
+    deleteEntry: typeof keychainDeleteEntry;
+  };
 }
 
 // ============================================================================
@@ -413,46 +466,70 @@ function closeQuietly(conn: Database.Database): void {
 }
 
 // ============================================================================
-// Touch ID — biometrics.rs is NOT ported (rule 3)
+// Touch ID — the real Keychain backend (ADD-11, keychain.ts)
 // ============================================================================
+//
+// `keychain.ts` already ports biometrics.rs's `has`/`store`/`read`/`delete`
+// in full over real Security.framework FFI (see that file's own header
+// comment for the FFI details and for exactly what is/isn't verifiable in
+// this dev sandbox). The four functions below are the `rooms.rs` command
+// BODIES — `state.with_room` guard, `humanize_storage_error`, which of the
+// four route through the open room vs. take a bare path — wired onto it.
+// {@link RoomManagerDeps.keychain} is the test seam: real `keychain.ts` calls
+// unless a test overrides them, never a fabricated result.
 
-const BIOMETRICS_NOT_PORTED =
-  "crate::biometrics (Keychain-backed, Touch-ID-guarded storage of a room's " +
-  "password, in src-tauri/src/biometrics.rs) has no Electron port yet — this " +
-  "batch ports only the room lifecycle that would call it.";
-
-export const TOUCH_ID_HAS_NOT_IMPLEMENTED = `NOT_IMPLEMENTED: touchid_has (crate::biometrics::has) — ${BIOMETRICS_NOT_PORTED}`;
-export const TOUCH_ID_ENABLE_NOT_IMPLEMENTED = `NOT_IMPLEMENTED: touchid_enable (crate::biometrics::store) — ${BIOMETRICS_NOT_PORTED}`;
-export const TOUCH_ID_DISABLE_NOT_IMPLEMENTED = `NOT_IMPLEMENTED: touchid_disable (crate::biometrics::delete) — ${BIOMETRICS_NOT_PORTED}`;
-export const TOUCH_ID_OPEN_NOT_IMPLEMENTED = `NOT_IMPLEMENTED: touchid_open (crate::biometrics::read) — ${BIOMETRICS_NOT_PORTED}`;
-
-/** True if a biometric Keychain entry exists for this room path — and never
- * prompts, in Rust. A fabricated `false` here would claim certainty about
- * Keychain state this port cannot check, so it rejects instead of guessing. */
-export function touchIdHas(_path: string): Promise<boolean> {
-  return Promise.reject(new Error(TOUCH_ID_HAS_NOT_IMPLEMENTED));
+/** True if a biometric Keychain entry exists for this room path — never
+ * prompts, matching `keychain.ts`'s `has()` (itself ported from
+ * biometrics.rs's `has`, which never returns an `Err`). Ported from
+ * `touchid_has`, which is NOT gated on a room being open. */
+export async function touchIdHas(path: string, deps: RoomManagerDeps): Promise<boolean> {
+  const has = deps.keychain?.has ?? keychainHas;
+  return has(path);
 }
 
-/** Store the currently-open room's password in the Keychain, guarded by
- * biometrics. */
-export function touchIdEnable(_state: RoomManagerState): Promise<void> {
-  return Promise.reject(new Error(TOUCH_ID_ENABLE_NOT_IMPLEMENTED));
+/** Store the CURRENTLY-OPEN room's password in the Keychain, guarded by
+ * biometrics. Ported from `touchid_enable` — the one Touch ID command that
+ * DOES route through `state.with_room`, so "no room open" is exactly {@link
+ * NO_ROOM_OPEN} and a storage-shaped failure gets {@link
+ * humanizeStorageError}'s rewrite, same as every other `with_room` command. */
+export async function touchIdEnable(
+  state: RoomManagerState,
+  deps: RoomManagerDeps
+): Promise<void> {
+  const room = requireRoom(state);
+  const store = deps.keychain?.store ?? keychainStore;
+  try {
+    store(room.path, room.password);
+  } catch (err) {
+    throw humanizeStorageError(err, room.path);
+  }
 }
 
 /** Turn Touch ID off for a room: delete its Keychain entry (idempotent, in
- * Rust). */
-export function touchIdDisable(_path: string): Promise<void> {
-  return Promise.reject(new Error(TOUCH_ID_DISABLE_NOT_IMPLEMENTED));
+ * `keychain.ts` as in Rust). Ported from `touchid_disable`, which — unlike
+ * `touchid_enable` — does NOT go through `state.with_room`: it takes a room
+ * PATH rather than the open room, and works whether or not that room is open
+ * (or exists). */
+export async function touchIdDisable(path: string, deps: RoomManagerDeps): Promise<void> {
+  const deleteEntry = deps.keychain?.deleteEntry ?? keychainDeleteEntry;
+  deleteEntry(path);
 }
 
-/** Fingerprint-unlock: read the stored password via biometrics, then take the
- * normal `openRoom` path. */
-export function touchIdOpen(
-  _state: RoomManagerState,
-  _deps: RoomManagerDeps,
-  _path: string
+/** Fingerprint-unlock: trigger the system biometric prompt to read the stored
+ * password, then take the normal `open_room` path — reusing the
+ * ALREADY-guarded {@link openRoom} (rollback refusal included), exactly as
+ * `touchid_open`'s Rust body calls the `open_room` COMMAND, not the unguarded
+ * `open_room_impl`. A read failure (cancel, no match, no entry, Keychain
+ * unavailable) propagates as-is: `touchid_open` does not route through
+ * `with_room` either, so there is no humanization to apply here. */
+export async function touchIdOpen(
+  state: RoomManagerState,
+  deps: RoomManagerDeps,
+  path: string
 ): Promise<RoomInfo> {
-  return Promise.reject(new Error(TOUCH_ID_OPEN_NOT_IMPLEMENTED));
+  const read = deps.keychain?.read ?? keychainRead;
+  const password = read(path);
+  return openRoom(state, deps, path, password);
 }
 
 // ============================================================================
