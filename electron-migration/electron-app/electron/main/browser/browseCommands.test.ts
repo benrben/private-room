@@ -232,6 +232,7 @@ function fakeBrowser(overrides: Partial<ChromeBrowser> = {}): ChromeBrowser & {
     tabList: (): BrowserTab[] => [],
     setBounds: () => {},
     protection: (): BrowserProtection => ({ state: "active" }),
+    blockedCount: () => 0,
     retryProtection: () => {},
     verifyEphemeral: () => true,
     sessionId: () => "s1",
@@ -452,6 +453,21 @@ describe("browserInfo", () => {
     const browser = fakeBrowser();
     browser.takeover = true;
     expect((await browserInfo(baseDeps(null, browser))).takeover).toBe(true);
+  });
+
+  it("carries the funnel's real blocked count out to the shield, zero included", async () => {
+    // This poll is the only channel the number has out of the native layer, so
+    // a count kept accurately on the page and then dropped here would look
+    // exactly like the mockup "12 blocked" it replaces. A distinct number, not
+    // a truthy one: a hardcoded 0 must fail.
+    expect((await browserInfo(baseDeps(null, fakeBrowser({ blockedCount: () => 7 })))).blockedCount)
+      .toBe(7);
+    expect((await browserInfo(baseDeps(null, fakeBrowser()))).blockedCount).toBe(0);
+    // A browser with nothing open says only that, and a count would be a claim
+    // about a page that is not there.
+    expect(
+      "blockedCount" in (await browserInfo(baseDeps(null, fakeBrowser({ isOpen: () => false })))),
+    ).toBe(false);
   });
 });
 

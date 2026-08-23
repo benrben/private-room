@@ -122,6 +122,19 @@ describe("private_filters_match_exactly_the_hosts_the_guard_rejects", () => {
     expect(classify("http://localhost.:11434/api/delete", "xhr", null)).toBe("private-network");
   });
 
+  it("is not fooled by an obfuscated spelling of a private literal", () => {
+    // Both layers classify `URL.hostname`, so both inherit the WHATWG parser's
+    // normalisation of decimal/hex/short-form IPv4 rather than checking it —
+    // an assumption worth an assertion, since the equivalence test above would
+    // stay green if the parser stopped normalising and BOTH layers let the same
+    // address through together.
+    for (const url of ["http://2130706433/", "http://0x7f000001/", "http://127.1/"]) {
+      expect(new URL(url).hostname, url).toBe("127.0.0.1");
+      expect(guardBlocks(url), url).toBe(true);
+      expect(classify(url, "image", "https://news.example/"), url).toBe("private-network");
+    }
+  });
+
   it("DIVERGES on purpose for a hostname that merely LOOKS like a private prefix", () => {
     // rules.rs matches URL text, so `^https?://10\.` also blocks the NAME
     // `10.example.com`; its own comment accepts that as a side effect of having

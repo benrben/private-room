@@ -73,7 +73,7 @@ import {
   waitReady as bridgeWaitReady,
   type CallAsyncOptions,
 } from "./evalBridge.js";
-import { attachContentBlocking, type ContentBlockingDeps } from "./contentBlocking.js";
+import { registerWebRequestFunnel, type WebRequestFunnelDeps } from "./webRequestFunnel.js";
 import type { DownloadGatingDeps } from "./downloadGating.js";
 import type { NavigationDeps } from "./navigation.js";
 import { checkPublicHttpUrl } from "./guard.js";
@@ -180,9 +180,18 @@ export class Browser {
 
   // -------------------------------------------------------------- dependencies
 
-  private contentBlockingDepsFor(id: string): ContentBlockingDeps {
+  /**
+   * The webRequest funnel's deps for one page — the count, journal and
+   * event closures webRequestFunnel.ts's `registerWebRequestFunnel` needs,
+   * built the same way `navigationDepsFor`/`downloadGatingDeps` already
+   * close over `id` for their own layers.
+   */
+  private webRequestFunnelDepsFor(id: string): WebRequestFunnelDeps {
     return {
       recordedTopUrl: () => this.registry.recordedUrl(id),
+      journal: (kind, url, detail) => this.journal(kind, url, detail),
+      emitBlocked: (url) => this.emitBlocked(url),
+      countBlocked: () => this.registry.bumpBlockedCount(id),
     };
   }
 
@@ -252,7 +261,7 @@ export class Browser {
     const id = this.registry.nextId();
     const build = this.deps.createPage ?? createLivePage;
     const page = build(id, {
-      contentBlocking: this.contentBlockingDepsFor(id),
+      contentBlocking: this.webRequestFunnelDepsFor(id),
       downloadGating: this.downloadGatingDeps(),
       navigation: this.navigationDepsFor(id),
     });
@@ -281,7 +290,13 @@ export class Browser {
     // the navigation: a page not yet in the ledger has nowhere to keep a
     // verdict, and the blocker's verdict is already known by now. This is also
     // what OPENS the browsing sitting, so every line below carries it.
-    this.registry.addPage({ id, url: parsed.toString(), title: "", protection: page.protection });
+    this.registry.addPage({
+      id,
+      url: parsed.toString(),
+      title: "",
+      protection: page.protection,
+      blockedCount: 0,
+    });
     this.journalBlockerVerdict(page.protection);
 
     this.selectTab(id);
@@ -407,7 +422,7 @@ export class Browser {
   retryProtection(): void {
     if (this.pages.size === 0) throw new Error("The browser isn't open.");
     for (const [id, page] of this.pages) {
-      const blocking = attachContentBlocking(page.webSession, this.contentBlockingDepsFor(id));
+      const blocking = registerWebRequestFunnel(page.webSession, this.webRequestFunnelDepsFor(id));
       const verdict: Protection = blocking.ok
         ? { state: "active" }
         : { state: "failed", reason: blocking.reason };
@@ -446,6 +461,23 @@ export class Browser {
   activeUrl(): string | undefined {
     const id = this.activeId();
     return id ? this.registry.recordedUrl(id) : undefined;
+  }
+
+  /**
+   * How many real cancellations the webRequest funnel has made on the
+   * ACTIVE page's session (webRequestFunnel.ts, tabs.ts's
+   * `Page.blockedCount`) — `0` when no page is open, matching `activeUrl`'s
+   * own shape rather than `protection()`'s worst-of-every-open-page one:
+   * this is a fact about the page showing, like `url`/`title`, not a
+   * whole-browser verdict.
+   *
+   * Read by `browserInfo()` (browseCommands.ts) onto `BrowserInfo.blockedCount`
+   * — the poll the shield already runs, which is the only channel out of the
+   * native layer.
+   */
+  blockedCount(): number {
+    const id = this.activeId();
+    return id ? this.registry.blockedCount(id) : 0;
   }
 
   /** Correct the ACTIVE page's record from the page script's own

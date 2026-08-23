@@ -29,11 +29,26 @@ import { readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { OnBeforeRequestListenerDetails } from "electron";
 import type { BrowseJournalRow } from "../../shared/apiTypes.js";
 import { Browser, type BrowserDeps } from "./browser.js";
 import { MAX_TABS, PARKED, type Bounds } from "./tabs.js";
-import { attachContentBlocking } from "./contentBlocking.js";
+import { registerWebRequestFunnel } from "./webRequestFunnel.js";
 import type { CreatePageDeps, LivePage, WindowContentView } from "./webviewManager.js";
+
+type WebRequestListener = (
+  details: OnBeforeRequestListenerDetails,
+  callback: (response: { cancel?: boolean }) => void,
+) => void;
+
+function fakeRequest(over: Partial<OnBeforeRequestListenerDetails>): OnBeforeRequestListenerDetails {
+  return {
+    url: "https://example.com/",
+    resourceType: "mainFrame",
+    frame: { url: "", top: { url: "" } },
+    ...over,
+  } as OnBeforeRequestListenerDetails;
+}
 
 // ---------------------------------------------------------------------------
 // A fake page: everything a `LivePage` carries, with the four objects browser.ts
@@ -48,6 +63,12 @@ interface FakePage {
   removedFromWindow: number;
   bounds: Bounds[];
   blockingAttaches: number;
+  /** The listener the LAST `onBeforeRequest` registration captured — real
+   *  requests never reach this fake session, so a test drives it by hand to
+   *  prove browser.ts's own funnel-deps wiring, not the funnel's policy
+   *  (webRequestFunnel.test.ts already proves that against deps built by
+   *  hand). */
+  webRequestListener: WebRequestListener | null;
   live: LivePage;
 }
 
@@ -115,15 +136,17 @@ function harness(): Harness {
       removedFromWindow: 0,
       bounds: [],
       blockingAttaches: 0,
+      webRequestListener: null,
       live: null as unknown as LivePage,
     };
     const webSession = {
       isPersistent: () => h.persistentFor.has(id),
       getStoragePath: () => (h.storagePathFor.has(id) ? "/tmp/persisted" : null),
       webRequest: {
-        onBeforeRequest() {
+        onBeforeRequest(listener: WebRequestListener) {
           if (h.blockingThrowsFor.has(id)) throw new Error("webRequest unavailable");
           rec.blockingAttaches += 1;
+          rec.webRequestListener = listener;
         },
       },
     };
@@ -148,9 +171,11 @@ function harness(): Harness {
       },
     };
     rec.live = { id, view, contents, webSession, protection: { state: "unknown" } } as unknown as LivePage;
-    // The REAL attach, so the verdict this page carries is the one the real
-    // code would have produced.
-    const blocking = attachContentBlocking(webSession, pageDeps.contentBlocking);
+    // The REAL registration (webRequestFunnel.ts), so the verdict this page
+    // carries — and, once a test drives `webRequestListener` by hand, the
+    // journal/emit/count wiring it produces — is the one the real code
+    // (webviewManager.ts's `createLivePage`) would have produced.
+    const blocking = registerWebRequestFunnel(webSession, pageDeps.contentBlocking);
     rec.live.protection = blocking.ok
       ? { state: "active" }
       : { state: "failed", reason: blocking.reason };
@@ -406,6 +431,94 @@ describe("the shield speaks for the WHOLE browser", () => {
 
   it("refuses to retry when the browser isn't open", () => {
     expect(() => h.browser.retryProtection()).toThrow("The browser isn't open.");
+  });
+});
+
+describe("the webRequest funnel's deps are really wired (not just constructed)", () => {
+  // webRequestFunnel.test.ts proves the funnel's OWN journal/emit/count
+  // decisions against hand-built deps; what only THIS file can prove is that
+  // `Browser.webRequestFunnelDepsFor` actually threads its journal,
+  // emitBlocked and countBlocked closures down to the registration
+  // `newTab()` makes — a deps object built but never passed through would
+  // pass every other test in this suite unchanged.
+
+  it("counts a real cancellation on the page it happened on", () => {
+    const id = h.browser.newTab("https://site0.example/");
+    expect(h.browser.blockedCount()).toBe(0);
+
+    const rec = h.pages.get(id) as FakePage;
+    const cb = vi.fn();
+    rec.webRequestListener?.(
+      fakeRequest({ url: "http://127.0.0.1:11434/api/delete", resourceType: "image" }),
+      cb,
+    );
+
+    expect(cb).toHaveBeenCalledWith({ cancel: true });
+    expect(h.browser.blockedCount()).toBe(1);
+  });
+
+  it("journals and emits a main-frame private-network block, through browser.ts's OWN journal/emit", () => {
+    const id = h.browser.newTab("https://site0.example/");
+    const rec = h.pages.get(id) as FakePage;
+    const cb = vi.fn();
+
+    rec.webRequestListener?.(
+      fakeRequest({ url: "http://192.168.1.1/admin", resourceType: "mainFrame" }),
+      cb,
+    );
+
+    expect(h.journal).toContainEqual([
+      "blocked",
+      "http://192.168.1.1/admin",
+      "Navigation blocked: private or non-web address.",
+    ]);
+    expect(h.emitted).toContainEqual(["browser-blocked", { url: "http://192.168.1.1/admin" }]);
+    expect(h.browser.blockedCount()).toBe(1);
+  });
+
+  it("counts a sub-resource block WITHOUT journalling or emitting", () => {
+    const id = h.browser.newTab("https://site0.example/");
+    const rec = h.pages.get(id) as FakePage;
+    const journalledBefore = h.journal.length;
+    const emittedBefore = h.emitted.length;
+
+    rec.webRequestListener?.(
+      fakeRequest({ url: "http://127.0.0.1:9000/px.gif", resourceType: "image" }),
+      vi.fn(),
+    );
+
+    expect(h.browser.blockedCount()).toBe(1);
+    expect(h.journal.length).toBe(journalledBefore);
+    expect(h.emitted.length).toBe(emittedBefore);
+  });
+
+  it("reports the ACTIVE page's count, not a background page's", () => {
+    const ids = openPages(h, 2);
+    const background = h.pages.get(ids[0] as string) as FakePage;
+    background.webRequestListener?.(
+      fakeRequest({ url: "http://127.0.0.1/x", resourceType: "image" }),
+      vi.fn(),
+    );
+    // ids[1] is the active tab (each newTab selects the page it opens).
+    expect(h.browser.blockedCount()).toBe(0);
+    h.browser.selectTab(ids[0] as string);
+    expect(h.browser.blockedCount()).toBe(1);
+  });
+
+  it("is 0 with no page open", () => {
+    expect(h.browser.blockedCount()).toBe(0);
+  });
+
+  it("re-attaching on retry keeps counting on the SAME registration deps", () => {
+    const id = h.browser.newTab("https://site0.example/");
+    h.browser.retryProtection();
+    const rec = h.pages.get(id) as FakePage;
+
+    rec.webRequestListener?.(
+      fakeRequest({ url: "http://127.0.0.1/x", resourceType: "image" }),
+      vi.fn(),
+    );
+    expect(h.browser.blockedCount()).toBe(1);
   });
 });
 

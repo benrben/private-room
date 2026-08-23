@@ -10,7 +10,8 @@
 // same thing). Every DECISION this file would otherwise make has been moved
 // into a pure, tested module (tabs, protection, readiness, rules, navGuard,
 // downloads, evalBridge) or into a glue module with an injected minimal
-// interface (contentBlocking, navigation, popup, downloadGating). What is left
+// interface (webRequestFunnel atop contentBlocking, navigation, popup,
+// downloadGating). What is left
 // here is the ORDER of real Electron calls — and the parts of that order this
 // workspace CAN prove are proven for real, against a spawned Electron binary,
 // in browserLive.test.ts.
@@ -50,7 +51,7 @@
 import { randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 import type { Session, WebContents, WebContentsView } from "electron";
-import { attachContentBlocking, type ContentBlockingDeps } from "./contentBlocking.js";
+import { registerWebRequestFunnel, type WebRequestFunnelDeps } from "./webRequestFunnel.js";
 import { attachDownloadGating, type DownloadGatingDeps } from "./downloadGating.js";
 import { attachNavigationGating, type NavigationDeps } from "./navigation.js";
 import { attachPopupHandling } from "./popup.js";
@@ -94,7 +95,7 @@ export interface LivePage {
 }
 
 export interface CreatePageDeps {
-  contentBlocking: ContentBlockingDeps;
+  contentBlocking: WebRequestFunnelDeps;
   downloadGating: DownloadGatingDeps;
   navigation: NavigationDeps;
 }
@@ -126,7 +127,7 @@ export function createLivePage(id: string, deps: CreatePageDeps): LivePage {
   // browsing sitting when it records the page, and a line written before that
   // would be filed under no sitting at all — invisible to a Journal view that
   // defaults to "what just happened".
-  const blocking = attachContentBlocking(webSession, deps.contentBlocking);
+  const blocking = registerWebRequestFunnel(webSession, deps.contentBlocking);
   const protection: Protection = blocking.ok
     ? { state: "active" }
     : { state: "failed", reason: blocking.reason };

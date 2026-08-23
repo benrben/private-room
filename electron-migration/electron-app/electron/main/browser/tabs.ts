@@ -85,6 +85,17 @@ export interface Page {
   url: string;
   title: string;
   protection: Protection;
+  /**
+   * Real cancellations the webRequest funnel has made on THIS page's own
+   * session (webRequestFunnel.ts) — genuinely new state, not a port:
+   * browser.rs never counted a block at all, which is exactly what let the
+   * shield's "12 blocked" read as a real count when it was a mockup number
+   * (product audit, 2026-08-15). Page-lifetime, like `protection`, not
+   * per-navigation: `ensure()` sends this same session/page to a new URL
+   * without minting a new one, and there is no per-load reset hook wired up
+   * for it here (a defensible follow-up, not a forgotten one).
+   */
+  blockedCount: number;
 }
 
 /** A short, honest label for a page before its `<title>` is known: the host.
@@ -295,6 +306,20 @@ export class TabRegistry {
   setProtection(id: string, verdict: Protection): void {
     const page = this.find(id);
     if (page) page.protection = verdict;
+  }
+
+  /** One more real cancellation on `id`'s session. A no-op for an id that is
+   *  no longer open — the funnel can outlive the tab it was attached to by at
+   *  most one in-flight request, and a late count has nowhere honest to go. */
+  bumpBlockedCount(id: string): void {
+    const page = this.find(id);
+    if (page) page.blockedCount += 1;
+  }
+
+  /** How many real cancellations `id`'s session has made. `0` for an id that
+   *  is not open, matching every other per-page reader in this class. */
+  blockedCount(id: string): number {
+    return this.find(id)?.blockedCount ?? 0;
   }
 
   /** The browsing sitting the journal is currently writing into, `""` between

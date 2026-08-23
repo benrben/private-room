@@ -51,9 +51,21 @@ export interface ContentBlockingDeps {
    *  classification — never asked of a live view, for the same reason nothing
    *  else in this port re-derives a page's URL from one. */
   recordedTopUrl(): string | undefined;
-  /** Told what was blocked and why. Optional: the journal is the caller's
-   *  concern, and a per-request journal line would be a browsing history. */
-  onBlocked?(url: string, reason: BlockReason): void;
+  /**
+   * Told what was blocked, why, and what KIND of request it was. Optional:
+   * the journal is the caller's concern, and a per-request journal line would
+   * be a browsing history for every tracker pixel.
+   *
+   * A NOTIFICATION, NEVER A VETO. It is called after the request has already
+   * been answered, and a throw out of it is contained — see `attachContentBlocking`.
+   *
+   * `resourceType` rides along so a caller can draw the same "was this the
+   * top document" line `classifyRequest` itself draws internally (a
+   * `mainFrame` request is the only kind `"private-network"` can ever pair
+   * with — `"tracker"` returns `null` for `mainFrame` before it gets the
+   * chance) without re-deriving it from `details` a second time.
+   */
+  onBlocked?(url: string, reason: BlockReason, resourceType: RequestResourceType): void;
 }
 
 /**
@@ -87,6 +99,19 @@ export function resolveTopLevelUrl(
 /**
  * Register the block/allow decision on one page's session. Returns
  * synchronously — see the module header for why there is no async half.
+ *
+ * THE VERDICT IS DELIVERED BEFORE ANYTHING IS TOLD ABOUT IT, and a sink that
+ * throws is contained. Chromium holds every request open until this callback
+ * runs exactly once; `onBlocked` is a notification into I/O this module does not
+ * own — journal.ts writes to a room DB that can be closed underneath an
+ * in-flight request, and the `browser-blocked` event goes to a window that can
+ * be gone. Notifying first left a throwing sink able to swallow the callback
+ * entirely, which stalls the very request the funnel just decided to cancel
+ * (fail-closed, but a page hung on a dead request instead of failing cleanly)
+ * and puts an uncaught exception through Electron's webRequest dispatch. Both
+ * sinks are already best-effort by their own contracts — `journal()` swallows
+ * its own DB failures, an event to a closed window is nothing to recover — so
+ * containing the throw loses no diagnostic that was ever going to be acted on.
  */
 export function attachContentBlocking(
   session: BlockingSessionLike | Session,
@@ -94,13 +119,20 @@ export function attachContentBlocking(
 ): ContentBlockingResult {
   try {
     (session as BlockingSessionLike).webRequest.onBeforeRequest((details, callback) => {
+      const resourceType = details.resourceType as RequestResourceType;
       const reason = classifyRequest({
         url: details.url,
-        resourceType: details.resourceType as RequestResourceType,
+        resourceType,
         topLevelUrl: resolveTopLevelUrl(details, deps),
       });
-      if (reason !== null) deps.onBlocked?.(details.url, reason);
       callback({ cancel: reason !== null });
+      if (reason === null) return;
+      try {
+        deps.onBlocked?.(details.url, reason, resourceType);
+      } catch {
+        // See the doc comment: bookkeeping cannot be allowed to void a decision
+        // already given to Chromium.
+      }
     });
     return { ok: true };
   } catch (e) {

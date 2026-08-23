@@ -1800,6 +1800,15 @@ export interface BrowserInfo {
   /** The browsing sitting the journal is currently writing into, `""` when no
    *  page is open. */
   session?: string;
+  /**
+   * Real cancellations the one webRequest funnel made on the ACTIVE page —
+   * private-network AND tracker blocks alike, counted the moment `cancel:true`
+   * is answered. The audit-wave mockups' "12 blocked" was fiction (nothing
+   * behind the shield counted anything); this is the first version of the
+   * number that is actually true. Absent from an older backend, same as
+   * `protection` — never assume zero means "nothing was blocked".
+   */
+  blockedCount?: number;
 }
 
 /** The content blocker's real verdict, asked of WebKit rather than assumed.

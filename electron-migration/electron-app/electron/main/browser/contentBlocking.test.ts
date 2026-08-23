@@ -127,6 +127,38 @@ describe("attachContentBlocking", () => {
     expect(blocked).toEqual([["http://127.0.0.1:11434/api/delete", "private-network"]]);
   });
 
+  it("reports the request's own resourceType alongside the verdict", () => {
+    // A caller (webRequestFunnel.ts) needs this to draw the "was this the
+    // top document" line without re-deriving it from `details` a second
+    // time — it must be the REQUEST's kind, not always "mainFrame" and not
+    // always the topLevelUrl's.
+    const { session, listener } = fakeSession();
+    const seen: Array<[string, string]> = [];
+    attachContentBlocking(session, {
+      recordedTopUrl: () => undefined,
+      onBlocked: (_url, reason, resourceType) => seen.push([reason, resourceType]),
+    });
+    const cb = vi.fn();
+
+    listener()(
+      details({ url: "http://192.168.1.1/", resourceType: "mainFrame", frame: frame("", "") }),
+      cb,
+    );
+    listener()(
+      details({
+        url: "http://127.0.0.1:9000/",
+        resourceType: "image",
+        frame: frame("", "https://news.example/"),
+      }),
+      cb,
+    );
+
+    expect(seen).toEqual([
+      ["private-network", "mainFrame"],
+      ["private-network", "image"],
+    ]);
+  });
+
   it("cancels a third-party tracker and lets the page's own resources through", () => {
     const { session, listener } = fakeSession();
     attachContentBlocking(session, { recordedTopUrl: () => "https://news.example/" });
@@ -172,6 +204,42 @@ describe("attachContentBlocking", () => {
       listener()(details({ url }), cb);
     }
     expect(cb).toHaveBeenCalledTimes(3);
+  });
+
+  it("answers the callback even when the onBlocked sink THROWS", () => {
+    // The same "no request is left hanging" invariant, against the failure that
+    // can actually reach it in production: `onBlocked` is a notification into
+    // I/O this module does not own (a room DB that can close under an in-flight
+    // request, a `browser-blocked` event to a window that can be gone). Notified
+    // BEFORE the callback, one throw swallowed the verdict and stalled the very
+    // request the funnel had just decided to cancel.
+    const { session, listener } = fakeSession();
+    attachContentBlocking(session, {
+      recordedTopUrl: () => undefined,
+      onBlocked: () => {
+        throw new Error("room closed under us");
+      },
+    });
+    const cb = vi.fn();
+    expect(() =>
+      listener()(details({ url: "http://192.168.1.1/admin", resourceType: "mainFrame" }), cb),
+    ).not.toThrow();
+    expect(cb).toHaveBeenCalledWith({ cancel: true });
+  });
+
+  it("notifies AFTER the request is answered, never before", () => {
+    // The ordering is the fix, not the try/catch: a sink that hangs, re-enters
+    // or throws must find the decision already delivered.
+    const { session, listener } = fakeSession();
+    const order: string[] = [];
+    attachContentBlocking(session, {
+      recordedTopUrl: () => undefined,
+      onBlocked: () => order.push("notified"),
+    });
+    listener()(details({ url: "http://192.168.1.1/admin", resourceType: "mainFrame" }), () =>
+      order.push("answered"),
+    );
+    expect(order).toEqual(["answered", "notified"]);
   });
 
   it("reports a registration that THREW as a failed verdict, never as protected", () => {

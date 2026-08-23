@@ -59,6 +59,7 @@ export interface ChromeBrowser {
   tabList(): BrowserTab[];
   setBounds(b: Bounds): void;
   protection(): BrowserProtection;
+  blockedCount(): number;
   retryProtection(): void;
   verifyEphemeral(): boolean;
   sessionId(): string;
@@ -266,6 +267,12 @@ export async function browserInfo(deps: BrowseCommandsDeps): Promise<BrowserInfo
     // "Trackers blocked." off the STORAGE check, which knows nothing about the
     // rule list.
     protection: browser.protection(),
+    // What it BLOCKED, on the page showing — a real count of cancellations the
+    // one webRequest funnel actually made (webRequestFunnel.ts), where the
+    // audit-wave shield's "12 blocked" was a mockup number behind which nothing
+    // counted anything. Always sent while a page is open, `0` included: absent
+    // means an older backend, not "nothing was blocked".
+    blockedCount: browser.blockedCount(),
     // The browsing sitting the journal is writing into — empty when none is
     // live — so the Journal can tell this sitting from the earlier ones.
     session: browser.sessionId(),

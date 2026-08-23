@@ -30,6 +30,7 @@ const page = (id: string, url = "https://example.com/", title = ""): Page => ({
   url,
   title,
   protection: UNKNOWN_PROTECTION,
+  blockedCount: 0,
 });
 
 describe("closing_a_page_shows_its_right_neighbour_then_its_left", () => {
@@ -265,5 +266,41 @@ describe("page ids", () => {
     r.addPage(page(ids[0] as string));
     r.dropPage(ids[0] as string);
     expect(r.nextId()).toBe("3");
+  });
+});
+
+describe("blockedCount (webRequestFunnel.ts's per-page counter)", () => {
+  it("starts at zero and climbs one real cancellation at a time", () => {
+    const r = new TabRegistry();
+    r.addPage(page("0"));
+    expect(r.blockedCount("0")).toBe(0);
+    r.bumpBlockedCount("0");
+    r.bumpBlockedCount("0");
+    expect(r.blockedCount("0")).toBe(2);
+  });
+
+  it("keeps each page's count independent of its neighbours", () => {
+    const r = new TabRegistry();
+    r.addPage(page("0"));
+    r.addPage(page("1"));
+    r.bumpBlockedCount("0");
+    expect(r.blockedCount("0")).toBe(1);
+    expect(r.blockedCount("1")).toBe(0);
+  });
+
+  it("is a silent no-op for a page that is not open", () => {
+    // The funnel can outlive the tab it was attached to by at most one
+    // in-flight request; a late count has nowhere honest to go.
+    const r = new TabRegistry();
+    expect(() => r.bumpBlockedCount("missing")).not.toThrow();
+    expect(r.blockedCount("missing")).toBe(0);
+  });
+
+  it("survives a same-tab navigation — it is page-lifetime, not per-load", () => {
+    const r = new TabRegistry();
+    r.addPage(page("0", "https://first.example/"));
+    r.bumpBlockedCount("0");
+    r.recordUrl("0", "https://second.example/");
+    expect(r.blockedCount("0")).toBe(1);
   });
 });
