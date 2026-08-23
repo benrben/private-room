@@ -122,8 +122,14 @@ export function stripMarkupBlocks(content: string): string {
 
 /** CHG-14: include common 2-letter function words so the >=2 length filter
  * can admit high-signal short terms (AI, EU, Q2, IP) without letting these
- * through. */
-const STOPWORDS: ReadonlySet<string> = new Set([
+ * through.
+ *
+ * Exported (Rust's `retrieval.rs::STOPWORDS` is `pub(crate)`, reused by
+ * `moonshot/graph.rs::index_terms` via `use super::*` — this is the same
+ * crate-wide sharing, not a new seam) so {@link ../moonshotGraph.js}'s own
+ * `indexTerms` filters against the identical list rather than a second,
+ * driftable copy. */
+export const STOPWORDS: ReadonlySet<string> = new Set([
   "is", "to", "of", "in", "on", "at", "it", "be", "as", "by", "an", "or", "if", "we", "do",
   "so", "up", "my", "me", "no", "us", "am", "he",
   "the", "and", "for", "are", "but", "not", "you", "all", "can", "her", "was", "one", "our",
@@ -154,8 +160,10 @@ function byteLen(s: string): number {
  * points, which matters less here only because {@link stripHebrewMarks} has
  * already removed those by the time this runs — exactly as the Rust source
  * does, and for the same reason.)
- */
-const NOT_ALPHANUMERIC = /[^\p{Alphabetic}\p{N}]+/u;
+ *
+ * Exported for the same reason as {@link STOPWORDS} above: `moonshot/graph.rs`'s
+ * `index_terms` splits on this exact same `!c.is_alphanumeric()` predicate. */
+export const NOT_ALPHANUMERIC = /[^\p{Alphabetic}\p{N}]+/u;
 
 /**
  * The search terms in a question: Hebrew marks stripped first (a pasted
