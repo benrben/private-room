@@ -36,13 +36,14 @@
  *
  *   2. `commands::shotsplit` (689 lines: sentence/word-boundary packing with
  *      its own round-trip invariant — "put the parts back together and you
- *      have every word you started with") — NOT ported. {@link storyPlanSplit}
- *      is an honest, labelled `NOT_IMPLEMENTED` refusal (never a naive
- *      stand-in that could silently drop or reorder the user's script), the
- *      same shape `organizeTools.ts`'s `mark_image` and `jobDownload.ts`'s
- *      `FETCH_DOWNLOAD_NOT_IMPLEMENTED` already use. Its one CONSTANT,
- *      `MAX_PARTS`, is mirrored below because {@link storyApplySplit} enforces
- *      it directly.
+ *      have every word you started with") — NOW PORTED, as `shotsplitTools.ts`
+ *      (a later batch in this same migration). {@link storyPlanSplit} is the
+ *      real `story_plan_split` again: the script's own declared chunks win
+ *      when it has any ({@link scriptChunks}), otherwise the room cuts it by
+ *      length ({@link splitScript}/{@link partsFor}). `MAX_PARTS` is imported
+ *      from `shotsplitTools.ts` rather than mirrored a second time, now that
+ *      the real module exists — {@link storyApplySplit} still enforces it
+ *      directly, same as before.
  *
  *   3. `commands::media_limits` (453 lines: the per-model legal-duration
  *      catalogue) — PORTED as `mediaLimits.ts` in a later batch, so
@@ -101,6 +102,7 @@ import { resolvedBaseUrl } from "./engineRouting.js";
 import { modelSetting } from "./gatherContext.js";
 import { allowsSeconds, limitsFor } from "./mediaLimits.js";
 import { sidecarJsonCancellable } from "./sidecarJsonCancellable.js";
+import { MAX_PARTS, partsFor, scriptChunks, splitScript } from "./shotsplitTools.js";
 import type { OpenRoom } from "./turnEngine.js";
 // Every frontend-facing shape this file returns is NOT redeclared here. All six
 // already exist, camelCased and field-for-field with the Rust structs, in
@@ -692,32 +694,56 @@ export function shotPrompt(
 // ------------------------------------------------------ splitting a script
 
 /**
- * `commands::shotsplit` (689 lines: `script_chunks`/`parts_for`/`split_script`,
- * a greedy sentence/word-boundary packer with its own round-trip invariant and
- * fixture-file test suite) has no Electron port anywhere in this migration. It
- * is a self-contained algorithmic module with real design decisions of its own,
- * genuinely outside this batch's scope, and a naive stand-in would silently
- * violate its core promise — no word of the user's script can go missing. So
- * {@link storyPlanSplit} refuses by name (rule 3) rather than guessing the
- * algorithm from its test names.
+ * Cut a script into shots of a fixed length — the whole point of the
+ * feature. Ported from `story_plan_split`.
+ *
+ * No model is asked. See `shotsplitTools.ts`: it is free, it is instant,
+ * nothing leaves the Mac, and — the part that matters — no word can go
+ * missing, which is not a promise a model can make about a five-minute
+ * script.
+ *
+ * THE SCRIPT'S OWN CHUNKS WIN. A script written as `**00:00–00:15** — …` has
+ * already been broken into shots by its author, with the lengths they chose.
+ * Re-cutting that by character count puts boundaries in the middle of their
+ * beats and silently reflows their pacing — so the room only decides where
+ * the cuts go when nobody has decided already ({@link scriptChunks}).
  */
-export const STORY_PLAN_SPLIT_NOT_IMPLEMENTED =
-  "NOT_IMPLEMENTED: cutting a script into shots needs commands/shotsplit.rs's " +
-  "sentence/word-boundary packing algorithm (script_chunks/parts_for/split_script), " +
-  "which has no Electron port yet.";
+export function storyPlanSplit(script: string, minutes: number, secondsEach: number): ShotPlan {
+  const chunks = scriptChunks(script);
+  if (chunks !== undefined) {
+    const shots: PlannedShot[] = chunks
+      .slice(0, MAX_PARTS)
+      .map((c) => ({ action: c.action, seconds: c.seconds }));
+    return {
+      parts: shots.length,
+      totalSeconds: shots.reduce((sum, s) => sum + s.seconds, 0),
+      shots,
+      fromScript: true,
+    };
+  }
 
-/** Ported from `story_plan_split` — see
- * {@link STORY_PLAN_SPLIT_NOT_IMPLEMENTED}. */
-export function storyPlanSplit(_script: string, _minutes: number, _secondsEach: number): ShotPlan {
-  throw new Error(STORY_PLAN_SPLIT_NOT_IMPLEMENTED);
+  const clampedSecondsEach = clamp(secondsEach, 1, 60);
+  // The runtime the user asked for, not one derived from the script's
+  // length: how long the words take to say is a judgement only they can
+  // make, and guessing it would silently change the shape of their episode.
+  //
+  // A runtime of ZERO is not a request for one shot — it is an empty or
+  // half-typed field, and answering it with a single 15-second shot for a
+  // five-minute script is the failure this `max` exists to prevent.
+  const asked = Math.round(Math.max(minutes, 0) * 60);
+  const total = asked === 0 ? clampedSecondsEach : Math.max(asked, clampedSecondsEach);
+  const parts = partsFor(total, clampedSecondsEach);
+  const shots: PlannedShot[] = splitScript(script, parts).map((action) => ({
+    action,
+    seconds: clampedSecondsEach,
+  }));
+  return {
+    parts: shots.length,
+    totalSeconds: shots.reduce((sum, s) => sum + s.seconds, 0),
+    shots,
+    fromScript: false,
+  };
 }
-
-/** The most shots one script may be cut into. Mirrors
- * `commands::shotsplit::MAX_PARTS` — a cross-module CONSTANT, not a re-port of
- * that module, the same choice this file already makes for `KEEP_ALIVE_WARM`.
- * Needed here because {@link storyApplySplit} enforces it directly, whether or
- * not the plan came from the (unimplemented) {@link storyPlanSplit}. */
-const MAX_PARTS = 80;
 
 /**
  * The nearest length this model will actually film. Ported from

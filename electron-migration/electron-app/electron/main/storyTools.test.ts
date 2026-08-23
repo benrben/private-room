@@ -68,7 +68,6 @@ import {
   storyUpdateCast,
   storyUpdateList,
   storyUpdateShot,
-  STORY_PLAN_SPLIT_NOT_IMPLEMENTED,
   type PlannedShot,
   type RoomSource,
 } from "./storyTools.js";
@@ -633,9 +632,54 @@ describe("storyAddCastMany", () => {
 // =========================================================== split
 
 describe("storyPlanSplit", () => {
-  it("is an honest NOT_IMPLEMENTED refusal, not a guessed re-implementation", () => {
-    expect(() => storyPlanSplit("A script.", 5, 15)).toThrow(STORY_PLAN_SPLIT_NOT_IMPLEMENTED);
-    expect(STORY_PLAN_SPLIT_NOT_IMPLEMENTED).toContain("shotsplit.rs");
+  // The algorithm itself (script_chunks/parts_for/split_script) has its own
+  // full test suite in shotsplitTools.test.ts, ported side-by-side with
+  // commands/shotsplit.rs's own `mod tests`. These exercise story_plan_split's
+  // OWN logic on top of it: which branch wins, and how minutes/secondsEach
+  // become a shot count.
+
+  it("a script that declares its own chunks wins, verbatim lengths and all", () => {
+    const script = "**00:00-00:15** — One.\n\n**00:15-00:45** — Two.";
+    const plan = storyPlanSplit(script, 5, 15);
+    expect(plan.fromScript).toBe(true);
+    expect(plan.parts).toBe(2);
+    expect(plan.shots.map((s) => s.seconds)).toEqual([15, 30]);
+    expect(plan.totalSeconds).toBe(45);
+    expect(plan.shots[0]!.action).toBe("One");
+    expect(plan.shots[1]!.action).toBe("Two");
+  });
+
+  it("plain prose is cut by length: a zero/blank runtime still gets one shot's worth, not one shot for a five-minute script", () => {
+    // minutes=0 (an empty or half-typed field) must not silently answer a
+    // long script with a single shot — total falls back to secondsEach, not
+    // to something derived from the script's own length.
+    const plan = storyPlanSplit("Some prose with no markers at all.", 0, 15);
+    expect(plan.fromScript).toBe(false);
+    expect(plan.parts).toBe(1);
+    expect(plan.shots.length).toBe(1);
+    expect(plan.shots[0]!.seconds).toBe(15);
+    expect(plan.totalSeconds).toBe(15);
+  });
+
+  it("a real runtime is cut into that many shots of secondsEach length each", () => {
+    // One minute at 15 seconds a shot: four shots, every word preserved.
+    const script =
+      "The harbour is empty. Mira walks the quay, counting. " +
+      "A light comes on in the chandlery! Doran is already there.";
+    const plan = storyPlanSplit(script, 1, 15);
+    expect(plan.fromScript).toBe(false);
+    expect(plan.parts).toBe(4);
+    expect(plan.shots.length).toBe(4);
+    expect(plan.shots.every((s) => s.seconds === 15)).toBe(true);
+    expect(plan.totalSeconds).toBe(60);
+    expect(plan.shots.map((s) => s.action).join(" ").split(/\s+/u).filter(Boolean)).toEqual(
+      script.split(/\s+/u).filter(Boolean)
+    );
+  });
+
+  it("secondsEach is clamped to 1..=60, matching story_apply_split's own legal range", () => {
+    const plan = storyPlanSplit("One shot only.", 0, 200);
+    expect(plan.shots[0]!.seconds).toBe(60);
   });
 });
 
