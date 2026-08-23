@@ -274,7 +274,7 @@ describe("searchAll", () => {
       "deposit*",
       "{a b}",
       "a:b",
-      "deposit refund",
+      "deposit\u0000refund",
     ]) {
       expect(() => searchAll(db, q), `query ${JSON.stringify(q)} threw`).not.toThrow();
     }

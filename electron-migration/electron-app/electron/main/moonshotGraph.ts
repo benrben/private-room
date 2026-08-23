@@ -167,7 +167,7 @@
  *    nothing here and removes any doubt.
  *  - Pair keys (`pair_key` in Rust, returning a `(String, String)` tuple used
  *    as a `HashMap`/`HashSet` key) become a single joined string
- *    (`${lo} ${hi}`) for use as a `Map`/`Set` key — ` ` cannot
+ *    (`${lo}\u0000${hi}`) for use as a `Map`/`Set` key — `\u0000` cannot
  *    appear in a UUID or in FTS-searched text, so this cannot collide.
  *  - `median`/`adaptive_floor`'s `HashMap<(usize, usize), (f32, bool)>` score
  *    cache becomes a `Map<string, [number, boolean]>` keyed by `"i,j"`
@@ -450,10 +450,10 @@ function adaptiveFloor(sortedDesc: readonly number[]): number {
 }
 
 /** Unordered key for a pair of node ids, so the same relation found twice is
- * one edge. ` ` cannot appear in a UUID or in FTS-searched text, so this
+ * one edge. `\u0000` cannot appear in a UUID or in FTS-searched text, so this
  * cannot collide two distinct pairs onto one key. */
 function pairKeyStr(a: string, b: string): string {
-  return a <= b ? `${a} ${b}` : `${b} ${a}`;
+  return a <= b ? `${a}\u0000${b}` : `${b}\u0000${a}`;
 }
 
 /** Collects at most one edge per pair, keeping the most-trusted kind (then
