@@ -20,11 +20,19 @@
  * `json.rs` has no `#[tauri::command]` of its own — it is pure helper code
  * three Rust commands call into (`studio_mindmap`, `studio_flashcards`,
  * `generate_podcast_script`, plus a `chat_commands/knowledge.rs` reader).
- * None of those commands are ported yet: `execTool.ts`'s `studio_flashcards`/
- * `studio_mindmap`/`generate_podcast_script` arms are still
- * `notImplemented("the Studio generators — out of scope for this batch per
- * its own brief")`. So there is no exec_tool arm to wire from this file; it
- * exists for whoever ports those studios next.
+ * UPDATE: all three now use it for real (`studiosMindmap.ts`,
+ * `studiosFlashcards.ts`, `studiosPodcast.ts` — each artifact's own
+ * `StudioSpec`/fallback-parse/render half). UPDATE 2: `studios.rs`'s shared
+ * `run_studio`/`run_studio_core` pipeline is ALSO now real (`studiosCmds.ts`'s
+ * `runStudio`/`makeRunStudio`), so all three can actually RUN a spec, tested
+ * against a fixture room. What still keeps `execTool.ts`'s `studio_flashcards`/
+ * `studio_mindmap`/`generate_podcast_script` arms refusing is one level
+ * further out: `runStudio` needs a live `RoomSource`/`CancelState` only an
+ * app-wide host bootstrap can construct (`ExecToolDeps` carries neither
+ * today — the same gap its own `downloadJob`/`workflowRun` seams document for
+ * their job-queue-backed arms), so each arm still refuses with that
+ * artifact's own `RUN_STUDIO_PIPELINE_GAP` (naming precisely what is real vs
+ * missing) rather than the one-liner this comment used to describe.
  *
  * Every function here only READS a parsed value — none builds a fresh object
  * and assigns a room/model-controlled key onto it, so there is no

@@ -195,6 +195,12 @@ describe("exhaustive tool-arm coverage — the single most valuable test in this
       "list_workflows",
       "save_workflow",
       "update_workflow",
+      // The sketch tools (sketchCommands.ts, ported from `commands/
+      // sketch.rs` + `commands/sketchdoc.rs`). Both touch only the room, so
+      // with no room open they answer "No room is open." like every other
+      // real arm.
+      "draw",
+      "read_drawing",
     ];
     const stubbedNames = NAMED_ARM_TOOL_NAMES.filter((n) => !REAL_ARMS.includes(n));
     for (const name of stubbedNames) {

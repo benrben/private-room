@@ -11,12 +11,14 @@
  * MOST ARMS ARE STUBS, and that is the honest state of the port rather than an
  * oversight. `exec_tool` dispatches into whole subsystems this rewrite has not
  * reached — `edit_match.rs`, the AgentUi screen-driving bridge, the private
- * browser's command surface, the Scripts/Studio/sketch/STT/
- * jobs-workflows/local-generate lanes, and the external-CLI advisor
- * subprocess. `web.rs` (and its `fetch`/`guard`/`search` submodules) is now
- * REAL — see `web_search`/`fetch_page` below — but `save_link`/`download_url`,
- * whose OWN arms reach further pieces of it plus `files.rs`'s
- * `import_link_and_index`, are not.
+ * browser's command surface, the Scripts/Studio/STT/jobs-workflows/
+ * local-generate lanes, and the external-CLI advisor subprocess. `web.rs`
+ * (and its `fetch`/`guard`/`search` submodules) is now REAL — see
+ * `web_search`/`fetch_page` below — but `save_link`/`download_url`, whose OWN
+ * arms reach further pieces of it plus `files.rs`'s `import_link_and_index`,
+ * are not. `sketch.rs`/`sketchdoc.rs` (the `creator.draw` agent tools) are
+ * ALSO now REAL — see `read_drawing`/`draw` below, against
+ * `sketchCommands.ts`.
  *
  * THE INVARIANT THIS FILE EXISTS TO HOLD: every name the tool catalog or an
  * `McpRoute` can produce reaches a NAMED arm. A stub returns a labeled
@@ -116,6 +118,7 @@ import {
   execOpenFile,
   execSearchRoom,
 } from "./fileTools.js";
+import { execDraw, execReadDrawing } from "./sketchCommands.js";
 import {
   agentDeleteMcp,
   agentListMcps,
@@ -166,6 +169,10 @@ import {
   type McpRoute,
 } from "./toolSpecs.js";
 import { missingRequiredArg } from "./toolSchema.js";
+import { mindmapSpec, RUN_STUDIO_PIPELINE_GAP as RUN_STUDIO_PIPELINE_GAP_MINDMAP } from "./studiosMindmap.js";
+import { EXEC_STUDIO_FLASHCARDS_GAP, execStudioFlashcards } from "./studiosFlashcards.js";
+import { execStudio, type RunStudioDeps, type StudioSpec } from "./studiosCmds.js";
+import { podcastSpec, RUN_STUDIO_PIPELINE_GAP as RUN_STUDIO_PIPELINE_GAP_PODCAST } from "./studiosPodcast.js";
 
 // ------------------------------------------------------------------ ToolEffects
 
@@ -288,11 +295,13 @@ function notImplemented(reason: string): ToolOutcome {
 // ------------------------------------------------------------------------ deps
 
 /** Everything a real arm in this batch needs. Everything else (files,
- * retrieval, edit_match, the UI bridge, browse, scripts, studios, sketch,
+ * retrieval, edit_match, the UI bridge, browse, scripts, studios,
  * skills commands, MCP management, jobs/workflows, local_generate, the
  * external-CLI advisor call, and live connector dispatch) is out of scope —
  * see the module doc — so `deps` carries only what {@link execTool}'s REAL
- * arms use. */
+ * arms use. (`draw`/`read_drawing` are real too, against
+ * `sketchCommands.ts` — they need only `deps.db` and `deps.emit`, already
+ * on this list.) */
 export interface ExecToolDeps {
   /** The open room's connection, or `null` when no room is open (mirrors
    * `state.room.lock().unwrap().as_ref().ok_or("No room is open.")`). */
@@ -520,6 +529,23 @@ export interface ExecToolDeps {
    * busy, the worst possible shape for the bug to take.
    */
   workflowRun?: AgentTestWorkflowDeps;
+  /**
+   * `studiosCmds.ts`'s `RunStudioDeps` — the live `RoomSource` (the app's
+   * actually-open room) plus the app-wide cancel-tree `CancelState`
+   * `studiosFlashcards.ts`'s `execStudioFlashcards` needs to run the real,
+   * tested `runStudio` pipeline. Mirrors {@link ExecToolDeps.downloadJob}
+   * exactly: `undefined` (every test but its own) means no host bootstrap has
+   * wired an app-wide room/cancel-tree into execTool yet, so
+   * `studio_flashcards` refuses with `NOT_IMPLEMENTED` rather than
+   * fabricating a saved deck — see `studiosFlashcards.ts`'s own
+   * `EXEC_STUDIO_FLASHCARDS_GAP` doc for exactly what that means and why.
+   *
+   * Deliberately the SAME bundle {@link studioFlashcards} (a future
+   * Tauri-command-equivalent IPC handler) would also take — one live
+   * `RunStudioDeps`, not a second per-tool copy — so a host bootstrap that
+   * builds one wires both the button and the agent tool from it.
+   */
+  runStudioDeps?: RunStudioDeps;
 }
 
 /** What an injected connector call returns: the tool's text plus any images it
@@ -1758,15 +1784,64 @@ export async function execTool(
       return notImplemented("the Scripts subsystem (fingerprint consent + script execution) — Batch D");
 
     // -------------------------------------------------------------------- sketch
-    case "read_drawing":
-    case "draw":
-      return notImplemented("sketch.rs (the creator.draw agent) — out of scope for this batch per its own brief");
+    //
+    // REAL — against `sketchCommands.ts`/`sketchDoc.ts`/`sketchRaster.ts`,
+    // the `commands/sketch.rs` + `commands/sketchdoc.rs` port.
+    // `read_drawing`'s picture-attachment wiring uses this module's own real
+    // `requireRoom` plus the already-committed `modelSetting`/
+    // `runsOnThisMac`/`activePolicy` — see `sketchCommands.ts`'s module doc.
+    case "read_drawing": {
+      const room = requireRoom(deps);
+      return room.ok ? execReadDrawing(room.db, args, effects) : fail(room.error);
+    }
+    case "draw": {
+      const room = requireRoom(deps);
+      return room.ok ? execDraw(room.db, args, deps.emit) : fail(room.error);
+    }
 
     // ------------------------------------------------------------------- studios
+    //
+    // ONE arm in Rust (`agent.rs` ~4299: `"studio_flashcards" |
+    // "studio_mindmap" | "generate_podcast_script" => { ... }`), differing only
+    // by which `spec` it builds — so ONE `execStudio` call here, per spec.
+    // These were three separate cases with three different verdicts until an
+    // audit found that only `studio_flashcards` ran even when
+    // `ExecToolDeps.runStudioDeps` WAS supplied: the mind-map and podcast arms
+    // refused unconditionally, leaving two of the three model-invocable Studio
+    // tools dead in a fully-bootstrapped app. `deps.runStudioDeps === undefined`
+    // is the one genuinely-missing piece (no host bootstrap builds a live
+    // `RoomSource`/`CancelState` yet), and each name keeps its own gap sentence
+    // for that case.
     case "studio_flashcards":
     case "studio_mindmap":
-    case "generate_podcast_script":
-      return notImplemented("the Studio generators — out of scope for this batch per its own brief");
+    case "generate_podcast_script": {
+      const studioDeps = deps.runStudioDeps;
+      if (studioDeps === undefined) {
+        // A `switch`, not a `{}` lookup table keyed by `name`: an object
+        // literal indexed by a string reads through `Object.prototype`, the
+        // read-side hole `jsonTools.ts`'s own `ownValue` doc describes.
+        switch (name) {
+          case "studio_mindmap":
+            return notImplemented(RUN_STUDIO_PIPELINE_GAP_MINDMAP);
+          case "generate_podcast_script":
+            return notImplemented(RUN_STUDIO_PIPELINE_GAP_PODCAST);
+          default:
+            return notImplemented(EXEC_STUDIO_FLASHCARDS_GAP);
+        }
+      }
+      try {
+        // `execStudioFlashcards` IS `execStudio(deps, flashcardsSpec(), ...)`
+        // — called by name so the binding other callers already use stays the
+        // one this arm goes through.
+        if (name === "studio_flashcards") {
+          return ok(await execStudioFlashcards(studioDeps, deps.runId ?? null, args));
+        }
+        const spec: StudioSpec = name === "studio_mindmap" ? mindmapSpec() : podcastSpec();
+        return ok(await execStudio(studioDeps, spec, deps.runId ?? null, args));
+      } catch (err) {
+        return fail(errMessage(err));
+      }
+    }
 
     // ------------------------------------------------------------- transcription
     case "stt_status":
