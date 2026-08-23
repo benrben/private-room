@@ -13,5 +13,11 @@
     "outDir": "dist",
     "rootDir": "."
   },
-  "include": ["electron/**/*.ts", "cli/**/*.ts"]
+  "include": ["electron/**/*.ts", "cli/**/*.ts"],
+  // Excluded because the renderer lane needs the "DOM" lib this (Node-only)
+  // program deliberately omits -- NOT because it goes unchecked: it is a
+  // separate project with its own tsconfig, and `npm run typecheck` invokes
+  // that one too. Adding renderer sources without updating that script would
+  // leave them typechecked by nothing.
+  "exclude": ["electron/renderer"]
 }

@@ -7,7 +7,7 @@
   "scripts": {
     "test": "vitest run",
     "test:watch": "vitest",
-    "typecheck": "tsc -b --noEmit"
+    "typecheck": "tsc -b --noEmit && tsc -p electron/renderer/tsconfig.json --noEmit"
   },
   "dependencies": {
     "better-sqlite3-multiple-ciphers": "^12.4.1",
