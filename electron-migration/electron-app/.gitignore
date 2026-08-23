@@ -1,0 +1,16 @@
+# Scratch compile output for the real-Electron boot test
+# (electron/main/index.electron.test.ts) — built on the fly from the real
+# electron/**/*.ts sources via tsconfig.build.json, never hand-edited, never
+# shipped.
+dist_boot/
+
+# Leftover scratch output from the two superseded merge candidates
+# (tsconfig.build_a.json / tsconfig.build_b.json, both removed). The
+# directories are stale build artefacts, not source; kept ignored so a future
+# `git add -A` cannot pick them up.
+dist_a/
+dist_b/
+
+# Scratch compile output for electron/renderer/tsconfig.json — the renderer
+# subproject's own DOM-lib typecheck target, never hand-edited, never shipped.
+dist_renderer/

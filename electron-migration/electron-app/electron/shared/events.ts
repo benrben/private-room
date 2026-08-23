@@ -287,6 +287,7 @@ export type EventPayloads = {
   "menu-action": string;
   "ytdlp-progress": YtdlpProgressEvent;
   "agent-ui-request": AgentUiRequest;
+  "pull-progress": { status: string; percent: number | null };
 };
 
 // extracted events: browser-journal, browser-navigated, browser-searched,

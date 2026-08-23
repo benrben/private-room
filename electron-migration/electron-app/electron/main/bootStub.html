@@ -1,0 +1,33 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Arcelle — boot stub</title>
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'" />
+    <style>
+      body {
+        font: 14px -apple-system, system-ui, sans-serif;
+        padding: 2rem;
+        color: #222;
+        background: #fafafa;
+      }
+    </style>
+  </head>
+  <body>
+    <!--
+      This is NOT the app's UI — there is no renderer in this Electron
+      workspace yet (no src/ or renderer/ directory). It exists only so a real
+      BrowserWindow has a real page to load, proving that page can reach
+      `window.arcelle` through the real preload contextBridge (D10). A later,
+      separate step ports the actual pre-migration frontend in its place.
+
+      Deliberately script-free, with `default-src 'none'`: the boot proof is
+      driven from OUTSIDE the page (index.electron.test.ts evaluates JS in this
+      page's own context over CDP), so nothing here needs to run on its own —
+      and a stub page that executes no script of its own is one fewer thing to
+      keep honest.
+    -->
+    <h1>Arcelle</h1>
+    <p>Electron main process booted. This is the migration boot stub, not the app UI.</p>
+  </body>
+</html>
