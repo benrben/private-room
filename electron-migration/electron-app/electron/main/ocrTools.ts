@@ -30,17 +30,10 @@
  * PORTED FOR REAL — pure logic, no Vision/CoreGraphics dependency, exactly
  * the "parsing, math, format detection" carve-out:
  *   - {@link isOcrCandidate} — `is_ocr_candidate`, one line, own Rust test
- *     ported verbatim below. NOTE: `retrievalBackfill.ts` already carries an
- *     independent copy of this same one-liner (`isOcrCandidate`, ported
- *     before this file existed) with a doc comment there claiming "no port
- *     elsewhere in this tree and needs none" — which this file now makes
- *     literally false. Left as its own copy rather than reached into a file
- *     this batch was not asked to touch; the two are identical in behavior
- *     (both are a direct one-line translation of the same Rust source), so
- *     the duplication is harmless today but is a real candidate for a future
- *     cleanup pass (have `retrievalBackfill.ts` import from here instead,
- *     the same consolidation `peaksTools.ts`'s own doc invites for its
- *     `mediaKind` copy).
+ *     ported verbatim below. THE canonical home: `retrievalBackfill.ts`
+ *     imports it from here rather than carrying its own copy, the same
+ *     consolidation `peaksTools.ts`'s own doc already established for
+ *     `retrievalBackfill.ts`'s `mediaKind` import.
  *   - {@link pageRasterSize} — `page_raster_size`, the PDF page-size caps
  *     (area cap FIRST, then per-edge cap — order matters, see the Rust
  *     comment) that stop an attacker-controlled `/MediaBox` from asking for

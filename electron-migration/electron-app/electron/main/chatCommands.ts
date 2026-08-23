@@ -67,13 +67,7 @@
  *     real `stripThinkSpans` and `capabilities.ts`'s real `declaredFor`/
  *     `Support` (this port's `is_cli_engine`-successor, per that module's own
  *     doc).
- *   - {@link CmdCtx.askQuiet}/{@link CmdCtx.askStructured} — over
- *     `ollamaGenerate.ts`'s real `generate`/`chatStructured` (the sidecar
- *     `/generate` POST, with PRIV-1 policy injection and provider-catalog
- *     wiring already real there).
  *   - `#checkpoint` — over `roomCheckpoints.ts`'s real `createCheckpointCore`.
- *   - {@link CmdCtx.mapWindows}/{@link CmdCtx.foldNotes}/{@link CmdCtx.digest} —
- *     the full-ops map/reduce, over the two points above.
  *   - {@link watchStream} — the Stop/stall watchdog race, pure and fully
  *     ported (both Rust tests reproduced) — see its own doc for the one place
  *     the JS/Rust cancellation MODELS genuinely differ.
@@ -84,10 +78,22 @@
  *     and can't stream the pipeline), dispatch, unread-note/stopped-suffix,
  *     persist. All real.
  *
+ * {@link CmdCtx} DOES NOT reimplement `ask_quiet`/`ask_streaming`/
+ * `ask_structured`/`map_windows`/`fold_notes`/`digest`, unlike Rust's own
+ * `impl CmdCtx` inherent methods. An earlier revision of this file DID carry a
+ * second, class-method copy of that toolkit — never reachable, because every
+ * `cmd_*` body (in `chatCommandsKnowledge.ts`/`chatCommandsGenerate.ts`) calls
+ * the FREE-FUNCTION versions those two files already own, passing `ctx` as
+ * plain data (`digest(ctx, ...)`, not `ctx.digest(...)`). Two live copies of
+ * the same behavior, one of them provably dead — the class-method copy was
+ * deleted rather than kept "just in case"; {@link CmdCtx} here is a pure data
+ * container (plus {@link CmdCtx.unreadCount}, which {@link runCommand} itself
+ * reads).
+ *
  * `/generate_stream` IS PORTED — by `chatCommandsGenerate.ts`, whose own
  * `generateStream` is the real NDJSON client for `sidecar::generate_stream`
- * (the tool-less, streamed plain-generate endpoint `ask_streaming` rides).
- * {@link CmdCtx.askStreaming}'s {@link StreamGenerateFn} seam therefore
+ * (the tool-less, streamed plain-generate endpoint the free `askStreaming`
+ * rides). Its {@link StreamGenerateFn} seam (`ctx.generateStream`) therefore
  * defaults to {@link defaultStreamGenerate}, a thin adapter over it. It used
  * to default to a `NOT_IMPLEMENTED` refusal, correctly, when nothing in this
  * tree POSTed that path; keeping the refusal after a sibling in the same
@@ -142,15 +148,10 @@ import { byteLength, partitionWindows, sliceUtf8 } from "./extractionWindow.js";
 import { declaredFor } from "./capabilities.js";
 import { stripThinkSpans, listModels as listModelsReal } from "./engineRouting.js";
 import { bestLocalDefault } from "./ollamaModels.js";
-import {
-  generate as generateReal,
-  chatStructured as chatStructuredReal,
-  plainGenerateBody,
-} from "./ollamaGenerate.js";
+import { generate as generateReal, chatStructured as chatStructuredReal } from "./ollamaGenerate.js";
 import { defaultProviderDeps, type ProviderDeps } from "./providers.js";
 import { createCheckpointCore } from "./roomCheckpoints.js";
 import type { RoomManagerState } from "./roomManager.js";
-import type { SidecarChatMessage } from "./sidecar.js";
 import { TurnId, type EventSender } from "./turn.js";
 import { createToolEffects, effectsJson, type ToolEffects } from "./execTool.js";
 import { modelSetting, parseTemperature } from "./gatherContext.js";
@@ -284,17 +285,6 @@ export const CMD_WINDOW_CHARS = 16_000;
  * `CMD_WINDOW_OVERLAP`. */
 export const CMD_WINDOW_OVERLAP = 400;
 
-/** Guard against a fold that never shrinks, NOT a coverage cap. Ported
- * verbatim from `FOLD_MAX_ROUNDS`. */
-const FOLD_MAX_ROUNDS = 6;
-
-/** System prompt for the map half of a fold. Ported verbatim from `NOTE_SYS`. */
-const NOTE_SYS =
-  "You take faithful, dense notes on ONE part of a longer source. Keep every " +
-  "fact, name, number, date, decision, commitment and telling quote a reader " +
-  "of the whole source would need — these notes will REPLACE this part later, " +
-  "so anything you leave out is lost. No preamble, no commentary.";
-
 /**
  * Every window of `text`, in order — exhaustive. Ported verbatim from
  * `cmd_windows`, over `extractionWindow.ts`'s real `partitionWindows`
@@ -350,7 +340,6 @@ export function quietStepText(raw: string): string {
 /** Wall-clock ceiling for a single non-streamed command step (`askQuiet`).
  * Ported verbatim from `COMMAND_STEP_TIMEOUT_SECS`. */
 export const COMMAND_STEP_TIMEOUT_SECS = 300;
-const COMMAND_STEP_TIMEOUT_MS = COMMAND_STEP_TIMEOUT_SECS * 1_000;
 
 /** Longest gap with no token before a STREAMED step counts as stalled — the
  * ordinary (streaming-capable engine) budget. Ported verbatim from
@@ -400,9 +389,10 @@ const STREAM_STALLED_MESSAGE =
  * `watch_stream` DROP the future the instant it decides to hang up — for a
  * real HTTP stream that tears the connection down, exactly what an in-stream
  * Stop does. A JS `Promise` cannot be un-awaited from outside; `fut` here is
- * expected to be built (by {@link CmdCtx.askStreaming}'s `streamGenerate`
- * dependency) so that ITS OWN internals already watch `cancel` and abort their
- * own request — the same "cancel is polled inside the call" contract
+ * expected to be built (by a `streamGenerate`-shaped dependency, the same
+ * seam `chatCommandsGenerate.ts`'s own free `askStreaming` reads off
+ * `ctx.generateStream`) so that ITS OWN internals already watch `cancel` and
+ * abort their own request — the same "cancel is polled inside the call" contract
  * `sidecarJsonCancellable.ts` already gives `ollamaGenerate.ts`'s `generate`/
  * `chatStructured`. What THIS function adds on top, faithfully, is the OUTER
  * race Rust's watchdog exists for: noticing a Stop or a stall the inner call
@@ -461,10 +451,9 @@ export function watchStream(
 // /generate_stream — REAL, via chatCommandsGenerate.ts's own NDJSON client.
 // ============================================================================
 
-/** What {@link CmdCtx.askStreaming} needs from a real `/generate_stream` POST:
- * the request body (built by `plainGenerateBody`, identically to the
- * non-streamed path), the shared cancel flag to poll internally, and a
- * per-chunk delta callback — mirroring `sidecar::generate_stream`'s own
+/** What the free `askStreaming` (`chatCommandsGenerate.ts`) needs from a real
+ * `/generate_stream` POST: the request body, the shared cancel flag to poll
+ * internally, and a per-chunk delta callback — mirroring `sidecar::generate_stream`'s own
  * `move |d| { ... }` callback shape. Returns the FULL accumulated text on a
  * clean finish (matching `Ok(full)` from the Rust source, which the caller
  * treats identically to a Stop's partial). */
@@ -482,10 +471,9 @@ export type StreamGenerateFn = (
  *
  * This used to be a `NOT_IMPLEMENTED` refusal, correctly, when no Electron
  * code POSTed `/generate_stream` anywhere. `chatCommandsGenerate.ts` now
- * does — that is the endpoint its own `askStreaming` rides — so a refusal
- * here would be a stub standing in front of a working implementation, not an
- * honest gap. See {@link CmdCtx.askStreaming} for the one behavioural
- * consequence of the adapter's own `AbortController`.
+ * does — that is the endpoint its own free `askStreaming` rides — so a
+ * refusal here would be a stub standing in front of a working implementation,
+ * not an honest gap.
  */
 export function defaultStreamGenerateWith(providerDeps: ProviderDeps): StreamGenerateFn {
   return (body, cancel, onDelta) =>
@@ -499,14 +487,13 @@ export const defaultStreamGenerate: StreamGenerateFn = defaultStreamGenerateWith
 // CmdCtx — everything a command workflow needs. Ported from `CmdCtx<'a>`.
 // ============================================================================
 
-/** Everything {@link CmdCtx}'s own methods need to actually call an engine.
- * Every field defaults to the real, already-ported implementation except
- * {@link streamGenerate} — see the module doc. */
+/** The engine-calling seams the command bodies (`chatCommandsKnowledge.ts`/
+ * `chatCommandsGenerate.ts`) read straight off `ctx` as plain data — see the
+ * module doc. Every field defaults to the real, already-ported
+ * implementation when the caller omits it. */
 export interface CmdCtxDeps {
   generate?: typeof generateReal;
   chatStructured?: typeof chatStructuredReal;
-  streamGenerate?: StreamGenerateFn;
-  providerDeps?: ProviderDeps;
   /** Forwarded verbatim to the command bodies' own seams — see
    * {@link CommandBodyCtx}. */
   generateStream?: typeof generateStream;
@@ -546,11 +533,16 @@ export interface CmdCtxOpts extends CmdCtxDeps {
 }
 
 /**
- * Everything a command workflow needs. Ported from `CmdCtx<'a>`. Kept as a
- * class (this port's precedent for a type with real per-instance mutable
- * state and behavior — see `cancel.ts`'s `Node`/`CancelFlag`), rather than a
- * plain struct plus free functions, since `unread` genuinely is instance
- * state one method mutates and another reads.
+ * Everything a command workflow needs. Ported from `CmdCtx<'a>`'s FIELDS —
+ * not its `impl CmdCtx` methods (`ask_quiet`/`ask_streaming`/`ask_structured`/
+ * `map_windows`/`fold_notes`/`digest`/`cancelled`/`step`/`note_unread`):
+ * those are real here too, but as the FREE FUNCTIONS
+ * `chatCommandsKnowledge.ts`/`chatCommandsGenerate.ts` already own (every
+ * `cmd_*` body calls `digest(ctx, ...)`, never `ctx.digest(...)`) — see the
+ * module doc. A class rather than a plain object literal only because
+ * {@link unreadCount} needs somewhere to live and `unread` is real
+ * per-instance mutable state one caller mutates and another reads (`cancel.
+ * ts`'s `Node`/`CancelFlag` is this port's precedent for that shape).
  *
  * `implements CommandBodyCtx` IS THE CONNECTION, and is deliberately checked
  * by the compiler rather than asserted in a comment: Rust's `run_command`
@@ -586,9 +578,6 @@ export class CmdCtx implements CommandBodyCtx {
   readonly layoutGraph?: LayoutGraphFn;
   readonly stepTimeoutMs?: number;
 
-  private readonly streamGenerateFn: StreamGenerateFn;
-  private readonly providerDeps: ProviderDeps;
-
   constructor(opts: CmdCtxOpts) {
     this.model = opts.model;
     this.refs = opts.refs;
@@ -619,203 +608,15 @@ export class CmdCtx implements CommandBodyCtx {
     if (opts.stepTimeoutMs !== undefined) {
       this.stepTimeoutMs = opts.stepTimeoutMs;
     }
-    this.providerDeps = opts.providerDeps ?? defaultProviderDeps;
-    this.streamGenerateFn = opts.streamGenerate ?? defaultStreamGenerateWith(this.providerDeps);
-  }
-
-  /** Ported from `CmdCtx::cancelled`. */
-  cancelled(): boolean {
-    return this.cancel.load();
-  }
-
-  /** One step chip, stamped with this command's run and chat. Ported from
-   * `CmdCtx::step`. */
-  step(label: string): void {
-    this.turn.step(this.send, label);
-  }
-
-  /** Record that one window of the source could not be read. Ported from
-   * `CmdCtx::note_unread`. */
-  noteUnread(): void {
-    this.unread.count += 1;
   }
 
   /** How many windows of the source could not be read this run — read by
-   * {@link runCommand} at the end, matching `ctx.unread.load(...)`. */
+   * {@link runCommand} at the end, matching `ctx.unread.load(...)`. Every
+   * `cmd_*` body increments {@link unread}'s `count` directly (the free
+   * `noteUnread(ctx)` in `chatCommandsKnowledge.ts`), so this class needs no
+   * mutating counterpart of its own. */
   unreadCount(): number {
     return this.unread.count;
-  }
-
-  /**
-   * One model call streamed live into the chat. Ported from
-   * `CmdCtx::ask_streaming`. Every emitted delta rides `this.turn.emit(...,
-   * "ask-delta", d)`, unchanged from the Rust source.
-   */
-  async askStreaming(system: string, user: string): Promise<string> {
-    const messages: SidecarChatMessage[] = [
-      { role: "system", content: system },
-      { role: "user", content: user },
-    ];
-    const body = plainGenerateBody(this.model, messages, this.temperature, KEEP_ALIVE_WARM);
-    const lastToken = { value: Date.now() };
-    const partial = { value: "" };
-    const fut = this.streamGenerateFn(body, this.cancel, (delta) => {
-      lastToken.value = Date.now();
-      partial.value += delta;
-      this.turn.emit(this.send, "ask-delta", delta);
-    });
-    return watchStream(fut, this.cancel, lastToken, partial, streamIdleSecs(this.model), COMMAND_STOP_GRACE_MS);
-  }
-
-  /**
-   * One model call whose output is NOT shown as chat, so it isn't streamed.
-   * Ported from `CmdCtx::ask_quiet`, over `ollamaGenerate.ts`'s real
-   * `generate`.
-   *
-   * TIMEOUT MODEL DIFFERENCE FROM RUST: Rust's `tokio::time::timeout` wraps
-   * the whole call and, on expiry, DROPS it — which aborts the in-flight
-   * request as a side effect of the drop. A JS `Promise` returned by
-   * `generate()` cannot be un-awaited the same way, so this races it against a
-   * plain timer instead ({@link raceWithTimeout}): the caller gets the exact
-   * same actionable error within the same budget, but the abandoned sidecar
-   * call itself keeps running in the background until it resolves on its own
-   * (or until a genuine user Stop reaches it through the shared `cancelFlag`,
-   * which `generate()`'s own `opts.cancel` polls for real, same as Rust's
-   * `Some(self.cancel.clone())`).
-   */
-  async askQuiet(system: string, user: string, temp: number | null): Promise<string> {
-    const messages: SidecarChatMessage[] = [
-      { role: "system", content: system },
-      { role: "user", content: user },
-    ];
-    const call = (this.generate ?? generateReal)(this.model, messages, temp, KEEP_ALIVE_WARM, {
-      cancel: this.cancel,
-      providerDeps: this.providerDeps,
-    });
-    const text = await raceWithTimeout(
-      call,
-      this.stepTimeoutMs ?? COMMAND_STEP_TIMEOUT_MS,
-      STEP_TIMEOUT_MESSAGE
-    );
-    return quietStepText(text);
-  }
-
-  /**
-   * ADD-22: like {@link askQuiet}, but the reply is CONSTRAINED to `schema`.
-   * Ported from `CmdCtx::ask_structured`, over `ollamaGenerate.ts`'s real
-   * `chatStructured`. No timeout of its own, matching the Rust source.
-   */
-  async askStructured(system: string, user: string, temp: number | null, schema: unknown): Promise<string> {
-    const messages: SidecarChatMessage[] = [
-      { role: "system", content: system },
-      { role: "user", content: user },
-    ];
-    return (this.chatStructured ?? chatStructuredReal)(this.model, messages, temp, KEEP_ALIVE_WARM, schema, {
-      cancel: this.cancel,
-      providerDeps: this.providerDeps,
-    });
-  }
-
-  /**
-   * The MAP half of a full pass: one quiet call per window of `source`, in
-   * order. Ported from `CmdCtx::map_windows`. A Stop between windows ends the
-   * pass with what it already has; a window whose call fails (or times out)
-   * contributes nothing and counts as unread rather than aborting the run.
-   */
-  async mapWindows(
-    source: string,
-    label: string,
-    system: string,
-    user: (window: string) => string,
-    temp: number | null
-  ): Promise<string[]> {
-    const windows = cmdWindows(source);
-    const total = windows.length;
-    const out: string[] = [];
-    for (let i = 0; i < windows.length; i++) {
-      if (this.cancelled()) {
-        break;
-      }
-      if (total > 1) {
-        this.step(`${label} (${i + 1}/${total})`);
-      }
-      let piece: string;
-      try {
-        piece = await this.askQuiet(system, user(windows[i] as string), temp);
-      } catch {
-        this.noteUnread();
-        continue;
-      }
-      const trimmed = piece.trim();
-      if (trimmed !== "") {
-        out.push(trimmed);
-      } else {
-        this.noteUnread();
-      }
-    }
-    return out;
-  }
-
-  /**
-   * The REDUCE half: fold notes down to something one call can hold. Ported
-   * from `CmdCtx::fold_notes`. Every round has already seen the whole source,
-   * so this loses detail, never coverage.
-   */
-  async foldNotes(notes: readonly string[], label: string): Promise<string> {
-    let text = notes.join("\n\n");
-    for (let round = 0; round < FOLD_MAX_ROUNDS; round++) {
-      if (byteLength(text) <= CMD_WINDOW_CHARS || this.cancelled()) {
-        break;
-      }
-      const before = byteLength(text);
-      const roundNotes = await this.mapWindows(text, label, NOTE_SYS, (w) => `Notes:\n${w}`, 0.2);
-      if (roundNotes.length === 0) {
-        break;
-      }
-      const joined = roundNotes.join("\n\n");
-      // A round that didn't shrink won't shrink next time either.
-      if (byteLength(joined) >= before) {
-        break;
-      }
-      text = joined;
-    }
-    return text;
-  }
-
-  /**
-   * The whole of `text`, reduced to what one call can hold WITHOUT dropping
-   * any of it — the "full ops" replacement for a byte clamp. Ported from
-   * `CmdCtx::digest`.
-   */
-  async digest(text: string, label: string): Promise<string> {
-    if (byteLength(text) <= CMD_WINDOW_CHARS) {
-      return text;
-    }
-    const notes = await this.mapWindows(text, label, NOTE_SYS, (w) => `Part of the source:\n${w}`, 0.2);
-    return this.foldNotes(notes, label);
-  }
-}
-
-/** `commands::models::KEEP_ALIVE_WARM` — a plain literal, not a re-port of
- * that lookup table, matching `filePass.ts`/`storyTools.ts`/`recRead.ts`'s
- * already-established precedent for the same constant. */
-const KEEP_ALIVE_WARM = "30m";
-
-const STEP_TIMEOUT_MESSAGE =
-  "The model took too long to respond. Try a shorter selection, or switch to a faster model in Settings.";
-
-/** Race `promise` against a `ms`-budget timer, rejecting with `message` if the
- * timer wins. See {@link CmdCtx.askQuiet}'s own doc for how this differs from
- * Rust's drop-based `tokio::time::timeout`. */
-async function raceWithTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error(message)), ms);
-  });
-  try {
-    return await Promise.race([promise, timeout]);
-  } finally {
-    clearTimeout(timer);
   }
 }
 
@@ -950,8 +751,6 @@ export interface RunCommandDeps {
   /** Forwarded into every {@link CmdCtx} this run builds. */
   generate?: typeof generateReal;
   chatStructured?: typeof chatStructuredReal;
-  streamGenerate?: StreamGenerateFn;
-  providerDeps?: ProviderDeps;
   generateStream?: typeof generateStream;
   transcribeAudio?: TranscribeAudioFn;
   layoutGraph?: LayoutGraphFn;
@@ -1035,8 +834,6 @@ export async function runCommand(req: RunCommandRequest, deps: RunCommandDeps): 
       emit: deps.emit ?? deps.send,
       generate: deps.generate,
       chatStructured: deps.chatStructured,
-      streamGenerate: deps.streamGenerate,
-      providerDeps: deps.providerDeps,
       generateStream: deps.generateStream,
       transcribeAudio: deps.transcribeAudio,
       layoutGraph: deps.layoutGraph,

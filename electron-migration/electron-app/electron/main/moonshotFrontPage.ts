@@ -64,20 +64,16 @@
  * cleaned-up version of it. See `moonshotFrontPage.test.ts`'s
  * `sequencedRooms`-driven tests for both re-read points exercised directly.
  *
- * ONE DEPENDENCY STILL NEEDED PORTING HERE, TINY AND DUPLICATED RATHER THAN
- * SHARED, following this rewrite's established "too small to justify a
- * shared port" precedent (`storyTools.ts`'s own module doc lists
- * `splitWhitespace`/`namesAppear`, `capabilities.ts` lists
- * `isCloudModel`/`primaryCliScope`, as exactly this):
- *
- *  - {@link isSummaryFile} — `commands::summarize::is_summary_file`. That
- *    whole module (`summarize.rs`) has no Electron port yet, but the
- *    predicate itself is two string comparisons and an `&&`, reproduced
- *    verbatim here rather than invented. When `summarize.rs` is ported for
- *    real, that file's version should become the shared one and this local
- *    copy should be deleted in favor of importing it — exactly the
- *    "duplicated now, promote later" note `feedbackTools.ts` makes about its
- *    own `bestLocalDefault`.
+ * `isSummaryFile` — `commands::summarize::is_summary_file` — USED TO BE a
+ * tiny duplicated-rather-than-shared copy here, written when `summarize.rs`
+ * had no Electron port yet ("when it is ported for real, that file's version
+ * should become the shared one and this local copy should be deleted in
+ * favor of importing it" — this file's own prediction). `summarizeTools.ts`
+ * is now that real port and exports {@link isSummaryFile} for real, so this
+ * file imports it — the same "the moment the overlap was found" promotion
+ * the OVERLAP note above already did for {@link resolveStructuredModel}.
+ * `moonshotAiActions.ts` carried the identical duplicate for the identical
+ * reason and was promoted alongside this file.
  *
  * REUSED, not re-declared:
  *  - {@link FrontPage} — already declared, camelCase and field-for-field with
@@ -123,27 +119,11 @@ import {
   sidecarJsonCancellable,
   type SidecarPostOutcome,
 } from "./sidecarJsonCancellable.js";
+import { isSummaryFile } from "./summarizeTools.js";
 import type { OpenRoom } from "./turnEngine.js";
 
 export type { FrontPage };
 export type { OpenRoom, RoomSource };
-
-// ---------------------------------------------------- is_summary_file (dup)
-
-/** `commands::summarize::SUMMARY_FILE_NAME` — the one canonical, overwrite-
- * in-place summary file. See this module's doc for why this is duplicated
- * rather than imported. */
-const SUMMARY_FILE_NAME = "Room summary.html";
-
-/** `commands::summarize::is_summary_file`, verbatim: true for the app's own
- * generated summary file (current HTML name, or the legacy Markdown name so
- * an old room's summary is not fed back into a new one), so both `frontPageOf`
- * and `frontPageSuggestions` leave the room's own output out of the strip and
- * the file-name list they show/send. A user upload sharing the name is NOT
- * excluded — `source` must be `"generated"`. */
-function isSummaryFile(name: string, source: string): boolean {
-  return (name === SUMMARY_FILE_NAME || name === "Room summary.md") && source === "generated";
-}
 
 // ------------------------------------------------------------ FileMeta shape
 

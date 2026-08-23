@@ -53,15 +53,16 @@
  *     same reason `chatCommandsKnowledge.ts` gives for its own copy: it is
  *     four lines, and every existing copy lives inside a much larger,
  *     unrelated file.
- *   - `isSummaryFile` (private) — a direct port of
- *     `commands/summarize.rs::is_summary_file` (2 lines), needed by
- *     {@link gatherScopeText}'s whole-room branch to exclude the app's own
- *     generated room summary from being summarized/analyzed/etc. again.
- *     `moonshotFrontPage.ts` (the concurrent batch above) carries an identical
- *     private copy for the identical reason — this port's established
- *     "duplicate a small pure predicate rather than import across an
- *     unrelated file" convention (`storyTools.ts`'s own doc names it), not an
- *     oversight.
+ *   - `isSummaryFile`, needed by {@link gatherScopeText}'s whole-room branch
+ *     to exclude the app's own generated room summary from being
+ *     summarized/analyzed/etc. again — USED TO BE a direct, private port of
+ *     `commands/summarize.rs::is_summary_file` (2 lines), duplicated because
+ *     `summarize.rs` had no Electron port yet (`moonshotFrontPage.ts` carried
+ *     an identical private copy for the identical reason). `summarizeTools.ts`
+ *     is now that real port and exports {@link isSummaryFile} for real, so
+ *     this file imports it instead — the same promotion
+ *     {@link resolveStructuredModel} itself already got below, the moment
+ *     `moonshotCmds.ts` existed to import it from.
  *
  * `resolveStructuredModel` ITSELF is NOT re-derived here: `moonshotCmds.ts`
  * (the concurrent port of `moonshot.rs`, the dispatcher these submodules
@@ -160,6 +161,7 @@ import {
   sidecarJsonCancellable,
   type SidecarPostOutcome,
 } from "./sidecarJsonCancellable.js";
+import { isSummaryFile } from "./summarizeTools.js";
 import { clampBytes } from "./textClamp.js";
 import { isFailureNotice } from "./turnNotices.js";
 import { emitUnowned, type EventSender } from "./turn.js";
@@ -205,16 +207,6 @@ function requireRoom(rooms: RoomSource): RoomHandle {
 // studios.rs's small text-gathering/naming helpers — the exact slice
 // `ai_actions.rs` calls. See this module's own doc.
 // ============================================================================
-
-/** `commands/summarize.rs::is_summary_file` (`SUMMARY_FILE_NAME` inlined —
- * two lines, ported verbatim rather than importing a whole unported module
- * for one string comparison). True for the app's own generated room-summary
- * file, current HTML name or the legacy Markdown one, but only when it was
- * actually GENERATED — a user file that merely shares the name is not
- * excluded. */
-function isSummaryFile(name: string, source: string): boolean {
-  return (name === "Room summary.html" || name === "Room summary.md") && source === "generated";
-}
 
 /** The byte cap every gathered blob (whole document, whole-room digest, or
  * @-ref concatenation) is held to before it reaches a model call. Ported

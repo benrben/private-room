@@ -1,11 +1,12 @@
 /**
  * Tests for `chatCommands.ts`: the `CHAT_COMMANDS` catalog, the full-ops
  * window/history helpers, the quiet-step/streaming-idle helpers, the
- * `watchStream` watchdog, `CmdCtx`'s engine-calling methods, and the
- * `runCommand` dispatcher end to end. Reproduces all three of
- * `chat_commands.rs`'s own `#[cfg(test)]` modules
- * (`full_ops_tests`/`quiet_step_tests`/`stream_watchdog_tests`), plus new
- * coverage for the dispatcher itself.
+ * `watchStream` watchdog, and the `runCommand` dispatcher end to end.
+ * `CmdCtx`'s own engine-calling toolkit (`ask_quiet`/`ask_streaming`/
+ * `map_windows`/`fold_notes`/`digest`/…) is reproduced instead in
+ * `chatCommandsKnowledge.test.ts`/`chatCommandsGenerate.test.ts`, against the
+ * free functions those files actually call — see `CmdCtx has no dead
+ * duplicate toolkit` below for why this file no longer carries its own copy.
  *
  * Real fixture rooms (`db-host/open.ts`'s `createRoom`), real `cancel.ts`
  * state, real `turn.ts` envelopes — this repo's convention: real behavior
@@ -49,20 +50,13 @@ import {
   watchStream,
   type CommandResult,
   type RunCommandDeps,
-  type StreamGenerateFn,
 } from "./chatCommands.js";
 import { insertMessage, listMessages } from "./db-host/messages.js";
 import { listFiles } from "./db-host/files.js";
 import { listMemories } from "./db-host/memories.js";
 import { createRoom } from "./db-host/open.js";
 import { setSetting } from "./db-host/settings.js";
-import {
-  chatStructured as chatStructuredReal,
-  generate as generateReal,
-  type GenerateOpts,
-} from "./ollamaGenerate.js";
 import { createRoomManagerState, type RoomManagerState } from "./roomManager.js";
-import type { SidecarChatMessage } from "./sidecar.js";
 import { TurnId } from "./turn.js";
 import type { TurnRoomSource } from "./turnEngine.js";
 
@@ -96,11 +90,6 @@ function freshRoom(): { db: Database.Database; room: TurnRoomSource; checkpointS
   const checkpointState = createRoomManagerState();
   checkpointState.room = { conn: db, path: roomPath, name: "Test Room", password: PASSWORD };
   return { db, room, checkpointState, path: roomPath };
-}
-
-function recordingSender(): { send: (event: string, payload: unknown) => void; events: Array<[string, unknown]> } {
-  const events: Array<[string, unknown]> = [];
-  return { send: (event, payload) => events.push([event, payload]), events };
 }
 
 function baseDeps(fixture: ReturnType<typeof freshRoom>, overrides: Partial<RunCommandDeps> = {}): RunCommandDeps {
@@ -290,26 +279,7 @@ describe("watchStream", () => {
 // CmdCtx
 // ============================================================================
 
-function makeCtx(opts: {
-  generate?: (
-    model: string,
-    messages: readonly SidecarChatMessage[],
-    temperature: number | null,
-    keepAlive: string,
-    opts?: GenerateOpts
-  ) => Promise<string>;
-  chatStructured?: (
-    model: string,
-    messages: readonly SidecarChatMessage[],
-    temperature: number | null,
-    keepAlive: string,
-    schema: unknown,
-    opts?: unknown
-  ) => Promise<string>;
-  streamGenerate?: StreamGenerateFn;
-  cancel?: CancelFlag;
-  send?: (event: string, payload: unknown) => void;
-}): CmdCtx {
+function makeCtx(opts: { cancel?: CancelFlag; send?: (event: string, payload: unknown) => void } = {}): CmdCtx {
   const cancel = opts.cancel ?? new CancelFlag();
   return new CmdCtx({
     model: "qwen3.5:4b",
@@ -321,78 +291,38 @@ function makeCtx(opts: {
     turn: new TurnId("ask-1", "chat-1"),
     send: opts.send ?? (() => {}),
     room: { roomEpoch: () => 1, currentRoomPath: () => null, currentRoom: () => null },
-    generate: opts.generate as unknown as typeof generateReal,
-    chatStructured: opts.chatStructured as unknown as typeof chatStructuredReal,
-    streamGenerate: opts.streamGenerate,
   });
 }
 
-describe("CmdCtx.askQuiet", () => {
-  it("strips a model's <think> preamble from a quiet step", async () => {
-    const generate = vi.fn().mockResolvedValue("<think>reasoning</think>Bonjour le monde.");
-    const ctx = makeCtx({ generate });
-    await expect(ctx.askQuiet("system", "user text", 0.2)).resolves.toBe("Bonjour le monde.");
-    expect(generate).toHaveBeenCalledWith(
-      "qwen3.5:4b",
-      [
-        { role: "system", content: "system" },
-        { role: "user", content: "user text" },
-      ],
-      0.2,
-      "30m",
-      expect.objectContaining({ cancel: expect.any(CancelFlag) })
-    );
-  });
-
-  it("times out with an actionable message when the model never answers", async () => {
-    vi.useFakeTimers();
-    const generate = vi.fn().mockReturnValue(new Promise<string>(() => {}));
-    const ctx = makeCtx({ generate });
-    const pending = ctx.askQuiet("system", "user text", null);
-    // Attach the rejection assertion before advancing the clock — see the
-    // matching comment on the watchStream "silent stream" test above.
-    const assertion = expect(pending).rejects.toThrow(/took too long/);
-    await vi.advanceTimersByTimeAsync(300_000);
-    await assertion;
+describe("CmdCtx has no dead duplicate toolkit", () => {
+  it("does not redeclare the ask/map/fold/digest methods chatCommandsKnowledge.ts/chatCommandsGenerate.ts already own", () => {
+    // A prior batch's three concurrent build agents each built their own
+    // CmdCtx; fixing the two incompatible ones (this file's module doc) left
+    // a THIRD, structurally-valid-but-unreachable one behind — this class
+    // quietly reimplementing, as instance methods, the exact toolkit every
+    // real `cmd_*` body already calls as free functions (`digest(ctx, ...)`,
+    // never `ctx.digest(...)`). Reintroducing any of these as methods here
+    // would resurrect that dead copy.
+    const ctx = makeCtx();
+    for (const name of [
+      "askQuiet",
+      "askStreaming",
+      "askStructured",
+      "mapWindows",
+      "foldNotes",
+      "digest",
+      "cancelled",
+      "step",
+      "noteUnread",
+    ]) {
+      expect(name in ctx).toBe(false);
+    }
+    // The one method runCommand itself still reads off a real CmdCtx.
+    expect(typeof ctx.unreadCount).toBe("function");
   });
 });
 
-describe("CmdCtx.askStructured", () => {
-  it("passes the schema through to chatStructured with no timeout of its own", async () => {
-    const chatStructured = vi.fn().mockResolvedValue('{"ok":true}');
-    const ctx = makeCtx({ chatStructured });
-    const schema = { type: "object" };
-    await expect(ctx.askStructured("sys", "usr", 0.5, schema)).resolves.toBe('{"ok":true}');
-    expect(chatStructured).toHaveBeenCalledWith(
-      "qwen3.5:4b",
-      [
-        { role: "system", content: "sys" },
-        { role: "user", content: "usr" },
-      ],
-      0.5,
-      "30m",
-      schema,
-      expect.objectContaining({ cancel: expect.any(CancelFlag) })
-    );
-  });
-});
-
-describe("CmdCtx.askStreaming", () => {
-  it("emits every delta as ask-delta and resolves the future's own final text", async () => {
-    const { send, events } = recordingSender();
-    const streamGenerate = vi.fn(
-      async (_body: Record<string, unknown>, _cancel: CancelFlag, onDelta: (d: string) => void) => {
-        onDelta("Bon");
-        onDelta("jour");
-        return "Bonjour le monde.";
-      }
-    );
-    const ctx = makeCtx({ streamGenerate, send });
-    await expect(ctx.askStreaming("sys", "usr")).resolves.toBe("Bonjour le monde.");
-    const deltas = events.filter(([event]) => event === "ask-delta");
-    expect(deltas.map(([, payload]) => (payload as { v: string }).v)).toEqual(["Bon", "jour"]);
-  });
-
+describe("defaultStreamGenerate", () => {
   it("defaults to the REAL /generate_stream client, not a NOT_IMPLEMENTED stub", async () => {
     // `chatCommandsGenerate.ts` ports `sidecar::generate_stream` for real, so
     // this seam must reach it. Proven without a network: the real client's
@@ -408,95 +338,6 @@ describe("CmdCtx.askStreaming", () => {
     expect(err?.message).not.toMatch(/NOT_IMPLEMENTED/);
     expect(err?.message).toMatch(/no sidecar in this test/);
     vi.mocked(ensureUp).mockReset();
-  });
-
-  it("a Stop mid-stream keeps the partial once the grace period elapses", async () => {
-    vi.useFakeTimers();
-    const cancel = new CancelFlag();
-    const streamGenerate = vi.fn(
-      async (_body: Record<string, unknown>, _c: CancelFlag, onDelta: (d: string) => void) => {
-        onDelta("partial answer");
-        cancel.store(true);
-        return new Promise<string>(() => {}); // never actually finishes
-      }
-    );
-    const ctx = makeCtx({ streamGenerate, cancel });
-    const pending = ctx.askStreaming("sys", "usr");
-    // One tick to let streamGenerate emit its delta and flip cancel, then run
-    // past the poll cadence + the stop grace period.
-    await vi.advanceTimersByTimeAsync(0);
-    await vi.advanceTimersByTimeAsync(2_000);
-    await expect(pending).resolves.toBe("partial answer");
-  });
-});
-
-describe("CmdCtx.mapWindows / foldNotes / digest", () => {
-  it("mapWindows steps per window only when there is more than one, and counts unread windows", async () => {
-    const { send, events } = recordingSender();
-    const source = "x".repeat(CMD_WINDOW_CHARS + 1000); // forces >1 window
-    let call = 0;
-    const generate = vi.fn().mockImplementation(async () => {
-      call += 1;
-      // The second window's model call comes back empty -> counted unread.
-      return call === 2 ? "" : `note ${call}`;
-    });
-    const ctx = makeCtx({ generate, send });
-    const notes = await ctx.mapWindows(source, "Reading", "sys", (w) => w, 0.2);
-    expect(notes).toEqual(["note 1"]);
-    expect(ctx.unreadCount()).toBe(1);
-    const steps = events.filter(([event]) => event === "ask-step").map(([, p]) => (p as { v: string }).v);
-    expect(steps).toEqual(["Reading (1/2)", "Reading (2/2)"]);
-  });
-
-  it("mapWindows does not step at all for a single-window source", async () => {
-    const { send, events } = recordingSender();
-    const generate = vi.fn().mockResolvedValue("only note");
-    const ctx = makeCtx({ generate, send });
-    const notes = await ctx.mapWindows("short source", "Reading", "sys", (w) => w, null);
-    expect(notes).toEqual(["only note"]);
-    expect(events.filter(([event]) => event === "ask-step")).toHaveLength(0);
-  });
-
-  it("a failed window is counted unread, not thrown", async () => {
-    const generate = vi.fn().mockRejectedValue(new Error("engine down"));
-    const ctx = makeCtx({ generate });
-    const notes = await ctx.mapWindows("short source", "Reading", "sys", (w) => w, null);
-    expect(notes).toEqual([]);
-    expect(ctx.unreadCount()).toBe(1);
-  });
-
-  it("foldNotes stops once a round fails to shrink", async () => {
-    // Every round echoes back exactly what it was given -> never shrinks.
-    const generate = vi.fn().mockImplementation(async (_m: string, messages: SidecarChatMessage[]) => {
-      const user = messages[1]!.content;
-      return user.replace(/^Notes:\n/, "");
-    });
-    const ctx = makeCtx({ generate });
-    const big = "y".repeat(CMD_WINDOW_CHARS + 500);
-    const folded = await ctx.foldNotes([big], "Folding");
-    // Stops after the first non-shrinking round rather than looping forever:
-    // `text` is only ever reassigned to a round's joined output once that
-    // round proved it shrank, so a round that doesn't leaves the ORIGINAL
-    // text untouched — never mind that this source needed two window calls
-    // (it is 500 bytes over budget) to produce that one non-shrinking round.
-    expect(folded).toBe(big);
-    expect(generate).toHaveBeenCalledTimes(2);
-  });
-
-  it("digest returns short text unchanged with no model call", async () => {
-    const generate = vi.fn();
-    const ctx = makeCtx({ generate });
-    await expect(ctx.digest("short", "Reading")).resolves.toBe("short");
-    expect(generate).not.toHaveBeenCalled();
-  });
-
-  it("digest maps then folds a long text", async () => {
-    const generate = vi.fn().mockResolvedValue("a short note");
-    const ctx = makeCtx({ generate });
-    const long = "z".repeat(CMD_WINDOW_CHARS + 1000);
-    // Two windows (1000 bytes over budget), one note apiece, joined — already
-    // well under CMD_WINDOW_CHARS so foldNotes's own loop never fires.
-    await expect(ctx.digest(long, "Reading")).resolves.toBe("a short note\n\na short note");
   });
 });
 
@@ -617,8 +458,10 @@ describe("runCommand", () => {
   it("appends the unread-parts note when the handler flagged coverage gaps", async () => {
     const fixture = freshRoom();
     const handler = vi.fn(async (ctx: CmdCtx): Promise<CommandResult> => {
-      ctx.noteUnread();
-      ctx.noteUnread();
+      // Matches how the real `cmd_*` bodies flag a gap — `chatCommandsKnowledge
+      // .ts`'s private `noteUnread(ctx)` mutates this same field directly.
+      ctx.unread.count += 1;
+      ctx.unread.count += 1;
       return { content: "Partial summary.", sources: [], effects: defaultCommandResult().effects };
     });
     const msg = await runCommand(

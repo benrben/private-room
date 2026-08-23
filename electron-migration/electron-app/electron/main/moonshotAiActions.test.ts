@@ -245,6 +245,28 @@ describe("gatherScopeText", () => {
     expect(text).toContain("A person's own file.");
   });
 
+  it("also excludes the LEGACY 'Room summary.md' name, not just the current .html one", () => {
+    // Regression guard for the isSummaryFile consolidation: this file used to
+    // carry its own private copy of `summarize.rs::is_summary_file` before
+    // importing it from `summarizeTools.ts` (which owns the full unit-level
+    // coverage, including this legacy-name case, in its own test file). Both
+    // names are exercised here too so a future drift between the import and
+    // this call site's expectations fails an integration test as well.
+    const room = freshRoom("My Room");
+    insertFile(room.db, "One.md", "text/markdown", Buffer.from("x"), "First file body.", "user");
+    insertFile(
+      room.db,
+      "Room summary.md",
+      "text/markdown",
+      Buffer.from("x"),
+      "An old room's generated summary.",
+      "generated"
+    );
+    const [, text] = gatherScopeText(room.db, null, room.name);
+    expect(text).toContain("First file body.");
+    expect(text).not.toContain("Room summary");
+  });
+
   it("refuses a room with no readable text yet", () => {
     const room = freshRoom();
     expect(() => gatherScopeText(room.db, null, room.name)).toThrow(

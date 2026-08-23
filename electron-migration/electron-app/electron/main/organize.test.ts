@@ -303,6 +303,26 @@ describe("organize", () => {
     expect(r.failed, "an empty name resolves to nothing, silently").toEqual([]);
   });
 
+  it("merge_files survives an `into` name whose extension is an Object.prototype key", () => {
+    // `into` is MODEL INPUT (the merge_files tool's own new-file-name
+    // argument), so an extension of `constructor`/`__proto__`/… must not
+    // read `Object`/`Object.prototype` off the plain MIME_BY_EXT `{}`
+    // literal in place of "not found" — see docsHtml.ts's `noteMime` for the
+    // same class of bug on a sibling copy of this table. A non-string mime
+    // reaching `insertFile` dies inside better-sqlite3 with "SQLite3 can
+    // only bind numbers, strings, bigints, buffers, and null"; guarded, it
+    // falls back to text/plain exactly like `mime_guess::from_path` does.
+    const db = room();
+    add(db, "one.md", "First half.");
+    add(db, "two.md", "Second half.");
+    for (const into of ["Report.constructor", "Report.__proto__", "Report.hasOwnProperty"]) {
+      const [name] = merge(db, ["one.md", "two.md"], into, false, false);
+      expect(name).toBe(into);
+      const [id] = findFileLike(db, name);
+      expect(getFileMeta(db, id).mimeType).toBe("text/plain");
+    }
+  });
+
   it("merge_does_not_trash_a_source_it_could_not_read", () => {
     // The `merged.includes(name)` filter on the trash list. A file skipped for
     // having no readable text contributed nothing to the merged document, so

@@ -3,12 +3,15 @@
  * `src-tauri/src/commands/retrieval/backfill.rs`.
  *
  * `passIsCurrent`'s three cases are a direct port of backfill.rs's own
- * `#[cfg(test)] mod tests`, and `isOcrCandidate`'s is a direct port of
- * `ocr.rs`'s `ocr_candidates_are_images_and_pdfs`. Those are the only Rust
- * unit tests that exist for this material: `spawn_reextract_backfill`,
- * `spawn_legacy_text_repair` and `backfill_embeddings` each need a real
- * `tauri::AppHandle`, which the Rust suite never constructs. Everything else
- * here is new coverage, following the precedent `autoIndex.test.ts` and
+ * `#[cfg(test)] mod tests` — the only Rust unit tests that exist for this
+ * material (`spawn_reextract_backfill`, `spawn_legacy_text_repair` and
+ * `backfill_embeddings` each need a real `tauri::AppHandle`, which the Rust
+ * suite never constructs). `isOcrCandidate`'s own port of `ocr.rs`'s
+ * `ocr_candidates_are_images_and_pdfs` lives in `ocrTools.test.ts` — this file
+ * imports the predicate from `ocrTools.ts` rather than carrying a second copy,
+ * and exercises it only through `runReextractBackfill`'s real skip branch
+ * below ("skips images, PDFs and media using the REAL predicates"). Everything
+ * else here is new coverage, following the precedent `autoIndex.test.ts` and
  * `privacy.test.ts` set for a ported room-lifecycle background pass.
  *
  * REAL FIXTURE ROOMS throughout (this directory's convention): every test that
@@ -53,7 +56,6 @@ import {
   embedQuestion,
   embedViaSidecar,
   extractTextNotImplemented,
-  isOcrCandidate,
   passIsCurrent,
   runEmbedBackfillPass,
   runLegacyTextRepair,
@@ -137,26 +139,6 @@ describe("passIsCurrent", () => {
 
   it("the current pass writes (the_current_pass_writes)", () => {
     expect(passIsCurrent(3, 3, ROOM, ROOM)).toBe(true);
-  });
-});
-
-// ============================================================================
-// is_ocr_candidate — ocr.rs's own test, verbatim
-// ============================================================================
-
-describe("isOcrCandidate", () => {
-  it("ocr candidates are images and pdfs (ocr_candidates_are_images_and_pdfs)", () => {
-    expect(isOcrCandidate("image/jpeg", "jpg")).toBe(true);
-    expect(isOcrCandidate("image/png", "png")).toBe(true);
-    expect(isOcrCandidate("application/pdf", "pdf")).toBe(true);
-    // Not scans: text/office formats we already extract natively.
-    expect(isOcrCandidate("text/plain", "txt")).toBe(false);
-    expect(
-      isOcrCandidate(
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        "docx"
-      )
-    ).toBe(false);
   });
 });
 
@@ -681,6 +663,29 @@ describe("runReextractBackfill", () => {
       },
     });
     expect(seen).toEqual(["notes.xlsx"]);
+    db.close();
+  });
+
+  it("uses ocrTools.ts's own startsWith semantics, not a hypothetical looser copy", async () => {
+    // Regression guard for the isOcrCandidate consolidation: this file used
+    // to carry its OWN byte-identical copy of `ocr::is_ocr_candidate` before
+    // importing it from `ocrTools.ts`. A mime that merely CONTAINS "image/"
+    // (rather than starting with it) is exactly the case ocrTools.test.ts's
+    // own adversarial coverage pins down — reused here at the real call site
+    // so a future drift between the two would fail an integration test too,
+    // not only ocrTools.ts's own unit test.
+    const db = freshRoom();
+    addFile(db, "weird.bin", "application/x-image/jpeg", null);
+    const seen: string[] = [];
+    await runReextractBackfill({
+      rooms: fakeRooms(() => ({ db, path: ROOM })),
+      roomEpoch: () => 0,
+      extractText: (name) => {
+        seen.push(name);
+        return "recovered";
+      },
+    });
+    expect(seen).toEqual(["weird.bin"]);
     db.close();
   });
 

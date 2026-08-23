@@ -286,6 +286,24 @@ describe("saveGeneratedFile", () => {
     const db = freshRoomDb();
     expect(saveGeneratedFile(db, "weird.xyz", "???").mimeType).toBe("text/plain");
   });
+
+  it("survives a requested name whose extension is an Object.prototype key", () => {
+    // `requestedName` is the USER'S OWN TYPED TEXT ("save that as …", parsed
+    // by `requestedFileName`) — so an extension of `constructor`/
+    // `__proto__`/… must not read `Object`/`Object.prototype` off the plain
+    // MIME_BY_EXT `{}` literal in place of "not found" (see docsHtml.ts's
+    // `noteMime` for the same class of bug on a sibling copy of this table).
+    // A non-string mime reaching `insertFile` dies inside better-sqlite3 with
+    // "SQLite3 can only bind numbers, strings, bigints, buffers, and null";
+    // guarded, it falls back to text/plain exactly like
+    // `mime_guess::from_path` does in Rust.
+    const db = freshRoomDb();
+    for (const name of ["Report.constructor", "Report.__proto__", "Report.hasOwnProperty"]) {
+      const meta = saveGeneratedFile(db, name, "content");
+      expect(meta.name).toBe(name);
+      expect(meta.mimeType).toBe("text/plain");
+    }
+  });
 });
 
 // ============================================================== streamAnswer

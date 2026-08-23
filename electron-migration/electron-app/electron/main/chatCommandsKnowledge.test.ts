@@ -375,6 +375,32 @@ describe("digest", () => {
     await digest(ctx, big, "Reading");
     expect(ctx.unread.count).toBeGreaterThan(0);
   });
+
+  it("a fold round that fails to shrink stops the pass rather than looping FOLD_MAX_ROUNDS times", async () => {
+    // The private foldNotes's own guard: every round has already seen the
+    // whole source, so a round that comes back no smaller than it went in
+    // must stop (giving up honestly) rather than spin for all 6 rounds —
+    // real notes never regenerate identically, but a pathological model
+    // reply (or a summarizer that just echoes its input back) must not hang
+    // the command. Each call ECHOES the window it was given, minus its
+    // "Part of the source:\n"/"Notes:\n" prefix, so nothing ever shrinks.
+    const rooms = new TestRoomSource();
+    let calls = 0;
+    const fake: FakeGenerate = async (_m, messages) => {
+      calls += 1;
+      const user = messages[1]?.content ?? "";
+      return user.replace(/^(Part of the source:\n|Notes:\n)/, "");
+    };
+    const ctx = baseCtx(rooms, { generate: fake as never });
+    const big = "y".repeat(CMD_WINDOW_CHARS + 500);
+    const out = await digest(ctx, big, "Reading");
+    // Gave up rather than fabricating a shrunk result: still over budget.
+    expect(Buffer.byteLength(out, "utf8")).toBeGreaterThan(CMD_WINDOW_CHARS);
+    // Bounded well below what even ONE further non-shrinking round would
+    // add (2 more windows), let alone all 6 — the initial map plus exactly
+    // one fold round that then stops.
+    expect(calls).toBeLessThan(6);
+  });
 });
 
 // ============================================================================

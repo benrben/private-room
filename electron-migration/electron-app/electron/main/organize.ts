@@ -206,6 +206,19 @@ const MIME_BY_EXT: Readonly<Record<string, string>> = {
   yml: "text/yaml",
 };
 
+/** `MIME_BY_EXT[extensionOf(name)] ?? "text/plain"`, own-property-guarded —
+ * see `docsHtml.ts`'s `noteMime` for the bug this pattern fixes. `into`
+ * (`merge_files`'s new-file name, this function's only caller) is MODEL
+ * INPUT: an extension of `constructor`/`__proto__`/… reads `Object`/
+ * `Object.prototype` off the plain `{}` literal above, `?? "text/plain"`
+ * never fires for a non-nullish value, and a non-string mime reaching
+ * `insertFile` dies inside better-sqlite3 instead of falling back like
+ * `mime_guess::from_path` (no prototype chain to leak) does in Rust. */
+function mimeFor(name: string): string {
+  const ext = extensionOf(name);
+  return Object.prototype.hasOwnProperty.call(MIME_BY_EXT, ext) ? (MIME_BY_EXT[ext] as string) : "text/plain";
+}
+
 /** The message a thrown DB error contributes to a {@link BulkFailure} — the
  * TS stand-in for the `String` Rust's `Result` carried. */
 function errorText(e: unknown): string {
@@ -652,14 +665,7 @@ export function merge(
   // written, so it keeps telling the truth about which file that was.
   name = availableName(db, name);
   const content = body.trimStart();
-  const meta = insertFile(
-    db,
-    name,
-    MIME_BY_EXT[extensionOf(name)] ?? "text/plain",
-    Buffer.from(content, "utf8"),
-    content,
-    "generated"
-  );
+  const meta = insertFile(db, name, mimeFor(name), Buffer.from(content, "utf8"), content, "generated");
 
   // Only now, and only if asked. Trashing before the write would risk losing
   // the sources to a failed insert. Only the files that really CONTRIBUTED are

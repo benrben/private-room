@@ -228,6 +228,20 @@ const MIME_BY_EXT: Readonly<Record<string, string>> = {
   yml: "text/yaml",
 };
 
+/** `MIME_BY_EXT[extensionOf(name)] ?? "text/plain"`, own-property-guarded —
+ * see `docsHtml.ts`'s `noteMime` for the bug this pattern fixes.
+ * `requestedName` (this function's only caller passes the USER'S typed "save
+ * that as …" text straight through) can carry an extension of
+ * `constructor`/`__proto__`/…, which reads `Object`/`Object.prototype` off
+ * the plain `{}` literal above rather than `undefined`; `?? "text/plain"`
+ * never fires for a non-nullish value, and a non-string mime reaching
+ * `insertFile` dies inside better-sqlite3 instead of falling back like
+ * `mime_guess::from_path` (no prototype chain to leak) does in Rust. */
+function mimeFor(name: string): string {
+  const ext = extensionOf(name);
+  return Object.prototype.hasOwnProperty.call(MIME_BY_EXT, ext) ? (MIME_BY_EXT[ext] as string) : "text/plain";
+}
+
 /**
  * `files.rs::save_generated_impl`, DB half: insert freshly authored text as a
  * new room file, defaulting to `.md` when the requested name carries no
@@ -241,8 +255,7 @@ const MIME_BY_EXT: Readonly<Record<string, string>> = {
  */
 export function saveGeneratedFile(db: Database.Database, requestedName: string, content: string): FileMeta {
   const name = extensionOf(requestedName) === "" ? `${requestedName}.md` : requestedName;
-  const mime = MIME_BY_EXT[extensionOf(name)] ?? "text/plain";
-  return insertFile(db, name, mime, Buffer.from(content, "utf8"), content, "generated");
+  return insertFile(db, name, mimeFor(name), Buffer.from(content, "utf8"), content, "generated");
 }
 
 // -------------------------------------------------------------- streamAnswer

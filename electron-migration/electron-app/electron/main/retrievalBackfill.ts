@@ -35,13 +35,13 @@
  *    the already-ported `ensureUp`/`busy`/`authedHeaders` (`sidecar.ts`) and
  *    `resolvedBaseUrl` (`engineRouting.ts`), parsed exactly as
  *    `ollama::embed` parses it.
- *  - {@link isOcrCandidate} — `ocr::is_ocr_candidate`, verbatim (it is one
- *    line: image mime or a `.pdf`), with its own Rust unit test ported. It has
- *    no port elsewhere in this tree and needs none — a seam for a one-line
- *    predicate would be a stub standing in for nothing.
- *  - `extensionOf`/`isImage` (`editMatchExtraction.ts`) and `mediaKind`
- *    (`peaksTools.ts`, a verbatim port of `stt::media_kind`) are IMPORTED, not
- *    re-declared and not stubbed. Getting these wrong is not cosmetic: with
+ *  - `extensionOf`/`isImage` (`editMatchExtraction.ts`), `mediaKind`
+ *    (`peaksTools.ts`, a verbatim port of `stt::media_kind`) and
+ *    `isOcrCandidate` (`ocrTools.ts`, `ocr::is_ocr_candidate`) are IMPORTED,
+ *    not re-declared and not stubbed — `ocrTools.ts` is the canonical home;
+ *    this file used to carry its own byte-identical copy of the one-liner,
+ *    a duplication a later cleanup pass removed. Getting these wrong is not
+ *    cosmetic: with
  *    `isImage`/`isOcrCandidate`/`mediaKind` stubbed to "no", every scan, photo
  *    and recording in the room is fed to the document extractor by
  *    {@link runReextractBackfill} — the exact thing `backfill.rs`'s skip
@@ -113,6 +113,7 @@ import { authedHeaders, busy, ensureUp } from "./sidecar.js";
 import { resolvedBaseUrl } from "./engineRouting.js";
 import { extensionOf, isImage } from "./editMatchExtraction.js";
 import { mediaKind } from "./peaksTools.js";
+import { isOcrCandidate } from "./ocrTools.js";
 import {
   filesMissingText,
   filesWithBytes,
@@ -186,15 +187,6 @@ export function passIsCurrent(
 // ============================================================================
 // ocr::is_ocr_candidate — a real port, not a seam
 // ============================================================================
-
-/** Files whose text arrives from the OCR worker rather than a document
- * extractor: images and PDFs. Ported verbatim from `ocr::is_ocr_candidate` —
- * the whole function is `mime.starts_with("image/") || ext == "pdf"`, and the
- * rest of `ocr.rs` (the macOS Vision recognizer) is a subsystem neither pass
- * here touches. */
-export function isOcrCandidate(mime: string, ext: string): boolean {
-  return mime.startsWith("image/") || ext === "pdf";
-}
 
 // ============================================================================
 // ollama::embed / embed_question
