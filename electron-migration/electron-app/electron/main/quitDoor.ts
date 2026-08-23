@@ -1,18 +1,35 @@
 /**
- * The QUIT door: the one exit that never passes through a window close.
+ * The QUIT door: every way out of the app, asked once.
  *
- * Closing the window is already guarded in the renderer (it registers a
- * close handler that intercepts every native close request). ⌘Q is a
- * different event entirely — macOS's default menu Quit calls
- * `app.quit()` / `NSApplication terminate:` style behavior, which does not
- * necessarily route through a window's own close handler — so the
- * renderer guard can be bypassed and an unsaved editor buffer would go out
- * with the process, silently.
+ * ============================================================================
+ * WHAT CHANGED IN THE PORT, AND WHY THIS FILE'S ORIGINAL PREMISE NO LONGER
+ * HOLDS
+ * ============================================================================
+ * Under Tauri this module guarded ⌘Q alone, and said so: "closing the window
+ * is already guarded in the renderer (it registers a close handler that
+ * intercepts every native close request)". That was true there —
+ * `Workspace.tsx` registers `getCurrentWindow().onCloseRequested(...)`, and
+ * Tauri prevents every native close for a window that has a JS listener. ⌘Q
+ * was the exception, because tao has no `applicationShouldTerminate:` hook, so
+ * a real macOS Quit never reached JS at all.
  *
- * The main-process "before-quit" style hook is the only place that DOES see
- * it. That handler is synchronous-ish and cannot itself ask a question, so
- * the shape is: hold the exit once, ask the window, and let the window
- * finish the quit itself.
+ * Electron inverts exactly that. `app.on("before-quit")` DOES see ⌘Q, the Dock
+ * menu, logout and every internal `app.quit()` — the original bug simply does
+ * not exist here. But an isolated Electron renderer has no
+ * `onCloseRequested` equivalent: the red button and ⌘W reach
+ * `BrowserWindow`'s own `close` event in the MAIN process and nowhere else. So
+ * the guard the renderer used to own has to move here too, or closing the
+ * window becomes the new silent way to throw an unsaved buffer away.
+ *
+ * `main/index.ts` therefore asks this one door from THREE entrances — the
+ * menu's ⌘Q row (via `menu.ts`'s `quit`), `before-quit`, and the window's
+ * `close` — all sharing the single {@link QuitDoor} instance, so its one-shot
+ * latch means "held once", not "held once per entrance".
+ *
+ * The event-loop side of each is synchronous and cannot itself ask a question,
+ * so the shape is unchanged from the Rust original: hold the exit once, ask the
+ * window, and let the window answer — {@link QuitDoor.rearm} for "stay",
+ * {@link QuitDoor.confirmQuit} for "go".
  */
 
 /** The window event that asks the question. Named here rather than spelled
@@ -72,6 +89,28 @@ export class QuitDoor {
    * time" instead of "never again".
    */
   rearm(): void {
+    this.quitHeld = false;
+  }
+
+  /**
+   * The window answered the quit question with "yes" — the user was shown what
+   * they stand to lose and chose to go anyway.
+   *
+   * THE STEP THE TAURI BUILD DID NOT NEED A DOOR METHOD FOR. There, the
+   * frontend answered "Quit and discard" by calling
+   * `@tauri-apps/plugin-process`'s bare `exit(0)`; an isolated Electron
+   * renderer cannot exit anything, so the answer comes back as the
+   * `quit_guard_confirm` command and the caller (`main/index.ts`'s host bridge)
+   * runs the real `app.quit()`.
+   *
+   * Both flags, not just the latch: the buffer is being discarded on purpose,
+   * so leaving `unsavedEdits` armed would make the very quit the user just
+   * authorized get held all over again by the next entrance it passes through
+   * — `app.quit()` fires `before-quit` AND the window's `close`, so a door left
+   * armed here would re-ask twice on the way out.
+   */
+  confirmQuit(): void {
+    this.unsavedEdits = false;
     this.quitHeld = false;
   }
 

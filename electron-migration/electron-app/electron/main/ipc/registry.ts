@@ -11,7 +11,7 @@
  * sketches a `defineHandlers(h: { [K in keyof Commands]: (a) => Promise<r> })`
  * shape, where a missing or misspelled handler is a compile error. That form
  * assumes ONE function per command, all sharing one dependency object. What
- * actually exists is 31 independently-authored `registerXIpc(ipcMain, ...)`
+ * actually exists is 33 independently-authored `registerXIpc(ipcMain, ...)`
  * functions, each closing over its OWN dependency shape — a bare
  * `RoomManagerState`, several structurally-similar-but-not-identical
  * `RoomSource` flavors, a `RecBridgeCtx`, a `Map` of pending approvals,
@@ -47,9 +47,9 @@
  * ============================================================================
  * THE ROOM-SOURCE ADAPTER PROBLEM
  * ============================================================================
- * There is no ONE `RoomSource` type in this tree. Reading the 31 modules
- * surfaced several structurally distinct "which room is open" interfaces, none
- * of them importing a shared one:
+ * There is no ONE `RoomSource` type in this tree. Reading the room-scoped
+ * modules surfaced several structurally distinct "which room is open"
+ * interfaces, none of them importing a shared one:
  *
  *   - `{ currentRoom(): { db, path } | null }` — `OpenRoom` (`turnEngine.ts`),
  *     independently re-declared by name in `docxEdit.ts`/`editGate.ts`/
@@ -119,14 +119,55 @@
  * documented as open.
  *
  * ============================================================================
+ * THE HOST BRIDGE — five channels this file registers directly
+ * ============================================================================
+ * Everything above is a `registerXIpc(...)` call. Five channels are not, and
+ * are registered by {@link registerAllIpc} itself, through the SAME recording
+ * shim so the completeness diff still sees them:
+ *
+ *   - `run_command` — the `#command` dispatch surface. Its dependency bundle
+ *     is `liveContext.ts`'s `assembleLiveContext(state, emit)`, built from the
+ *     same `state`/`emit` every module above closes over, so a `#command` run
+ *     sees the room `open_room` opened in this same process. `runCommand`
+ *     itself owns the catalog validation and the "No room is open." refusal;
+ *     this registration adds nothing but the channel.
+ *   - `set_unsaved_edits` / `quit_guard_rearm` / `quit_guard_confirm` —
+ *     `quitDoor.ts`'s three renderer-facing questions (the first two are
+ *     Rust's `commands/shell_exit.rs`; the third replaces the
+ *     `@tauri-apps/plugin-process` `exit(0)` the frontend used to finish a
+ *     held quit with, which an isolated Electron renderer cannot do).
+ *   - `menu_sync` — `menu.ts`'s push of the window's layout state onto the
+ *     live native menu.
+ *
+ * The last four act on objects this file cannot build: the process's ONE
+ * `QuitDoor`, the ONE installed `Electron.Menu` and the real `app`, all owned
+ * by `main/index.ts`. They arrive as {@link HostBridge}, a required option —
+ * required, not optional, because {@link KNOWN_UNREGISTERED_COMMANDS} does not
+ * list these five, so a caller that could omit them would boot a registry the
+ * completeness invariant correctly refuses.
+ *
+ * WHY HERE AND NOT IN `index.ts` DIRECTLY, since that is where the objects
+ * live: a channel registered outside {@link registerAllIpc} is invisible to
+ * the recording shim, so the registry would keep reporting it as an unwired
+ * gap while it was in fact live — the exact drift `KNOWN_UNREGISTERED_COMMANDS`
+ * exists to make impossible, and a `goneStale` entry nothing would ever catch.
+ * One place registers channels; that property is worth more than the tidiness
+ * of keeping this file free of `handle` calls.
+ *
+ * ============================================================================
  * NOT WIRED HERE, deliberately (SCOPE BOUNDARIES)
  * ============================================================================
- * A real `CmdCtx`/`ExecToolDeps` object graph for `#commands`/`exec_tool`, the
- * ad-blocker/webRequest funnel, and DB `utilityProcess` isolation are
- * untouched by this file — each is its own sequenced step. Their command
- * surface (`ask`, `run_command`, the `mcp_*` family, `browser_*`,
- * jobs/workflows CRUD) is exactly the bulk of
- * {@link KNOWN_UNREGISTERED_COMMANDS} below.
+ * The rest of the turn engine (`ask`/`cancel_ask`/`handoff_chat`) and the
+ * wider `exec_tool` dispatch surface both need a live, per-run room MCP bridge
+ * (`turnEngine.ts`'s required `AskDeps.mcp`) that neither this file nor
+ * `liveContext.ts` builds — see that module's own doc on the app-wide
+ * `McpManager` and consent surface this migration has never stood up.
+ * `liveExecToolDeps` is real and ready for whichever batch does.
+ *
+ * The ad-blocker/webRequest funnel and DB `utilityProcess` isolation are
+ * untouched by this file too — each is its own sequenced step. Their command
+ * surface (the `mcp_*` family, `browser_*`, jobs/workflows CRUD) is exactly
+ * the bulk of {@link KNOWN_UNREGISTERED_COMMANDS} below.
  */
 
 import type { IpcMain, IpcMainInvokeEvent } from "electron";
@@ -179,6 +220,17 @@ import { registerStudiosPodcastAudioIpc } from "../studiosPodcastAudio.js";
 import { registerVideoIpc } from "../videoTools.js";
 import { registerVisionIpc } from "../visionTools.js";
 import { registerWorkflowComposeIpc } from "../workflowCompose.js";
+// The two plugin-surface modules. Like every module above they import
+// `electron` for TYPES only, so pulling them in here costs this file nothing at
+// runtime; the real `dialog`/`shell` objects arrive through
+// {@link RegisterAllIpcOptions}, injected by `main/index.ts`.
+import { registerDialogIpc, type DialogDeps } from "../dialogTools.js";
+import { registerShellIpc, type ShellDeps } from "../shellTools.js";
+
+// ---- the host bridge's own three dependencies (see the module doc) --------
+import { runCommand, type RunCommandRequest } from "../chatCommands.js";
+import { assembleLiveContext } from "../liveContext.js";
+import type { ViewMenuState } from "../menu.js";
 
 // ============================================================================
 // The compile-checked command-name list (see module doc, point 1)
@@ -198,21 +250,23 @@ import { ALL_COMMAND_NAMES } from "../../shared/channelAllowlist.js";
  * `registry.test.ts`), NOT hand-maintained here — a hardcoded count is exactly
  * the kind of claim that goes quietly wrong (one candidate shipped
  * `moduleCount: 30` next to 31 real calls, with a test asserting the 30). */
-export const WIRED_MODULE_COUNT = 31;
+export const WIRED_MODULE_COUNT = 33;
 
 // ============================================================================
 // The honest gap list (see module doc, point 2)
 // ============================================================================
 
 /**
- * Every `Commands` key the 31 wired `registerXIpc` modules do not cover.
- * Every one belongs to a subsystem with no `registerXIpc` module yet (the turn
- * engine's `ask`/`run_command`/`cancel_ask`/`handoff_chat`, the `mcp_*`
- * connector family, every `browser_*` channel, jobs/workflows CRUD, file
- * trash/versions beyond what `safetyTools.ts` covers, the privacy command
- * surface, and a handful of others) — none is a channel a wired module
- * silently dropped. {@link checkCompleteness} re-verifies this set against the
- * OBSERVED gap on every run, so it cannot go stale without a failing test.
+ * Every `Commands` key neither the 33 wired `registerXIpc` modules nor this
+ * file's own host-bridge block covers. Every one belongs to a subsystem with
+ * no `registerXIpc` module yet (the rest of the turn engine —
+ * `ask`/`cancel_ask`/`handoff_chat`, which need the room MCP bridge
+ * `run_command` does not — the `mcp_*` connector family, every `browser_*`
+ * channel, jobs/workflows CRUD, file trash/versions beyond what
+ * `safetyTools.ts` covers, the privacy command surface, and a handful of
+ * others) — none is a channel a wired module silently dropped.
+ * {@link checkCompleteness} re-verifies this set against the OBSERVED gap on
+ * every run, so it cannot go stale without a failing test.
  */
 export const KNOWN_UNREGISTERED_COMMANDS: ReadonlySet<string> = new Set<string>([
   "add_privacy_block",
@@ -292,13 +346,11 @@ export const KNOWN_UNREGISTERED_COMMANDS: ReadonlySet<string> = new Set<string>(
   "mcp_set_server_enabled",
   "mcp_set_tool_enabled",
   "mcp_status",
-  "menu_sync",
   "move_files_to_folder",
   "open_html_in_browser",
   "open_scratch_pad",
   "privacy_preview",
   "privacy_status",
-  "quit_guard_rearm",
   "remove_privacy_entity",
   "rename_file",
   "resolve_agent_ui",
@@ -309,7 +361,6 @@ export const KNOWN_UNREGISTERED_COMMANDS: ReadonlySet<string> = new Set<string>(
   "resume_job",
   "retranscribe_file",
   "reveal_logs",
-  "run_command",
   "run_script",
   "run_workflow",
   "save_generated_file",
@@ -323,7 +374,6 @@ export const KNOWN_UNREGISTERED_COMMANDS: ReadonlySet<string> = new Set<string>(
   "set_privacy_global",
   "set_privacy_room",
   "set_script_schedule",
-  "set_unsaved_edits",
   "set_workflow_pinned",
   "set_workflow_schedule",
   "set_workflow_status",
@@ -487,10 +537,71 @@ export function buildSafetyRoomSource(state: RoomManagerState): SafetyRoomSource
 // registerAllIpc
 // ============================================================================
 
+/**
+ * The two host-owned objects three of {@link registerAllIpc}'s own channels
+ * act on — see the module doc's "THE HOST BRIDGE".
+ *
+ * Methods rather than the objects themselves (`QuitDoor`, `Electron.Menu`), so
+ * this file neither imports Electron's `Menu` type at runtime nor grows a
+ * second opinion about how a menu is synced: the caller that built the menu
+ * decides, and this file only decides WHEN.
+ */
+export interface HostBridge {
+  /** `quitDoor.setUnsavedEdits` — the frontend's answer to "is there anything
+   * to lose right now?". */
+  setUnsavedEdits(on: boolean): void;
+  /** `quitDoor.rearm` — the window answered the quit question with "no". */
+  rearmQuitGuard(): void;
+  /** `quitDoor.confirmQuit` + the real `app.quit()` — the window answered with
+   * "yes". Both halves belong to the caller: this file has no `app`, and a
+   * door cleared without an exit following would leave the user's answer
+   * unanswered. */
+  confirmQuit(): void;
+  /** `menuSync(theInstalledMenu, view)` — push the window's layout state onto
+   * the live native menu. */
+  syncMenu(view: ViewMenuState): void;
+}
+
+/**
+ * Read `menu_sync`'s payload into a real {@link ViewMenuState}.
+ *
+ * An IPC payload is data from outside, and `menu.ts`'s own doc asks its caller
+ * to do exactly this: "a caller relaying an IPC payload that might omit it
+ * should default the field to `""` itself before calling in". Every flag
+ * defaults to `false` — the safe direction for a tick (a row claiming a pane
+ * is open when it is not is the lie worth avoiding) and for `enabled` (a
+ * greyed row cannot mislead). `sidebar` defaults to `""`, which
+ * `sidebarLabel` already turns back into the generic "Sidebar".
+ */
+export function readViewMenuState(args: unknown): ViewMenuState {
+  const view = (args as { view?: Partial<ViewMenuState> } | null | undefined)?.view;
+  return {
+    enabled: view?.enabled === true,
+    library: view?.library === true,
+    assistant: view?.assistant === true,
+    focus: view?.focus === true,
+    railLabels: view?.railLabels === true,
+    railLabelsSettable: view?.railLabelsSettable === true,
+    sidebar: typeof view?.sidebar === "string" ? view.sidebar : "",
+  };
+}
+
 export interface RegisterAllIpcOptions {
   ipcMain: Pick<IpcMain, "handle">;
   state: RoomManagerState;
   deps: RoomManagerDeps;
+  /** The quit door, the live menu and the app's own exit — see
+   * {@link HostBridge}. Required: the four channels it backs are not in
+   * {@link KNOWN_UNREGISTERED_COMMANDS}, so a registry built without it would
+   * fail its own completeness invariant. */
+  host: HostBridge;
+  /** Electron's real `dialog` plus the main window to sheet a panel onto —
+   * `dialogTools.ts`'s own deps, injected here for the same reason `host` is:
+   * this file must not import the `electron` module at runtime. */
+  dialog: DialogDeps;
+  /** Electron's real `shell` plus the `/usr/bin/open -a` bridge —
+   * `shellTools.ts`'s own deps. */
+  shell: ShellDeps;
   /** `window.webContents.send` fan-out, threaded to every module whose deps
    * accept one (`EmitFn`/`EventSender` — structurally identical
    * `(event: string, payload: unknown) => void` in every module that declares
@@ -543,7 +654,7 @@ export function createDefaultRoomManagerDeps(
  * a repeated channel, and this shim's own duplicate check is per-call.
  */
 export function registerAllIpc(opts: RegisterAllIpcOptions): RegisterAllIpcResult {
-  const { state, deps, emit, userDataDir, resourcesPath } = opts;
+  const { state, deps, emit, host, dialog, shell, userDataDir, resourcesPath } = opts;
 
   const registeredChannels = new Set<string>();
   const recordingIpcMain: Pick<IpcMain, "handle"> = {
@@ -575,6 +686,40 @@ export function registerAllIpc(opts: RegisterAllIpcOptions): RegisterAllIpcResul
   registerRoomManagerIpc(recordingIpcMain, state, deps);
   registerRoomCheckpointsIpc(recordingIpcMain, state, deps);
   registerChatIpc(recordingIpcMain, state);
+
+  // ---- the host bridge: the four channels this file registers itself ------
+  // See the module doc's "THE HOST BRIDGE" for why these are here rather than
+  // in `main/index.ts`, and why they go through `recordingIpcMain` like
+  // everything else. `assembleLiveContext` closes over the SAME `state`/`emit`
+  // as every module above, so a `#command` sees the room `open_room` opened.
+  const liveContext = assembleLiveContext(state, emit);
+  recordingIpcMain.handle("run_command", (_event: IpcMainInvokeEvent, args: unknown) =>
+    runCommand(args as RunCommandRequest, liveContext.runCommandDeps)
+  );
+  recordingIpcMain.handle("set_unsaved_edits", (_event: IpcMainInvokeEvent, args: unknown): void => {
+    const on = (args as { on?: unknown } | null | undefined)?.on;
+    if (typeof on !== "boolean") {
+      // Decided failure behavior: REFUSE, never coerce. Reading a malformed
+      // payload as `false` would silently disarm the unsaved-edits guard and
+      // the next ⌘Q would take the buffer with it — the exact bug
+      // `quitDoor.ts` exists to have fixed once.
+      throw new Error("set_unsaved_edits needs a boolean `on`.");
+    }
+    host.setUnsavedEdits(on);
+  });
+  recordingIpcMain.handle("quit_guard_rearm", (): void => {
+    host.rearmQuitGuard();
+  });
+  recordingIpcMain.handle("quit_guard_confirm", (): void => {
+    host.confirmQuit();
+  });
+  recordingIpcMain.handle("menu_sync", (_event: IpcMainInvokeEvent, args: unknown): void => {
+    host.syncMenu(readViewMenuState(args));
+  });
+
+  // ---- the two plugin surfaces: arcelle.dialog / arcelle.shell ------------
+  registerDialogIpc(recordingIpcMain, dialog);
+  registerShellIpc(recordingIpcMain, shell);
 
   // ---- standalone channels with no room dependency ----
   registerDictIpc(recordingIpcMain);

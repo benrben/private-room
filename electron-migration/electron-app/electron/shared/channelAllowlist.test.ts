@@ -17,9 +17,16 @@ describe("channelAllowlist command names", () => {
     // `ipc-contract.ts`'s own trailing comment claims 291; the compile-checked
     // object literal in `channelAllowlist.ts` is checked against the actual
     // `Commands` type at build time, so the true count is whatever TypeScript
-    // accepted (296). Pinned here so a future contract edit is a deliberate,
-    // noticed change rather than a silent one.
-    expect(ALL_COMMAND_NAMES.length).toBe(296);
+    // accepted. Pinned here so a future contract edit is a deliberate, noticed
+    // change rather than a silent one.
+    //
+    // 303 = the 296 commands extracted from `api.ts`, plus the 7 this
+    // migration added for surfaces Tauri answered with PLUGINS rather than
+    // commands: `dialog_open`/`dialog_save`/`dialog_message` (plugin-dialog),
+    // `open_url`/`open_path`/`reveal_item_in_dir` (plugin-opener), and
+    // `quit_guard_confirm` (plugin-process's `exit(0)`, which finished a held
+    // quit).
+    expect(ALL_COMMAND_NAMES.length).toBe(303);
   });
 
   it("COMMAND_CHANNEL_SET agrees with ALL_COMMAND_NAMES", () => {

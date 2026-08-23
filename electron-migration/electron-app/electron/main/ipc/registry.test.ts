@@ -32,6 +32,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { IpcMain, IpcMainInvokeEvent } from "electron";
 
 import type { RoomInfo } from "../../shared/apiTypes.js";
+import type { DialogDeps } from "../dialogTools.js";
 import type { RoomManagerState } from "../roomManager.js";
 import {
   ALL_COMMAND_NAMES,
@@ -43,6 +44,7 @@ import {
   createDefaultRoomManagerDeps,
   createRoomManagerState,
   registerAllIpc,
+  readViewMenuState,
 } from "./registry.js";
 
 let tmpDir: string | undefined;
@@ -97,6 +99,16 @@ interface Built {
   state: RoomManagerState;
   userDataDir: string;
   emitted: [string, unknown][];
+  /** What the host bridge was asked to do — the four channels whose whole
+   * job is to reach `main/index.ts`'s quit door, live menu and app exit.
+   * Recorded rather than executed, since none of those exists outside a real
+   * bootstrap; `index.test.ts` drives the real ones. */
+  hostCalls: [string, unknown][];
+  /** What `arcelle.dialog`/`arcelle.shell` were asked to do, same reasoning:
+   * `dialogTools.test.ts`/`shellTools.test.ts` own their behavior, this file
+   * only proves the registry reaches the injected objects. */
+  dialogCalls: [string, unknown][];
+  shellCalls: [string, unknown][];
 }
 
 function build(): Built {
@@ -107,16 +119,71 @@ function build(): Built {
   const emit = (event: string, payload: unknown): void => {
     emitted.push([event, payload]);
   };
+  const hostCalls: [string, unknown][] = [];
+  const dialogCalls: [string, unknown][] = [];
+  const shellCalls: [string, unknown][] = [];
   const deps = createDefaultRoomManagerDeps(userDataDir, emit);
   const result = registerAllIpc({
     ipcMain,
     state,
     deps,
     emit,
+    host: {
+      setUnsavedEdits: (on) => hostCalls.push(["setUnsavedEdits", on]),
+      rearmQuitGuard: () => hostCalls.push(["rearmQuitGuard", null]),
+      confirmQuit: () => hostCalls.push(["confirmQuit", null]),
+      syncMenu: (view) => hostCalls.push(["syncMenu", view]),
+    },
+    dialog: {
+      dialog: {
+        showOpenDialog: ((...args: unknown[]) => {
+          dialogCalls.push(["showOpenDialog", args]);
+          return Promise.resolve({ canceled: false, filePaths: ["/tmp/picked"] });
+        }) as unknown as DialogDeps["dialog"]["showOpenDialog"],
+        showSaveDialog: ((...args: unknown[]) => {
+          dialogCalls.push(["showSaveDialog", args]);
+          return Promise.resolve({ canceled: true, filePath: "" });
+        }) as unknown as DialogDeps["dialog"]["showSaveDialog"],
+        showMessageBox: ((...args: unknown[]) => {
+          dialogCalls.push(["showMessageBox", args]);
+          return Promise.resolve({ response: 0, checkboxChecked: false });
+        }) as unknown as DialogDeps["dialog"]["showMessageBox"],
+      },
+      getMainWindow: () => null,
+    },
+    shell: {
+      shell: {
+        openExternal: (url: string) => {
+          shellCalls.push(["openExternal", url]);
+          return Promise.resolve();
+        },
+        openPath: (p: string) => {
+          shellCalls.push(["openPath", p]);
+          return Promise.resolve("");
+        },
+        showItemInFolder: (p: string) => {
+          shellCalls.push(["showItemInFolder", p]);
+        },
+      },
+      openWithApp: (app: string, target: string) => {
+        shellCalls.push(["openWithApp", [app, target]]);
+        return Promise.resolve();
+      },
+    },
     userDataDir,
     resourcesPath: null,
   });
-  return { ...result, handlers, calls, state, userDataDir, emitted };
+  return {
+    ...result,
+    handlers,
+    calls,
+    state,
+    userDataDir,
+    emitted,
+    hostCalls,
+    dialogCalls,
+    shellCalls,
+  };
 }
 
 describe("registerAllIpc — registration", () => {
@@ -390,5 +457,143 @@ describe("registerAllIpc — dependency seams this registry owns", () => {
 
     await handlers.get("close_room")!(fakeEvent, {});
     expect(explicitModel()).toBeNull();
+  });
+});
+
+// ============================================================================
+// The host bridge — the four channels registerAllIpc registers itself
+// ============================================================================
+
+describe("registerAllIpc — the host-bridge channels", () => {
+  it("registers all five through the recording shim, so the completeness diff sees them", () => {
+    // The point of registering these HERE rather than on `ipcMain` directly in
+    // `main/index.ts`: a channel outside the shim stays listed as an unwired
+    // gap forever while being live. Both halves are asserted — present in the
+    // observed set, absent from the documented gap list.
+    const { registeredChannels } = build();
+    for (const channel of [
+      "run_command",
+      "set_unsaved_edits",
+      "quit_guard_rearm",
+      "quit_guard_confirm",
+      "menu_sync",
+    ]) {
+      expect(registeredChannels.has(channel), `${channel} was not registered`).toBe(true);
+      expect(KNOWN_UNREGISTERED_COMMANDS.has(channel), `${channel} is still listed as a gap`).toBe(
+        false
+      );
+    }
+  });
+
+  it("set_unsaved_edits / quit_guard_rearm / quit_guard_confirm reach the host's quit door", async () => {
+    const { handlers, hostCalls } = build();
+    await handlers.get("set_unsaved_edits")!(fakeEvent, { on: true });
+    await handlers.get("quit_guard_rearm")!(fakeEvent, {});
+    await handlers.get("quit_guard_confirm")!(fakeEvent, {});
+    expect(hostCalls).toEqual([
+      ["setUnsavedEdits", true],
+      ["rearmQuitGuard", null],
+      ["confirmQuit", null],
+    ]);
+  });
+
+  it("set_unsaved_edits REFUSES a non-boolean payload rather than reading it as false", async () => {
+    // Coercing would silently disarm the guard — see the handler's own comment.
+    // A synchronous throw, which is what real Electron's `ipcMain.handle`
+    // turns into a rejected `invoke()` on the renderer side either way.
+    const { handlers, hostCalls } = build();
+    expect(() => handlers.get("set_unsaved_edits")!(fakeEvent, { on: "yes" })).toThrow(
+      "needs a boolean"
+    );
+    expect(() => handlers.get("set_unsaved_edits")!(fakeEvent, {})).toThrow("needs a boolean");
+    expect(hostCalls).toEqual([]);
+  });
+
+  it("menu_sync hands the host a complete ViewMenuState, defaulted field by field", async () => {
+    const { handlers, hostCalls } = build();
+    await handlers.get("menu_sync")!(fakeEvent, {
+      view: { enabled: true, library: true, sidebar: "Sketches" },
+    });
+    expect(hostCalls).toEqual([
+      [
+        "syncMenu",
+        {
+          enabled: true,
+          library: true,
+          assistant: false,
+          focus: false,
+          railLabels: false,
+          railLabelsSettable: false,
+          sidebar: "Sketches",
+        },
+      ],
+    ]);
+  });
+
+  it("the six dialog/shell channels are registered over the INJECTED modules", async () => {
+    // `dialogTools.test.ts`/`shellTools.test.ts` own what these handlers do.
+    // What this owns is that the registry wired them at all, and wired them to
+    // the objects the caller handed in rather than to something of its own —
+    // the failure mode being a registry that registers the channel names (so
+    // the completeness diff is happy) over a module nothing can observe.
+    const { registeredChannels, handlers, dialogCalls, shellCalls } = build();
+    for (const channel of [
+      "dialog_open",
+      "dialog_save",
+      "dialog_message",
+      "open_url",
+      "open_path",
+      "reveal_item_in_dir",
+    ]) {
+      expect(registeredChannels.has(channel), `${channel} was not registered`).toBe(true);
+      expect(KNOWN_UNREGISTERED_COMMANDS.has(channel), `${channel} is listed as a gap`).toBe(false);
+    }
+
+    await handlers.get("dialog_open")!(fakeEvent, {});
+    await handlers.get("dialog_message")!(fakeEvent, { message: "hi" });
+    await handlers.get("open_url")!(fakeEvent, { url: "https://example.com/x" });
+    await handlers.get("reveal_item_in_dir")!(fakeEvent, { paths: ["/tmp/a"] });
+
+    expect(dialogCalls.map(([name]) => name)).toEqual(["showOpenDialog", "showMessageBox"]);
+    expect(shellCalls).toEqual([
+      ["openExternal", "https://example.com/x"],
+      ["showItemInFolder", "/tmp/a"],
+    ]);
+  });
+
+  it("readViewMenuState survives a missing view, a null payload and a wrong-typed sidebar", () => {
+    const allOff = {
+      enabled: false,
+      library: false,
+      assistant: false,
+      focus: false,
+      railLabels: false,
+      railLabelsSettable: false,
+      sidebar: "",
+    };
+    expect(readViewMenuState(undefined)).toEqual(allOff);
+    expect(readViewMenuState(null)).toEqual(allOff);
+    expect(readViewMenuState({})).toEqual(allOff);
+    expect(readViewMenuState({ view: { sidebar: 7 } })).toEqual(allOff);
+  });
+
+  it("run_command reaches the real runCommand: a real catalog refusal, then a real room refusal", async () => {
+    const { handlers } = build();
+    const req = {
+      askId: randomUUID(),
+      chatId: randomUUID(),
+      command: "not-a-real-command",
+      args: "",
+      refs: [],
+      raw: "#not-a-real-command",
+    };
+    // Catalog validation happens before the room is even looked at, so this
+    // message can only come from `runCommand` itself.
+    await expect(handlers.get("run_command")!(fakeEvent, req)).rejects.toThrow(
+      "Unknown command #not-a-real-command."
+    );
+    await expect(
+      handlers.get("run_command")!(fakeEvent, { ...req, command: "checkpoint", raw: "#checkpoint" })
+    ).rejects.toThrow("No room is open.");
   });
 });

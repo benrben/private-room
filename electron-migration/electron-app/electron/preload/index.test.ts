@@ -181,4 +181,173 @@ describe("installArcelleBridge", () => {
     installArcelleBridge(contextBridge, ipcRenderer);
     expect(await exposedApi!.invoke("list_roles", {})).toEqual({ echoed: "list_roles" });
   });
+
+  it("exposes the dialog and shell namespaces alongside invoke/on", () => {
+    const ipcRenderer = fakeIpcRenderer();
+    const exposed = new Map<string, unknown>();
+    installArcelleBridge({ exposeInMainWorld: (k, a) => exposed.set(k, a) }, ipcRenderer);
+    const api = exposed.get("arcelle") as {
+      dialog: Record<string, unknown>;
+      shell: Record<string, unknown>;
+    };
+    expect(Object.keys(api.dialog).sort()).toEqual([
+      "ask",
+      "confirm",
+      "message",
+      "open",
+      "save",
+    ]);
+    expect(Object.keys(api.shell).sort()).toEqual(["openPath", "openUrl", "revealItemInDir"]);
+  });
+});
+
+// ============================================================================
+// arcelle.dialog — the real plugin's client-side functions, reproduced
+// ============================================================================
+
+/** An `ipcRenderer` whose `dialog_message` answers with a chosen result. */
+function messageAnswering(result: string): IpcRendererLike & { calls: { invoke: unknown[][] } } {
+  const fake = fakeIpcRenderer();
+  fake.invoke = vi.fn((channel: string, args?: unknown) => {
+    fake.calls.invoke.push([channel, args]);
+    return Promise.resolve(channel === "dialog_message" ? result : { echoed: channel });
+  }) as unknown as IpcRendererLike["invoke"];
+  return fake;
+}
+
+describe("arcelle.dialog", () => {
+  it("open/save forward their options flat, and an absent options object becomes {}", async () => {
+    const ipcRenderer = fakeIpcRenderer();
+    const api = createArcelleApi(ipcRenderer);
+    await api.dialog.open({ multiple: true, directory: true });
+    await api.dialog.save();
+    expect(ipcRenderer.calls.invoke).toEqual([
+      ["dialog_open", { multiple: true, directory: true }],
+      ["dialog_save", {}],
+    ]);
+  });
+
+  it("message accepts a bare TITLE STRING in place of options, like the real plugin", async () => {
+    const ipcRenderer = messageAnswering("Ok");
+    const api = createArcelleApi(ipcRenderer);
+    await api.dialog.message("Tauri is awesome", "Arcelle");
+    expect(ipcRenderer.calls.invoke[0]).toEqual([
+      "dialog_message",
+      { message: "Tauri is awesome", title: "Arcelle", kind: undefined, buttons: undefined },
+    ]);
+  });
+
+  it("message passes the friendly buttons union straight through", async () => {
+    const ipcRenderer = messageAnswering("Keep both");
+    const api = createArcelleApi(ipcRenderer);
+    const result = await api.dialog.message("Name taken", {
+      kind: "warning",
+      buttons: { ok: "Replace", cancel: "Keep both" },
+    });
+    expect(ipcRenderer.calls.invoke[0]?.[1]).toMatchObject({
+      kind: "warning",
+      buttons: { ok: "Replace", cancel: "Keep both" },
+    });
+    expect(result).toBe("Keep both");
+  });
+
+  it("ask defaults to YesNo and is true only for Yes", async () => {
+    const yes = createArcelleApi(messageAnswering("Yes"));
+    const no = createArcelleApi(messageAnswering("No"));
+    expect(await yes.dialog.ask("Sure?")).toBe(true);
+    expect(await no.dialog.ask("Sure?")).toBe(false);
+  });
+
+  it("confirm defaults to OkCancel and is true only for Ok", async () => {
+    // THE regression this whole split exists for: `confirm()` compares against
+    // the plugin's `"Ok"` TOKEN, while the button on screen reads "OK". A main
+    // process answering with the label would make this false for a user who
+    // pressed OK — and `confirm` is what guards eight real delete/discard
+    // prompts in this app.
+    const ipcRenderer = messageAnswering("Ok");
+    const api = createArcelleApi(ipcRenderer);
+    expect(await api.dialog.confirm("Delete this?")).toBe(true);
+    expect(ipcRenderer.calls.invoke[0]?.[1]).toMatchObject({ buttons: "OkCancel" });
+    expect(await createArcelleApi(messageAnswering("Cancel")).dialog.confirm("Delete this?")).toBe(
+      false
+    );
+  });
+
+  it("a custom okLabel switches to a custom button pair and is compared against", async () => {
+    const ipcRenderer = messageAnswering("Quit and discard");
+    const api = createArcelleApi(ipcRenderer);
+    const go = await api.dialog.confirm("This file has edits you haven't saved yet.", {
+      title: "Unsaved edits",
+      kind: "warning",
+      okLabel: "Quit and discard",
+    });
+    expect(go).toBe(true);
+    expect(ipcRenderer.calls.invoke[0]?.[1]).toMatchObject({
+      buttons: { ok: "Quit and discard", cancel: "Cancel" },
+    });
+  });
+
+  it("a custom cancelLabel alone still switches to custom buttons, keeping the default ok", async () => {
+    const ipcRenderer = messageAnswering("Ok");
+    const api = createArcelleApi(ipcRenderer);
+    await api.dialog.confirm("Update?", { cancelLabel: "Skip this version" });
+    expect(ipcRenderer.calls.invoke[0]?.[1]).toMatchObject({
+      buttons: { ok: "Ok", cancel: "Skip this version" },
+    });
+  });
+
+  it("an EMPTY okLabel keeps the real plugin's own odd || / ?? mix, quirk and all", async () => {
+    // The real `ask()` uses `||` to decide whether the buttons are custom, but
+    // `??` to pick the label it compares against. With `okLabel: ""` those
+    // disagree: the buttons stay the `YesNo` preset (`""` is falsy) while the
+    // label compared against stays `""` (`??` does not replace an empty
+    // string), so pressing Yes answers FALSE. Measured against the installed
+    // plugin source, not guessed — and reproduced rather than "fixed", because
+    // a port that silently improves on its original is a port nothing can be
+    // checked against. No call site passes an empty label; if one ever does,
+    // this test is where the decision to diverge gets made.
+    const ipcRenderer = messageAnswering("Yes");
+    const api = createArcelleApi(ipcRenderer);
+    expect(await api.dialog.ask("Sure?", { okLabel: "" })).toBe(false);
+    expect(ipcRenderer.calls.invoke[0]?.[1]).toMatchObject({ buttons: "YesNo" });
+  });
+
+  it("every dialog call goes through the SAME allowlist as invoke — no second door", async () => {
+    const ipcRenderer = fakeIpcRenderer();
+    const api = createArcelleApi(ipcRenderer);
+    // A sanity check on the wiring rather than on the guard itself: the sugar
+    // reaches ipcRenderer only via `call`, so a channel it names that was ever
+    // removed from `Commands` would reject here rather than being forwarded.
+    await api.dialog.open();
+    expect((ipcRenderer.calls.invoke[0] ?? [])[0]).toBe("dialog_open");
+  });
+});
+
+describe("arcelle.shell", () => {
+  it("openUrl/openPath send the plugin's own `with` field name", async () => {
+    const ipcRenderer = fakeIpcRenderer();
+    const api = createArcelleApi(ipcRenderer);
+    await api.shell.openUrl("https://example.com/x", "Firefox");
+    await api.shell.openPath("/tmp/movie.mkv", "VLC");
+    expect(ipcRenderer.calls.invoke).toEqual([
+      ["open_url", { url: "https://example.com/x", with: "Firefox" }],
+      ["open_path", { path: "/tmp/movie.mkv", with: "VLC" }],
+    ]);
+  });
+
+  it("revealItemInDir normalizes one path or many into the wire's { paths } shape", async () => {
+    const ipcRenderer = fakeIpcRenderer();
+    const api = createArcelleApi(ipcRenderer);
+    await api.shell.revealItemInDir("/a/one");
+    await api.shell.revealItemInDir(["/a/one", "/b/two"]);
+    expect(ipcRenderer.calls.invoke).toEqual([
+      ["reveal_item_in_dir", { paths: ["/a/one"] }],
+      ["reveal_item_in_dir", { paths: ["/a/one", "/b/two"] }],
+    ]);
+  });
+
+  it("resolves undefined rather than the raw invoke result — the plugin's void contract", async () => {
+    const api = createArcelleApi(fakeIpcRenderer());
+    expect(await api.shell.openUrl("https://example.com/x")).toBeUndefined();
+  });
 });

@@ -46,4 +46,26 @@ describe("QuitDoor", () => {
     // next press through, because nothing re-armed it.
     expect(door.holdForUnsaved(null)).toBe(false);
   });
+
+  // "Yes, discard them" — the answer the Tauri build finished with `exit(0)`.
+  it("confirm_quit_disarms_the_door_completely_so_the_authorized_exit_is_never_re_held", () => {
+    const door = new QuitDoor();
+    door.setUnsavedEdits(true);
+    expect(door.holdForUnsaved(null)).toBe(true); // asked
+
+    door.confirmQuit();
+
+    // `app.quit()` passes THREE entrances on the way out (the menu row that
+    // started it, `before-quit`, and the window's `close`), and each one asks
+    // this same door. Clearing only the latch would leave `unsavedEdits`
+    // armed, so the very exit the user just authorized would be held again —
+    // a second "Unsaved edits" dialog for a decision already made.
+    expect(door.holdForUnsaved(null)).toBe(false);
+    expect(door.holdForUnsaved(null)).toBe(false);
+
+    // And it is not a permanent disarm: a LATER edit is guarded again, exactly
+    // as after a save.
+    door.setUnsavedEdits(true);
+    expect(door.holdForUnsaved(null)).toBe(true);
+  });
 });

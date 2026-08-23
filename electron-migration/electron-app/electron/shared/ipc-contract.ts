@@ -789,6 +789,117 @@ export interface Commands {
   write_recovery_key: { args: Record<string, never>; result: string };
   has_recovery_key: { args: { path: string }; result: boolean };
   open_room_with_recovery: { args: { path: string; code: string }; result: RoomInfo };
+
+  // ---- the plugin surfaces (NOT from api.ts's invoke call sites) ---------
+  // Everything above was extracted from an `invoke("name", …)` in api.ts.
+  // These seven were not, and could not have been: under Tauri they were not
+  // commands of ours at all. Six back the two Tauri PLUGINS the frontend calls
+  // as plain JS imports (`@tauri-apps/plugin-dialog`,
+  // `@tauri-apps/plugin-opener`), which the Electron port has to supply
+  // itself; the seventh, `quit_guard_confirm`, is the one step of the quit door
+  // the Tauri build answered with a third plugin (`plugin-process`'s
+  // `exit(0)`). See the comment on each group below.
+  //
+  // SHAPES READ FROM THE REAL, INSTALLED PLUGIN SOURCE
+  // (`node_modules/@tauri-apps/plugin-{dialog,opener}/dist-js/{index.js,index.d.ts}`),
+  // never guessed — the field names, the defaults, and the result types below
+  // all come from that reading, and `preload/index.ts` re-implements those
+  // modules' own client-side functions on top of these channels so a renderer
+  // port changes an import rather than a call shape.
+  //
+  // TWO DELIBERATE DEVIATIONS FROM THE LITERAL TAURI WIRE, both because these
+  // are new channels of OURS rather than descriptions of an existing wire (the
+  // header's "model the shape the invoke call actually sends" rule applies to
+  // the extracted 296):
+  //   1. `dialog_open`/`dialog_save` take their options FLAT, not nested under
+  //      an `options` key as `invoke('plugin:dialog|open', { options })` does.
+  //      Every other entry in this interface passes flat named args, and the
+  //      renderer-facing `open(options)`/`save(options)` signature is identical
+  //      either way.
+  //   2. `dialog_message`'s `buttons` carries the plugin's own FRIENDLY union
+  //      (`'YesNo'`, `{ok, cancel}`, …), not the tagged
+  //      `{OkCancelCustom: [ok, cancel]}` shape its `buttonsToRust()` encodes
+  //      to. That encoding exists to satisfy a Rust serde enum; re-encoding
+  //      into it here only to decode it again in `dialogTools.ts` would carry a
+  //      foreign engine's serialization artifact into a contract that has no
+  //      Rust on either end.
+
+  /** `plugin:dialog|open`. `null` on cancel; an array when `multiple` is set,
+   * otherwise the single chosen path — mirroring `OpenDialogReturn<T>`, which
+   * the caller can discriminate because it knows the args it sent.
+   *
+   * DROPPED from the real `OpenDialogOptions`, named rather than silently
+   * omitted: `recursive`, `pickerMode` and `fileAccessMode`, each documented by
+   * the plugin itself as "meant for mobile platforms (iOS and Android)". This
+   * app is Mac-only and Electron's `showOpenDialog` has no counterpart for any
+   * of the three. */
+  dialog_open: {
+    args: {
+      title?: string;
+      filters?: DialogFilter[];
+      defaultPath?: string;
+      multiple?: boolean;
+      directory?: boolean;
+      /** macOS-only in the real plugin too, and enabled by default there — so
+       * only an explicit `false` turns it off. */
+      canCreateDirectories?: boolean;
+    };
+    result: string | string[] | null;
+  };
+  /** `plugin:dialog|save` (`SaveDialogOptions`). `null` on cancel. */
+  dialog_save: {
+    args: {
+      title?: string;
+      filters?: DialogFilter[];
+      defaultPath?: string;
+      canCreateDirectories?: boolean;
+    };
+    result: string | null;
+  };
+  /** `plugin:dialog|message` — the ONE command behind the plugin's three JS
+   * functions. `message`/`ask`/`confirm` are client-side sugar over it in the
+   * real plugin (`index.js`'s `messageCommand`), and are client-side sugar over
+   * it in `preload/index.ts` too, for the same reason: the difference between
+   * them is which buttons they ask for and which answer counts as yes, not
+   * which dialog is shown.
+   *
+   * `okLabel` is deliberately absent from `MessageDialogOptions` here: the real
+   * plugin's own type marks it `@deprecated Use buttons instead` and folds it
+   * into `buttons` before the command is ever called. A contract with no
+   * back-compat callers starts at the recommended shape. */
+  dialog_message: {
+    args: {
+      message: string;
+      title?: string;
+      kind?: MessageDialogKind;
+      buttons?: MessageDialogButtons;
+    };
+    result: MessageDialogResult;
+  };
+
+  /** `plugin:opener|open_url`. The wire field really is named `with` (the JS
+   * wrapper's `openWith` parameter is sent as `{ url, with: openWith }`), so it
+   * is named `with` here. */
+  open_url: { args: { url: string; with?: string }; result: void };
+  /** `plugin:opener|open_path`, same `with` convention. */
+  open_path: { args: { path: string; with?: string }; result: void };
+  /** `plugin:opener|reveal_item_in_dir`. The plugin's JS wrapper normalizes its
+   * `string | string[]` parameter into `{ paths }` before invoking; these args
+   * are that already-normalized shape rather than the union the wrapper exists
+   * to remove. */
+  reveal_item_in_dir: { args: { paths: string[] }; result: void };
+
+  /** THE QUIT DOOR'S THIRD ANSWER — "the user was asked about unsaved edits and
+   * said go ahead; finish the quit now."
+   *
+   * `set_unsaved_edits` arms the door and `quit_guard_rearm` cancels a held
+   * quit; until this channel there was no way to COMPLETE one. The Tauri build
+   * did not need a command for it because the frontend could call
+   * `@tauri-apps/plugin-process`'s bare `exit(0)`; an isolated Electron
+   * renderer has no equivalent, so without this the user answering "Quit and
+   * discard" left the app running until they pressed ⌘Q a second time.
+   * See `quitDoor.ts`'s `confirmQuit` and `main/index.ts`'s host bridge. */
+  quit_guard_confirm: { args: Record<string, never>; result: void };
 }
 
 // merged: 291 commands total (chunk 1: 37, chunk 2: 36, chunk 3: 36,
@@ -796,3 +907,45 @@ export interface Commands {
 // No command-name collisions were found across the 8 chunks (each of the
 // 8 line-range extractions was disjoint and every top-level key across all
 // chunks appears exactly once).
+// (That count is of the api.ts extraction only, and predates later additions
+// to this file; `channelAllowlist.ts`'s `ALL_COMMAND_NAMES.length` is the one
+// number anything should ever compute from.)
+
+// ============================================================================
+// The dialog plugin's own option/result types
+// ============================================================================
+// Declared here rather than in `apiTypes.ts` because they belong to this
+// contract, not to api.ts's type surface: the frontend imports them from
+// `@tauri-apps/plugin-dialog` today, and will import them from the renderer's
+// own bridge module after the cutover. Each mirrors the real plugin type of the
+// same name.
+
+/** `DialogFilter`. */
+export interface DialogFilter {
+  name: string;
+  extensions: string[];
+}
+
+/** `MessageDialogOptions['kind']` — `'info'` when unset, per the plugin. */
+export type MessageDialogKind = "info" | "warning" | "error";
+
+/** `MessageDialogDefaultButtons`. */
+export type MessageDialogDefaultButtons = "Ok" | "OkCancel" | "YesNo" | "YesNoCancel";
+
+/** `MessageDialogCustomButtons` — the three custom shapes, kept as a union so
+ * an object with, say, `yes` but no `cancel` cannot be passed. */
+export type MessageDialogCustomButtons =
+  | { ok: string }
+  | { ok: string; cancel: string }
+  | { yes: string; no: string; cancel: string };
+
+/** `MessageDialogButtons`. */
+export type MessageDialogButtons = MessageDialogDefaultButtons | MessageDialogCustomButtons;
+
+/** `MessageDialogResult` — `'Yes' | 'No' | 'Ok' | 'Cancel' | (string & {})`:
+ * one of the four named answers for a preset button set, or the clicked
+ * button's own label for a custom one. Written with
+ * `Record<never, never>` rather than the plugin's `{}` because this repo's lint
+ * rules reject the bare `{}` type; the two mean the same thing here — "a string
+ * that keeps its literal type in a union". */
+export type MessageDialogResult = "Yes" | "No" | "Ok" | "Cancel" | (string & Record<never, never>);
