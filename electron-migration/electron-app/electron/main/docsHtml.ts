@@ -6,16 +6,14 @@
  * `html_document`, and the two CSS constants it inlines
  * (`NOTEBOOK_CSS`/`DOC_STYLE`).
  *
- * NOT PORTED, because `create_file`'s own arm never reaches them:
+ * STILL NOT PORTED, because `create_file`'s own arm never reaches them:
  * `SCRATCH_PAD_TEMPLATE`/`ensure_scratch_pad`/`open_scratch_pad` (the sidebar
  * chip's get-or-create entry point — `create_file` builds its fresh pad from
  * the MODEL's own content, never the template), `create_note`/`save_and_open`
  * (thin wrappers `agent.rs` itself does not call — `save_and_open` also emits
- * `agent-open-file`, which no arm in this batch does), `doc_hero`/
- * `file_glyph`/`title_from_name`/`html_titled_doc` (the Studio/summarize
- * templates' header helpers — a different set of callers), `refs_files`/
- * `refs_context`/`name_from_topic`/`html_note_name`/`extract_md_table` (other
- * commands entirely).
+ * `agent-open-file`, which no arm in this batch does), `file_glyph`
+ * (the Studio summary's per-file icon — a different caller),
+ * `extract_md_table` (`#to-sheet`, other commands entirely).
  *
  * `NOTEBOOK_CSS`/`DOC_STYLE` are copied CHARACTER-FOR-CHARACTER from the
  * Rust source's two `r####"…"####` raw strings (verified against
@@ -36,7 +34,28 @@
  * `mime_guess::from_path(name).first_or(TEXT_PLAIN).essence_str()` — against
  * that same table, which is also exactly what `create_file`'s own non-pad
  * branch computes inline in Rust.
+ *
+ * EXTENDED (2026-08, the `chat_commands/knowledge.rs` batch) with the rest of
+ * `docs_html.rs`'s pure/DB-read helpers that command needs and this file had
+ * previously scoped out by name: {@link refsFiles}/{@link refsContext}
+ * (`refs_files`/`refs_context`), {@link nameFromTopic}/{@link htmlNoteName}
+ * (`name_from_topic`/`html_note_name`), {@link titleFromName} plus the
+ * private `docHero` (`title_from_name`/`doc_hero`), and
+ * {@link htmlTitledDoc} (`html_titled_doc`). All five are ported verbatim.
+ *
+ * NOT ADDED: `create_note`/`save_and_open`/`file_glyph`/`extract_md_table` —
+ * still other commands' territory (`#to-sheet`'s table read, the scratch pad,
+ * and the Studio summary's per-file icon respectively). `save_and_open` in
+ * particular does NOT live here even though `chat_commands/knowledge.rs`'s
+ * own `cmd_add_file`/`cmd_extract` call it: `artifactBuilder.ts` (the
+ * `chat_commands/generate.rs` batch) already imports THIS file for
+ * `noteMime`, so importing `Artifact`/`Written` the other way here would be a
+ * cycle. It is ported instead in `chatCommandsKnowledge.ts`, the one file in
+ * this batch that may safely depend on both.
  */
+
+import type Database from "better-sqlite3-multiple-ciphers";
+import { getFileFull } from "./db-host/files.js";
 
 // ---------------------------------------------------------- extension / mime
 
@@ -408,4 +427,121 @@ export function htmlDocument(title: string, body: string): string {
     `<footer class="doc-foot">Arcelle \u00b7 generated on this Mac</footer>\n` +
     `</body>\n</html>\n`
   );
+}
+
+// ---- refs / topic-derived names (docs_html.rs, added for chat_commands/knowledge.rs) --
+
+/**
+ * Pinned files as (name, full text) pairs \u2014 for commands that process each
+ * `@file` on its own. A ref that no longer resolves (the file was removed
+ * after being pinned) is SKIPPED rather than an error, matching Rust's
+ * `filter_map(|id| db::get_file_full(conn, id).ok())`. No truncation and no
+ * file skipped for SIZE: the caller decides how to fit a long file into model
+ * calls (`cmdWindows`), because deciding it here can only mean throwing text
+ * away. Ported verbatim from `docs_html.rs`'s `refs_files`.
+ */
+export function refsFiles(db: Database.Database, refs: readonly string[]): Array<[string, string]> {
+  const out: Array<[string, string]> = [];
+  for (const id of refs) {
+    try {
+      const [name, , , text] = getFileFull(db, id);
+      out.push([name, text ?? ""]);
+    } catch {
+      // Skipped \u2014 matches Rust's `.ok()`.
+    }
+  }
+  return out;
+}
+
+/**
+ * Pinned-file text as one context blob, plus the file names \u2014 the WHOLE text
+ * of every `@file`, in order.
+ *
+ * This used to clamp each file to 6000 bytes and silently drop any file once
+ * a shared budget ran out, which is what made `#minutes` on an hour-long
+ * meeting cover only its first ~5 minutes: ~6 KB of transcript is about 1000
+ * words. A command that can't fit this in one call now windows it and runs a
+ * pass per window instead of losing the tail. Ported verbatim from
+ * `docs_html.rs`'s `refs_context`.
+ */
+export function refsContext(db: Database.Database, refs: readonly string[]): [string, string[]] {
+  const files = refsFiles(db, refs);
+  const names = files.map(([n]) => n);
+  let ctx = "";
+  for (const [name, text] of files) {
+    if (text.trim() !== "") {
+      ctx += `[file: ${name}]\n${text}\n\n`;
+    }
+  }
+  return [ctx, names];
+}
+
+/** Derive a filename from a topic \u2014 first few words, path-safe, `.md`. The
+ * character class is `\p{Alphabetic}\p{N}`, matching Rust's derived
+ * `char::is_alphanumeric()` (see `db-host/retrieval.ts`'s `questionTerms` for
+ * the same class, and why it is not `\p{L}`). Ported verbatim from
+ * `docs_html.rs`'s `name_from_topic`. */
+export function nameFromTopic(topic: string): string {
+  const words = topic.split(/\s+/u).filter((w) => w !== "").slice(0, 8);
+  const joined = words.join(" ");
+  let base = "";
+  for (const c of joined) {
+    base += /[\p{Alphabetic}\p{N}]/u.test(c) || c === " " || c === "-" ? c : " ";
+  }
+  base = base
+    .split(/\s+/u)
+    .filter((w) => w !== "")
+    .join(" ");
+  if (base === "") {
+    base = "Note";
+  }
+  return `${base}.md`;
+}
+
+/** ADD-22: a topic-derived file name with an `.html` extension (generated
+ * documents default to HTML). Ported verbatim from `docs_html.rs`'s
+ * `html_note_name`. */
+export function htmlNoteName(topic: string): string {
+  const md = nameFromTopic(topic);
+  const stem = md.endsWith(".md") ? md.slice(0, -3) : md;
+  return `${stem}.html`;
+}
+
+/** The display title for a generated document, derived from its file name
+ * with the extension dropped: "Q3 report.html" -> "Q3 report". Ported
+ * verbatim from `docs_html.rs`'s `title_from_name`. */
+export function titleFromName(name: string): string {
+  const i = name.lastIndexOf(".");
+  return i > 0 ? name.slice(0, i) : name;
+}
+
+/** A polished document header: an uppercase accent eyebrow, a large title, an
+ * optional muted subline, and an accent rule. `subHtml` is inserted as-is, so
+ * callers pass already-escaped content. Ported verbatim from `docs_html.rs`'s
+ * `doc_hero`. Not exported \u2014 `htmlTitledDoc` is the only caller this batch
+ * needs (the eyebrow/subline-carrying callers, the Studio summary and
+ * `#minutes`, are `commands/summarize.rs`/`minutes.rs`, out of this batch's
+ * scope). */
+function docHero(eyebrow: string, title: string, subHtml: string): string {
+  let h = '<header class="hero">\n';
+  if (eyebrow !== "") {
+    h += `<div class="eyebrow">${htmlEscape(eyebrow)}</div>\n`;
+  }
+  h += `<h1>${htmlEscape(title)}</h1>\n`;
+  if (subHtml.trim() !== "") {
+    h += `<p class="sub">${subHtml}</p>\n`;
+  }
+  h += '<div class="rule"></div>\n</header>\n';
+  return h;
+}
+
+/** Wrap a model-authored document body into a full page, giving it a title
+ * header derived from `title` \u2014 unless the model already returned a whole
+ * HTML page, in which case it passes through untouched (no double
+ * header/wrap). Ported verbatim from `docs_html.rs`'s `html_titled_doc`. */
+export function htmlTitledDoc(name: string, title: string, body: string): string {
+  if (isFullHtmlDoc(body)) {
+    return htmlDocument(name, body);
+  }
+  return htmlDocument(name, docHero("", title, "") + body);
 }

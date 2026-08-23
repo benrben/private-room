@@ -13,14 +13,19 @@
  * caller-facing shape. New `_b`-suffixed file, not a change to any file this
  * batch did not create.
  *
- * SCOPED TO WHAT `file_pass.rs` ACTUALLY CALLS: `new`, `by`, `duringRun`,
- * `fromFiles`, `cancelWith`, `commit`. The Rust struct also carries
- * `indexed_as` (index a drawing's derived text instead of its raw JSON),
- * `note` (the extension-defaulting Markdown constructor), `via_tool` and
- * `cancel_maybe` — none of which `file_pass.rs` uses, so none are ported
- * here. A future batch that needs one of those (the sketch/create pages,
- * ordinary tool-driven file writes) extends this file rather than
- * reinventing the funnel a second time.
+ * SCOPED TO WHAT `file_pass.rs` ACTUALLY CALLED AT THE TIME: `new`, `by`,
+ * `duringRun`, `fromFiles`, `cancelWith`, `commit`. `via_tool`/`cancel_maybe`
+ * are still unported — nothing in this tree has called for them yet.
+ *
+ * EXTENDED, as this file's own doc above invited, by the
+ * `chat_commands/generate.rs` batch (2026-08): {@link Artifact.indexedAs}
+ * (`indexed_as` — index a drawing's derived text instead of its raw JSON,
+ * needed by `#sketch`) and the static {@link Artifact.note} (the
+ * extension-defaulting Markdown constructor, needed by `#minutes`/
+ * `#to-sheet`/`#translate`). Both are ported verbatim from `artifact.rs`.
+ * `commit`'s call to `stageArtifact` now passes `indexedText ?? content` as
+ * the separately-indexed `text` argument — previously always `content` twice
+ * over, which was simply what `indexedAs` had no caller to exercise yet.
  *
  * Why the check-then-commit split matters, verbatim from the Rust doc: "The
  * cancel check sits between staging and committing on purpose. Checking
@@ -38,6 +43,18 @@ import {
   type Provenance,
 } from "./db-host/artifacts.js";
 import type { FileMeta } from "./db-host/files.js";
+import { noteMime } from "./docsHtml.js";
+
+/** `extraction::extension_of` — a bare local copy, matching `docsHtml.ts`'s
+ * own (its module doc explains why: `extraction::extension_of` is external to
+ * every Rust file that has needed it so far, and this rewrite has no
+ * `extraction.ts` yet for either copy to import instead). Used only to decide
+ * whether {@link Artifact.note}'s name already carries an extension. */
+function extensionOf(name: string): string {
+  const base = name.split(/[/\\]/).pop() ?? name;
+  const idx = base.lastIndexOf(".");
+  return idx <= 0 ? "" : base.slice(idx + 1).toLowerCase();
+}
 
 /** What a committed artifact turned out to be. `versioned` is true when this
  * write became a new version of an artifact that was already there. */
@@ -57,6 +74,7 @@ export class Artifact {
   private readonly content: string;
   private readonly prov: Provenance = {};
   private cancel: CancelFlag | null = null;
+  private indexedText: string | null = null;
 
   /** An artifact with an explicit mime (a generated HTML page, a CSV). */
   constructor(name: string, mime: string, content: string) {
@@ -67,6 +85,24 @@ export class Artifact {
 
   static new(name: string, mime: string, content: string): Artifact {
     return new Artifact(name, mime, content);
+  }
+
+  /** A generated note — Markdown by default, mime derived from the name. The
+   * extension default lives here so every `#command` that writes a note
+   * shares it rather than risking two callers disagreeing about what an
+   * extension-less name means. Ported verbatim from `Artifact::note`. */
+  static note(name: string, content: string): Artifact {
+    const named = extensionOf(name) === "" ? `${name}.md` : name;
+    return new Artifact(named, noteMime(named), content);
+  }
+
+  /** Index this artifact as `text` rather than as its own bytes — a `.sketch`
+   * is a JSON document, and indexing that source would put coordinates and
+   * colour names into search results and the model's retrieved context.
+   * Ported verbatim from `Artifact::indexed_as`. */
+  indexedAs(text: string): this {
+    this.indexedText = text;
+    return this;
   }
 
   /** Which agent or command produced it. */
@@ -104,7 +140,7 @@ export class Artifact {
    */
   commit(db: Database.Database): Written {
     const bytes = Buffer.from(this.content, "utf8");
-    const staged = stageArtifact(db, this.name, this.mime, bytes, this.content, this.prov);
+    const staged = stageArtifact(db, this.name, this.mime, bytes, this.indexedText ?? this.content, this.prov);
     if (this.cancel !== null && this.cancel.load()) {
       // Discarding is best-effort — the sweep on the next room open is the
       // backstop — but the REPORT must be exact: nothing was saved.

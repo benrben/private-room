@@ -437,8 +437,14 @@ export function execOpenFile(
  * fallback for PDFs). Returns the payload plus a short human description;
  * fails if the quote can't be found or neither a quote nor a cell range was
  * given. Ported verbatim from `agent.rs`'s `build_annotation`.
+ *
+ * EXPORTED (2026-08, the `chat_commands/knowledge.rs` batch) for
+ * `chatCommandsKnowledge.ts`'s `#highlight`, whose Rust counterpart
+ * (`chat_commands/knowledge.rs::cmd_highlight`) calls this SAME
+ * `agent.rs::build_annotation` function directly — one function, two Rust
+ * callers, and now two TS callers of one export rather than a second copy.
  */
-function buildAnnotation(
+export function buildAnnotation(
   id: string,
   realName: string,
   extracted: string | null,
