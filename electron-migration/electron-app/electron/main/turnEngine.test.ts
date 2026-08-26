@@ -14,7 +14,7 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import * as http from "node:http";
 import type { AddressInfo } from "node:net";
 import os from "node:os";
@@ -47,6 +47,8 @@ import {
   type StreamAnswerRequest,
   type TurnRoomSource,
 } from "./turnEngine.js";
+import { createWorkspaceRoom } from "./workspace/roomLayout.js";
+import { WorkspaceService } from "./workspace/workspaceService.js";
 
 // ------------------------------------------------------------------ fixtures
 
@@ -789,6 +791,38 @@ describe("ask", () => {
     expect(files[0]?.name).toBe("Poem.md");
     // The stopped marker is stripped from the copy.
     expect(files[0]?.extracted_text).toBe("Roses are red...");
+  });
+
+  it("the pure-save fast path publishes a normal file in a workspace room", async () => {
+    const parent = mkdtempSync(path.join(os.tmpdir(), "turn-workspace-"));
+    tmpDirs.push(parent);
+    const root = path.join(parent, "Room");
+    const { db } = createWorkspaceRoom(root, "correct horse battery staple", "Room");
+    const workspace = new WorkspaceService(db, root);
+    const chat = createChat(db);
+    insertMessage(db, chat.id, "user", "write me a poem", [], null);
+    insertMessage(db, chat.id, "assistant", "Workspace roses", [], null);
+    const room = makeRoomSource({ db, path: root, workspace });
+
+    const msg = await ask(
+      {
+        askId: "ask-workspace-save",
+        chatId: chat.id,
+        question: "save that as a file called Poem",
+        attachments: [],
+        viewing: null,
+        privacyBypass: false,
+      },
+      askDeps(room, createCancelState(), () => {}),
+    );
+
+    expect(msg.content).toBe('Saved your previous answer to the room as "Poem.md".');
+    expect(readFileSync(path.join(root, "Poem.md"), "utf8")).toBe("Workspace roses");
+    const row = db.prepare(
+      "SELECT storage_kind, original_bytes FROM files WHERE name = 'Poem.md'",
+    ).get() as { storage_kind: string; original_bytes: Buffer | null };
+    expect(row).toEqual({ storage_kind: "workspace", original_bytes: null });
+    db.close();
   });
 
   it("the fast path never turns one of the app's OWN failure notices into a document", async () => {

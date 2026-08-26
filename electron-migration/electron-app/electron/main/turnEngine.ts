@@ -67,7 +67,8 @@ import {
   type CancelState,
   type Node as CancelNode,
 } from "./cancel.js";
-import { insertFile, type FileMeta } from "./db-host/files.js";
+import { availableName, insertFile, type FileMeta } from "./db-host/files.js";
+import { createRoomFile } from "./workspace/roomContent.js";
 import {
   insertHandoffMessage,
   insertMessage,
@@ -258,6 +259,24 @@ function mimeFor(name: string): string {
 export function saveGeneratedFile(db: Database.Database, requestedName: string, content: string): FileMeta {
   const name = extensionOf(requestedName) === "" ? `${requestedName}.md` : requestedName;
   return insertFile(db, name, mimeFor(name), Buffer.from(content, "utf8"), content, "generated");
+}
+
+export async function saveGeneratedFileInRoom(
+  room: OpenRoom,
+  requestedName: string,
+  content: string,
+): Promise<FileMeta> {
+  if (room.workspace === undefined) return saveGeneratedFile(room.db, requestedName, content);
+  const requested = extensionOf(requestedName) === "" ? `${requestedName}.md` : requestedName;
+  const name = availableName(room.db, requested);
+  return createRoomFile(
+    room,
+    name,
+    mimeFor(name),
+    Buffer.from(content, "utf8"),
+    content,
+    "generated",
+  );
 }
 
 // -------------------------------------------------------------- streamAnswer
@@ -610,7 +629,7 @@ export async function ask(req: AskRequest, deps: AskDeps): Promise<Message> {
       const prev = lastRealAssistantReply(room.db, req.chatId);
       if (prev !== null) {
         const name = requestedFileName(req.question) ?? "Saved answer";
-        const meta = saveGeneratedFile(room.db, name, stripStoppedSuffix(prev.content));
+        const meta = await saveGeneratedFileInRoom(room, name, stripStoppedSuffix(prev.content));
         try {
           deps.notifyFilesChanged?.();
         } catch {
