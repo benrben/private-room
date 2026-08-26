@@ -57,6 +57,28 @@ function batch(
   return report;
 }
 
+async function batchAsync(
+  state: RoomManagerState,
+  ids: readonly string[],
+  operation: (id: string) => Promise<void>,
+): Promise<BulkReport> {
+  const room = state.room;
+  if (room === null) throw new Error("No room is open.");
+  const unique = [...new Set(ids)];
+  const kept = unique.slice(0, MAX_BULK_FILES);
+  const report: BulkReport = { ok: [], failed: [], capped: unique.length - kept.length };
+  for (const id of kept) {
+    const name = anyFileName(room.conn, id) ?? id;
+    try {
+      await operation(id);
+      report.ok.push(name);
+    } catch (error) {
+      report.failed.push({ name, error: error instanceof Error ? error.message : String(error) });
+    }
+  }
+  return report;
+}
+
 export function registerFileSurfaceIpc(
   ipcMain: Pick<IpcMain, "handle">,
   state: RoomManagerState,
@@ -190,16 +212,45 @@ export function registerFileSurfaceIpc(
     return result;
   });
 
-  ipcMain.handle("trash_files", (_event: IpcMainInvokeEvent, raw: unknown) =>
-    changedIf(batch(state, stringIds(args(raw).ids), (id) => trashFile(room().conn, id, { kind: "user" }))),
-  );
-  ipcMain.handle("restore_files", (_event: IpcMainInvokeEvent, raw: unknown) =>
-    changedIf(batch(state, stringIds(args(raw).ids), (id) => restoreFile(room().conn, id))),
-  );
-  ipcMain.handle("move_files_to_folder", (_event: IpcMainInvokeEvent, raw: unknown) => {
+  ipcMain.handle("trash_files", async (_event: IpcMainInvokeEvent, raw: unknown) => {
+    const open = room();
+    const ids = stringIds(args(raw).ids);
+    return changedIf(open.workspace === undefined
+      ? batch(state, ids, (id) => trashFile(open.conn, id, { kind: "user" }))
+      : await batchAsync(state, ids, (id) => open.workspace!.trash(id)));
+  });
+  ipcMain.handle("restore_files", async (_event: IpcMainInvokeEvent, raw: unknown) => {
+    const open = room();
+    const ids = stringIds(args(raw).ids);
+    return changedIf(open.workspace === undefined
+      ? batch(state, ids, (id) => restoreFile(open.conn, id))
+      : await batchAsync(state, ids, (id) => open.workspace!.restore(id)));
+  });
+  ipcMain.handle("move_files_to_folder", async (_event: IpcMainInvokeEvent, raw: unknown) => {
     const a = args(raw);
     const folderId = typeof a.folderId === "string" ? a.folderId : null;
-    return changedIf(batch(state, stringIds(a.fileIds), (id) => moveFileToFolder(room().conn, id, folderId)));
+    const open = room();
+    if (open.workspace === undefined) {
+      return changedIf(batch(state, stringIds(a.fileIds), (id) => moveFileToFolder(open.conn, id, folderId)));
+    }
+    const folder = folderId === null ? null : open.conn.prepare(
+      "SELECT name FROM folders WHERE id = ?",
+    ).get(folderId) as { name: string } | undefined;
+    if (folderId !== null && folder === undefined) throw new Error("That folder no longer exists.");
+    const folderName = folder?.name ?? null;
+    return changedIf(await batchAsync(state, stringIds(a.fileIds), async (id) => {
+      const row = open.conn.prepare(
+        "SELECT relative_path, content_sha256 FROM files WHERE id = ? AND trashed_at IS NULL",
+      ).get(id) as { relative_path: string | null; content_sha256: string | null } | undefined;
+      if (row?.relative_path === null || row?.relative_path === undefined) {
+        throw new Error("That file is no longer in this room.");
+      }
+      const destination = folderName === null
+        ? path.posix.basename(row.relative_path)
+        : path.posix.join(folderName, path.posix.basename(row.relative_path));
+      await open.workspace!.move(id, destination, row.content_sha256 ?? undefined);
+      open.conn.prepare("UPDATE files SET folder_id = ? WHERE id = ?").run(folderId, id);
+    }));
   });
   ipcMain.handle("delete_files_permanently", (_event: IpcMainInvokeEvent, raw: unknown) =>
     changedIf(batch(state, stringIds(args(raw).ids), (id) => {

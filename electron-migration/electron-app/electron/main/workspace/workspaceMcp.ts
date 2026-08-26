@@ -1,6 +1,7 @@
 import path from "node:path";
 import { Readable } from "node:stream";
 import type { RoomManagerState } from "../roomManager.js";
+import { setFileExtractedText } from "../db-host/files.js";
 import { normalizeRelativePath, pathKey } from "./pathSafety.js";
 
 interface FileRow {
@@ -116,13 +117,19 @@ export function createWorkspaceMcpBridge(
           let row: FileRow | undefined;
           try { row = file(relative); } catch { row = undefined; }
           if (row === undefined) {
-            await room().workspace!.createFile(relative, Readable.from([Buffer.from(content)]), "agent");
+            const created = await room().workspace!.createFile(
+              relative,
+              Readable.from([Buffer.from(content)]),
+              "agent",
+            );
+            setFileExtractedText(room().conn, created.fileId, content);
           } else {
             await room().workspace!.writeAtomic(
               row.id,
               Readable.from([Buffer.from(content)]),
               row.content_sha256 ?? undefined,
             );
+            setFileExtractedText(room().conn, row.id, content);
           }
           return { path: `/${relative}` };
         }
@@ -144,12 +151,14 @@ export function createWorkspaceMcpBridge(
             Readable.from([Buffer.from(next)]),
             row.content_sha256 ?? undefined,
           );
+          setFileExtractedText(room().conn, row.id, next);
           return { path: `/${relative}`, occurrences: args.replace_all === true ? occurrences : 1 };
         }
 
         if (operation === "delete") {
           const relative = virtualPath(args.path);
-          await room().workspace!.trash(file(relative).id);
+          const row = file(relative);
+          await room().workspace!.trash(row.id, row.content_sha256 ?? undefined);
           return { path: `/${relative}` };
         }
 

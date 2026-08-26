@@ -7,7 +7,7 @@ import { requestAgentUi } from "./agentUiSurfaceIpc.js";
 import type { FileRuntimeStores } from "./fileRuntimeSurfaceIpc.js";
 import { findFileLike, getFileBytes, getFileMeta } from "./db-host/files.js";
 import { getSetting } from "./db-host/settings.js";
-import { stageMediaBytes } from "./mediaTools.js";
+import { stageMediaBytes, stageMediaStream } from "./mediaTools.js";
 import { createDownloadEngineDeps } from "./mediaDownloadSurfaceIpc.js";
 import { createWorkflowRunDeps } from "./jobWorkflowSurfaceIpc.js";
 import {
@@ -181,12 +181,28 @@ export function applyLiveAppServices(
       if (kind === "media_frame") {
         if (state.room === null) throw new Error("No room is open.");
         const [id] = findFileLike(state.room.conn, String(args.name ?? ""));
-        const bytes = getFileBytes(state.room.conn, id);
-        if (bytes === null) throw new Error("That media file has no saved bytes.");
         const meta = getFileMeta(state.room.conn, id);
         if (!meta.mimeType.startsWith("video/")) throw new Error(`“${meta.name}” is not a video.`);
+        let token: string;
+        if (state.room.workspace !== undefined) {
+          const row = state.room.conn.prepare(
+            "SELECT size_bytes FROM files WHERE id = ? AND storage_kind = 'workspace' AND trashed_at IS NULL",
+          ).get(id) as { size_bytes: number } | undefined;
+          if (row === undefined) throw new Error("That media file is unavailable.");
+          const openRoom = state.room;
+          token = stageMediaStream(
+            services.files.mediaStreams,
+            row.size_bytes,
+            meta.mimeType,
+            async () => openRoom.workspace!.readStream(id),
+          );
+        } else {
+          const bytes = getFileBytes(state.room.conn, id);
+          if (bytes === null) throw new Error("That media file has no saved bytes.");
+          token = stageMediaBytes(services.files.mediaStreams, bytes, meta.mimeType);
+        }
         requestArgs = {
-          token: stageMediaBytes(services.files.mediaStreams, bytes, meta.mimeType),
+          token,
           mime: meta.mimeType,
           seconds: parseTimestamp(args.at),
         };

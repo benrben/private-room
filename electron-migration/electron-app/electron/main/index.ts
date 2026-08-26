@@ -322,7 +322,7 @@ import {
 } from "./ipc/registry.js";
 import { invalidateFileContentCacheForEvent, type FileRuntimeStores } from "./fileRuntimeSurfaceIpc.js";
 import { createLiveUpdater } from "./updater/liveUpdater.js";
-import { mediaResponse } from "./mediaTools.js";
+import { mediaStreamingResponse } from "./mediaTools.js";
 import { buildTemplate, dispatch, menuSync, type DispatchDeps, type MainWindowLike } from "./menu.js";
 import { QuitDoor, QUIT_REQUESTED } from "./quitDoor.js";
 import type { DialogDeps } from "./dialogTools.js";
@@ -648,9 +648,9 @@ export async function bootstrap(opts: BootstrapOptions): Promise<BootstrapResult
         },
       });
     });
-    opts.electron.protocol.handle("roommedia", (request) => {
+    opts.electron.protocol.handle("roommedia", async (request) => {
       const url = new URL(request.url);
-      const result = mediaResponse(runtimeStores.mediaStreams, url.pathname, request.headers.get("range"));
+      const result = await mediaStreamingResponse(runtimeStores.mediaStreams, url.pathname, request.headers.get("range"));
       return new Response(result.body, { status: result.status, headers: result.headers });
     });
   }

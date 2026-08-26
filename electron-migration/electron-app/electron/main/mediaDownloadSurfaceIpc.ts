@@ -6,7 +6,7 @@ import type { IpcMain, IpcMainInvokeEvent } from "electron";
 import type { RoomManagerDeps, RoomManagerState } from "./roomManager.js";
 import type { EventSender } from "./turn.js";
 import type { FileMeta as SharedFileMeta } from "../shared/apiTypes.js";
-import { availableName, insertFileFromUrl } from "./db-host/files.js";
+import { availableName, getFileMeta, insertFileFromUrl, setFileExtractedText } from "./db-host/files.js";
 import { extractDocumentText } from "./documentExtraction.js";
 import { webAccessEnabled } from "./browser/webAccess.js";
 import {
@@ -31,6 +31,7 @@ export function createDownloadEngineDeps(
   state: RoomManagerState,
   userDataDir: string,
   emit: EventSender,
+  testing: { extractText?: typeof extractDocumentText } = {},
 ): DownloadEngineDeps {
   const room = () => {
     if (!state.room) throw new Error("No room is open.");
@@ -41,7 +42,18 @@ export function createDownloadEngineDeps(
     const bytes = await fs.promises.readFile(filePath);
     const name = availableName(open.conn, displayName || path.basename(filePath) || "download");
     const mime = guessDownloadMime(name);
-    const meta = insertFileFromUrl(open.conn, name, mime, bytes, await extractDocumentText(name, bytes), "download", sourceUrl);
+    const extracted = await (testing.extractText ?? extractDocumentText)(name, bytes);
+    const meta = open.workspace === undefined
+      ? insertFileFromUrl(open.conn, name, mime, bytes, extracted, "download", sourceUrl)
+      : await open.workspace.createFile(name, fs.createReadStream(filePath), "download").then((entry) => {
+        open.conn.prepare(
+          "UPDATE files SET mime_type = ?, origin_url = ? WHERE id = ?",
+        ).run(mime, sourceUrl, entry.fileId);
+        if (extracted !== null && extracted.trim() !== "") {
+          setFileExtractedText(open.conn, entry.fileId, extracted);
+        }
+        return getFileMeta(open.conn, entry.fileId);
+      });
     emit("room-files-changed", {});
     await fs.promises.rm(filePath, { force: true }).catch(() => {});
     return meta as unknown as SharedFileMeta;

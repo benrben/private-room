@@ -2,7 +2,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import type { Readable } from "node:stream";
+import { Readable } from "node:stream";
 import type { IpcMain, IpcMainInvokeEvent } from "electron";
 import type { RoomManagerDeps, RoomManagerState } from "./roomManager.js";
 import type { EventSender } from "./turn.js";
@@ -28,7 +28,12 @@ import {
   studioPrompts,
   type HtmlPreviews,
 } from "./studiosCmds.js";
-import { createMediaStreams, stageMediaBytes, type MediaStreams } from "./mediaTools.js";
+import {
+  createMediaStreams,
+  stageMediaBytes,
+  stageMediaStream,
+  type MediaStreams,
+} from "./mediaTools.js";
 import { searchWeb } from "./webSearch.js";
 import { isOcrCandidate, OCR_TEXT_PREFIX, recognize, recognizeViaSidecar } from "./ocrTools.js";
 import { getRecMeta } from "./db-host/recordings.js";
@@ -196,9 +201,36 @@ export function registerFileRuntimeSurfaceIpc(
     const open = room();
     if (open.workspace !== undefined) {
       const row = open.conn.prepare(
-        "SELECT name, mime_type, extracted_text FROM files WHERE id = ? AND trashed_at IS NULL",
-      ).get(id) as { name: string; mime_type: string | null; extracted_text: string | null } | undefined;
+        "SELECT name, mime_type, extracted_text, size_bytes FROM files WHERE id = ? AND trashed_at IS NULL",
+      ).get(id) as {
+        name: string;
+        mime_type: string | null;
+        extracted_text: string | null;
+        size_bytes: number;
+      } | undefined;
       if (row === undefined) throw new Error("File not found.");
+      const mime = row.mime_type ?? "application/octet-stream";
+      const kind = getRecMeta(open.conn, id) !== null ? "recording" : viewerKind(row.name, mime);
+      const byteViewer = !["markdown", "html", "json", "subtitle", "prose", "log", "code", "text"]
+        .includes(kind);
+      if (byteViewer) {
+        const token = stageMediaStream(
+          stores.mediaStreams,
+          row.size_bytes,
+          mime,
+          async () => open.workspace!.readStream(id),
+        );
+        return buildFileContent(
+          open.conn,
+          stores,
+          id,
+          row.name,
+          row.mime_type,
+          null,
+          row.extracted_text,
+          token,
+        );
+      }
       return readAll(open.workspace.readStream(id)).then((bytes) =>
         buildFileContent(open.conn, stores, id, row.name, row.mime_type, bytes, row.extracted_text));
     }
@@ -214,6 +246,7 @@ export function registerFileRuntimeSurfaceIpc(
     mime0: string | null,
     bytes: Buffer | null,
     extracted: string | null,
+    stagedToken: string | null = null,
   ): FileContent {
     const mime = mime0 ?? "application/octet-stream";
     // A `recordings` row—not the WAV MIME—is the database's explicit marker
@@ -231,7 +264,7 @@ export function registerFileRuntimeSurfaceIpc(
       editable: ["markdown", "html", "json", "subtitle", "prose", "log", "code", "text", "csv"].includes(kind),
       text: extracted ?? (bytes && mime.startsWith("text/") ? bytes.toString("utf8") : null),
       dataB64: null,
-      mediaToken: byteViewer && bytes ? stageMediaBytes(runtimeStores.mediaStreams, bytes, mime) : null,
+      mediaToken: stagedToken ?? (byteViewer && bytes ? stageMediaBytes(runtimeStores.mediaStreams, bytes, mime) : null),
       mediaMeta: jsonOrNull(getMediaMeta(db, id)),
       webMeta: jsonOrNull(getWebMeta(db, id)),
     };
@@ -251,43 +284,77 @@ export function registerFileRuntimeSurfaceIpc(
 
   ipcMain.handle("decode_file_text", (_e: IpcMainInvokeEvent, raw: unknown) => {
     const a = rec(raw);
-    const [name, _mime, bytes] = getFileFull(room().conn, String(a.id ?? ""));
-    if (!bytes) throw new Error("This file has no stored bytes.");
-    const chosen = typeof a.encoding === "string" && a.encoding.trim() ? a.encoding : null;
-    const bom = bytes.length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf;
-    const encoding = chosen ?? "UTF-8";
-    let lossy = false;
-    let text: string;
-    try { text = new TextDecoder(encoding, { fatal: true }).decode(bytes); }
-    catch { text = new TextDecoder(encoding, { fatal: false }).decode(bytes); lossy = true; }
-    return {
-      text, encoding, source: chosen ? "chosen" : bom ? "bom" : "utf8", lossy,
-      editable: !lossy && viewerKind(name, guessDownloadMime(name)) !== "binary",
-      options: [
-        { name: "UTF-8", title: "Unicode (UTF-8)" },
-        { name: "windows-1252", title: "Western (Windows-1252)" },
-        { name: "windows-1255", title: "Hebrew (Windows-1255)" },
-        { name: "windows-1251", title: "Cyrillic (Windows-1251)" },
-      ],
+    const open = room();
+    const id = String(a.id ?? "");
+    const decode = (name: string, bytes: Buffer) => {
+      const chosen = typeof a.encoding === "string" && a.encoding.trim() ? a.encoding : null;
+      const bom = bytes.length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf;
+      const encoding = chosen ?? "UTF-8";
+      let lossy = false;
+      let text: string;
+      try { text = new TextDecoder(encoding, { fatal: true }).decode(bytes); }
+      catch { text = new TextDecoder(encoding, { fatal: false }).decode(bytes); lossy = true; }
+      return {
+        text, encoding, source: chosen ? "chosen" : bom ? "bom" : "utf8", lossy,
+        editable: !lossy && viewerKind(name, guessDownloadMime(name)) !== "binary",
+        options: [
+          { name: "UTF-8", title: "Unicode (UTF-8)" },
+          { name: "windows-1252", title: "Western (Windows-1252)" },
+          { name: "windows-1255", title: "Hebrew (Windows-1255)" },
+          { name: "windows-1251", title: "Cyrillic (Windows-1251)" },
+        ],
+      };
     };
+    if (open.workspace !== undefined) {
+      const row = open.conn.prepare(
+        "SELECT name FROM files WHERE id = ? AND trashed_at IS NULL",
+      ).get(id) as { name: string } | undefined;
+      if (row === undefined) throw new Error("File not found.");
+      return readAll(open.workspace.readStream(id)).then((bytes) => decode(row.name, bytes));
+    }
+    const [name, _mime, bytes] = getFileFull(open.conn, id);
+    if (!bytes) throw new Error("This file has no stored bytes.");
+    return decode(name, bytes);
   });
 
   ipcMain.handle("import_link", async (_e: IpcMainInvokeEvent, raw: unknown) => {
     const url = String(rec(raw).url ?? "");
     const page = await fetchReadable(url);
-    const name = availableName(room().conn, `${page.title || new URL(url).hostname}.md`);
+    const open = room();
+    const name = availableName(open.conn, `${page.title || new URL(url).hostname}.md`);
     const content = `# ${page.title}\n\nSource: ${url}\n\n${page.text}`;
-    const meta = insertFileFromUrl(room().conn, name, "text/markdown", Buffer.from(content), content, "web", url);
+    const meta = open.workspace === undefined
+      ? insertFileFromUrl(open.conn, name, "text/markdown", Buffer.from(content), content, "web", url)
+      : await open.workspace.createFile(name, Readable.from([Buffer.from(content)]), "web").then((entry) => {
+        open.conn.prepare(
+          "UPDATE files SET mime_type = 'text/markdown', origin_url = ? WHERE id = ?",
+        ).run(url, entry.fileId);
+        setFileExtractedText(open.conn, entry.fileId, content);
+        return getFileMeta(open.conn, entry.fileId);
+      });
     changed();
+    deps.scheduleAutoIndex?.(open.path);
     return meta;
   });
-  ipcMain.handle("open_scratch_pad", () => {
-    const db = room().conn;
+  ipcMain.handle("open_scratch_pad", async () => {
+    const open = room();
+    const db = open.conn;
     const existing = fileByExactName(db, SCRATCH_PAD_NAME);
     if (existing) return existing;
     const content = "# Scratch pad\n\n";
-    const meta = insertFile(db, SCRATCH_PAD_NAME, "text/markdown", Buffer.from(content), content, "generated");
+    const meta = open.workspace === undefined
+      ? insertFile(db, SCRATCH_PAD_NAME, "text/markdown", Buffer.from(content), content, "generated")
+      : await open.workspace.createFile(
+        SCRATCH_PAD_NAME,
+        Readable.from([Buffer.from(content)]),
+        "generated",
+      ).then((entry) => {
+        db.prepare("UPDATE files SET mime_type = 'text/markdown' WHERE id = ?").run(entry.fileId);
+        setFileExtractedText(db, entry.fileId, content);
+        return getFileMeta(db, entry.fileId);
+      });
     changed();
+    deps.scheduleAutoIndex?.(open.path);
     return meta;
   });
   ipcMain.handle("open_html_in_browser", (_e: IpcMainInvokeEvent, raw: unknown) => {

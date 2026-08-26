@@ -100,6 +100,7 @@
  */
 
 import { randomUUID } from "node:crypto";
+import { Readable } from "node:stream";
 
 // -------------------------------------------------------------- MediaStreams
 
@@ -110,6 +111,10 @@ export interface StagedMedia {
   bytes: Buffer;
   mime: string;
   seq: number;
+  /** Workspace files stay on disk and are opened only when the protocol asks
+   * for bytes. Blob rooms leave this undefined and keep using `bytes`. */
+  openStream?: () => Promise<Readable>;
+  sizeBytes?: number;
 }
 
 /** Keep at most this many staged media entries alive. Opening a new file
@@ -168,6 +173,39 @@ export function stageMediaBytes(streams: MediaStreams, bytes: Buffer, mime: stri
     streams.map.delete(oldestKey);
   }
   streams.map.set(token, { bytes, mime, seq });
+  return token;
+}
+
+/** Stage a trusted stream factory without copying a normal workspace file
+ * into the main-process heap. The factory returns a fresh stream for every
+ * media request because Chromium may make several independent range reads. */
+export function stageMediaStream(
+  streams: MediaStreams,
+  sizeBytes: number,
+  mime: string,
+  openStream: () => Promise<Readable>,
+): string {
+  const seq = streams.next++;
+  const token = `${seq}-${randomUUID()}`;
+  while (streams.map.size >= MAX_STAGED) {
+    let oldestKey: string | undefined;
+    let oldestSeq = Number.POSITIVE_INFINITY;
+    for (const [key, staged] of streams.map) {
+      if (staged.seq < oldestSeq) {
+        oldestSeq = staged.seq;
+        oldestKey = key;
+      }
+    }
+    if (oldestKey === undefined) break;
+    streams.map.delete(oldestKey);
+  }
+  streams.map.set(token, {
+    bytes: Buffer.alloc(0),
+    mime,
+    seq,
+    openStream,
+    sizeBytes,
+  });
   return token;
 }
 
@@ -328,6 +366,12 @@ export interface MediaHttpResponse {
   body: Buffer;
 }
 
+export interface StreamingMediaHttpResponse {
+  status: number;
+  headers: MediaHeader[];
+  body: Buffer | ReadableStream<Uint8Array>;
+}
+
 const ALLOW_ORIGIN: MediaHeader = ["Access-Control-Allow-Origin", "*"];
 
 /**
@@ -391,4 +435,79 @@ export function mediaResponse(
     ["Content-Range", `bytes ${start}-${end}/${len}`],
   ];
   return { status: 206, headers, body };
+}
+
+async function rangeStream(
+  source: Readable,
+  start: number,
+  end: number,
+): Promise<ReadableStream<Uint8Array>> {
+  async function* selected(): AsyncGenerator<Buffer> {
+    let position = 0;
+    try {
+      for await (const raw of source) {
+        const chunk = Buffer.isBuffer(raw) ? raw : Buffer.from(raw as Uint8Array);
+        const chunkStart = position;
+        const chunkEnd = position + chunk.length - 1;
+        position += chunk.length;
+        if (chunkEnd < start) continue;
+        if (chunkStart > end) break;
+        const from = Math.max(0, start - chunkStart);
+        const to = Math.min(chunk.length, end - chunkStart + 1);
+        if (to > from) yield chunk.subarray(from, to);
+        if (chunkEnd >= end) break;
+      }
+    } finally {
+      source.destroy();
+    }
+  }
+  return Readable.toWeb(Readable.from(selected())) as ReadableStream<Uint8Array>;
+}
+
+/** Async protocol response used for normal workspace files. Legacy staged
+ * blobs still delegate to the exact synchronous implementation above. */
+export async function mediaStreamingResponse(
+  streams: MediaStreams,
+  path: string,
+  range: string | null | undefined,
+): Promise<StreamingMediaHttpResponse> {
+  const token = path.replace(/^\/+/, "");
+  const staged = streams.map.get(token);
+  if (staged?.openStream === undefined || staged.sizeBytes === undefined) {
+    return mediaResponse(streams, path, range);
+  }
+  const len = staged.sizeBytes;
+  const base: MediaHeader[] = [
+    ["Content-Type", staged.mime],
+    ["Accept-Ranges", "bytes"],
+    ["Cache-Control", "no-store"],
+    ALLOW_ORIGIN,
+  ];
+  if (range === null || range === undefined) {
+    const stream = await staged.openStream();
+    return {
+      status: 200,
+      headers: [...base, ["Content-Length", String(len)]],
+      body: await rangeStream(stream, 0, Math.max(0, len - 1)),
+    };
+  }
+  const parsed = parseRange(range, len);
+  if (parsed === null) {
+    return {
+      status: 416,
+      headers: [["Content-Range", `bytes */${len}`], ALLOW_ORIGIN],
+      body: Buffer.alloc(0),
+    };
+  }
+  const [start, end] = parsed;
+  const stream = await staged.openStream();
+  return {
+    status: 206,
+    headers: [
+      ...base,
+      ["Content-Length", String(end - start + 1)],
+      ["Content-Range", `bytes ${start}-${end}/${len}`],
+    ],
+    body: await rangeStream(stream, start, end),
+  };
 }
