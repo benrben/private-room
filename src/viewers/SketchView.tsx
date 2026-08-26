@@ -267,6 +267,17 @@ export default function SketchView({ fileId, text }: Props) {
   /** Every pending reveal timer, so a new drawing or an unmount can drop them. */
   const revealTimers = useRef<number[]>([]);
   const dirty = useRef(false);
+  /** The writes themselves are serialized, not only their debounce timers.
+   *
+   * A second edit can become idle while the previous workspace write is still
+   * flushing and updating its hash. Sending both IPC calls at once lets two
+   * otherwise-correct optimistic writes start from the same hash: one then
+   * fails as a conflict, or (on a fast rename) the older document can land
+   * last. This queue is also used by the unmount flush, so closing the drawing
+   * cannot race a save already in flight. A rejected write is swallowed only
+   * as the queue's predecessor; the individual caller still receives the
+   * rejection and reports/retries it below. */
+  const saveChain = useRef<Promise<void>>(Promise.resolve());
   /** How many edits have been scheduled for saving, ever.
    *
    * A write in flight carries the number it started with. If an edit is made
@@ -277,6 +288,12 @@ export default function SketchView({ fileId, text }: Props) {
   const docVersion = useRef(0);
   /** Version history is taken once per editing session, not once per stroke. */
   const snapshotted = useRef(false);
+  /** Exact normal-file JSON this canvas last read or successfully wrote.
+   * Sent with the next save as the optimistic base, so a Finder/editor change
+   * made while the canvas is open is reported as a conflict instead of being
+   * silently overwritten. Agent events advance it to the document their tool
+   * has already committed before the local merge is saved. */
+  const persistedDoc = useRef(text);
 
   // --- live gesture state (not React state: it changes per pointer event) ---
   const [preview, setPreview] = useState<SketchElement | null>(null);
@@ -309,12 +326,32 @@ export default function SketchView({ fileId, text }: Props) {
   const [textValue, setTextValue] = useState("");
 
   // ----------------------------------------------------------------- saving
+  const persist = useCallback(
+    (next: Sketch): Promise<void> => {
+      const write = saveChain.current
+        .catch(() => undefined)
+        .then(async () => {
+          const serialized = serializeSketch(next);
+          await api.saveSketch(
+            fileId,
+            serialized,
+            !snapshotted.current,
+            persistedDoc.current,
+          );
+          snapshotted.current = true;
+          persistedDoc.current = serialized;
+        });
+      saveChain.current = write;
+      return write;
+    },
+    [fileId],
+  );
+
   const flush = useCallback(
     async (next: Sketch) => {
       const wrote = docVersion.current;
       try {
-        await api.saveSketch(fileId, serializeSketch(next), !snapshotted.current);
-        snapshotted.current = true;
+        await persist(next);
         if (retryTimer.current) window.clearTimeout(retryTimer.current);
         retryTimer.current = null;
         retryIn.current = SAVE_RETRY_MS;
@@ -344,7 +381,7 @@ export default function SketchView({ fileId, text }: Props) {
         retryIn.current = Math.min(retryIn.current * 2, SAVE_RETRY_MAX_MS);
       }
     },
-    [fileId],
+    [persist],
   );
   /** The live `flush`, so the retry it schedules can call the next one without
    * the callback having to name itself. */
@@ -412,10 +449,10 @@ export default function SketchView({ fileId, text }: Props) {
       dropRevealTimers();
       // The one moment work can be lost: unmounting inside the idle window.
       if (dirty.current) {
-        void api.saveSketch(fileId, serializeSketch(docRef.current), !snapshotted.current);
+        void persist(docRef.current);
       }
     },
-    [fileId, dropRevealTimers],
+    [dropRevealTimers, persist],
   );
 
   // ------------------------------------------------- the agent drawing here
@@ -494,6 +531,9 @@ export default function SketchView({ fileId, text }: Props) {
           setNote(`The room drew something this page couldn't read: ${parsed.error}`);
           return;
         }
+        // The tool writes before it emits this event. Its whole document is
+        // therefore the new optimistic base for the merge autosaved below.
+        persistedDoc.current = e.doc;
         // The note shares its slot with the save state (`{note ?? saveWord}`),
         // so a note that outlives its cause would silently mask "Saving…" and
         // "Couldn't save" from then on. A drawing that parses is the answer to

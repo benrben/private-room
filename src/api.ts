@@ -1220,8 +1220,8 @@ export const api = {
   // updateFileContent: that snapshots a version, reindexes and broadcasts
   // room-files-changed on every call. `snapshot` is true once per editing
   // session, which is where version history actually belongs.
-  saveSketch: (id: string, doc: string, snapshot: boolean): Promise<void> =>
-    invoke<void>("save_sketch", { id, doc, snapshot }),
+  saveSketch: (id: string, doc: string, snapshot: boolean, expectedDoc?: string): Promise<void> =>
+    invoke<void>("save_sketch", { id, doc, snapshot, expectedDoc }),
   exportSketchSvg: (id: string): Promise<FileMeta> =>
     invoke<FileMeta>("export_sketch_svg", { id }),
   /** …and as a flat picture, for everywhere that will not take a vector. */

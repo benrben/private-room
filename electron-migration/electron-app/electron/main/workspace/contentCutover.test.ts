@@ -5,6 +5,7 @@ import { Readable } from "node:stream";
 import type { IpcMain, IpcMainInvokeEvent } from "electron";
 import { afterEach, describe, expect, it } from "vitest";
 import { createRoomManagerState, type RoomManagerDeps } from "../roomManager.js";
+import { setRecMeta } from "../db-host/recordings.js";
 import { registerFileRuntimeSurfaceIpc } from "../fileRuntimeSurfaceIpc.js";
 import { registerFileSurfaceIpc } from "../fileSurfaceIpc.js";
 import { createDownloadEngineDeps } from "../mediaDownloadSurfaceIpc.js";
@@ -57,6 +58,52 @@ function ipcHandlers(): {
 const event = {} as IpcMainInvokeEvent;
 
 describe("workspace content cutover", () => {
+  it("opens a converted sketch from its normal JSON file, not its search labels", async () => {
+    const { state, db, workspace } = await fixture();
+    const { ipc, handlers } = ipcHandlers();
+    const stores = registerFileRuntimeSurfaceIpc(
+      ipc,
+      state,
+      { userDataDir: temporary!, spawnRoomServerIfEnabled: () => {} },
+      temporary!,
+      () => {},
+      { openPath: async () => {} },
+    );
+    const json = JSON.stringify({
+      version: 1,
+      width: 1600,
+      height: 1000,
+      seq: 1,
+      elements: [{
+        id: "e1", type: "rect", x: 20, y: 20, w: 120, h: 70,
+        ink: "blue", label: "Real file label",
+      }],
+    });
+    const created = await workspace.createFile(
+      "Converted flow.sketch",
+      Readable.from([Buffer.from(json)]),
+      "migration",
+    );
+    db.prepare(
+      "UPDATE files SET mime_type = 'application/json', extracted_text = ? WHERE id = ?",
+    ).run("Real file label\n", created.fileId);
+
+    try {
+      const content = await handlers.get("get_file_content")!(event, { id: created.fileId }) as {
+        kind: string;
+        text: string | null;
+        mediaToken: string | null;
+      };
+      expect(content.kind).toBe("sketch");
+      expect(content.text).toBe(json);
+      expect(content.text).not.toBe("Real file label\n");
+      expect(content.mediaToken).toBeNull();
+      expect(stores.mediaStreams.map.size).toBe(0);
+    } finally {
+      db.close();
+    }
+  });
+
   it("creates and decodes the scratch pad as a normal file without live blob bytes", async () => {
     const { root, state, db } = await fixture();
     const { ipc, handlers } = ipcHandlers();
@@ -124,6 +171,51 @@ describe("workspace content cutover", () => {
       );
       expect(response.status).toBe(206);
       expect(Buffer.from(await new Response(response.body).arrayBuffer()).toString("utf8")).toBe("2345");
+    } finally {
+      db.close();
+    }
+  });
+
+  it("serves preserved legacy recording MIME as playable audio after conversion", async () => {
+    const { state, db, workspace } = await fixture();
+    const { ipc, handlers } = ipcHandlers();
+    const stores = registerFileRuntimeSurfaceIpc(
+      ipc,
+      state,
+      { userDataDir: temporary!, spawnRoomServerIfEnabled: () => {} },
+      temporary!,
+      () => {},
+      { openPath: async () => {} },
+    );
+    const audioBytes = Buffer.from("aac-in-mp4 fixture bytes");
+    const created = await workspace.createFile(
+      "Recordings/converted-call.m4a",
+      Readable.from([audioBytes]),
+      "recording",
+    );
+    // Old rooms used several labels for the same AAC-in-MP4 container. The
+    // conversion keeps this private metadata exactly, so the viewer boundary
+    // must normalize it when it exposes the now-normal file to Chromium.
+    db.prepare("UPDATE files SET mime_type = 'audio/m4a' WHERE id = ?").run(created.fileId);
+    setRecMeta(db, created.fileId, JSON.stringify({ durationCs: 100, segments: [] }));
+
+    try {
+      const content = await handlers.get("get_file_content")!(event, { id: created.fileId }) as {
+        kind: string;
+        mediaToken: string;
+      };
+      expect(content.kind).toBe("recording");
+      expect(stores.mediaStreams.map.get(content.mediaToken)?.mime).toBe("audio/mp4");
+
+      const response = await mediaStreamingResponse(
+        stores.mediaStreams,
+        `/${content.mediaToken}`,
+        "bytes=0-2",
+      );
+      expect(response.status).toBe(206);
+      expect(response.headers).toContainEqual(["Content-Type", "audio/mp4"]);
+      expect(Buffer.from(await new Response(response.body).arrayBuffer()))
+        .toEqual(audioBytes.subarray(0, 3));
     } finally {
       db.close();
     }

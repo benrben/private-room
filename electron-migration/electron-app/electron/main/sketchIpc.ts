@@ -66,8 +66,8 @@ export function registerSketchIpc(ipcMain: Pick<IpcMain, "handle">, room: RoomSo
     emitSafely(emit, "room-files-changed", undefined);
     return meta;
   });
-  handle("save_sketch", async (args: { id: string; doc: string; snapshot: boolean }) => {
-    await writeSketchInRoom(openRoom(room), args.id, args.doc, args.snapshot);
+  handle("save_sketch", async (args: { id: string; doc: string; snapshot: boolean; expectedDoc?: string }) => {
+    await writeSketchInRoom(openRoom(room), args.id, args.doc, args.snapshot, args.expectedDoc);
   });
   handle("export_sketch_svg", async (args: { id: string }) => {
     const meta = await exportSketchSvgInRoom(openRoom(room), args.id);

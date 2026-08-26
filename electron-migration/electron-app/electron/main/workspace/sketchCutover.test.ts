@@ -1,15 +1,20 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { createToolEffects, execTool } from "../execTool.js";
 import {
+  createSketch,
   execReadDrawingInRoom,
   exportSketchPngInRoom,
   exportSketchSvgInRoom,
+  writeSketch,
   writeSketchInRoom,
 } from "../sketchCommands.js";
-import { createWorkspaceRoom } from "./roomLayout.js";
+import { applyScript, defaultSketch, sketchToJson } from "../sketchDoc.js";
+import { createRoom } from "../db-host/open.js";
+import { convertLegacyRoomToWorkspace } from "./conversion.js";
+import { createWorkspaceRoom, openWorkspaceRoom } from "./roomLayout.js";
 import { WorkspaceService } from "./workspaceService.js";
 
 let temporary: string | null = null;
@@ -61,6 +66,64 @@ describe("workspace drawing cutover", () => {
       expect(currentRows.every((item) => item.original_bytes === null)).toBe(true);
     } finally {
       db.close();
+    }
+  });
+
+  it("keeps the page and agent drawing tools live after legacy conversion", async () => {
+    temporary = await mkdtemp(path.join(os.tmpdir(), "arcelle-sketch-converted-"));
+    const password = "correct horse battery staple";
+    const source = path.join(temporary, "Legacy.roomai");
+    const root = path.join(temporary, "Converted Room");
+    const legacy = createRoom(source, password, "Legacy");
+    const meta = createSketch(legacy, "Converted flow");
+    const before = defaultSketch();
+    const seeded = applyScript(before, 'rect 20 20 120 70 blue "Before conversion"');
+    if (!seeded.ok) throw new Error(seeded.error);
+    writeSketch(legacy, meta.id, sketchToJson(before), false);
+    legacy.close();
+
+    await convertLegacyRoomToWorkspace(source, password, root);
+    const opened = openWorkspaceRoom(root, password);
+    const workspace = new WorkspaceService(opened.db, root);
+    const room = { db: opened.db, path: root, workspace };
+    try {
+      const outcome = await execTool(
+        "draw",
+        { name: "Converted flow", script: 'text 220 80 red 24 "After conversion"' },
+        createToolEffects(),
+        { db: opened.db, routes: [], currentRoom: () => room },
+      );
+      expect(outcome.ok).toBe(true);
+
+      const disk = await readFile(path.join(root, "Converted flow.sketch"), "utf8");
+      expect(disk).toContain("Before conversion");
+      expect(disk).toContain("After conversion");
+      const row = opened.db.prepare(
+        "SELECT original_bytes, storage_kind FROM files WHERE id = ?",
+      ).get(meta.id) as { original_bytes: Buffer | null; storage_kind: string };
+      expect(row).toEqual({ original_bytes: null, storage_kind: "workspace" });
+
+      const read = await execReadDrawingInRoom(
+        room,
+        { name: "Converted flow" },
+        { pendingImages: [], visionChat: false },
+      );
+      expect(read.ok && read.text).toContain("After conversion");
+      const svg = await exportSketchSvgInRoom(room, meta.id);
+      expect(await readFile(path.join(root, svg.name), "utf8")).toContain("After conversion");
+
+      // The canvas loaded `disk`, then another app changed the normal file.
+      // Its autosave must not adopt a newer database hash and overwrite that
+      // external work; it carries the exact document it was based on.
+      const external = disk.replace("After conversion", "Changed outside Arcelle");
+      await writeFile(path.join(root, "Converted flow.sketch"), external, "utf8");
+      const local = disk.replace("After conversion", "Changed on canvas");
+      await expect(writeSketchInRoom(room, meta.id, local, false, disk))
+        .rejects.toThrow(/changed after it was opened/i);
+      expect(await readFile(path.join(root, "Converted flow.sketch"), "utf8"))
+        .toBe(external);
+    } finally {
+      opened.db.close();
     }
   });
 });

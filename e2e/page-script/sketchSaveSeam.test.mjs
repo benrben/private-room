@@ -72,6 +72,36 @@ test("a save that lands after a newer edit does not call the page clean", () => 
   assert.match(block("scheduleSave", 800), /docVersion\.current \+= 1;/);
 });
 
+test("workspace sketch writes and the close flush are serialized", () => {
+  // Debouncing prevents two idle timers from coexisting, but it does not stop
+  // the next timer from firing while an earlier IPC write is still flushing.
+  // Workspace writes use optimistic hashes, so concurrent saves can conflict
+  // or land out of order. Both the normal flush and the unmount flush must go
+  // through one promise chain.
+  const persist = block("persist", 900);
+  assert.match(persist, /saveChain\.current\s*\n?\s*\.catch\(\(\) => undefined\)/);
+  assert.match(persist, /api\.saveSketch\(/);
+  assert.match(persist, /saveChain\.current = write;/);
+  assert.match(block("flush", 1600), /await persist\(next\);/);
+  const cleanup = VIEW.slice(VIEW.indexOf("// A drawing has no Save button"), VIEW.indexOf("// ------------------------------------------------- the agent drawing here"));
+  assert.match(cleanup, /void persist\(docRef\.current\);/);
+  assert.doesNotMatch(cleanup, /void api\.saveSketch\(/);
+});
+
+test("a sketch save carries the exact document it was based on", () => {
+  // The workspace database may already have reconciled a Finder edit by the
+  // time autosave runs. Looking up the latest database hash inside the save
+  // would approve overwriting that external edit. The canvas must carry its
+  // own last-known normal-file JSON and advance it only after a real write or
+  // after an agent event whose write has already committed.
+  const persist = block("persist", 1200);
+  assert.match(persist, /persistedDoc\.current/);
+  assert.match(persist, /api\.saveSketch\([\s\S]*persistedDoc\.current/);
+  assert.match(persist, /persistedDoc\.current = serialized;/);
+  const drawn = VIEW.slice(VIEW.indexOf(".onSketchDrawn"), VIEW.indexOf(".onSketchDrawn") + 1800);
+  assert.match(drawn, /persistedDoc\.current = e\.doc;/);
+});
+
 test("a failed save asks again instead of sitting there saying it failed", () => {
   // A canvas has no Save button, so nothing else can force the write.
   const flush = block("flush", 1600);

@@ -790,7 +790,7 @@ export interface Commands {
   };
   create_sketch: { args: { name: string }; result: FileMeta };
   save_sketch: {
-    args: { id: string; doc: string; snapshot: boolean };
+    args: { id: string; doc: string; snapshot: boolean; expectedDoc?: string };
     result: void;
   };
   export_sketch_svg: { args: { id: string }; result: FileMeta };

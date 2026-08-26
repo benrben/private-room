@@ -30,6 +30,7 @@ import {
 } from "./studiosCmds.js";
 import {
   createMediaStreams,
+  playableMediaMime,
   stageMediaBytes,
   stageMediaStream,
   type MediaStreams,
@@ -89,6 +90,7 @@ function viewerKind(name: string, mime: string): ViewerKind {
   if (["zip", "tar", "gz", "7z", "rar"].includes(e)) return "archive";
   if (["md", "markdown"].includes(e)) return "markdown";
   if (["html", "htm"].includes(e)) return "html";
+  if (e === "sketch") return "sketch";
   if (e === "json") return "json";
   if (["srt", "vtt"].includes(e)) return "subtitle";
   if (["eml", "msg"].includes(e)) return "email";
@@ -225,13 +227,28 @@ export function registerFileRuntimeSurfaceIpc(
       if (row === undefined) throw new Error("File not found.");
       const mime = row.mime_type ?? "application/octet-stream";
       const kind = getRecMeta(open.conn, id) !== null ? "recording" : viewerKind(row.name, mime);
-      const byteViewer = !["markdown", "html", "json", "subtitle", "prose", "log", "code", "text"]
+      // A sketch is JSON edited by its own canvas. It needs the real document
+      // text, not a roommedia token and not `extracted_text` (which contains
+      // only the drawing's searchable labels). Treating it as a byte viewer
+      // made converted sketches open on those labels, so the canvas reported
+      // malformed JSON and could neither draw nor save.
+      const byteViewer = !["markdown", "html", "json", "subtitle", "prose", "log", "code", "text", "sketch"]
         .includes(kind);
       if (byteViewer) {
+        // The legacy database may carry MIME labels such as `audio/m4a` or
+        // `audio/mp4a-latm`. Chromium does not accept those labels for the
+        // AAC-in-MP4 bytes it can otherwise play. Conversion deliberately
+        // preserves that metadata, so normalize the response type when the
+        // normal workspace file is staged, not only when a new file is
+        // imported. This also gives old octet-stream media a playable type
+        // from its extension.
+        const streamMime = kind === "audio" || kind === "recording" || kind === "video"
+          ? playableMediaMime(mime, ext(row.name), kind === "video")
+          : mime;
         const token = stageMediaStream(
           stores.mediaStreams,
           row.size_bytes,
-          mime,
+          streamMime,
           async () => open.workspace!.readStream(id),
           async (start, end) => open.workspace!.readStream(id, { start, end }),
         );
@@ -271,15 +288,23 @@ export function registerFileRuntimeSurfaceIpc(
     const kind: ViewerKind = getRecMeta(db, id) !== null
       ? "recording"
       : viewerKind(name, mime);
-    const byteViewer = !["markdown", "html", "json", "subtitle", "prose", "log", "code", "text"].includes(kind);
+    const byteViewer = !["markdown", "html", "json", "subtitle", "prose", "log", "code", "text", "sketch"].includes(kind);
+    const stagedMime = kind === "audio" || kind === "recording" || kind === "video"
+      ? playableMediaMime(mime, ext(name), kind === "video")
+      : mime;
     const content: FileContent = {
       kind,
       name,
       mime,
       editable: ["markdown", "html", "json", "subtitle", "prose", "log", "code", "text", "csv"].includes(kind),
-      text: extracted ?? (bytes && mime.startsWith("text/") ? bytes.toString("utf8") : null),
+      // `extracted` is deliberately just labels for a sketch, so search can
+      // find a diagram without indexing coordinates and JSON keys. The canvas
+      // must instead receive the exact normal-file document.
+      text: kind === "sketch"
+        ? (bytes === null ? null : bytes.toString("utf8"))
+        : extracted ?? (bytes && mime.startsWith("text/") ? bytes.toString("utf8") : null),
       dataB64: null,
-      mediaToken: stagedToken ?? (byteViewer && bytes ? stageMediaBytes(runtimeStores.mediaStreams, bytes, mime) : null),
+      mediaToken: stagedToken ?? (byteViewer && bytes ? stageMediaBytes(runtimeStores.mediaStreams, bytes, stagedMime) : null),
       mediaMeta: jsonOrNull(getMediaMeta(db, id)),
       webMeta: jsonOrNull(getWebMeta(db, id)),
     };

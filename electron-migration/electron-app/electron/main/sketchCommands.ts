@@ -43,6 +43,7 @@
  */
 
 import type Database from "better-sqlite3-multiple-ciphers";
+import { createHash } from "node:crypto";
 import path from "node:path";
 import { Readable } from "node:stream";
 import {
@@ -488,6 +489,7 @@ export async function writeSketchInRoom(
   id: string,
   doc: string,
   snapshot: boolean,
+  expectedDoc?: string,
 ): Promise<void> {
   if (room.workspace === undefined) {
     writeSketch(room.db, id, doc, snapshot);
@@ -499,10 +501,18 @@ export async function writeSketchInRoom(
   ).get(id) as { content_sha256: string | null } | undefined;
   if (row === undefined) throw new Error("That drawing is no longer in this room.");
   if (snapshot) await room.workspace.snapshotVersion(id, "Before you drew");
+  // The editor sends the exact document it originally read (then advances it
+  // after each successful save). Using the database's hash at save time would
+  // silently bless an external Finder/editor change that happened while this
+  // canvas was open, and overwrite it. The normal file remains the truth: its
+  // bytes must still match the canvas's last-known document.
+  const expectedHash = expectedDoc === undefined
+    ? row.content_sha256 ?? undefined
+    : createHash("sha256").update(expectedDoc, "utf8").digest("hex");
   await room.workspace.writeAtomic(
     id,
     Readable.from([Buffer.from(doc, "utf8")]),
-    row.content_sha256 ?? undefined,
+    expectedHash,
   );
   setFileExtractedText(room.db, id, sketchExtractedText(parsed));
 }
