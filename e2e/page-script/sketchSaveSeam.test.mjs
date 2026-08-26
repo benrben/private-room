@@ -89,6 +89,27 @@ test("workspace sketch writes and the close flush are serialized", () => {
   assert.doesNotMatch(cleanup, /void api\.saveSketch\(/);
 });
 
+test("an external file refresh invalidates every stale canvas write", () => {
+  // `file-updated` makes the shell re-read and remount asynchronously. Until
+  // that finishes, the old canvas still owns its debounce, retry and unmount
+  // flush. It must cancel all three rather than relying on a late conflict to
+  // rescue bytes the external writer has already committed.
+  const external = VIEW.slice(
+    VIEW.indexOf("// A file-specific refresh means another writer"),
+    VIEW.indexOf("// A drawing has no Save button"),
+  );
+  assert.match(external, /api\.onFileUpdated/);
+  assert.match(external, /externalRevision\.current \+= 1;/);
+  assert.match(external, /dirty\.current = false;/);
+  assert.match(external, /clearTimeout\(saveTimer\.current\)/);
+  assert.match(external, /clearTimeout\(retryTimer\.current\)/);
+  const persist = block("persist", 1200);
+  assert.match(persist, /basedOnExternalRevision = externalRevision\.current/);
+  assert.match(persist, /externalRevision\.current !== basedOnExternalRevision/);
+  const flush = block("flush", 2000);
+  assert.match(flush, /externalRevision\.current !== basedOnExternalRevision/);
+});
+
 test("a sketch save carries the exact document it was based on", () => {
   // The workspace database may already have reconciled a Finder edit by the
   // time autosave runs. Looking up the latest database hash inside the save
@@ -106,7 +127,7 @@ test("a sketch save carries the exact document it was based on", () => {
 
 test("a failed save asks again instead of sitting there saying it failed", () => {
   // A canvas has no Save button, so nothing else can force the write.
-  const flush = block("flush", 1600);
+  const flush = block("flush", 2200);
   const caught = flush.slice(flush.indexOf("} catch {"));
   assert.match(caught, /retryTimer\.current = window\.setTimeout\(/);
   assert.match(caught, /retryIn\.current/, "and it backs off rather than spinning");

@@ -260,6 +260,14 @@ export default function SketchView({ fileId, text }: Props) {
   const drawingRef = useRef(false);
   const pendingAgent = useRef<{ doc: Sketch; added: string[]; removed: string[] } | null>(null);
   const saveTimer = useRef<number | null>(null);
+  /** Increments when another writer commits this file.
+   *
+   * The parent responds to `file-updated` by re-reading and remounting this
+   * viewer. Before that async read finishes, this component can still have an
+   * idle timer, a queued retry, or its unmount flush ready to write the old
+   * document. The revision invalidates all three explicitly; optimistic hashes
+   * remain the disk boundary, but a known-stale canvas should not even ask. */
+  const externalRevision = useRef(0);
   /** The pending retry after a save that failed, and how long the next one
    * waits. Reset the moment a write succeeds. */
   const retryTimer = useRef<number | null>(null);
@@ -328,9 +336,11 @@ export default function SketchView({ fileId, text }: Props) {
   // ----------------------------------------------------------------- saving
   const persist = useCallback(
     (next: Sketch): Promise<void> => {
+      const basedOnExternalRevision = externalRevision.current;
       const write = saveChain.current
         .catch(() => undefined)
         .then(async () => {
+          if (externalRevision.current !== basedOnExternalRevision) return;
           const serialized = serializeSketch(next);
           await api.saveSketch(
             fileId,
@@ -350,8 +360,10 @@ export default function SketchView({ fileId, text }: Props) {
   const flush = useCallback(
     async (next: Sketch) => {
       const wrote = docVersion.current;
+      const basedOnExternalRevision = externalRevision.current;
       try {
         await persist(next);
+        if (externalRevision.current !== basedOnExternalRevision) return;
         if (retryTimer.current) window.clearTimeout(retryTimer.current);
         retryTimer.current = null;
         retryIn.current = SAVE_RETRY_MS;
@@ -362,6 +374,7 @@ export default function SketchView({ fileId, text }: Props) {
           setSaveState("saved");
         }
       } catch {
+        if (externalRevision.current !== basedOnExternalRevision) return;
         // The same version test the success arm makes, for the same reason: a
         // write of a SUPERSEDED document failing says nothing about the one on
         // screen. Reporting it announced "Couldn't save" over a page whose
@@ -437,6 +450,26 @@ export default function SketchView({ fileId, text }: Props) {
     dropRevealTimers();
     setHidden(new Set());
   }, [dropRevealTimers]);
+
+  // A file-specific refresh means another writer has already committed a new
+  // source of truth. Cancel this instance before the parent's async re-read
+  // remounts it; otherwise its retry or unmount flush can resurrect the old
+  // drawing after the external save has reported success.
+  useEffect(() => {
+    let stop: (() => void) | undefined;
+    void api.onFileUpdated((updatedId) => {
+      if (updatedId !== fileId) return;
+      externalRevision.current += 1;
+      dirty.current = false;
+      if (saveTimer.current) window.clearTimeout(saveTimer.current);
+      saveTimer.current = null;
+      if (retryTimer.current) window.clearTimeout(retryTimer.current);
+      retryTimer.current = null;
+    }).then((unlisten) => {
+      stop = unlisten;
+    });
+    return () => stop?.();
+  }, [fileId]);
 
   // A drawing has no Save button, so an unmount mid-debounce is the one moment
   // work can be lost. Flush it.
