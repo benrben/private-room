@@ -204,11 +204,11 @@ Legend:
 - [x] Run the complete Python sidecar test suite.
 - [x] Test legacy rooms without conversion.
 - [x] Test interrupted conversion and resume.
-- [ ] Test power loss at every journal phase.
-- [ ] Test database corruption while normal files remain safe.
+- [x] Test power loss at every journal phase.
+- [x] Test database corruption while normal files remain safe.
 - [ ] Test password change and recovery.
 - [ ] Test large video, recording and generated artifacts.
-- [ ] Test Unicode, case collisions, long paths and symlinks.
+- [x] Test Unicode, case collisions, long paths and symlinks.
 - [ ] Test iCloud, Dropbox, network drives and offline placeholders.
 - [ ] Test two-process and duplicate-room conflicts.
 - [ ] Complete traversal, shell escape, `.arcelle` and privacy security review.
