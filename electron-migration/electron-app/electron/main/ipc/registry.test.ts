@@ -395,6 +395,35 @@ describe("registerAllIpc — one shared room across module boundaries", () => {
     expect(await handlers.get("file_versions_kept")!(fakeEvent, {})).toEqual(expect.any(Number));
   });
 
+  it("preserves the workspace service across the shared room adapter", async () => {
+    const { handlers, userDataDir } = build();
+    const roomPath = path.join(userDataDir, "Sketch Workspace");
+    await handlers.get("create_room")!(fakeEvent, {
+      path: roomPath,
+      password: "correct horse battery staple",
+      name: "Sketch Workspace",
+      format: "workspace-folder",
+    });
+    const sketch = (await handlers.get("create_sketch")!(fakeEvent, {
+      name: "Normal file",
+    })) as { id: string };
+    const doc = JSON.stringify({
+      version: 1,
+      width: 1600,
+      height: 1000,
+      seq: 1,
+      elements: [{ id: "e1", type: "rect", x: 10, y: 10, w: 80, h: 60, ink: "blue" }],
+    });
+
+    await handlers.get("save_sketch")!(fakeEvent, {
+      id: sketch.id,
+      doc,
+      snapshot: false,
+    });
+
+    expect(readFileSync(path.join(roomPath, "Normal file.sketch"), "utf8")).toBe(doc);
+  });
+
   it("reuses a staged media token until a file-change event invalidates it", async () => {
     const { handlers, runtimeStores, state, userDataDir } = build();
     const roomPath = path.join(userDataDir, `pr-media-${randomUUID()}.roomai`);

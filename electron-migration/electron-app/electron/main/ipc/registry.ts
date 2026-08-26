@@ -383,7 +383,7 @@ export function checkCompleteness(registeredChannels: ReadonlySet<string>): Comp
 // ============================================================================
 
 /** The widest `currentRoom()` shape any wired module's `RoomSource` needs — a
- * superset of `OpenRoom` (`{db, path}`), `moonshotAiActions.ts`'s `RoomHandle`
+ * superset of `OpenRoom` (`{db, path, workspace?}`), `moonshotAiActions.ts`'s `RoomHandle`
  * (`OpenRoom` + `name`), and `moonshotServer.ts`'s `RoomServerRoomSource`
  * (`{path, name, db}`). Field order is irrelevant — TypeScript's structural
  * typing only checks presence and type. */
@@ -391,6 +391,10 @@ export interface AppRoomHandle {
   db: Database.Database;
   path: string;
   name: string;
+  /** Preserve the hybrid room's normal-file service. Dropping this field made
+   * every module registered through this shared adapter silently take its
+   * legacy database-blob branch even while a workspace room was open. */
+  workspace?: OpenRoom["workspace"];
 }
 
 /** One object, built off the real {@link RoomManagerState}, that structurally
@@ -406,7 +410,12 @@ export function buildRoomSource(state: RoomManagerState): {
     currentRoom: (): AppRoomHandle | null =>
       state.room === null
         ? null
-        : { db: state.room.conn, path: state.room.path, name: state.room.name },
+        : {
+            db: state.room.conn,
+            path: state.room.path,
+            name: state.room.name,
+            workspace: state.room.workspace,
+          },
     roomEpoch: (): number => state.roomEpoch,
     rollingBack: (): boolean => state.rollingBack,
   };

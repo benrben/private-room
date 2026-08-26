@@ -91,6 +91,8 @@ try {
   assert.equal(content.text, before);
 
   await window.reload({ waitUntil: "domcontentloaded", timeout: 15_000 });
+  const reloadedRoom = await invoke(window, "room_info");
+  assert.equal(reloadedRoom.path, workspacePath);
   await window.locator(".workspace").waitFor();
   await window.locator('[data-area="sketch"]').evaluate((button) => button.click());
   await window.getByRole("list", { name: "Sketches in this room" }).waitFor();
