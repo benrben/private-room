@@ -32,8 +32,8 @@ Automated tests fail when a provider, specialist, graph shape, evidence file, or
 | Write baseline and rollback | Implemented | Implemented | Partial | Partial | Partial |
 | Workspace isolation | Implemented | Implemented | Implemented | Implemented | Implemented |
 | Cloud redacted mirror | Implemented | Implemented | N/A | Partial | Partial |
-| Shared 16 specialists | Missing | Missing | Implemented | Implemented | Implemented |
-| Capability probe and safe fallback | Partial | Partial | Implemented | Implemented | Implemented |
+| Shared 16 specialists | Implemented | Implemented | Implemented | Implemented | Implemented |
+| Capability probe and safe fallback | Implemented | Implemented | Implemented | Implemented | Implemented |
 
 Important details:
 
@@ -42,8 +42,8 @@ Important details:
 - Both native providers use the Electron orchestrator, baseline, final scan, rollback, and macOS sandbox.
 - Deep Harness builds its subagents from the existing Python registry. It uses the authenticated workspace bridge. It does not receive database keys or normal system paths.
 - Deep Harness still uses the older sidecar event stream. It is not yet fully connected to the normalized Electron run UI.
-- Codex and Claude do not yet generate the sixteen Arcelle specialist definitions from the shared manifest.
-- Native capability probes exist. Restricted CLI fallbacks do not exist yet.
+- Codex and Claude generate specialist definitions from the same shared manifest. Claude receives SDK subagent definitions. Codex receives the generated collaboration catalog.
+- Native capability probes and restricted CLI fallbacks use the common harness contract.
 - Ollama cloud and OpenRouter are not yet guaranteed to receive the redacted mirror for every Deep run.
 
 ## Specialist parity
@@ -66,8 +66,8 @@ Current provider behavior:
 | Provider family | Shared specialist status |
 |---|---|
 | Deep Harness: Ollama local, Ollama cloud, OpenRouter | The main agent and fifteen subagents are built from the Python registry. The registry has parity tests against the shared manifest. |
-| Codex native | Runs the Codex coordinator. Arcelle specialist definitions are not generated yet. |
-| Claude native | Runs the Claude coordinator and can receive native subagent events. Arcelle specialist definitions are not generated yet. |
+| Codex native | Runs the Codex coordinator with a generated specialist catalog and normalized collaboration events. |
+| Claude native | Runs the Claude coordinator with generated SDK subagents and normalized subagent events. |
 
 ## `original_bytes` inventory
 
@@ -112,9 +112,7 @@ Main blockers:
 
 1. Route remaining agent edit, merge, whole-file pass, document, and media byte paths through the room content abstraction.
 2. Connect Deep Harness runs to the same normalized Electron event and approval lifecycle.
-3. Generate Codex and Claude specialist definitions from `config/agent-manifest.json`.
-4. Add restricted Codex and Claude CLI fallbacks.
-5. Guarantee redacted mirrors for every cloud Deep Harness run.
-6. Finish full-suite, power-loss, corruption, password, synced-folder, duplicate-room, and security release tests.
+3. Guarantee redacted mirrors for every cloud Deep Harness run.
+4. Finish the full Electron suite, synced-folder and security release tests.
 
 General availability must stay disabled until these blockers and the unchecked tasks in `WORKSPACE_HARNESS_TASKS.md` are complete.

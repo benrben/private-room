@@ -212,7 +212,7 @@ Legend:
 - [ ] Test iCloud, Dropbox, network drives and offline placeholders.
 - [x] Test two-process and duplicate-room conflicts.
 - [ ] Complete traversal, shell escape, `.arcelle` and privacy security review.
-- [ ] Write upgrade, rollback, support and recovery documentation.
+- [x] Write upgrade, rollback, support and recovery documentation.
 - [ ] Enable general availability only after parity and security gates pass.
 
 ## Current release gate
