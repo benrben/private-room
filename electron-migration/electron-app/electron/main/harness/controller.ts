@@ -156,6 +156,7 @@ export class HarnessController {
       room.workspace,
       room.descriptor.roomId,
       () => room.workspaceIndexer?.indexPending() ?? Promise.resolve(),
+      (progress) => this.emit("workspace-operation-progress", progress),
     );
     const orchestrator = new HarnessOrchestrator(protection, {
       beforeFinish: async (runId, status, send) => {

@@ -105,6 +105,7 @@ import {
   strandedCheckpointNames,
 } from "./roomCheckpoints.js";
 import { inspectSealedPackage } from "./workspace/sealedPackage.js";
+import type { WorkspaceOperationProgressEvent } from "../shared/workspaceProgress.js";
 
 const PASSWORD = "correct horse battery staple";
 const OTHER_PASSWORD = "a totally different passphrase";
@@ -201,7 +202,14 @@ describe("workspace-folder checkpoints", () => {
       const imported = await room.workspace!.importFile(sourcePath, "notes.txt");
       const roomId = room.descriptor!.roomId;
 
-      const saved = await createRoomCheckpoint(state, "Before edit");
+      const progress: WorkspaceOperationProgressEvent[] = [];
+      const saved = await createRoomCheckpoint(state, "Before edit", (event) => progress.push(event));
+      expect(progress[0]).toMatchObject({
+        operationId: saved.id, operation: "workspace-checkpoint", phase: "preparing", status: "started",
+      });
+      expect(progress.filter((event) => event.phase === "copying-files").map((event) => event.completed))
+        .toEqual([0, 1]);
+      expect(progress.at(-1)).toMatchObject({ phase: "completed", status: "completed" });
       expect(inspectSealedPackage(
         checkpointFilePath(checkpointsDir(roomPath), saved.id),
         PASSWORD,

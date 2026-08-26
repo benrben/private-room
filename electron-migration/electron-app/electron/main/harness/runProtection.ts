@@ -5,6 +5,8 @@ import { sha256File } from "../workspace/hash.js";
 import { resolveWorkspacePath } from "../workspace/pathSafety.js";
 import { WorkspaceService } from "../workspace/workspaceService.js";
 import type { HarnessContext } from "./types.js";
+import type { WorkspaceOperationProgressSink } from "../../shared/workspaceProgress.js";
+import { WorkspaceOperationReporter } from "../workspace/operationProgress.js";
 
 interface RunFileRow {
   file_id: string;
@@ -36,9 +38,28 @@ export class RunProtection {
     private readonly workspace: WorkspaceService,
     private readonly roomId: string,
     private readonly reindexChanged: () => Promise<unknown> = async () => undefined,
+    private readonly progress?: WorkspaceOperationProgressSink,
   ) {}
 
   async createBaseline(context: HarnessContext): Promise<void> {
+    const reporter = context.writeEnabled
+      ? new WorkspaceOperationReporter("write-baseline", this.progress, context.runId)
+      : null;
+    reporter?.start();
+    try {
+      await this.createBaselineCore(context, reporter);
+      reporter?.complete();
+    } catch (error) {
+      reporter?.fail();
+      throw error;
+    }
+  }
+
+  private async createBaselineCore(
+    context: HarnessContext,
+    reporter: WorkspaceOperationReporter | null,
+  ): Promise<void> {
+    reporter?.emit("scanning", 0, null);
     await this.workspace.reconcile();
     this.workspace.db.prepare(
       `INSERT INTO agent_runs(
@@ -64,6 +85,8 @@ export class RunProtection {
        ORDER BY relative_path`,
     ).all() as Array<{ id: string; relative_path: string; content_sha256: string }>;
     try {
+      let completed = 0;
+      reporter?.emit("snapshotting", completed, files.length, "files");
       for (const file of files) {
         const object = await this.workspace.snapshot(file.id, "agent_run", context.runId, "baseline");
         this.workspace.db.prepare(
@@ -71,6 +94,8 @@ export class RunProtection {
              run_id, file_id, baseline_path, baseline_hash, baseline_object_id
            ) VALUES (?, ?, ?, ?, ?)`,
         ).run(context.runId, file.id, file.relative_path, object.sha256, object.id);
+        completed += 1;
+        reporter?.emit("snapshotting", completed, files.length, "files");
       }
       this.workspace.db.prepare("UPDATE agent_runs SET baseline_completed = 1, status = 'running' WHERE run_id = ?")
         .run(context.runId);

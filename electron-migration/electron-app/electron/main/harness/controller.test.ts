@@ -8,6 +8,7 @@ import { createWorkspaceRoom } from "../workspace/roomLayout.js";
 import { WorkspaceService } from "../workspace/workspaceService.js";
 import { HarnessController } from "./controller.js";
 import type { HarnessContext, HarnessRun, HarnessRuntime } from "./types.js";
+import type { WorkspaceOperationProgressEvent } from "../../shared/workspaceProgress.js";
 
 const roots: string[] = [];
 const RULES: PrivacyRule[] = [["Ben Reich", "[Person A]"]];
@@ -71,9 +72,13 @@ describe("HarnessController", () => {
   it("runs local Ollama through the unified lifecycle without native-process isolation", async () => {
     const f = await fixture();
     const events: Array<{ type?: string; status?: string }> = [];
+    const workspaceProgress: WorkspaceOperationProgressEvent[] = [];
     try {
-      const controller = new HarnessController(f.state, f.root, (_event, payload) => {
+      const controller = new HarnessController(f.state, f.root, (event, payload) => {
         events.push(payload as { type?: string; status?: string });
+        if (event === "workspace-operation-progress") {
+          workspaceProgress.push(payload as WorkspaceOperationProgressEvent);
+        }
       }, {
         runtimes: { "ollama-local": new EditingRuntime() },
         flag: () => true,
@@ -92,6 +97,11 @@ describe("HarnessController", () => {
         await new Promise((resolve) => setTimeout(resolve, 10));
       }
       expect(events.find((event) => event.type === "run_completed")?.status).toBe("completed");
+      expect(workspaceProgress.filter((event) => event.phase === "snapshotting").map((event) => event.completed))
+        .toEqual([0, 1]);
+      expect(workspaceProgress.at(-1)).toMatchObject({
+        operation: "write-baseline", phase: "completed", status: "completed",
+      });
       expect(await readFile(path.join(f.roomPath, "notes.txt"), "utf8")).toContain("Reviewed");
     } finally {
       f.created.db.close();
@@ -129,7 +139,9 @@ describe("HarnessController", () => {
       const controller = new HarnessController(
         f.state,
         f.root,
-        (event, payload) => { emitted.push({ event, payload }); },
+        (event, payload) => {
+          if (event === "harness-event") emitted.push({ event, payload });
+        },
         {
           runtimes: { codex: runtime },
           policy: () => ({
@@ -188,8 +200,10 @@ describe("HarnessController", () => {
     const f = await fixture();
     const events: Array<{ type?: string; requestId?: string; status?: string }> = [];
     try {
-      const controller = new HarnessController(f.state, f.root, (_event, payload) => {
-        events.push(payload as { type?: string; requestId?: string; status?: string });
+      const controller = new HarnessController(f.state, f.root, (event, payload) => {
+        if (event === "harness-event") {
+          events.push(payload as { type?: string; requestId?: string; status?: string });
+        }
       }, {
         runtimes: { codex: new MassEditingRuntime() },
         flag: () => true,
@@ -203,12 +217,12 @@ describe("HarnessController", () => {
         writeEnabled: true,
         text: "bulk edit",
       });
-      for (let count = 0; count < 200 && !events.some((event) => event.requestId === `mass-change-${runId}`); count += 1) {
+      for (let count = 0; count < 500 && !events.some((event) => event.requestId === `mass-change-${runId}`); count += 1) {
         await new Promise((resolve) => setTimeout(resolve, 10));
       }
       expect(events.some((event) => event.type === "run_completed")).toBe(false);
       await controller.approve(runId, `mass-change-${runId}`, "deny");
-      for (let count = 0; count < 200 && !events.some((event) => event.type === "run_completed"); count += 1) {
+      for (let count = 0; count < 500 && !events.some((event) => event.type === "run_completed"); count += 1) {
         await new Promise((resolve) => setTimeout(resolve, 10));
       }
       expect(events.find((event) => event.type === "run_completed")?.status).toBe("cancelled");

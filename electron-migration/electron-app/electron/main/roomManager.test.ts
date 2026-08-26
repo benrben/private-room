@@ -1673,9 +1673,13 @@ const EXPECTED_CHANNELS = [
   "touchid_open",
 ];
 
-function register(state: RoomManagerState, deps: RoomManagerDeps): Map<string, Handler> {
+function register(
+  state: RoomManagerState,
+  deps: RoomManagerDeps,
+  send: (channel: string, payload: unknown) => void = () => undefined,
+): Map<string, Handler> {
   const handlers = new Map<string, Handler>();
-  const fakeEvent = {} as never;
+  const fakeEvent = { sender: { send } } as never;
   const handle = vi.fn((channel: string, listener: (...args: unknown[]) => unknown) => {
     handlers.set(channel, (...args: unknown[]) => listener(fakeEvent, ...args));
   });
@@ -1688,6 +1692,53 @@ describe("registerRoomManagerIpc", () => {
     const handlers = register(createRoomManagerState(), baseDeps("/tmp"));
     expect([...handlers.keys()].sort()).toEqual([...EXPECTED_CHANNELS].sort());
     expect(handlers.size).toBe(EXPECTED_CHANNELS.length);
+  });
+
+  it("sends provider-neutral progress for conversion and sealed package commands", async () => {
+    const dir = freshDir();
+    const state = createRoomManagerState();
+    const sent: Array<[string, { operation?: string; phase?: string }]> = [];
+    const handlers = register(state, baseDeps(dir), (channel, payload) => {
+      sent.push([channel, payload as { operation?: string; phase?: string }]);
+    });
+    const workspacePath = path.join(dir, "Progress Room");
+    const sealedPath = path.join(dir, "Progress.arcelle");
+    handlers.get("create_room")!({
+      path: workspacePath,
+      password: PASSWORD,
+      name: "Progress Room",
+      format: "workspace-folder",
+    });
+    await handlers.get("create_sealed_package")!({
+      destinationPath: sealedPath,
+      exportPassword: null,
+    });
+    await handlers.get("close_room")!();
+    await handlers.get("import_sealed_package")!({
+      packagePath: sealedPath,
+      packagePassword: PASSWORD,
+      destinationPath: path.join(dir, "Imported Progress Room"),
+      workspacePassword: null,
+    });
+
+    const legacyPath = path.join(dir, "Progress Legacy.roomai");
+    dbCreateRoom(legacyPath, PASSWORD, "Progress Legacy").close();
+    await handlers.get("convert_legacy_room")!({
+      sourcePath: legacyPath,
+      password: PASSWORD,
+      destinationPath: path.join(dir, "Converted Progress Room"),
+    });
+
+    expect(new Set(sent.map(([, payload]) => payload.operation))).toEqual(new Set([
+      "sealed-package-create",
+      "sealed-package-import",
+      "legacy-conversion",
+    ]));
+    expect(sent.every(([channel]) => channel === "workspace-operation-progress")).toBe(true);
+    for (const operation of ["sealed-package-create", "sealed-package-import", "legacy-conversion"]) {
+      expect(sent.some(([, payload]) => payload.operation === operation && payload.phase === "completed"))
+        .toBe(true);
+    }
   });
 
   it("create_room / room_info / rename_room / close_room / open_room reach the real logic", async () => {

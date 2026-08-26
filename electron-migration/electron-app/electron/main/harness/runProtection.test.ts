@@ -7,6 +7,7 @@ import { createWorkspaceRoom } from "../workspace/roomLayout.js";
 import { WorkspaceService } from "../workspace/workspaceService.js";
 import { RunProtection } from "./runProtection.js";
 import type { HarnessContext } from "./types.js";
+import type { WorkspaceOperationProgressEvent } from "../../shared/workspaceProgress.js";
 
 const roots: string[] = [];
 
@@ -66,7 +67,13 @@ describe("RunProtection conflict recovery", () => {
     const workspace = new WorkspaceService(db, workspaceRoot);
     try {
       const file = await workspace.importFile(source, "notes.txt");
-      const protection = new RunProtection(workspace, descriptor.roomId);
+      const progress: WorkspaceOperationProgressEvent[] = [];
+      const protection = new RunProtection(
+        workspace,
+        descriptor.roomId,
+        async () => undefined,
+        (event) => progress.push(event),
+      );
       const context: HarnessContext = {
         runId: "run-1",
         roomId: descriptor.roomId,
@@ -79,6 +86,11 @@ describe("RunProtection conflict recovery", () => {
         exposureVerified: true,
       };
       await protection.createBaseline(context);
+      expect(progress.filter((event) => event.phase === "snapshotting").map((event) => event.completed))
+        .toEqual([0, 1]);
+      expect(progress.at(-1)).toMatchObject({
+        operationId: "run-1", operation: "write-baseline", phase: "completed", status: "completed",
+      });
       await workspace.writeAtomic(file.fileId, Readable.from(["agent edit"]));
       await protection.finish(context.runId, "completed");
 

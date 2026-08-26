@@ -200,6 +200,7 @@ import { existsSync, mkdirSync, renameSync, rmSync, statSync, unlinkSync } from 
 import path from "node:path";
 import type { IpcMain, IpcMainInvokeEvent } from "electron";
 import type { CheckpointMeta, RoomInfo } from "../shared/apiTypes.js";
+import type { WorkspaceOperationProgressSink } from "../shared/workspaceProgress.js";
 import {
   checkpointFilePath,
   checkpointIdOk,
@@ -290,6 +291,7 @@ async function createWorkspaceCheckpoint(
   state: RoomManagerState,
   name: string,
   auto: boolean,
+  progress?: WorkspaceOperationProgressSink,
 ): Promise<CheckpointMeta> {
   const room = requireRoom(state);
   if (room.workspace === undefined || room.descriptor?.kind !== "workspace-folder") {
@@ -312,6 +314,7 @@ async function createWorkspaceCheckpoint(
       payloadPath,
       room.password,
       "checkpoint",
+      { operation: "workspace-checkpoint", operationId: id, progress },
     );
     const trimmed = name.trim();
     const meta: CheckpointMeta = {
@@ -350,13 +353,14 @@ function checkpointName(dir: string, id: string): string {
  */
 export async function createRoomCheckpoint(
   state: RoomManagerState,
-  name: string
+  name: string,
+  progress?: WorkspaceOperationProgressSink,
 ): Promise<CheckpointMeta> {
   if (state.rollingBack) {
     throw new Error(ROLLBACK_BUSY);
   }
   if (requireRoom(state).workspace !== undefined) {
-    return createWorkspaceCheckpoint(state, name, false);
+    return createWorkspaceCheckpoint(state, name, false, progress);
   }
   return createCheckpointCore(state, name, false);
 }
@@ -814,9 +818,14 @@ export function registerRoomCheckpointsIpc(
     ipcMain.handle(channel, (_event: IpcMainInvokeEvent, ...args: A) => fn(...args));
   };
 
-  handle(
+  ipcMain.handle(
     "create_room_checkpoint",
-    (args: { name: string }): Promise<CheckpointMeta> => createRoomCheckpoint(state, args.name)
+    (event: IpcMainInvokeEvent, args: { name: string }): Promise<CheckpointMeta> =>
+      createRoomCheckpoint(
+        state,
+        args.name,
+        (progress) => event?.sender?.send?.("workspace-operation-progress", progress),
+      ),
   );
   handle("list_room_checkpoints", (): CheckpointList => listRoomCheckpoints(state));
   handle("delete_room_checkpoint", (args: { id: string }): void =>

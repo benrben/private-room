@@ -29,6 +29,7 @@
 
 import type { IpcMain, IpcMainInvokeEvent } from "electron";
 import type { RoomInfo } from "../shared/apiTypes.js";
+import type { WorkspaceOperationProgressSink } from "../shared/workspaceProgress.js";
 import { convertLegacyRoomToWorkspace } from "./workspace/conversion.js";
 import {
   createSealedPackage,
@@ -70,6 +71,8 @@ export function registerRoomManagerIpc(
   const handle = <A extends unknown[], R>(channel: string, fn: (...args: A) => R): void => {
     ipcMain.handle(channel, (_event: IpcMainInvokeEvent, ...args: A) => fn(...args));
   };
+  const progressFor = (event: IpcMainInvokeEvent): WorkspaceOperationProgressSink =>
+    (progress) => event?.sender?.send?.("workspace-operation-progress", progress);
 
   handle(
     "create_room",
@@ -86,18 +89,20 @@ export function registerRoomManagerIpc(
     (args: { path: string; password: string }): RoomInfo =>
       openRoom(state, deps, args.path, args.password)
   );
-  handle(
+  ipcMain.handle(
     "convert_legacy_room",
-    (args: { sourcePath: string; password: string; destinationPath: string }) => {
+    (event: IpcMainInvokeEvent, args: { sourcePath: string; password: string; destinationPath: string }) => {
       if (state.room !== null) {
         throw new Error("Lock the open room before converting a legacy room.");
       }
-      return convertLegacyRoomToWorkspace(args.sourcePath, args.password, args.destinationPath);
+      return convertLegacyRoomToWorkspace(args.sourcePath, args.password, args.destinationPath, {
+        progress: progressFor(event),
+      });
     },
   );
-  handle(
+  ipcMain.handle(
     "create_sealed_package",
-    (args: { destinationPath: string; exportPassword: string | null; purpose?: string }) => {
+    (event: IpcMainInvokeEvent, args: { destinationPath: string; exportPassword: string | null; purpose?: string }) => {
       const room = state.room;
       if (room?.workspace === undefined || room.descriptor?.kind !== "workspace-folder") {
         throw new Error("Sealed package creation is available for workspace rooms.");
@@ -109,6 +114,7 @@ export function registerRoomManagerIpc(
         args.destinationPath,
         args.exportPassword ?? room.password,
         args.purpose ?? "backup",
+        { progress: progressFor(event) },
       );
     },
   );
@@ -117,9 +123,9 @@ export function registerRoomManagerIpc(
     (args: { packagePath: string; password: string }) =>
       inspectSealedPackage(args.packagePath, args.password),
   );
-  handle(
+  ipcMain.handle(
     "import_sealed_package",
-    (args: {
+    (event: IpcMainInvokeEvent, args: {
       packagePath: string;
       packagePassword: string;
       destinationPath: string;
@@ -131,6 +137,7 @@ export function registerRoomManagerIpc(
         args.packagePassword,
         args.destinationPath,
         args.workspacePassword ?? args.packagePassword,
+        { progress: progressFor(event) },
       );
     },
   );
