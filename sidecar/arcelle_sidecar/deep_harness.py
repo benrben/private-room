@@ -40,6 +40,8 @@ from .mcp_client import McpClient
 from .messages import Message
 from .privacy import is_nonlocal_model
 
+MODEL_SEPARATOR = ":" * 2
+
 
 def _text(content: Any) -> str:
     if isinstance(content, str):
@@ -170,7 +172,7 @@ _PARAMETER_SIZE = re.compile(r"(?:^|[-:])(?P<size>\d+(?:\.\d+)?)b(?:$|[-:])", re
 
 def is_small_parameter_model(model: str) -> bool:
     """Conservative small-model hint used by the existing deterministic graph."""
-    match = _PARAMETER_SIZE.search(model.split("::")[-1])
+    match = _PARAMETER_SIZE.search(model.split(MODEL_SEPARATOR)[-1])
     return match is not None and float(match.group("size")) <= 8.0
 
 
@@ -193,7 +195,7 @@ async def select_deep_harness(req: RunRequest) -> DeepHarnessDecision:
         return DeepHarnessDecision("deterministic", "The provider does not support tool calling.", small)
     # Native Codex/Claude own their rich harnesses. Requests that reach this
     # compatibility endpoint stay on the proven deterministic adapter.
-    if "::" in req.model:
+    if MODEL_SEPARATOR in req.model:
         return DeepHarnessDecision("deterministic", "This engine uses its native or compatibility harness.", small)
     caps = await ollama_capabilities(req.model, req.ollama_base_url)
     if "tools" not in {str(cap).casefold() for cap in caps}:
