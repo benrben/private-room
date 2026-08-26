@@ -140,11 +140,13 @@ Result at review time: 5 test files passed, 42 tests passed. A concurrent harnes
 
 The cancellation and authentication evidence is covered by:
 
+From `sidecar`:
+
 ```sh
-pytest -q sidecar/tests/test_server.py sidecar/tests/test_deep_harness.py
+.venv/bin/python -m pytest -q tests/test_server.py tests/test_deep_harness.py
 ```
 
-The focused Python command was attempted in the system Python environment, but collection could not start because the optional `fastapi` and `deepagents` packages were not installed. The referenced tests are existing evidence; they must be rerun in the configured sidecar environment before release.
+Result: 43 tests passed. Five third-party SWIG deprecation warnings were reported.
 
 ## Release Decision
 
