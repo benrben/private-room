@@ -241,15 +241,33 @@ def _safe_virtual_path(value: str) -> str:
 class ArcelleWorkspaceBackend(BackendProtocol):
     """Deep Agents filesystem backend that delegates every byte to Electron."""
 
-    def __init__(self, bridge: WorkspaceBridge, *, write_enabled: bool) -> None:
+    def __init__(self, bridge: WorkspaceBridge, *, write_enabled: bool, cancel: Any = None) -> None:
         self.bridge = bridge
         self.write_enabled = write_enabled
+        self.cancel = cancel
+        # One run, one backend. Repeated byte-identical mutations are model
+        # retries, not a reason to write/trash twice. Reads stay live.
+        self._mutations: dict[str, dict[str, Any]] = {}
 
     async def _call(self, operation: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        if self.cancel is not None and self.cancel.cancelled:
+            return {"error": "This run was cancelled."}
         try:
             return await self.bridge.call(operation, arguments)
         except Exception as exc:  # noqa: BLE001 - backend errors are tool results
             return {"error": str(exc)}
+
+    async def _mutate(self, operation: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        key = f"{operation}:{json.dumps(arguments, sort_keys=True, separators=(',', ':'))}"
+        cached = self._mutations.get(key)
+        if cached is not None:
+            return cached
+        payload = await self._call(operation, arguments)
+        # A failed operation may become valid after the user resolves a conflict;
+        # only successful commits are safe to suppress as duplicates.
+        if not payload.get("error"):
+            self._mutations[key] = payload
+        return payload
 
     async def als(self, path: str) -> LsResult:
         try:
@@ -282,7 +300,7 @@ class ArcelleWorkspaceBackend(BackendProtocol):
             safe = _safe_virtual_path(file_path)
         except ValueError as exc:
             return WriteResult(error=str(exc))
-        payload = await self._call("write", {"path": safe, "content": content})
+        payload = await self._mutate("write", {"path": safe, "content": content})
         return WriteResult(error=payload.get("error"), path=payload.get("path"))
 
     async def aedit(
@@ -298,7 +316,7 @@ class ArcelleWorkspaceBackend(BackendProtocol):
             safe = _safe_virtual_path(file_path)
         except ValueError as exc:
             return EditResult(error=str(exc))
-        payload = await self._call(
+        payload = await self._mutate(
             "edit",
             {
                 "path": safe,
@@ -320,7 +338,7 @@ class ArcelleWorkspaceBackend(BackendProtocol):
             safe = _safe_virtual_path(file_path)
         except ValueError as exc:
             return DeleteResult(error=str(exc))
-        payload = await self._call("delete", {"path": safe})
+        payload = await self._mutate("delete", {"path": safe})
         return DeleteResult(error=payload.get("error"), path=payload.get("path"))
 
     async def aglob(self, pattern: str, path: str | None = None) -> GlobResult:
@@ -474,7 +492,11 @@ def build_deep_agent(
     """Build the provider-neutral Deep Agent for Ollama/OpenRouter runs."""
     if deps.mcp is None:
         raise RuntimeError("Deep Harness needs the authenticated Arcelle MCP bridge.")
-    backend = ArcelleWorkspaceBackend(McpWorkspaceBridge(deps.mcp), write_enabled=write_enabled)
+    backend = ArcelleWorkspaceBackend(
+        McpWorkspaceBridge(deps.mcp),
+        write_enabled=write_enabled,
+        cancel=deps.cancel,
+    )
     adapter = ArcelleCompiledSubAgentAdapter(deps, write_enabled, max_rounds, small_model)
     subagents = [adapter.compile(spec.id) for spec in REGISTRY if spec.id != "chat.answer"]
     permissions = [

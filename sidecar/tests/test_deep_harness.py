@@ -66,6 +66,24 @@ async def test_workspace_backend_uses_bridge_and_honours_read_only() -> None:
 
 
 @pytest.mark.asyncio
+async def test_workspace_backend_suppresses_duplicate_mutations_and_honours_cancel() -> None:
+    class Cancel:
+        cancelled = False
+
+    cancel = Cancel()
+    bridge = Bridge()
+    backend = ArcelleWorkspaceBackend(bridge, write_enabled=True, cancel=cancel)
+    first = await backend.awrite("/notes.md", "changed")
+    second = await backend.awrite("/notes.md", "changed")
+    assert first.path == second.path == "/notes.md"
+    assert bridge.calls == [("write", {"path": "/notes.md", "content": "changed"})]
+
+    cancel.cancelled = True
+    assert (await backend.aread("/other.md")).error == "This run was cancelled."
+    assert len(bridge.calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_model_adapter_preserves_tool_calls() -> None:
     model = ArcelleHarnessModelAdapter(inner=Chat()).bind_tools(
         [
