@@ -5,7 +5,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { Redactor, type PrivacyRule } from "../privacyRedact.js";
 import { createRoomManagerState } from "../roomManager.js";
-import { createWorkspaceRoom } from "../workspace/roomLayout.js";
+import { createWorkspaceRoom, openWorkspaceRoom } from "../workspace/roomLayout.js";
 import { WorkspaceService } from "../workspace/workspaceService.js";
 import { HarnessController } from "./controller.js";
 import { RuntimeWithFallback } from "./legacyCli.js";
@@ -71,6 +71,42 @@ async function fixture() {
 }
 
 describe("HarnessController", () => {
+  it("rebinds history to the new SQLCipher connection after reopening the same room", async () => {
+    const f = await fixture();
+    let activeDb = f.created.db;
+    try {
+      const runtime = new EditingRuntime();
+      const controller = new HarnessController(f.state, f.root, () => undefined, {
+        runtimes: {
+          codex: runtime,
+          claude: runtime,
+          "ollama-local": runtime,
+          "ollama-cloud": runtime,
+          openrouter: runtime,
+        },
+        flag: () => true,
+        outsideWorkspaceIsolation: false,
+      });
+      await expect(controller.listHistory()).resolves.toEqual([]);
+
+      activeDb.close();
+      const reopened = openWorkspaceRoom(f.roomPath, "correct horse battery staple");
+      activeDb = reopened.db;
+      f.state.room = {
+        conn: reopened.db,
+        path: f.roomPath,
+        name: "Room",
+        password: "correct horse battery staple",
+        descriptor: reopened.descriptor,
+        workspace: new WorkspaceService(reopened.db, f.roomPath),
+      };
+
+      await expect(controller.listHistory()).resolves.toEqual([]);
+    } finally {
+      if (activeDb.open) activeDb.close();
+    }
+  });
+
   it("runs local Ollama through the unified lifecycle without native-process isolation", async () => {
     const f = await fixture();
     const events: Array<{ type?: string; status?: string; runId?: string }> = [];

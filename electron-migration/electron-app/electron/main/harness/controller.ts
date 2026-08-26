@@ -100,6 +100,7 @@ export class HarnessController {
   private readonly runRoots = new Map<string, string>();
   private orchestrator: HarnessOrchestrator | null = null;
   private roomId: string | null = null;
+  private workspace: object | null = null;
 
   constructor(
     private readonly state: RoomManagerState,
@@ -157,7 +158,16 @@ export class HarnessController {
     if (room?.workspace === undefined || room.descriptor?.kind !== "workspace-folder") {
       throw new Error("The unified file harness requires an unlocked workspace room.");
     }
-    if (this.orchestrator !== null && this.roomId === room.descriptor.roomId) return this.orchestrator;
+    // A lock/unlock or close/reopen creates a new WorkspaceService and opens a
+    // new SQLCipher connection even when the stable room ID is unchanged. An
+    // orchestrator retained for the old service would keep RunProtection
+    // pointed at the closed database and make history/rollback fail after the
+    // room is reopened.
+    if (
+      this.orchestrator !== null
+      && this.roomId === room.descriptor.roomId
+      && this.workspace === room.workspace
+    ) return this.orchestrator;
     if (this.pumps.size > 0) throw new Error("Wait for the active agent runs to stop before changing rooms.");
     const protection = new RunProtection(
       room.workspace,
@@ -178,6 +188,7 @@ export class HarnessController {
     orchestrator.register("openrouter", this.runtimes.openrouter);
     this.orchestrator = orchestrator;
     this.roomId = room.descriptor.roomId;
+    this.workspace = room.workspace;
     return orchestrator;
   }
 

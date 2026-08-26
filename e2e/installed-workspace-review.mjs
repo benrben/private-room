@@ -72,7 +72,7 @@ try {
     name: "Workspace Review",
     format: "workspace-folder",
   });
-  assert.equal(room.storageKind, "workspace");
+  assert.equal(room.path, roomPath);
   await stat(path.join(roomPath, ".arcelle", "room.json"));
   await stat(path.join(roomPath, ".arcelle", "room.db"));
 
@@ -80,15 +80,18 @@ try {
   await mkdir(path.join(roomPath, "Research"));
   await writeFile(path.join(roomPath, "Research", "data.csv"), "name,value\nalpha,1\n");
   const watcher = await invoke(window, "rescan_workspace_room");
-  assert.equal(watcher.state, "ready");
+  assert.equal(watcher.state, "healthy");
+  const reconciledFiles = await invoke(window, "list_files", {});
+  log(`reconciled files: ${JSON.stringify(reconciledFiles.map((file) => file.name))}`);
+  assert.deepEqual(reconciledFiles.map((file) => file.name).sort(), ["data.csv", "notes.md"]);
 
   await window.reload({ waitUntil: "domcontentloaded" });
   await window.locator(".workspace").waitFor({ state: "visible" });
   await window.getByRole("button", { name: "Open Library" }).click();
-  await window.getByText("notes.md", { exact: true }).waitFor();
-  await window.getByText("data.csv", { exact: true }).waitFor();
-  assert((await window.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)) <= 1);
   await shot(window, "02-workspace-library");
+  await window.getByText("notes", { exact: true }).first().waitFor();
+  await window.getByText("data", { exact: true }).first().waitFor();
+  assert((await window.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)) <= 1);
   log("normal-file reconciliation, library projection, and layout passed");
 
   await window.getByRole("button", { name: "Open room settings (⌘,)" }).click();
@@ -96,14 +99,14 @@ try {
   await window.getByText("Workspace agent diagnostics", { exact: true }).waitFor();
   const capabilities = await invoke(window, "harness_capabilities");
   assert.equal(capabilities.roomFormat, "workspace-folder");
-  assert.equal(typeof capabilities.providers.codex.available, "boolean");
-  assert.equal(typeof capabilities.providers.claude.available, "boolean");
+  assert.equal(typeof capabilities.providers.codex.installed, "boolean");
+  assert.equal(typeof capabilities.providers.claude.installed, "boolean");
   await shot(window, "03-settings-agents");
 
-  await window.getByRole("button", { name: "Privacy & recovery" }).click();
+  await window.getByRole("tab", { name: "Privacy & recovery" }).click();
   await window.getByText("normal files", { exact: false }).first().waitFor();
   await shot(window, "04-settings-privacy");
-  await window.getByRole("button", { name: "History & storage" }).click();
+  await window.getByRole("tab", { name: "History & storage" }).click();
   await window.getByRole("button", { name: "Rescan room" }).waitFor();
   await shot(window, "05-settings-history");
   await window.press("body", "Escape");
@@ -117,7 +120,7 @@ try {
   });
   await invoke(window, "create_room_checkpoint", { name: "Installed review" });
   const progress = await window.evaluate(() => globalThis.__arcelleReviewProgress);
-  assert(progress.some((item) => item.operation === "checkpoint"));
+  assert(progress.some((item) => item.operation === "workspace-checkpoint"));
   assert(progress.some((item) => item.phase === "completed"));
 
   const sealed = await invoke(window, "create_sealed_package", {
@@ -136,6 +139,7 @@ try {
   );
   const notesEntry = inspection.files.find((file) => file.relativePath === "notes.md");
   assert(notesEntry);
+  await invoke(window, "close_room", {});
   const extraction = await invoke(window, "extract_sealed_files", {
     packagePath: sealedPath,
     password,
@@ -144,14 +148,17 @@ try {
   });
   assert.equal(extraction.fileCount, 1);
   assert.match(await readFile(path.join(extractedPath, "notes.md"), "utf8"), /Normal file bytes/);
+  await invoke(window, "open_room", { path: roomPath, password });
+  await window.reload({ waitUntil: "domcontentloaded" });
+  await window.locator(".workspace").waitFor({ state: "visible" });
   log("checkpoint progress, sealed inspection, and selected extraction passed");
 
-  await window.getByRole("button", { name: "Activity" }).click();
+  await window.getByRole("tab", { name: "Activity" }).click();
   await window.getByRole("region", { name: "Workspace agents" }).waitFor();
   await window.getByText("Workspace agent", { exact: true }).waitFor();
   await shot(window, "06-agent-activity");
 
-  await window.getByRole("button", { name: /Lock this room/ }).click();
+  await window.getByRole("button", { name: "Lock", exact: true }).click();
   await window.getByText("This password unlocks chats, memory, search, and history.", { exact: false }).waitFor();
   await window.getByText("normal files in this workspace remain readable in Finder", { exact: false }).waitFor();
   await shot(window, "07-workspace-unlock");
@@ -168,4 +175,3 @@ try {
   if (app) await app.close().catch(() => {});
   await rm(temp, { recursive: true, force: true });
 }
-
