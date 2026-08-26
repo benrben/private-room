@@ -46,7 +46,7 @@ import {
   recChapterSet,
   recCorrectRange,
   recDeleteRange,
-  recExportClean,
+  recExportCleanHybrid,
   recGet,
   recHighlightAdd,
   recItemDelete,
@@ -157,7 +157,7 @@ export function registerRecIpc(
   );
   handle("voices_list", () => voicesList(openDb(room)));
   handle("voice_forget", (args: { name: string }) => voiceForget(openDb(room), args.name));
-  handle("rec_export_clean", (args: { id: string }) => recExportClean(openDb(room), ctx, args.id));
+  handle("rec_export_clean", (args: { id: string }) => recExportCleanHybrid(openDb(room), ctx, args.id));
   handle("rec_translate", (args: { id: string; language: string }) =>
     recTranslate(openDb(room), ctx, args.id, args.language)
   );

@@ -4,6 +4,7 @@ import path from "node:path";
 import { Readable } from "node:stream";
 import { afterEach, describe, expect, it } from "vitest";
 import { Artifact } from "../artifactBuilder.js";
+import { createRecBridgeCtx, recDeleteRange, recExportCleanHybrid } from "../recBridge.js";
 import {
   appendRecChunk,
   finalizeRecAudioHybrid,
@@ -11,7 +12,7 @@ import {
   setRecMeta,
 } from "../db-host/recordings.js";
 import { setFileExtractedText } from "../db-host/files.js";
-import { decodeWav, encodeWav } from "../recFormat.js";
+import { decodeWav, defaultRecMeta, encodeWav } from "../recFormat.js";
 import { storePodcastAudioOutput } from "../studiosPodcastAudio.js";
 import { saveFileNodeHybrid } from "../workflowEngine.js";
 import { createWorkspaceRoom } from "./roomLayout.js";
@@ -138,9 +139,31 @@ describe("generated output workspace cutover", () => {
       appendRecChunk(db, created.fileId, new Float32Array([0.6, 0.7]));
       expect(await recoverRecChunksHybrid(db, workspace)).toBe(1);
       expect(decodeWav(await readFile(path.join(root, "Recordings/call.wav")))).toHaveLength(5);
-      expect(db.prepare(
-        "SELECT original_bytes, extracted_text FROM files WHERE id = ?",
-      ).get(created.fileId)).toEqual({ original_bytes: null, extracted_text: "after" });
+      setRecMeta(db, created.fileId, JSON.stringify({
+        ...defaultRecMeta(),
+        durationCs: 5,
+        segments: [{
+          id: "segment-1",
+          source: "mic",
+          speaker: "You",
+          t0: 0,
+          t1: 5,
+          text: "hello",
+          words: [{ w: "hello", t0: 0, t1: 5, del: false }],
+          lang: null,
+          voice: null,
+        }],
+      }));
+      const ctx = createRecBridgeCtx({ currentRoom: () => ({ db, path: root, workspace }) });
+      recDeleteRange(db, ctx, created.fileId, 0, 5);
+      expect((db.prepare("SELECT original_bytes FROM files WHERE id = ?")
+        .get(created.fileId) as { original_bytes: Buffer | null }).original_bytes).toBeNull();
+      const edited = await recExportCleanHybrid(db, ctx, created.fileId);
+      expect(await readFile(path.join(root, "Recordings/call (edited).wav"))).not.toHaveLength(0);
+      expect((db.prepare("SELECT original_bytes FROM files WHERE id = ?")
+        .get(edited.id) as { original_bytes: Buffer | null }).original_bytes).toBeNull();
+      expect((db.prepare("SELECT original_bytes FROM files WHERE id = ?")
+        .get(created.fileId) as { original_bytes: Buffer | null }).original_bytes).toBeNull();
       expect((db.prepare("SELECT count(*) AS n FROM rec_chunks WHERE file_id = ?")
         .get(created.fileId) as { n: number }).n).toBe(0);
     } finally {

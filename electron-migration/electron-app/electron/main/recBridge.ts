@@ -1482,6 +1482,26 @@ function storeFileBytes(
   });
 }
 
+function storeTranscriptEdit(
+  db: Database.Database,
+  ctx: RecBridgeCtx,
+  id: string,
+  text: string,
+  cause: string,
+): void {
+  const open = ctx.deps.currentRoom();
+  if (open?.db === db && open.workspace !== undefined) {
+    // snapshotVersion captures the outgoing transcript before its first await.
+    // Audio bytes remain in the normal file; a failed history snapshot must
+    // never move a copy back into original_bytes.
+    void open.workspace.snapshotVersion(id, cause).catch(() => undefined);
+    setFileExtractedText(db, id, text);
+    return;
+  }
+  const bytes = getFileBytes(db, id) ?? Buffer.alloc(0);
+  storeFileBytes(db, id, bytes, text, cause);
+}
+
 /** Rust's `str::trim_end_matches` for one repeated suffix. */
 function trimEndMatches(s: string, suffix: string): string {
   let out = s;
@@ -1527,8 +1547,7 @@ export function recDeleteRange(
     }
   }
   meta.cuts = addCut(meta.cuts, { t0, t1 });
-  const bytes = getFileBytes(db, id) ?? Buffer.alloc(0);
-  storeFileBytes(db, id, bytes, transcriptText(meta), "Edited transcript");
+  storeTranscriptEdit(db, ctx, id, transcriptText(meta), "Edited transcript");
   setRecMeta(db, id, JSON.stringify(meta));
   return meta;
 }
@@ -1625,8 +1644,7 @@ export function recCorrectRange(
   if (n === 0) {
     throw new Error("Nothing to correct there.");
   }
-  const bytes = getFileBytes(db, id) ?? Buffer.alloc(0);
-  storeFileBytes(db, id, bytes, transcriptText(meta), "Corrected transcript");
+  storeTranscriptEdit(db, ctx, id, transcriptText(meta), "Corrected transcript");
   setRecMeta(db, id, JSON.stringify(meta));
   return meta;
 }
@@ -1720,6 +1738,42 @@ export function recExportClean(db: Database.Database, ctx: RecBridgeCtx, id: str
   setRecMeta(db, file.id, JSON.stringify(newMeta));
   ctx.deps.notifyFilesChanged?.();
   return file;
+}
+
+/** Workspace-aware edited-copy export used by the live IPC surface. */
+export async function recExportCleanHybrid(
+  db: Database.Database,
+  ctx: RecBridgeCtx,
+  id: string,
+): Promise<FileMeta> {
+  const open = ctx.deps.currentRoom();
+  if (open?.db !== db || open.workspace === undefined) return recExportClean(db, ctx, id);
+  const [name] = getFileFull(db, id);
+  const bytes = await open.workspace.readBuffer(id);
+  const meta = parseRecMeta(getRecMeta(db, id));
+  if (meta.cuts.length === 0 && meta.segments.every((s) => s.words.every((w) => w.del !== true))) {
+    throw new Error("No edits to apply — delete something from the transcript first.");
+  }
+  const spliced = spliceOut(decodeWav(bytes), meta.cuts);
+  const newMeta = reflowAfterCuts(meta, spliced.length);
+  const stem = trimEndMatches(name, ".wav");
+  const source = db.prepare("SELECT relative_path FROM files WHERE id = ?")
+    .get(id) as { relative_path: string | null };
+  const parent = source.relative_path === null ? "." : path.posix.dirname(source.relative_path);
+  const destination = parent === "."
+    ? `${stem} (edited).wav`
+    : path.posix.join(parent, `${stem} (edited).wav`);
+  const entry = await open.workspace.createFile(
+    destination,
+    Readable.from([encodeWav(spliced)]),
+    "recording",
+  );
+  const text = transcriptText(newMeta);
+  setFileExtractedText(db, entry.fileId, text);
+  db.prepare("UPDATE files SET mime_type = 'audio/wav' WHERE id = ?").run(entry.fileId);
+  setRecMeta(db, entry.fileId, JSON.stringify(newMeta));
+  ctx.deps.notifyFilesChanged?.();
+  return getFileMeta(db, entry.fileId);
 }
 
 // =============================================================================
@@ -1845,14 +1899,25 @@ export async function recTranslate(
 
   const stem = trimEndMatches(name, ".wav");
   const content = buildTranslatedDocument(stem, lang, translated, untranslated);
-  const file = insertFile(
-    db,
-    `${stem} — ${lang}.md`,
-    "text/markdown",
-    Buffer.from(content, "utf8"),
-    content,
-    "generated"
-  );
+  const open = ctx.deps.currentRoom();
+  const file = open?.db === db && open.workspace !== undefined
+    ? await open.workspace.createFile(
+        `${stem} — ${lang}.md`,
+        Readable.from([Buffer.from(content, "utf8")]),
+        "generated",
+      ).then((entry) => {
+        setFileExtractedText(db, entry.fileId, content);
+        db.prepare("UPDATE files SET mime_type = 'text/markdown' WHERE id = ?").run(entry.fileId);
+        return getFileMeta(db, entry.fileId);
+      })
+    : insertFile(
+        db,
+        `${stem} — ${lang}.md`,
+        "text/markdown",
+        Buffer.from(content, "utf8"),
+        content,
+        "generated",
+      );
   // Room map: this translation was made from THIS recording. The name says so
   // too, but a name is not evidence — renaming either file would leave the map
   // asserting a link it can no longer check.
