@@ -242,6 +242,7 @@ import {
   createWorkspaceRoom,
   describeRoom,
   openWorkspaceRoom,
+  registerWorkspaceCopyIdentity,
   releaseWorkspaceLease,
   WorkspaceLeaseConflictError,
   type WorkspaceLease,
@@ -273,6 +274,8 @@ export interface Room {
   workspaceLease?: WorkspaceLease;
   /** True when another Arcelle process/device owns the writer lease. */
   readOnly?: boolean;
+  /** True when a raw filesystem copy still has another room's stable id. */
+  duplicateRoomIdentity?: boolean;
   workspaceWatcher?: WorkspaceWatcher;
   workspaceWatcherHealth?: WorkspaceWatcherHealth;
   workspaceRuntimeClosed?: boolean;
@@ -784,7 +787,24 @@ export function infoOf(room: Room, userDataDir: string): RoomInfo {
     synced: isSyncedPath(room.path),
     pendingMcp: pendingMcpFor(room.conn, userDataDir),
     ...(room.readOnly === true ? { readOnly: true } : {}),
+    ...(room.duplicateRoomIdentity === true ? { duplicateRoomIdentity: true } : {}),
   };
+}
+
+function copiedWorkspaceIdentityPath(
+  descriptor: RoomDescriptor & { kind: "workspace-folder"; rootPath: string },
+  userDataDir: string,
+): string | null {
+  for (const recent of readRecent(userDataDir)) {
+    if (path.resolve(recent.path) === path.resolve(descriptor.rootPath)) continue;
+    try {
+      const other = describeRoom(recent.path);
+      if (other.kind === "workspace-folder" && other.roomId === descriptor.roomId) return recent.path;
+    } catch {
+      // Missing and stale recent entries are not identity evidence.
+    }
+  }
+  return null;
 }
 
 // ============================================================================
@@ -1091,11 +1111,19 @@ export function openRoomImpl(
   let readOnly = false;
   let conn: Database.Database;
   if (descriptor.kind === "workspace-folder" && descriptor.rootPath !== null) {
-    try {
-      lease = acquireWorkspaceLease(descriptor.rootPath);
-    } catch (error) {
-      if (!(error instanceof WorkspaceLeaseConflictError)) throw error;
+    const duplicateIdentity = copiedWorkspaceIdentityPath(
+      descriptor as RoomDescriptor & { kind: "workspace-folder"; rootPath: string },
+      deps.userDataDir,
+    ) !== null;
+    if (duplicateIdentity) {
       readOnly = true;
+    } else {
+      try {
+        lease = acquireWorkspaceLease(descriptor.rootPath);
+      } catch (error) {
+        if (!(error instanceof WorkspaceLeaseConflictError)) throw error;
+        readOnly = true;
+      }
     }
     try {
       conn = openWorkspaceRoom(descriptor.rootPath, password, readOnly).db;
@@ -1120,7 +1148,19 @@ export function openRoomImpl(
     : getMeta(conn, "name") ?? roomNameFromPath(roomPath);
   // D10 (the Closet): re-apply this room's saved remote-Ollama URL on unlock.
   applyOllamaOverride(conn);
-  const room: Room = { conn, path: descriptor.path, name, password, readOnly };
+  const room: Room = {
+    conn,
+    path: descriptor.path,
+    name,
+    password,
+    readOnly,
+    duplicateRoomIdentity: descriptor.kind === "workspace-folder"
+      && descriptor.rootPath !== null
+      && copiedWorkspaceIdentityPath(
+        descriptor as RoomDescriptor & { kind: "workspace-folder"; rootPath: string },
+        deps.userDataDir,
+      ) !== null,
+  };
   attachStorageRuntime(room, descriptor, lease);
 
   let info: RoomInfo;
@@ -1199,6 +1239,50 @@ export function openRoomImpl(
   }
 
   return info;
+}
+
+/** Register a raw Finder copy as an independent writable workspace. */
+export function registerWorkspaceCopy(
+  state: RoomManagerState,
+  deps: RoomManagerDeps,
+): RoomInfo {
+  if (state.rollingBack) throw new Error(ROLLBACK_BUSY);
+  const room = requireRoom(state);
+  if (
+    room.duplicateRoomIdentity !== true
+    || room.descriptor?.kind !== "workspace-folder"
+    || room.descriptor.rootPath === null
+  ) {
+    throw new Error("The open room is not an unregistered workspace copy.");
+  }
+  const rootPath = room.descriptor.rootPath;
+  const lease = acquireWorkspaceLease(rootPath);
+  const oldConn = room.conn;
+  try {
+    closeQuietly(oldConn);
+    const registered = registerWorkspaceCopyIdentity(rootPath, room.password);
+    room.conn = registered.db;
+    room.readOnly = false;
+    room.duplicateRoomIdentity = false;
+    attachStorageRuntime(room, registered.descriptor, lease);
+    startWorkspaceRuntime(state, room);
+    quiesceStaleJobs(room.conn);
+    runCreateOpenSpawns(deps, room);
+    pushRecent(deps.userDataDir, room.name, room.path);
+    return infoOf(room, deps.userDataDir);
+  } catch (error) {
+    releaseWorkspaceLease(lease);
+    try {
+      const reopened = openWorkspaceRoom(rootPath, room.password, true);
+      room.conn = reopened.db;
+      room.readOnly = true;
+      room.duplicateRoomIdentity = true;
+      attachStorageRuntime(room, reopened.descriptor);
+    } catch {
+      state.room = null;
+    }
+    throw error;
+  }
 }
 
 /** Ported from `open_room`: the rollback guard, then {@link openRoomImpl}. */
@@ -1380,9 +1464,21 @@ export function renameRoom(
       if (room.workspaceWatcher !== undefined) void room.workspaceWatcher.close().catch(() => undefined);
       room.workspaceIndexer?.close();
       room.conn.pragma("wal_checkpoint(FULL)");
-      renameSync(room.path, newPath);
-      room.path = newPath;
-      room.descriptor = describeRoom(newPath);
+      closeQuietly(room.conn);
+      try {
+        renameSync(room.path, newPath);
+        const reopened = openWorkspaceRoom(newPath, room.password);
+        room.conn = reopened.db;
+        room.path = newPath;
+        room.descriptor = reopened.descriptor;
+      } catch (error) {
+        if (existsSync(newPath) && !existsSync(oldPath)) {
+          try { renameSync(newPath, oldPath); } catch { /* original error wins */ }
+        }
+        room.conn = openWorkspaceRoom(oldPath, room.password).db;
+        room.workspaceRuntimeClosed = false;
+        throw error;
+      }
       room.workspace = new WorkspaceService(room.conn, newPath);
       room.contentStore = contentStoreFor(room.conn, newPath);
       if (room.workspaceLease !== undefined) {
@@ -1390,6 +1486,24 @@ export function renameRoom(
       }
       room.workspaceRuntimeClosed = false;
       startWorkspaceRuntime(state, room);
+
+      // Keychain accounts are keyed by the room path. Copy the credential to
+      // the new account before deleting the old one, so a failed Keychain
+      // write never destroys the still-valid biometric unlock entry.
+      const keychain = deps.keychain ?? {
+        has: keychainHas,
+        store: keychainStore,
+        read: keychainRead,
+        deleteEntry: keychainDeleteEntry,
+      };
+      try {
+        if (keychain.has(oldPath)) {
+          keychain.store(newPath, room.password);
+          keychain.deleteEntry(oldPath);
+        }
+      } catch (error) {
+        console.error(`Touch ID credential could not follow the renamed workspace: ${error instanceof Error ? error.message : String(error)}`);
+      }
     }
   }
   setMeta(room.conn, "name", trimmed);

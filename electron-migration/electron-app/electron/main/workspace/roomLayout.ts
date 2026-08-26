@@ -174,6 +174,7 @@ export function acquireWorkspaceLease(rootPath: string): WorkspaceLease {
     token,
     pid: process.pid,
     host: os.hostname(),
+    rootPath: path.resolve(rootPath),
     createdAt: new Date().toISOString(),
     renewedAt: new Date().toISOString(),
   });
@@ -197,8 +198,20 @@ export function acquireWorkspaceLease(rootPath: string): WorkspaceLease {
       return lease;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      let existing: { pid?: number; host?: string; renewedAt?: string; createdAt?: string } = {};
+      let existing: {
+        pid?: number;
+        host?: string;
+        rootPath?: string;
+        renewedAt?: string;
+        createdAt?: string;
+      } = {};
       try { existing = JSON.parse(readFileSync(lockPath, "utf8")); } catch { /* stale/corrupt */ }
+      // Finder copies `.arcelle/room.lock` together with the room. A lock
+      // explicitly naming another root never owns this copied folder.
+      if (existing.rootPath !== undefined && path.resolve(existing.rootPath) !== path.resolve(rootPath)) {
+        rmSync(lockPath, { force: true });
+        continue;
+      }
       if (existing.host === os.hostname() && processIsAlive(Number(existing.pid))) {
         throw new WorkspaceLeaseConflictError(false);
       }
@@ -212,6 +225,58 @@ export function acquireWorkspaceLease(rootPath: string): WorkspaceLease {
     }
   }
   throw new Error("Could not acquire the room write lease.");
+}
+
+/** Give a raw Finder copy a new identity after the user explicitly registers it. */
+export function registerWorkspaceCopyIdentity(
+  rootPath: string,
+  password: string,
+): { descriptor: RoomDescriptor & { kind: "workspace-folder"; rootPath: string }; db: Database.Database } {
+  const descriptor = describeRoom(rootPath);
+  if (descriptor.kind !== "workspace-folder" || descriptor.rootPath === null) {
+    throw new Error("This path is not an Arcelle workspace folder.");
+  }
+  const oldMarker = readWorkspaceMarker(rootPath);
+  const newRoomId = randomUUID();
+  const markerPath = privatePath(rootPath, MARKER_FILE);
+  const tempMarker = `${markerPath}.${randomUUID()}.tmp`;
+  const db = openRoom(descriptor.dbPath, password);
+  try {
+    migrate(db);
+    const marker: WorkspaceMarker = {
+      format: "arcelle-workspace",
+      formatVersion: WORKSPACE_FORMAT_VERSION,
+      roomId: newRoomId,
+    };
+    writeFileSync(tempMarker, `${JSON.stringify(marker, null, 2)}\n`, {
+      encoding: "utf8",
+      mode: 0o600,
+      flag: "wx",
+    });
+    db.transaction(() => {
+      setMeta(db, "workspace_room_id", newRoomId);
+      setMeta(db, "workspace_format_version", String(WORKSPACE_FORMAT_VERSION));
+    })();
+    try {
+      renameSync(tempMarker, markerPath);
+    } catch (error) {
+      // Keep the public marker and encrypted metadata in agreement if the
+      // final atomic marker swap fails.
+      setMeta(db, "workspace_room_id", oldMarker.roomId);
+      throw error;
+    }
+    return {
+      descriptor: describeRoom(rootPath) as RoomDescriptor & {
+        kind: "workspace-folder";
+        rootPath: string;
+      },
+      db,
+    };
+  } catch (error) {
+    rmSync(tempMarker, { force: true });
+    try { db.close(); } catch { /* best effort */ }
+    throw error;
+  }
 }
 
 export function releaseWorkspaceLease(lease: WorkspaceLease): void {

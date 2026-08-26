@@ -203,6 +203,7 @@ export interface Commands {
     };
   };
   rename_room: { args: { name: string }; result: RoomInfo };
+  register_workspace_copy: { args: Record<string, never>; result: RoomInfo };
   take_pending_open: { args: Record<string, never>; result: string | null };
   take_rec_recovery_error: { args: Record<string, never>; result: string | null };
   import_files: { args: { paths: string[] }; result: ImportReport };

@@ -11,6 +11,8 @@ export interface RoomInfo {
   pendingMcp: McpApproval | null;
   /** Another Arcelle process owns this workspace's writer lease. */
   readOnly?: boolean;
+  /** A raw filesystem copy reused another workspace's identity. */
+  duplicateRoomIdentity?: boolean;
 }
 
 /** An MCP config awaiting the user's approval before its servers start (SEC-1). */

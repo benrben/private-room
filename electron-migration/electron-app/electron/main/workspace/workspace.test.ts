@@ -1,4 +1,4 @@
-import { chmod, lstat, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, cp, lstat, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
@@ -9,6 +9,8 @@ import {
   acquireWorkspaceLease,
   createWorkspaceRoom,
   openWorkspaceRoom,
+  readWorkspaceMarker,
+  registerWorkspaceCopyIdentity,
   releaseWorkspaceLease,
   REMOTE_LEASE_STALE_MS,
 } from "./roomLayout.js";
@@ -222,6 +224,34 @@ describe("workspace room storage", () => {
     } finally {
       releaseWorkspaceLease(lease);
       db.close();
+    }
+  });
+
+  it("ignores a copied lock root and registers a raw copy with a fresh room id", async () => {
+    const parent = await temporaryRoot();
+    const originalRoot = path.join(parent, "Original Room");
+    const copyRoot = path.join(parent, "Finder Copy");
+    const created = createWorkspaceRoom(originalRoot, "correct horse battery staple", "Original Room");
+    const originalId = created.descriptor.roomId;
+    const originalLease = acquireWorkspaceLease(originalRoot);
+    created.db.close();
+    await cp(originalRoot, copyRoot, { recursive: true });
+
+    // The copied lock names Original Room and therefore cannot own Finder Copy.
+    const copyLease = acquireWorkspaceLease(copyRoot);
+    try {
+      const registered = registerWorkspaceCopyIdentity(copyRoot, "correct horse battery staple");
+      try {
+        expect(registered.descriptor.roomId).not.toBe(originalId);
+        expect(readWorkspaceMarker(copyRoot).roomId).toBe(registered.descriptor.roomId);
+        expect(registered.db.prepare("SELECT value FROM meta WHERE key = 'workspace_room_id'").get())
+          .toEqual({ value: registered.descriptor.roomId });
+      } finally {
+        registered.db.close();
+      }
+    } finally {
+      releaseWorkspaceLease(copyLease);
+      releaseWorkspaceLease(originalLease);
     }
   });
 

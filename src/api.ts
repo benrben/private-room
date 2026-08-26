@@ -271,6 +271,7 @@ export const api = {
    *  the top bar updates without a reopen. The name is trimmed; empty or over
    *  120 characters is rejected, as is a rename during a checkpoint rollback. */
   renameRoom: (name: string) => invoke<RoomInfo>("rename_room", { name }),
+  registerWorkspaceCopy: () => invoke<RoomInfo>("register_workspace_copy"),
   takePendingOpen: () => invoke<string | null>("take_pending_open"),
   /** The last unlock's "audio from an interrupted recording could not be
    *  restored" message, or null when nothing failed — which is the ordinary

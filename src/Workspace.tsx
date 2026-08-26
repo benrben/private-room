@@ -68,6 +68,7 @@ const FOCUSED_KINDS = new Set<ViewerKind>([
  * into the full-window frame: top bar / activity rail / resizable three-pane
  * grid (Library | workspace | AI) / status bar. */
 export default function Workspace({ info, onLock, onRenamed }: Props) {
+  const [registeringCopy, setRegisteringCopy] = useState(false);
   const s = useWorkspaceState(info);
   const actions = useWorkspaceActions(s, info, onLock);
 
@@ -754,7 +755,24 @@ export default function Workspace({ info, onLock, onRenamed }: Props) {
       {info.readOnly && (
         <div className="workspace-readonly-banner" role="status">
           <strong>Read-only room.</strong>{" "}
-          Another Arcelle process owns the writer lease. You can read the normal files here, but Arcelle will not save edits, run agents, index changes, or change private room data.
+          {info.duplicateRoomIdentity
+            ? "This folder is a raw copy with the same room identity as another workspace. Register it as a new copy before editing."
+            : "Another Arcelle process owns the writer lease. You can read the normal files here, but Arcelle will not save edits, run agents, index changes, or change private room data."}
+          {info.duplicateRoomIdentity && (
+            <button
+              type="button"
+              disabled={registeringCopy}
+              onClick={() => {
+                setRegisteringCopy(true);
+                void api.registerWorkspaceCopy()
+                  .then((next) => onRenamed?.(next))
+                  .catch((error) => s.pushToast("error", error instanceof Error ? error.message : String(error)))
+                  .finally(() => setRegisteringCopy(false));
+              }}
+            >
+              {registeringCopy ? "Registering…" : "Register as new copy"}
+            </button>
+          )}
         </div>
       )}
 

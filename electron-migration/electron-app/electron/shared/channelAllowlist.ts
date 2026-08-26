@@ -252,6 +252,7 @@ const ALL_COMMANDS_TYPED: { [K in keyof Commands]: true } = {
   rename_file: true,
   rename_folder: true,
   rename_room: true,
+  register_workspace_copy: true,
   resolve_agent_ui: true,
   resolve_edit_approval: true,
   resolve_mcp_call: true,

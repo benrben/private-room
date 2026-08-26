@@ -30,7 +30,7 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { cpSync, mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -71,6 +71,7 @@ import {
   parkInflightJobsForTeardown,
   pendingMcpFor,
   renameRoom,
+  registerWorkspaceCopy,
   reportRecRecoveryFailure,
   ROOM_SERVER_NOT_IMPLEMENTED,
   roomInfo,
@@ -485,6 +486,27 @@ describe("openRoom / openRoomImpl", () => {
     } finally {
       releaseWorkspaceLease(writer);
     }
+  });
+
+  it("opens a raw Finder copy read-only until it is registered with a fresh identity", () => {
+    const dir = freshDir();
+    const originalPath = path.join(dir, "Original Workspace");
+    const copyPath = path.join(dir, "Finder Copy");
+    const original = createRoomManagerState();
+    createRoom(original, baseDeps(dir), originalPath, PASSWORD, "Original Workspace", "workspace-folder");
+    const originalId = original.room!.descriptor!.roomId;
+    teardownOpenRoom(original, baseDeps(dir));
+    cpSync(originalPath, copyPath, { recursive: true });
+
+    const copied = createRoomManagerState();
+    const opened = openRoom(copied, baseDeps(dir), copyPath, PASSWORD);
+    expect(opened.readOnly).toBe(true);
+    expect(opened.duplicateRoomIdentity).toBe(true);
+    const registered = registerWorkspaceCopy(copied, baseDeps(dir));
+    expect(registered.readOnly).toBeUndefined();
+    expect(registered.duplicateRoomIdentity).toBeUndefined();
+    expect(copied.room!.descriptor!.roomId).not.toBe(originalId);
+    teardownOpenRoom(copied, baseDeps(dir));
   });
 
   it("falls back to the file's own name when the room has none in meta", () => {
@@ -1090,6 +1112,26 @@ describe("renameRoom", () => {
     reopened.room!.conn.close();
   });
 
+  it("moves a workspace Touch ID credential to the renamed outer folder", () => {
+    const dir = freshDir();
+    const oldPath = path.join(dir, "Old Workspace");
+    const state = createRoomManagerState();
+    const calls: string[] = [];
+    const keychain = {
+      has: (account: string) => account === oldPath,
+      store: (account: string, password: string) => { calls.push(`store:${account}:${password}`); },
+      read: () => PASSWORD,
+      deleteEntry: (account: string) => { calls.push(`delete:${account}`); },
+    };
+    const deps = baseDeps(dir, { keychain });
+    createRoom(state, deps, oldPath, PASSWORD, "Old Workspace", "workspace-folder");
+    const info = renameRoom(state, deps, "New Workspace");
+    const newPath = path.join(dir, "New Workspace");
+    expect(info.path).toBe(newPath);
+    expect(calls).toEqual([`store:${newPath}:${PASSWORD}`, `delete:${oldPath}`]);
+    teardownOpenRoom(state, deps);
+  });
+
   it("rejects an empty (or whitespace-only) name", () => {
     const dir = freshDir();
     const state = opened(dir);
@@ -1620,6 +1662,7 @@ const EXPECTED_CHANNELS = [
   "rescan_workspace_room",
   "set_workspace_watcher_polling",
   "rename_room",
+  "register_workspace_copy",
   "write_recovery_key",
   "has_recovery_key",
   "take_rec_recovery_error",
