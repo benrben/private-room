@@ -35,7 +35,7 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import * as http from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -78,6 +78,8 @@ import {
   type EmitFn,
 } from "./chatCommandsKnowledge.js";
 import type { ScoredChunk } from "./db-host/retrieval.js";
+import { createWorkspaceRoom } from "./workspace/roomLayout.js";
+import { WorkspaceService } from "./workspace/workspaceService.js";
 
 // ------------------------------------------------------------- fixtures
 
@@ -96,8 +98,8 @@ afterEach(() => {
 
 class TestRoomSource implements RoomSource {
   private room: RoomHandle | null = null;
-  open(db: Database.Database, roomPath: string): void {
-    this.room = { db, path: roomPath };
+  open(db: Database.Database, roomPath: string, workspace?: WorkspaceService): void {
+    this.room = { db, path: roomPath, ...(workspace === undefined ? {} : { workspace }) };
   }
   close(): void {
     this.room = null;
@@ -476,6 +478,30 @@ describe("cmdFind", () => {
 // ============================================================================
 
 describe("cmdAddFile", () => {
+  it("commits command artifacts to normal workspace files", async () => {
+    tmpDir = mkdtempSync(path.join(os.tmpdir(), "chat-knowledge-workspace-"));
+    const root = path.join(tmpDir, "Room");
+    const { db } = createWorkspaceRoom(root, "correct horse battery staple", "Room");
+    openDb = db;
+    const workspace = new WorkspaceService(db, root);
+    const rooms = new TestRoomSource();
+    rooms.open(db, root, workspace);
+
+    await withFakeSidecar(
+      () => ({ text: "<p>Workspace knowledge.</p>" }),
+      async () => {
+        await cmdAddFile(baseCtx(rooms, { args: "Workspace note" }));
+      },
+    );
+
+    expect(readFileSync(path.join(root, "Workspace note.html"), "utf8"))
+      .toContain("Workspace knowledge.");
+    const row = db.prepare(
+      "SELECT storage_kind, original_bytes FROM files WHERE name = 'Workspace note.html'",
+    ).get() as { storage_kind: string; original_bytes: Buffer | null };
+    expect(row).toEqual({ storage_kind: "workspace", original_bytes: null });
+  });
+
   it("Usage error on empty args", async () => {
     const { rooms } = freshRoom();
     await expect(cmdAddFile(baseCtx(rooms, { args: "  " }))).rejects.toThrow("Usage: #add-file");

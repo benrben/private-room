@@ -170,9 +170,17 @@ function emitSafely(emit: EmitFn | undefined, event: string, payload: unknown): 
  * appears in the sidebar AND jumps into the viewer. Ported verbatim; see this
  * module's own doc for why it lives here rather than in `docsHtml.ts`.
  */
-function saveAndOpen(rooms: RoomSource, emit: EmitFn | undefined, art: Artifact): Written {
+async function commitArtifact(room: RoomHandle, art: Artifact): Promise<Written> {
+  return room.workspace === undefined ? art.commit(room.db) : art.commitToWorkspace(room.workspace);
+}
+
+async function saveAndOpen(
+  rooms: RoomSource,
+  emit: EmitFn | undefined,
+  art: Artifact,
+): Promise<Written> {
   const room = requireRoom(rooms);
-  const written = art.commit(room.db);
+  const written = await commitArtifact(room, art);
   emitSafely(emit, "room-files-changed", undefined);
   emitSafely(emit, "agent-open-file", { id: written.meta.id });
   return written;
@@ -692,11 +700,11 @@ export async function cmdAddFile(ctx: CmdCtx): Promise<CommandResult> {
       // ART-1: `created` only ever names files that really landed — a staged
       // write that failed validation or lost a cancel race adds nothing.
       try {
-        const written = Artifact.note(name, doc)
+        const artifact = Artifact.note(name, doc)
           .by("#add-file")
           .duringRun(ctx.turn.runId)
-          .cancelWith(ctx.cancel)
-          .commit(room.db);
+          .cancelWith(ctx.cancel);
+        const written = await commitArtifact(room, artifact);
         created.push(written.meta.name);
       } catch {
         // Swallowed — matches Rust's `if let Ok(w) = ... { created.push(...) }`.
@@ -768,7 +776,7 @@ export async function cmdAddFile(ctx: CmdCtx): Promise<CommandResult> {
   const doc = htmlTitledDoc(name, titleFromName(name), body);
   // ART-1: staged, cancel-checked at the write, and versioned when the same
   // document is asked for twice.
-  const written = saveAndOpen(
+  const written = await saveAndOpen(
     ctx.rooms,
     ctx.emit,
     Artifact.new(name, noteMime(name), doc).by("#add-file").duringRun(ctx.turn.runId).fromFiles(ctx.refs).cancelWith(ctx.cancel)
@@ -1046,7 +1054,7 @@ export async function cmdExtract(ctx: CmdCtx): Promise<CommandResult> {
   }
 
   const csv = serializeDelim(rows, ",");
-  const written = saveAndOpen(
+  const written = await saveAndOpen(
     ctx.rooms,
     ctx.emit,
     Artifact.new("extract.csv", noteMime("extract.csv"), csv)
