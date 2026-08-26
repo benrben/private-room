@@ -4,6 +4,8 @@ import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
 import { afterEach, describe, expect, it } from "vitest";
+import { recoverPassword, writeRecovery } from "../db-host/recovery.js";
+import { changePassword } from "../safetyTools.js";
 import { createWorkspaceRoom, openWorkspaceRoom } from "./roomLayout.js";
 import { WorkspaceService } from "./workspaceService.js";
 
@@ -66,6 +68,40 @@ describe("workspace hardening acceptance", () => {
     await writeFile(path.join(f.root, ".arcelle", "room.db"), "not a database");
     expect(() => openWorkspaceRoom(f.root, password)).toThrow();
     expect(await readFile(path.join(f.root, "Research", "notes.txt"), "utf8")).toBe("survives");
+  });
+
+  it("rekeys workspace private state and replaces its recovery code without changing normal files", async () => {
+    const f = await fixture("password-recovery");
+    const dbPath = path.join(f.root, ".arcelle", "room.db");
+    const newPassword = "new correct horse battery staple";
+    try {
+      await f.workspace.createFile("notes.txt", Readable.from(["still normal"]), "fixture");
+      const oldCode = await writeRecovery(dbPath, password);
+      expect(await recoverPassword(dbPath, oldCode)).toBe(password);
+
+      const newCode = await changePassword(
+        f.created.db,
+        dbPath,
+        password,
+        newPassword,
+        undefined,
+        {
+          databasePath: dbPath,
+          biometricPath: f.root,
+          recoveryPath: dbPath,
+          checkpointsPath: f.root,
+        },
+      );
+      expect(newCode).not.toBeNull();
+      await expect(recoverPassword(dbPath, oldCode)).rejects.toThrow();
+      expect(await recoverPassword(dbPath, newCode!)).toBe(newPassword);
+      expect(await readFile(path.join(f.root, "notes.txt"), "utf8")).toBe("still normal");
+    } finally {
+      f.created.db.close();
+    }
+
+    const reopened = openWorkspaceRoom(f.root, newPassword);
+    reopened.db.close();
   });
 
   it("normalizes Unicode, rejects case aliases, supports long names, and never exposes symlinks", async () => {

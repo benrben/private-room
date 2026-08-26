@@ -206,7 +206,7 @@ Legend:
 - [x] Test interrupted conversion and resume.
 - [x] Test power loss at every journal phase.
 - [x] Test database corruption while normal files remain safe.
-- [ ] Test password change and recovery.
+- [x] Test password change and recovery.
 - [ ] Test large video, recording and generated artifacts.
 - [x] Test Unicode, case collisions, long paths and symlinks.
 - [ ] Test iCloud, Dropbox, network drives and offline placeholders.
