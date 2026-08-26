@@ -13,7 +13,20 @@ const { _electron: electron } = requireFromElectron("playwright");
 
 const appPath = process.env.ARCELLE_INSTALLED_APP || "/Applications/Arcelle.app";
 const executablePath = path.join(appPath, "Contents", "MacOS", "Arcelle");
-const model = process.env.ARCELLE_LOCAL_AGENT_MODEL || "qwen3.5:4b-mlx";
+const provider = process.env.ARCELLE_AGENT_PROVIDER || "ollama-local";
+const model = process.env.ARCELLE_AGENT_MODEL
+  || process.env.ARCELLE_LOCAL_AGENT_MODEL
+  || (provider === "ollama-local" ? "qwen3.5:4b-mlx" : undefined);
+const privacyMode = process.env.ARCELLE_AGENT_PRIVACY_MODE
+  || (provider === "ollama-local" ? "local" : "cloud-direct");
+const expectedHarness = {
+  "ollama-local": "arcelle-deep",
+  codex: "codex-app-server",
+  claude: "claude-agent-sdk",
+}[provider];
+if (!model) {
+  throw new Error("Set ARCELLE_AGENT_MODEL when reviewing a non-local provider.");
+}
 const password = "converted-agent-review-password";
 const temporary = await mkdtemp(path.join(os.tmpdir(), "arcelle-installed-conversion-agent-"));
 const sourcePath = path.join(temporary, "Legacy Agent Review.roomai");
@@ -71,19 +84,29 @@ try {
 
   const capabilities = await invoke(window, "harness_capabilities");
   assert.equal(capabilities.roomFormat, "workspace-folder");
-  assert.equal(capabilities.providers["ollama-local"].enabled, true);
-  assert.equal(capabilities.providers["ollama-local"].harness, "arcelle-deep");
+  assert.equal(capabilities.providers[provider].enabled, true, JSON.stringify(capabilities.providers[provider]));
+  if (expectedHarness) assert.equal(capabilities.providers[provider].harness, expectedHarness);
 
   await window.evaluate(() => {
     globalThis.__conversionAgentEvents = [];
+    globalThis.__conversionAgentApprovalErrors = [];
     window.arcelle.on("harness-event", (event) => {
       globalThis.__conversionAgentEvents.push(event);
+      if (event.type === "approval_requested") {
+        void window.arcelle.invoke("harness_approve", {
+          runId: event.runId,
+          requestId: event.requestId,
+          decision: "allow-run",
+        }).catch((error) => {
+          globalThis.__conversionAgentApprovalErrors.push(String(error));
+        });
+      }
     });
   });
   const started = await invoke(window, "harness_start", {
-    provider: "ollama-local",
-    model,
-    privacyMode: "local",
+    provider,
+    ...(model ? { model } : {}),
+    privacyMode,
     writeEnabled: true,
     text:
       "Use your workspace file tools. Read notes.txt, then append the exact line " +
@@ -98,6 +121,8 @@ try {
     { timeout: 10 * 60_000 },
   );
   const events = await window.evaluate(() => globalThis.__conversionAgentEvents);
+  const approvalErrors = await window.evaluate(() => globalThis.__conversionAgentApprovalErrors);
+  assert.deepEqual(approvalErrors, []);
   const terminal = events.findLast(
     (event) => event.runId === started.runId && (event.type === "run_completed" || event.type === "run_failed"),
   );
@@ -106,7 +131,7 @@ try {
     await readFile(path.join(workspacePath, "notes.txt"), "utf8"),
     /REAL AGENT EDIT CONFIRMED/,
   );
-  log(`real local Deep Agent edited the converted normal file with ${model}`);
+  log(`real ${provider} agent edited the converted normal file${model ? ` with ${model}` : ""}`);
 
   const rolledBack = await invoke(window, "harness_rollback", { runId: started.runId });
   assert.deepEqual(rolledBack.conflicts, []);

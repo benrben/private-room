@@ -129,6 +129,11 @@ try {
   assert.equal(peaks.silent, false);
   assert(Math.abs(peaks.duration - 1) < 0.01);
 
+  // Room creation/opening above used the test IPC directly. Reload once so
+  // the renderer boots from the now-open room and mounts its real workspace.
+  // Installed reviews run with an isolated temporary Keychain, preventing an
+  // unrelated provider credential sheet from blocking this navigation.
+  await window.reload({ waitUntil: "domcontentloaded", timeout: 15_000 });
   await window.locator(".workspace").waitFor({ state: "visible" });
   await window.locator('[data-area="recordings"]').click();
   const recordingRow = window.locator("button.file-main", { hasText: "converted-meeting" });
