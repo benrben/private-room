@@ -87,7 +87,7 @@ describe("channelAllowlist event names", () => {
     // `channelAllowlist.ts` is checked against the actual `EventPayloads`
     // type, so the true count is whatever TypeScript accepted. Pinned here so
     // a future contract edit is a deliberate, noticed change.
-    expect(ALL_EVENT_NAMES.length).toBe(61);
+    expect(ALL_EVENT_NAMES.length).toBe(62);
   });
 
   it("EVENT_CHANNEL_SET agrees with ALL_EVENT_NAMES", () => {

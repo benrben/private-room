@@ -445,6 +445,7 @@ const ALL_EVENTS_TYPED: { [K in keyof EventPayloads]: true } = {
   // nothing and would have shipped the gap silently.
   "pull-progress": true,
   "harness-event": true,
+  "workspace-operation-progress": true,
 };
 
 /** Runtime array of every valid `invoke()` channel name. */

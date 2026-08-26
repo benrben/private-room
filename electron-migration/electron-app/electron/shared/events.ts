@@ -31,6 +31,7 @@ import type {
   RecSegment,
 } from "./apiTypes.js";
 import type { HarnessEvent } from "./harnessTypes.js";
+import type { WorkspaceOperationProgressEvent } from "./workspaceProgress.js";
 
 /** The wire shape of every `ask-*` / turn event: the payload the listener
  * wants, in `v`, under the ids of the run and chat that produced it. Built by
@@ -290,6 +291,7 @@ export type EventPayloads = {
   "agent-ui-request": AgentUiRequest;
   "pull-progress": { status: string; percent: number | null };
   "harness-event": HarnessEvent;
+  "workspace-operation-progress": WorkspaceOperationProgressEvent;
 };
 
 // extracted events: browser-journal, browser-navigated, browser-searched,

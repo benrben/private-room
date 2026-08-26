@@ -97,6 +97,29 @@ describe("createArcelleApi.invoke", () => {
 });
 
 describe("createArcelleApi.on", () => {
+  it("exposes typed workspace-operation progress payloads", () => {
+    const ipcRenderer = fakeIpcRenderer();
+    const api = createArcelleApi(ipcRenderer);
+    const received: string[] = [];
+    api.on("workspace-operation-progress", (payload) => {
+      received.push(`${payload.operation}:${payload.phase}:${payload.completed}`);
+    });
+    const [, registeredListener] = (ipcRenderer.on as ReturnType<typeof vi.fn>).mock.calls[0] as [
+      string,
+      (event: unknown, payload: unknown) => void,
+    ];
+    registeredListener({}, {
+      operationId: "operation-1",
+      operation: "sealed-package-create",
+      phase: "copying-files",
+      status: "running",
+      completed: 2,
+      total: 4,
+      unit: "files",
+    });
+    expect(received).toEqual(["sealed-package-create:copying-files:2"]);
+  });
+
   it("subscribes a known event channel and unwraps the payload", () => {
     const ipcRenderer = fakeIpcRenderer();
     const api = createArcelleApi(ipcRenderer);

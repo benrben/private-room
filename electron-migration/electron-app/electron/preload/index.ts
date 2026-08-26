@@ -112,6 +112,7 @@ import type {
   MessageDialogKind,
   MessageDialogResult,
 } from "../shared/ipc-contract.js";
+import type { EventPayloads } from "../shared/events.js";
 
 /** Thrown (by `on`) or rejected with (by `invoke`) for a channel string that
  * is not on the respective allowlist. A distinct, named error so a caller — or
@@ -147,6 +148,11 @@ export interface ArcelleApi {
    * which carries a `sender` the renderer has no business touching. Throws
    * {@link UnknownChannelError} for a channel that is not a real
    * `EventPayloads` key. */
+  on<K extends keyof EventPayloads>(
+    channel: K,
+    callback: (payload: EventPayloads[K]) => void,
+  ): () => void;
+  /** Runtime guard overload retained for dynamically supplied channel names. */
   on(channel: string, callback: (payload: unknown) => void): () => void;
   /** `@tauri-apps/plugin-dialog`'s five functions — see the module doc. */
   dialog: ArcelleDialogApi;
