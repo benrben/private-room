@@ -19,6 +19,7 @@ import ts from "typescript";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const APP = readFileSync(join(root, "src/App.tsx"), "utf8");
+const UNLOCK = readFileSync(join(root, "src/screens/UnlockScreen.tsx"), "utf8");
 const fn = APP.slice(
   APP.indexOf("export function unlockMessage"),
   APP.indexOf("export default function App"),
@@ -90,4 +91,10 @@ test("both unlock paths actually call it", () => {
     (APP.match(/setError\(unlockMessage\(/g) ?? []).length >= 2,
     "both the typed-password and Touch ID paths must go through unlockMessage",
   );
+});
+
+test("a workspace unlock explains what the password does and does not protect", () => {
+  assert.match(UNLOCK, /password unlocks chats, memory, search, and history/i);
+  assert.match(UNLOCK, /normal files[^.]*remain readable in Finder/i);
+  assert.match(UNLOCK, /!\/\\\.\(\?:arcelle\|roomai\)/);
 });

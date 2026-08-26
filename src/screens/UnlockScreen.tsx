@@ -60,6 +60,12 @@ export function UnlockScreen({
           <p className="gate-sub">
             Unlock <strong className="gate-file">{fileNameOf(path)}</strong>
           </p>
+          {!/\.(?:arcelle|roomai)$/i.test(path) && (
+            <p className="gate-note">
+              This password unlocks chats, memory, search, and history. The
+              normal files in this workspace remain readable in Finder.
+            </p>
+          )}
           {canTouchId && (
             <button
               type="button"
