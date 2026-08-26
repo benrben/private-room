@@ -27,9 +27,12 @@ import { mkdtempSync, rmSync } from "node:fs";
 import type { AddressInfo } from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { Readable } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type Database from "better-sqlite3-multiple-ciphers";
 import { createRoom } from "./db-host/open.js";
+import { createWorkspaceRoom } from "./workspace/roomLayout.js";
+import { WorkspaceService } from "./workspace/workspaceService.js";
 import {
   chunksMissingEmbedding,
   forEachChunkEmbedding,
@@ -117,6 +120,18 @@ function addFile(
   text: string | null
 ): string {
   return insertFile(db, name, mime, Buffer.from(`${name}-bytes`, "utf8"), text, "upload").id;
+}
+
+function freshWorkspace(): {
+  db: Database.Database;
+  root: string;
+  workspace: WorkspaceService;
+} {
+  const tmpDir = mkdtempSync(path.join(os.tmpdir(), "retrieval-workspace-"));
+  tmpDirs.push(tmpDir);
+  const root = path.join(tmpDir, "Room");
+  const { db } = createWorkspaceRoom(root, "correct horse battery staple", "Test Room");
+  return { db, root, workspace: new WorkspaceService(db, root) };
 }
 
 // ============================================================================
@@ -628,6 +643,65 @@ describe("spawnEmbeddingBackfill", () => {
 // ============================================================================
 
 describe("runReextractBackfill", () => {
+  it("extracts a workspace file from normal bytes without repopulating original_bytes", async () => {
+    const { db, root, workspace } = freshWorkspace();
+    const bytes = Buffer.from("workspace spreadsheet bytes");
+    const entry = await workspace.createFile("numbers.xlsx", Readable.from([bytes]), "upload");
+    const notify = vi.fn();
+
+    await runReextractBackfill({
+      rooms: fakeRooms(() => ({ db, path: root, workspace })),
+      roomEpoch: () => 0,
+      notifyFilesChanged: notify,
+      extractText: (_name, source) => {
+        expect(source).toEqual(bytes);
+        return "42 43 44";
+      },
+    });
+
+    expect(getFileExtractedText(db, entry.fileId)).toBe("42 43 44");
+    const row = db.prepare(
+      "SELECT original_bytes FROM files WHERE id = ?",
+    ).get(entry.fileId) as { original_bytes: Buffer | null };
+    expect(row.original_bytes).toBeNull();
+    expect(await workspace.readBuffer(entry.fileId)).toEqual(bytes);
+    expect(notify).toHaveBeenCalledTimes(1);
+    db.close();
+  });
+
+  it("discards workspace extraction when the normal file changes during extraction", async () => {
+    const { db, root, workspace } = freshWorkspace();
+    const entry = await workspace.createFile(
+      "numbers.xlsx",
+      Readable.from([Buffer.from("old bytes")]),
+      "upload",
+    );
+    const initial = db.prepare(
+      "SELECT content_sha256 FROM files WHERE id = ?",
+    ).get(entry.fileId) as { content_sha256: string };
+    const replacement = Buffer.from("externally newer bytes");
+    const notify = vi.fn();
+
+    await runReextractBackfill({
+      rooms: fakeRooms(() => ({ db, path: root, workspace })),
+      roomEpoch: () => 0,
+      notifyFilesChanged: notify,
+      extractText: async () => {
+        await workspace.writeAtomic(
+          entry.fileId,
+          Readable.from([replacement]),
+          initial.content_sha256,
+        );
+        return "text from obsolete bytes";
+      },
+    });
+
+    expect(await workspace.readBuffer(entry.fileId)).toEqual(replacement);
+    expect(getFileExtractedText(db, entry.fileId)).toBeNull();
+    expect(notify).not.toHaveBeenCalled();
+    db.close();
+  });
+
   it("re-extracts a file that carries no text, and re-indexes it", async () => {
     const db = freshRoom();
     const id = addFile(db, "numbers.xlsx", "application/vnd.ms-excel", null);
@@ -832,6 +906,35 @@ describe("runLegacyTextRepair", () => {
       ...overrides,
     };
   }
+
+  it("repairs workspace legacy text while keeping current bytes in the normal file", async () => {
+    const { db, root, workspace } = freshWorkspace();
+    const bytes = Buffer.from("legacy doc bytes");
+    const entry = await workspace.createFile("lease.doc", Readable.from([bytes]), "upload");
+    const staleText = "Times New Roman / Droid Sans Fallback / …";
+    db.prepare("UPDATE files SET extracted_text = ? WHERE id = ?").run(staleText, entry.fileId);
+    const notify = vi.fn();
+
+    await runLegacyTextRepair({
+      rooms: fakeRooms(() => ({ db, path: root, workspace })),
+      roomEpoch: () => 0,
+      notifyFilesChanged: notify,
+      extractText: (_name, source) => {
+        expect(source).toEqual(bytes);
+        return "The tenant shall pay rent.";
+      },
+    });
+
+    expect(getFileExtractedText(db, entry.fileId)).toBe("The tenant shall pay rent.");
+    expect(getSetting(db, RUST_REPAIR_STAMP)).toBe("1");
+    const row = db.prepare(
+      "SELECT original_bytes FROM files WHERE id = ?",
+    ).get(entry.fileId) as { original_bytes: Buffer | null };
+    expect(row.original_bytes).toBeNull();
+    expect(await workspace.readBuffer(entry.fileId)).toEqual(bytes);
+    expect(notify).toHaveBeenCalledTimes(1);
+    db.close();
+  });
 
   it("re-reads a .doc file whose legacy extractor was wrong, and stamps the room", async () => {
     const db = freshRoom();

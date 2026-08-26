@@ -109,6 +109,7 @@
  * {@link EmbedBackfillState}.
  */
 
+import type Database from "better-sqlite3-multiple-ciphers";
 import { authedHeaders, busy, ensureUp } from "./sidecar.js";
 import { resolvedBaseUrl } from "./engineRouting.js";
 import { extensionOf, isImage } from "./editMatchExtraction.js";
@@ -118,6 +119,7 @@ import {
   filesMissingText,
   filesWithBytes,
   getFileFull,
+  setFileExtractedText,
   updateFileContent,
 } from "./db-host/files.js";
 import { getSetting, setSetting } from "./db-host/settings.js";
@@ -127,6 +129,69 @@ import {
   setChunkEmbedding,
 } from "./db-host/embeddings.js";
 import { pinnedDb, type RoomSource } from "./jobs.js";
+import { readRoomFile } from "./workspace/roomContent.js";
+
+interface ExtractionCandidate {
+  id: string;
+  name: string;
+  mime: string;
+  bytes: Buffer;
+  expectedHash: string | null;
+  workspace: boolean;
+}
+
+async function extractionCandidates(
+  room: NonNullable<ReturnType<RoomSource["current"]>>,
+  missingOnly: boolean,
+): Promise<ExtractionCandidate[]> {
+  if (room.workspace === undefined) {
+    const rows = missingOnly ? filesMissingText(room.db) : filesWithBytes(room.db);
+    return rows.map(([id, name, mime, bytes]) => ({
+      id, name, mime, bytes, expectedHash: null, workspace: false,
+    }));
+  }
+  const where = missingOnly ? "AND (extracted_text IS NULL OR trim(extracted_text) = '')" : "";
+  const rows = room.db.prepare(
+    `SELECT id, name, coalesce(mime_type, '') AS mime, content_sha256
+       FROM files
+      WHERE trashed_at IS NULL AND storage_kind = 'workspace' ${where}`,
+  ).all() as Array<{ id: string; name: string; mime: string; content_sha256: string | null }>;
+  const out: ExtractionCandidate[] = [];
+  for (const row of rows) {
+    try {
+      const bytes = (await readRoomFile(room, row.id)).bytes;
+      if (bytes !== null) out.push({
+        id: row.id,
+        name: row.name,
+        mime: row.mime,
+        bytes,
+        expectedHash: row.content_sha256,
+        workspace: true,
+      });
+    } catch {
+      // Offline or externally removed normal files are skipped safely.
+    }
+  }
+  return out;
+}
+
+function commitExtractedText(
+  db: Database.Database,
+  candidate: ExtractionCandidate,
+  text: string,
+): boolean {
+  if (!candidate.workspace) {
+    updateFileContent(db, candidate.id, candidate.bytes, text);
+    return true;
+  }
+  const current = db.prepare(
+    `SELECT content_sha256 FROM files
+      WHERE id = ? AND storage_kind = 'workspace' AND trashed_at IS NULL`,
+  ).get(candidate.id) as { content_sha256: string | null } | undefined;
+  if (current === undefined || current.content_sha256 !== candidate.expectedHash) return false;
+  setFileExtractedText(db, candidate.id, text);
+  return true;
+}
 
 // ============================================================================
 // Constants — verbatim from backfill.rs / ollama.rs
@@ -580,15 +645,16 @@ export async function runReextractBackfill(deps: ReextractBackfillDeps): Promise
   const path = startRoom.path;
   const epoch = deps.roomEpoch();
 
-  let candidates: Array<[string, string, string, Buffer]>;
+  let candidates: ExtractionCandidate[];
   try {
-    candidates = filesMissingText(startRoom.db);
+    candidates = await extractionCandidates(startRoom, true);
   } catch {
     candidates = []; // matches Rust's `.unwrap_or_default()`
   }
 
   let fixed = 0;
-  for (const [id, name, mime, bytes] of candidates) {
+  for (const candidate of candidates) {
+    const { id, name, mime, bytes } = candidate;
     const ext = extensionOf(name);
     // Skip scans/photos/media — their text arrives via the OCR/STT workers.
     if (isImage(mime) || isOcrCandidate(mime, ext) || mediaKind(mime, ext) !== null) {
@@ -606,8 +672,7 @@ export async function runReextractBackfill(deps: ReextractBackfillDeps): Promise
       return;
     }
     try {
-      updateFileContent(db, id, bytes, text);
-      fixed += 1;
+      if (commitExtractedText(db, candidate, text)) fixed += 1;
     } catch {
       // A failed write did not fix this file — not counted, and not fatal to
       // the rest of the pass. Matches Rust's `if ....is_ok() { fixed += 1 }`.
@@ -669,18 +734,19 @@ export async function runLegacyTextRepair(deps: LegacyTextRepairDeps): Promise<v
     return;
   }
 
-  let all: Array<[string, string, string, Buffer]>;
+  let all: ExtractionCandidate[];
   try {
-    all = filesWithBytes(startRoom.db);
+    all = await extractionCandidates(startRoom, false);
   } catch {
     all = []; // matches Rust's `.unwrap_or_default()`
   }
   // Filtered in TS with the same `extensionOf` the extractors use — see
   // `filesWithBytes`'s own doc for why this is not expressed in SQL.
-  const candidates = all.filter(([, name]) => REPAIRED_EXTENSIONS.has(extensionOf(name)));
+  const candidates = all.filter(({ name }) => REPAIRED_EXTENSIONS.has(extensionOf(name)));
 
   let fixed = 0;
-  for (const [id, name, , bytes] of candidates) {
+  for (const candidate of candidates) {
+    const { id, name, bytes } = candidate;
     const text = await deps.extractText(name, bytes);
     if (text === null) {
       continue;
@@ -705,8 +771,7 @@ export async function runLegacyTextRepair(deps: LegacyTextRepairDeps): Promise<v
     }
 
     try {
-      updateFileContent(db, id, bytes, text);
-      fixed += 1;
+      if (commitExtractedText(db, candidate, text)) fixed += 1;
     } catch {
       // best-effort, same swallow as `runReextractBackfill`.
     }
