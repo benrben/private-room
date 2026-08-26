@@ -37,6 +37,7 @@ import {
 import { searchWeb } from "./webSearch.js";
 import { isOcrCandidate, OCR_TEXT_PREFIX, recognize, recognizeViaSidecar } from "./ocrTools.js";
 import { getRecMeta } from "./db-host/recordings.js";
+import { logDir } from "./obs.js";
 
 export interface FileRuntimeHost {
   openPath(target: string): Promise<void>;
@@ -117,7 +118,7 @@ export function registerFileRuntimeSurfaceIpc(
   ipcMain: Pick<IpcMain, "handle">,
   state: RoomManagerState,
   deps: RoomManagerDeps,
-  userDataDir: string,
+  _userDataDir: string,
   emit: EventSender,
   host: FileRuntimeHost,
 ): FileRuntimeStores {
@@ -378,8 +379,10 @@ export function registerFileRuntimeSurfaceIpc(
   ipcMain.handle("stage_preview_html", (_e: IpcMainInvokeEvent, raw: unknown) =>
     stagePreviewHtmlCore(stores.htmlPreviews, String(rec(raw).html ?? "")));
   ipcMain.handle("reveal_logs", async () => {
-    const logs = path.join(userDataDir, "logs");
-    await fs.promises.mkdir(logs, { recursive: true });
+    // Host and sidecar logs intentionally share this OS temp directory. The
+    // old userData/logs target was an unrelated empty folder in installed
+    // builds, so it could not help diagnose a host or sidecar failure.
+    const logs = logDir();
     await host.openPath(logs);
     return logs;
   });

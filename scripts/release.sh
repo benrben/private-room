@@ -3,11 +3,15 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+ROOT="$(pwd -P)"
 APP_DIR="electron-migration/electron-app"
 VER="$(node -p "require('./${APP_DIR}/package.json').version")"
 TAG="v${VER}"
-MODELS="${ARCELLE_MODELS_DIR:-${APP_DIR}/assets/models}"
-SIDECAR="${ARCELLE_SIDECAR_STAGE_DIR:-sidecar/dist/arcelle-sidecar}"
+# `npm --prefix` runs the package script from APP_DIR. Keep the defaults
+# absolute so electron-builder does not accidentally resolve them relative to
+# that nested working directory.
+MODELS="${ARCELLE_MODELS_DIR:-${ROOT}/${APP_DIR}/assets/models}"
+SIDECAR="${ARCELLE_SIDECAR_STAGE_DIR:-${ROOT}/sidecar/dist/arcelle-sidecar}"
 
 scripts/preflight.sh
 command -v uv >/dev/null || { echo "uv is required" >&2; exit 1; }

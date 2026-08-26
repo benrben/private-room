@@ -48,3 +48,22 @@ test("the preflight it calls really compares every version site", () => {
     assert.ok(pf.includes(site), `${site} is not compared by the preflight`);
   }
 });
+
+test("release resource defaults stay absolute when npm changes into the Electron package", () => {
+  assert.match(sh, /^ROOT="\$\(pwd -P\)"$/m, "release root is not captured as an absolute path");
+  assert.match(
+    sh,
+    /^MODELS="\$\{ARCELLE_MODELS_DIR:-\$\{ROOT\}\/\$\{APP_DIR\}\/assets\/models\}"$/m,
+    "the bundled model default can be resolved from the Electron package working directory",
+  );
+  assert.match(
+    sh,
+    /^SIDECAR="\$\{ARCELLE_SIDECAR_STAGE_DIR:-\$\{ROOT\}\/sidecar\/dist\/arcelle-sidecar\}"$/m,
+    "the bundled sidecar default can be resolved from the Electron package working directory",
+  );
+  assert.match(
+    sh,
+    /ARCELLE_MODELS_DIR="\$MODELS"[\s\\]+ARCELLE_SIDECAR_STAGE_DIR="\$SIDECAR" npm run package:mac/,
+    "the validated absolute resources are not passed to the package build",
+  );
+});
