@@ -13,6 +13,7 @@
 @import "./styles/base.css";
 @import "./styles/paper.css";
 @import "./styles/gate.css";
+@import "./styles/workspace-operation-progress.css";
 @import "./styles/workspace.css";
 @import "./styles/sidebar.css";
 @import "./styles/sidebar-folders.css";

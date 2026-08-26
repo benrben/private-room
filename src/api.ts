@@ -128,6 +128,7 @@ import type {
   HarnessPrivacyMode,
   HarnessProvider,
   HarnessRollbackResult,
+  WorkspaceOperationProgressEvent,
 } from "./apiTypes";
 
 export interface RoomStorageUsage {
@@ -1544,6 +1545,15 @@ export const api = {
     listen<AgentUiRequest>("agent-ui-request", (e) => cb(e.payload)),
   onHarnessEvent: (cb: (event: HarnessEvent) => void): Promise<UnlistenFn> =>
     listen<HarnessEvent>("harness-event", (e) => cb(e.payload)),
+  /** Scan/copy/validate progress shared by migration, packages, checkpoints,
+   * and the protected baseline made before a write-enabled agent starts. */
+  onWorkspaceOperationProgress: (
+    cb: (event: WorkspaceOperationProgressEvent) => void,
+  ): Promise<UnlistenFn> =>
+    listen<WorkspaceOperationProgressEvent>(
+      "workspace-operation-progress",
+      (e) => cb(e.payload),
+    ),
   resolveAgentUi: (id: string, payload: unknown) =>
     invoke<void>("resolve_agent_ui", { id, payload }),
 

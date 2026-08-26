@@ -67,6 +67,37 @@ export interface HarnessRollbackResult {
   conflicts: string[];
 }
 
+/** Live, provider-neutral progress for long workspace storage operations. */
+export type WorkspaceOperationKind =
+  | "legacy-conversion"
+  | "sealed-package-create"
+  | "sealed-package-import"
+  | "workspace-checkpoint"
+  | "write-baseline";
+
+export type WorkspaceOperationPhase =
+  | "preparing"
+  | "planning"
+  | "scanning"
+  | "copying-files"
+  | "copying-history"
+  | "validating"
+  | "publishing"
+  | "snapshotting"
+  | "completed"
+  | "failed";
+
+export interface WorkspaceOperationProgressEvent {
+  /** Stable for one invocation; write baselines use the harness run ID. */
+  operationId: string;
+  operation: WorkspaceOperationKind;
+  phase: WorkspaceOperationPhase;
+  status: "started" | "running" | "completed" | "failed";
+  completed: number;
+  total: number | null;
+  unit: "steps" | "files" | "objects";
+}
+
 /** An MCP config awaiting the user's approval before its servers start (SEC-1). */
 export interface McpApproval {
   fingerprint: string;

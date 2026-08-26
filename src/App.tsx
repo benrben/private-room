@@ -10,6 +10,7 @@ import {
   writeRecoveryKey,
   hasRecoveryKey,
   openRoomWithRecovery,
+  type WorkspaceOperationProgressEvent,
 } from "./api";
 import Workspace from "./Workspace";
 import { Logomark } from "./icons";
@@ -28,12 +29,17 @@ import { StartScreen } from "./screens/StartScreen";
 import { CreateScreen } from "./screens/CreateScreen";
 import { UnlockScreen } from "./screens/UnlockScreen";
 import { RecoveryModal } from "./screens/RecoveryModal";
+import { WorkspaceOperationProgress } from "./screens/WorkspaceOperationProgress";
 import {
   SealLockingOverlay,
   SealUnlockingOverlay,
 } from "./screens/SealOverlay";
 import "./App.css";
 import "./seal.css";
+import {
+  removeWorkspaceOperation,
+  updateWorkspaceOperations,
+} from "./workspaceOperationProgress";
 
 /** What the unlock gate says when an open fails.
  *
@@ -103,6 +109,10 @@ export default function App() {
   const [recoveryMode, setRecoveryMode] = useState(false);
   const [recoveryInput, setRecoveryInput] = useState("");
   const [recoveryCopied, setRecoveryCopied] = useState(false);
+  const [workspaceOperations, setWorkspaceOperations] = useState<
+    WorkspaceOperationProgressEvent[]
+  >([]);
+  const workspaceOperationTimers = useRef(new Map<string, number>());
 
   // Navigation epoch: bumped on every goTo. In-flight unlock/create
   // continuations (an awaited openRoom, a pending seal timer) capture it and
@@ -192,6 +202,35 @@ export default function App() {
       unlisten.then((fn) => fn());
     };
   }, [goTo]);
+
+  // Storage work can begin on the unlock gate (conversion/import) or inside
+  // a room (backup/checkpoint/agent baseline), so the listener belongs above
+  // both screens. Terminal rows remain briefly so completion is perceptible;
+  // the existing success/error toast or gate message remains the durable result.
+  useEffect(() => {
+    const unlisten = api.onWorkspaceOperationProgress((event) => {
+      const priorTimer = workspaceOperationTimers.current.get(event.operationId);
+      if (priorTimer !== undefined) window.clearTimeout(priorTimer);
+      workspaceOperationTimers.current.delete(event.operationId);
+      setWorkspaceOperations((current) => updateWorkspaceOperations(current, event));
+      if (event.status === "completed" || event.status === "failed") {
+        const timer = window.setTimeout(() => {
+          setWorkspaceOperations((current) =>
+            removeWorkspaceOperation(current, event.operationId),
+          );
+          workspaceOperationTimers.current.delete(event.operationId);
+        }, 1800);
+        workspaceOperationTimers.current.set(event.operationId, timer);
+      }
+    });
+    return () => {
+      unlisten.then((stop) => stop());
+      for (const timer of workspaceOperationTimers.current.values()) {
+        window.clearTimeout(timer);
+      }
+      workspaceOperationTimers.current.clear();
+    };
+  }, []);
 
   // Refresh the recent-rooms list every time we land on the start screen,
   // so it reflects rooms opened since the app launched.
@@ -669,6 +708,7 @@ export default function App() {
           // and nothing remounts.
           onRenamed={(info) => setScreen({ kind: "workspace", info })}
         />
+        <WorkspaceOperationProgress operations={workspaceOperations} />
         {locking && <SealLockingOverlay slow={lockSlow} />}
       </>
     );
@@ -754,6 +794,7 @@ export default function App() {
           />
         )}
       </div>
+      <WorkspaceOperationProgress operations={workspaceOperations} />
       {entering && <SealUnlockingOverlay />}
       {recoveryCode && (
         <RecoveryModal
