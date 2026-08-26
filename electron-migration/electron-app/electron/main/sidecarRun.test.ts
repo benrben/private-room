@@ -78,10 +78,16 @@ describe("buildRunRequestBody", () => {
     expect(buildRunRequestBody(base)).toEqual({
       model: "qwen3.5:9b",
       question: "what does the lease say",
+      harness: "classic",
       messages: [],
       temperature: null,
       ollama_base_url: "http://127.0.0.1:11434",
-      mcp: { url: "http://127.0.0.1:1/mcp", token: "tok" },
+      mcp: {
+        url: "http://127.0.0.1:1/mcp",
+        token: "tok",
+        workspace_write: false,
+        baseline_run_id: "",
+      },
       web_enabled: false,
       max_rounds: null,
       turn_max_rounds: null,
@@ -97,6 +103,12 @@ describe("buildRunRequestBody", () => {
   it("carries every explicit value through under its exact snake_case wire name", () => {
     const body = buildRunRequestBody({
       ...base,
+      harness: "deep",
+      mcp: {
+        ...base.mcp,
+        workspaceWrite: true,
+        baselineRunId: "run-1",
+      },
       messages: [{ role: "user", content: "hi" }],
       temperature: 0.4,
       ollamaBaseUrl: "http://127.0.0.1:9999",
@@ -112,10 +124,16 @@ describe("buildRunRequestBody", () => {
     expect(body).toEqual({
       model: "qwen3.5:9b",
       question: "what does the lease say",
+      harness: "deep",
       messages: [{ role: "user", content: "hi" }],
       temperature: 0.4,
       ollama_base_url: "http://127.0.0.1:9999",
-      mcp: { url: "http://127.0.0.1:1/mcp", token: "tok" },
+      mcp: {
+        url: "http://127.0.0.1:1/mcp",
+        token: "tok",
+        workspace_write: true,
+        baseline_run_id: "run-1",
+      },
       web_enabled: true,
       max_rounds: 5,
       turn_max_rounds: 10,
@@ -128,12 +146,17 @@ describe("buildRunRequestBody", () => {
     });
   });
 
-  it("passes only the mcp url/token through, never a caller's extra keys", () => {
+  it("passes only the declared mcp capability fields, never caller extras", () => {
     // RunRequest carries extra="ignore", so a stray field is a SILENT drop on
     // the Python side rather than an error -- which is exactly why this
     // function names every key instead of serializing the caller's object.
     const req = { ...base, mcp: { url: "http://x/mcp", token: "t", extra: "nope" } } as RunViaSidecarRequest;
-    expect(buildRunRequestBody(req).mcp).toEqual({ url: "http://x/mcp", token: "t" });
+    expect(buildRunRequestBody(req).mcp).toEqual({
+      url: "http://x/mcp",
+      token: "t",
+      workspace_write: false,
+      baseline_run_id: "",
+    });
   });
 });
 

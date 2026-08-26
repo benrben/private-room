@@ -78,6 +78,11 @@ class McpConfig(BaseModel):
 
     url: str
     token: str
+    #: A write-capable workspace bridge is a run-scoped capability, not a
+    #: property inferred from the user's words. Electron sets these fields only
+    #: after the encrypted rollback baseline has committed.
+    workspace_write: bool = False
+    baseline_run_id: str = ""
 
 
 class ProviderConfig(BaseModel):
@@ -163,6 +168,16 @@ class RunRequest(BaseModel):
         if r and r.write is not None:
             return r.write
         return wants_write_tools(self.question)
+
+    def deep_workspace_write_authorized(self) -> bool:
+        """True only for a Deep Harness bridge protected by this run's baseline."""
+        return bool(
+            self.resolved_write()
+            and self.run_id
+            and self.mcp is not None
+            and self.mcp.workspace_write
+            and self.mcp.baseline_run_id == self.run_id
+        )
 
     def resolved_routing(self) -> tuple[bool, bool, bool, bool, bool]:
         """(write, ui, jobs, skills, connectors) — host decision else router."""

@@ -826,6 +826,10 @@ export interface SidecarChatMessage {
 export interface RunViaSidecarMcp {
   url: string;
   token: string;
+  /** Granted only by a run-scoped bridge after rollback baseline completion. */
+  workspaceWrite?: boolean;
+  /** Must equal this request's runId when workspaceWrite is true. */
+  baselineRunId?: string;
 }
 
 /**
@@ -836,6 +840,8 @@ export interface RunViaSidecarMcp {
 export interface RunViaSidecarRequest {
   model: string;
   question: string;
+  /** Provider-neutral agent runtime. Classic is the compatibility default. */
+  harness?: "classic" | "deep";
   /** Defaults to `[]` on the wire, matching `RunRequest.messages`'s own
    * `Field(default_factory=list)`. */
   messages?: SidecarChatMessage[];
@@ -886,10 +892,16 @@ export function buildRunRequestBody(req: RunViaSidecarRequest): Record<string, u
   return {
     model: req.model,
     question: req.question,
+    harness: req.harness ?? "classic",
     messages: req.messages ?? [],
     temperature: req.temperature ?? null,
     ollama_base_url: req.ollamaBaseUrl ?? "http://127.0.0.1:11434",
-    mcp: { url: req.mcp.url, token: req.mcp.token },
+    mcp: {
+      url: req.mcp.url,
+      token: req.mcp.token,
+      workspace_write: req.mcp.workspaceWrite ?? false,
+      baseline_run_id: req.mcp.baselineRunId ?? "",
+    },
     web_enabled: req.webEnabled ?? false,
     max_rounds: req.maxRounds ?? null,
     turn_max_rounds: req.turnMaxRounds ?? null,

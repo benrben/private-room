@@ -3219,14 +3219,31 @@ async def stream_events(req: RunRequest, deps_factory: Callable[[Emit], Deps]):
     async def driver() -> None:
         try:
             if req.harness == "deep":
-                from .deep_harness import run_deep_agent
+                from .deep_harness import run_deep_agent, select_deep_harness
 
-                await run_deep_agent(
-                    req.question,
-                    deps,
-                    write_enabled=req.resolved_write(),
-                    max_rounds=req.resolved_max_rounds(),
-                )
+                decision = await select_deep_harness(req)
+                if decision.use_deep_agent:
+                    requested_write = req.resolved_write()
+                    write_enabled = req.deep_workspace_write_authorized()
+                    if requested_write and not write_enabled:
+                        await deps.emit(
+                            {
+                                "t": "step",
+                                "v": "Deep Harness is read-only because no completed rollback baseline authorized this run.",
+                            }
+                        )
+                    await run_deep_agent(
+                        req.question,
+                        deps,
+                        write_enabled=write_enabled,
+                        max_rounds=req.resolved_max_rounds(),
+                        small_model=decision.small_model,
+                    )
+                else:
+                    await deps.emit(
+                        {"t": "step", "v": f"Using deterministic Arcelle harness: {decision.reason}"}
+                    )
+                    await run_agent(req, deps)
             else:
                 await run_agent(req, deps)
         except asyncio.CancelledError:
