@@ -35,6 +35,7 @@ import {
   importSealedPackage,
   inspectSealedPackage,
 } from "./workspace/sealedPackage.js";
+import { roomStorageUsage } from "./workspace/storageUsage.js";
 import {
   closeRoom,
   createRoom,
@@ -136,6 +137,10 @@ export function registerRoomManagerIpc(
   );
   handle("close_room", (): Promise<void> => closeRoom(state, deps));
   handle("room_info", (): RoomInfo | null => roomInfo(state, deps));
+  handle("room_storage_usage", () => {
+    if (state.room === null) throw new Error("No room is open.");
+    return roomStorageUsage(state.room);
+  });
   handle("rename_room", (args: { name: string }): RoomInfo => renameRoom(state, deps, args.name));
   handle("write_recovery_key", (): Promise<string> => writeRecoveryKey(state));
   handle("has_recovery_key", (args: { path: string }): boolean => hasRecoveryKey(args.path));

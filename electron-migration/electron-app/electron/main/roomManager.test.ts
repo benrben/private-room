@@ -1587,6 +1587,7 @@ const EXPECTED_CHANNELS = [
   "open_room_with_recovery",
   "close_room",
   "room_info",
+  "room_storage_usage",
   "rename_room",
   "write_recovery_key",
   "has_recovery_key",

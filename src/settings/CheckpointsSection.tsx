@@ -1,11 +1,12 @@
 import { useState } from "react";
 import { formatSize } from "../api";
-import type { CheckpointMeta } from "../api";
+import type { CheckpointMeta, RoomStorageUsage } from "../api";
 import { formatWhen } from "../workspace/composer";
 
 interface Props {
   checkpoints: CheckpointMeta[];
   totalBytes: number;
+  storageUsage: RoomStorageUsage | null;
   ckName: string;
   setCkName: (v: string) => void;
   creating: boolean;
@@ -42,6 +43,7 @@ const ONE_GB = 1024 * 1024 * 1024;
 export default function CheckpointsSection({
   checkpoints,
   totalBytes,
+  storageUsage,
   ckName,
   setCkName,
   creating,
@@ -63,6 +65,26 @@ export default function CheckpointsSection({
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
   return (
     <section id="set-checkpoints">
+      <h3>Room storage</h3>
+      {storageUsage && (
+        <div className="ckpt-list">
+          <div className="ckpt-total">
+            Current files · {formatSize(storageUsage.liveFileBytes)}
+          </div>
+          <div className="ckpt-total">
+            Encrypted Arcelle database · {formatSize(storageUsage.databaseBytes)}
+          </div>
+          <div className="ckpt-total">
+            Private encrypted history · {formatSize(storageUsage.privateHistoryBytes)}
+          </div>
+          <p className="settings-hint">
+            {storageUsage.kind === "workspace"
+              ? `Total managed disk use is ${formatSize(storageUsage.totalOnDiskBytes)}. Current files are normal files; chats, indexes, metadata and history stay private.`
+              : `This legacy room uses ${formatSize(storageUsage.totalOnDiskBytes)} in one encrypted database file. Current files and history are included inside it.`}
+          </p>
+        </div>
+      )}
+
       <h3>Checkpoints</h3>
       <p className="settings-hint">
         A checkpoint is a full, encrypted copy of this whole room — like a git

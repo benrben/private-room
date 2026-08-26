@@ -164,6 +164,16 @@ export interface Commands {
   touchid_disable: { args: { path: string }; result: void };
   touchid_open: { args: { path: string }; result: RoomInfo };
   room_info: { args: Record<string, never>; result: RoomInfo | null };
+  room_storage_usage: {
+    args: Record<string, never>;
+    result: {
+      kind: "legacy" | "workspace";
+      liveFileBytes: number;
+      databaseBytes: number;
+      privateHistoryBytes: number;
+      totalOnDiskBytes: number;
+    };
+  };
   rename_room: { args: { name: string }; result: RoomInfo };
   take_pending_open: { args: Record<string, never>; result: string | null };
   take_rec_recovery_error: { args: Record<string, never>; result: string | null };

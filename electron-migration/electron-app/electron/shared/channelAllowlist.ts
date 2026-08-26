@@ -259,6 +259,7 @@ const ALL_COMMANDS_TYPED: { [K in keyof Commands]: true } = {
   rollback_room_checkpoint: true,
   room_graph: true,
   room_info: true,
+  room_storage_usage: true,
   room_server_status: true,
   run_command: true,
   run_script: true,

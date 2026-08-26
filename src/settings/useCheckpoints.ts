@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { api, CheckpointMeta } from "../api";
+import { api, CheckpointMeta, type RoomStorageUsage } from "../api";
 
 /** Idea 9: whole-room checkpoints — create named copies of the room, delete
  * them, and roll the room back to one. Mirrors the `usePrivacy` shape (the
@@ -9,6 +9,7 @@ import { api, CheckpointMeta } from "../api";
 export function useCheckpoints() {
   const [checkpoints, setCheckpoints] = useState<CheckpointMeta[]>([]);
   const [totalBytes, setTotalBytes] = useState(0);
+  const [storageUsage, setStorageUsage] = useState<RoomStorageUsage | null>(null);
   const [ckName, setCkName] = useState("");
   const [creating, setCreating] = useState(false);
   const [ckError, setCkError] = useState("");
@@ -20,9 +21,13 @@ export function useCheckpoints() {
 
   const refresh = useCallback(async () => {
     try {
-      const list = await api.listRoomCheckpoints();
+      const [list, usage] = await Promise.all([
+        api.listRoomCheckpoints(),
+        api.roomStorageUsage(),
+      ]);
       setCheckpoints(list.entries);
       setTotalBytes(list.totalBytes);
+      setStorageUsage(usage);
     } catch {
       /* room may be locked/closed — leave the last list */
     }
@@ -76,6 +81,7 @@ export function useCheckpoints() {
   return {
     checkpoints,
     totalBytes,
+    storageUsage,
     ckName,
     setCkName,
     creating,

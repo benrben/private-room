@@ -124,6 +124,14 @@ import type {
   OrganizedChange,
 } from "./apiTypes";
 
+export interface RoomStorageUsage {
+  kind: "legacy" | "workspace";
+  liveFileBytes: number;
+  databaseBytes: number;
+  privateHistoryBytes: number;
+  totalOnDiskBytes: number;
+}
+
 /** The wire shape of every `ask-*` event: the payload the listener wants, in
  * `v`, under the ids of the run and chat that produced it. Built by
  * `crate::turn` on the host side — see `AskTurn`. */
@@ -212,6 +220,7 @@ export const api = {
   touchIdDisable: (path: string) => invoke<void>("touchid_disable", { path }),
   touchIdOpen: (path: string) => invoke<RoomInfo>("touchid_open", { path }),
   roomInfo: () => invoke<RoomInfo | null>("room_info"),
+  roomStorageUsage: () => invoke<RoomStorageUsage>("room_storage_usage"),
   /** Rename the open room. The name lives in the room's own encrypted `meta`
    *  table, not in the file path — renaming the `.roomai` in Finder changes
    *  nothing — so this command is the only way to change it. It writes both

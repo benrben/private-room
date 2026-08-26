@@ -50,7 +50,7 @@ Legend:
 - [x] Implement atomic create, write, import, move, trash and restore.
 - [x] Preserve original POSIX mode when replacing an existing file.
 - [x] Implement the ten-unpinned-version retention job for object-backed versions.
-- [ ] Add storage reporting for normal files, database and private history.
+- [x] Add storage reporting for normal files, database and private history.
 - [ ] Add safe read-only opening when another writer owns the lease.
 - [ ] Add remote-device lease expiry/recovery policy.
 
