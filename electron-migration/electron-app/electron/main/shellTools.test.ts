@@ -37,13 +37,15 @@ function fakeDeps(openPathResult = ""): ShellDeps & {
   const openExternal = vi.fn(() => Promise.resolve());
   const openPathFn = vi.fn(() => Promise.resolve(openPathResult));
   const showItemInFolder = vi.fn();
+  const trashItem = vi.fn(() => Promise.resolve());
   const openWithAppFn = vi.fn(() => Promise.resolve());
   return {
-    shell: { openExternal, openPath: openPathFn, showItemInFolder, trashItem: vi.fn(() => Promise.resolve()) },
+    shell: { openExternal, openPath: openPathFn, showItemInFolder, trashItem },
     openWithApp: openWithAppFn,
     openExternal,
     openPathFn,
     showItemInFolder,
+    trashItem,
     openWithAppFn,
   };
 }
