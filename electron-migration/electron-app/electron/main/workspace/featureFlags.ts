@@ -13,16 +13,20 @@ export type WorkspaceHarnessFlag = typeof WORKSPACE_HARNESS_FLAGS[number];
 
 const DEFAULTS: Record<WorkspaceHarnessFlag, boolean> = {
   workspace_rooms_v2: true,
-  workspace_conversion: false,
-  sealed_export_v2: false,
-  unified_harness: false,
-  codex_app_server: false,
-  claude_agent_sdk: false,
-  deep_agent_harness: false,
-  cloud_redacted_mirror: false,
+  workspace_conversion: true,
+  sealed_export_v2: true,
+  unified_harness: true,
+  codex_app_server: true,
+  claude_agent_sdk: true,
+  deep_agent_harness: true,
+  cloud_redacted_mirror: true,
 };
 
-/** Environment override for development and staged releases. */
+/**
+ * GA defaults enable the product surface. Runtime capability, provider
+ * installation, room format, privacy, baseline, and sandbox probes still
+ * fail closed before any harness or workspace operation can start.
+ */
 export function workspaceHarnessFlag(name: WorkspaceHarnessFlag): boolean {
   const key = `ARCELLE_${name.toUpperCase()}`;
   const value = process.env[key];

@@ -27,16 +27,16 @@ afterEach(() => {
 });
 
 describe("workspace harness feature flags", () => {
-  it("uses the staged-release defaults when no override is present", () => {
+  it("enables the GA surface when no override is present", () => {
     expect(workspaceHarnessCapabilities()).toEqual({
       workspace_rooms_v2: true,
-      workspace_conversion: false,
-      sealed_export_v2: false,
-      unified_harness: false,
-      codex_app_server: false,
-      claude_agent_sdk: false,
-      deep_agent_harness: false,
-      cloud_redacted_mirror: false,
+      workspace_conversion: true,
+      sealed_export_v2: true,
+      unified_harness: true,
+      codex_app_server: true,
+      claude_agent_sdk: true,
+      deep_agent_harness: true,
+      cloud_redacted_mirror: true,
     });
   });
 
@@ -55,7 +55,7 @@ describe("workspace harness feature flags", () => {
     process.env.ARCELLE_UNIFIED_HARNESS = "TRUE";
 
     expect(workspaceHarnessFlag("workspace_rooms_v2")).toBe(true);
-    expect(workspaceHarnessFlag("unified_harness")).toBe(false);
+    expect(workspaceHarnessFlag("unified_harness")).toBe(true);
   });
 
   it("does not change environment overrides while reading them", () => {
