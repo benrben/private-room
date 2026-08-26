@@ -95,6 +95,7 @@ import { createHash } from "node:crypto";
 import type { IpcMain, IpcMainInvokeEvent } from "electron";
 import type Database from "better-sqlite3-multiple-ciphers";
 import { getFileFull } from "./db-host/files.js";
+import { readRoomFile } from "./workspace/roomContent.js";
 import { buildZip, parseZip, readZipEntryText, type ZipEntry, type ZipWriteEntry } from "./editMatchZip.js";
 import { previewRenderNotImplemented, type PreviewRenderFn } from "./previewTools.js";
 import { convert as textutilConvert, resolveFieldCodes } from "./textUtil.js";
@@ -118,12 +119,12 @@ export interface RoomSource {
  * command already spells it. */
 const NO_ROOM_OPEN = "No room is open.";
 
-function openDb(room: RoomSource): Database.Database {
+function openRoom(room: RoomSource): OpenRoom {
   const open = room.currentRoom();
   if (open === null) {
     throw new Error(NO_ROOM_OPEN);
   }
-  return open.db;
+  return open;
 }
 
 // ============================================================================
@@ -428,6 +429,39 @@ export async function slidePreview(
   return { pngB64, slides };
 }
 
+/** Same renderer path, with current bytes loaded from the room's source of truth. */
+export async function slidePreviewInRoom(
+  open: OpenRoom,
+  id: string,
+  index: number,
+  cache: SlideCache,
+  render: PreviewRenderFn = previewRenderNotImplemented,
+): Promise<SlideImage | null> {
+  if (!Number.isInteger(index) || index < 0) {
+    throw new Error(
+      `slide_preview's index must be a non-negative integer (Tauri's usize deserialization ` +
+        `would refuse anything else before the command ever ran); got ${index}.`,
+    );
+  }
+  const file = await readRoomFile(open, id);
+  const bytes = file.bytes ?? Buffer.alloc(0);
+  if (bytes.length === 0) return null;
+  const ooxml = slideCountOf(bytes);
+  const slides = Math.max(ooxml, 1);
+  if (index >= slides) return null;
+  const key = `${id}:${index}:${deckDigest(bytes)}`;
+  const hit = cache.map.get(key);
+  if (hit !== undefined) return { pngB64: hit.pngB64, slides };
+  const staged = index === 0 || ooxml === 0 ? Buffer.from(bytes) : deckWithSlideFirst(bytes, index);
+  const png = await render(file.name, staged);
+  if (png === null) return null;
+  const pngB64 = png.toString("base64");
+  const seq = nextSlideSeq(cache);
+  evictToFit(cache.map, MAX_CACHED_SLIDES);
+  cache.map.set(key, { seq, pngB64 });
+  return { pngB64, slides };
+}
+
 // ============================================================================
 // Word-as-HTML (ported from office.rs's "Word as HTML" half)
 // ============================================================================
@@ -473,6 +507,12 @@ export async function officeHtml(db: Database.Database, id: string): Promise<str
   return textutilHtml(name, bytes);
 }
 
+export async function officeHtmlInRoom(open: OpenRoom, id: string): Promise<string | null> {
+  const file = await readRoomFile(open, id);
+  const bytes = file.bytes ?? Buffer.alloc(0);
+  return bytes.length === 0 ? null : textutilHtml(file.name, bytes);
+}
+
 // ============================================================================
 // IPC registration (not wired into any bootstrap — see this module's doc)
 // ============================================================================
@@ -499,10 +539,10 @@ export function registerOfficeIpc(
   ipcMain.handle(
     "slide_preview",
     (_event: IpcMainInvokeEvent, args: { id: string; index: number }) =>
-      slidePreview(openDb(room), args.id, args.index, cache, renderSlide)
+      slidePreviewInRoom(openRoom(room), args.id, args.index, cache, renderSlide)
   );
   ipcMain.handle(
     "office_html",
-    (_event: IpcMainInvokeEvent, args: { id: string }) => officeHtml(openDb(room), args.id)
+    (_event: IpcMainInvokeEvent, args: { id: string }) => officeHtmlInRoom(openRoom(room), args.id)
   );
 }

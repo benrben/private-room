@@ -5,7 +5,8 @@ import { randomUUID } from "node:crypto";
 import type { IpcMain, IpcMainInvokeEvent } from "electron";
 import type { RoomManagerDeps, RoomManagerState } from "./roomManager.js";
 import type { EventSender } from "./turn.js";
-import { getFileBytesNamed, listFiles } from "./db-host/files.js";
+import { listFiles } from "./db-host/files.js";
+import { readRoomFile } from "./workspace/roomContent.js";
 import {
   addScriptApproval,
   ensureScriptWorkflow,
@@ -56,8 +57,9 @@ export function createScriptApprovalRequester(
     if (readScriptApprovals(userDataDir).includes(request.sha)) return true;
     const open = state.room;
     if (!open) throw new Error("No room is open.");
-    const [name, bytes0] = getFileBytesNamed(open.conn, request.fileId);
-    const bytes = bytes0 ?? Buffer.alloc(0);
+    const file = await readRoomFile({ db: open.conn, path: open.path }, request.fileId);
+    const name = file.name;
+    const bytes = file.bytes ?? Buffer.alloc(0);
     const manifest = parseScriptManifest(name, bytes.toString("utf8"));
     const id = randomUUID();
     const decision = await new Promise<{ approved: boolean; remember: boolean }>((resolve) => {
@@ -148,8 +150,9 @@ export async function runScriptFile(
   fileId: string,
 ): Promise<string> {
   if (!state.room) throw new Error("No room is open.");
-  const [name, bytes0] = getFileBytesNamed(state.room.conn, fileId);
-  const bytes = bytes0 ?? Buffer.alloc(0);
+  const file = await readRoomFile({ db: state.room.conn, path: state.room.path }, fileId);
+  const name = file.name;
+  const bytes = file.bytes ?? Buffer.alloc(0);
   if (scriptLangOf(name) === null) throw new Error("Only .py or .js files can be run as scripts.");
   const manifest = parseScriptManifest(name, bytes.toString("utf8"));
   const runner = resolveInterpreter(manifest);

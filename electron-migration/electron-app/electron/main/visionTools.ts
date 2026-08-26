@@ -156,6 +156,7 @@ import {
   type VisionSupportDeps,
 } from "./capabilities.js";
 import { getFileBytes } from "./db-host/files.js";
+import { readRoomFile } from "./workspace/roomContent.js";
 import { listModels as listModelsReal, resolvedBaseUrl, stripThinkSpans } from "./engineRouting.js";
 import { modelSetting } from "./gatherContext.js";
 import { chatStructured, type StructuredOpts } from "./ollamaGenerate.js";
@@ -592,12 +593,12 @@ export interface RoomSource {
  * and `peaksTools.ts` already spell it. */
 const NO_ROOM_OPEN = "No room is open.";
 
-function openDb(room: RoomSource): Database.Database {
+function openRoom(room: RoomSource): OpenRoom {
   const open = room.currentRoom();
   if (open === null) {
     throw new Error(NO_ROOM_OPEN);
   }
-  return open.db;
+  return open;
 }
 
 /** `sidecarJsonCancellable`'s own signature — the seam {@link locateInImage}
@@ -708,6 +709,15 @@ export async function locateInImage(
   if (bytes === null) {
     throw new Error("File has no stored content.");
   }
+  return locateBytes(db, bytes, query, deps);
+}
+
+async function locateBytes(
+  db: Database.Database,
+  bytes: Buffer,
+  query: string,
+  deps: LocateInImageDeps,
+): Promise<ImageBox[]> {
   const explicit = modelSetting(db);
 
   const listModels = deps.listModels ?? listModelsReal;
@@ -755,6 +765,17 @@ export async function locateInImage(
   return decodeImageBoxes(boxesRaw);
 }
 
+export async function locateInImageInRoom(
+  open: OpenRoom,
+  fileId: string,
+  query: string,
+  deps: LocateInImageDeps = {},
+): Promise<ImageBox[]> {
+  const file = await readRoomFile(open, fileId);
+  if (file.bytes === null) throw new Error("File has no stored content.");
+  return locateBytes(open.db, file.bytes, query, deps);
+}
+
 /**
  * Registers {@link locateInImage} on the `locate_in_image` channel — the
  * Rust `#[tauri::command]` name (and `../shared/ipc-contract.ts`'s
@@ -776,6 +797,6 @@ export function registerVisionIpc(
   ipcMain.handle(
     "locate_in_image",
     (_event: IpcMainInvokeEvent, args: { fileId: string; query: string }) =>
-      locateInImage(openDb(room), args.fileId, args.query, deps)
+      locateInImageInRoom(openRoom(room), args.fileId, args.query, deps)
   );
 }

@@ -135,13 +135,13 @@ import type { IpcMain, IpcMainInvokeEvent } from "electron";
 import type { MediaMeta } from "../shared/apiTypes.js";
 import {
   availableName,
-  getFileFull,
   getFileName,
   getMediaMeta,
   insertFile,
   setMediaMeta,
   type FileMeta,
 } from "./db-host/files.js";
+import { createRoomFile, readRoomFile } from "./workspace/roomContent.js";
 import { extensionOf } from "./editMatchExtraction.js";
 import { probePath } from "./mediaProbe.js";
 import { mediaKind } from "./peaksTools.js";
@@ -524,13 +524,15 @@ interface StagedVideoBytes {
  * capture BEFORE the DB read (matching the Rust source's own read order:
  * `state.room_epoch()`, then the file row).
  */
-function takeMediaBytes(room: RoomSource, id: string): StagedVideoBytes {
+async function takeMediaBytes(room: RoomSource, id: string): Promise<StagedVideoBytes> {
   // Epoch read BEFORE the room-open check, mirroring Rust's own order
   // (`let epoch = state.room_epoch();` precedes `state.with_room(...)`,
   // which is what can fail with "No room is open.").
   const epoch = room.roomEpoch();
   const open = requireRoom(room);
-  const [name, mimeRaw, bytesRaw] = getFileFull(open.db, id);
+  const file = await readRoomFile(open, id);
+  const { name, bytes: bytesRaw } = file;
+  const mimeRaw = file.mimeType;
   const mime = mimeRaw ?? "";
   const ext = extensionOf(name);
   if (mediaKind(mime, ext) !== "video") {
@@ -613,7 +615,7 @@ export async function probeVideoMeta(
     }
   }
 
-  const staged = takeMediaBytes(room, id);
+  const staged = await takeMediaBytes(room, id);
   const probed = await probeBytes(staged.bytes, staged.ext, probe);
   if (probed === null) {
     return null;
@@ -778,7 +780,7 @@ export async function videoTrim(
   endSecs: number,
   deps: VideoIpcDeps = {}
 ): Promise<FileMeta> {
-  const staged = takeMediaBytes(room, id);
+  const staged = await takeMediaBytes(room, id);
   const cachedJson = getMediaMeta(requireRoom(room).db, id);
   const knownDuration = cachedJson !== null ? parseCachedMediaMeta(cachedJson)?.durationSecs ?? null : null;
   const [start, end] = validateSpan(startSecs, endSecs, knownDuration);
@@ -816,7 +818,7 @@ export async function videoTrim(
 
   // Several trims of one video are normal; disambiguate.
   const finalName = availableName(open.db, newName);
-  const file = insertFile(open.db, finalName, staged.mime, clip, null, "generated");
+  const file = await createRoomFile(open, finalName, staged.mime, clip, null, "generated");
   if (metaJson !== null) {
     setMediaMeta(open.db, file.id, metaJson);
   }
@@ -875,6 +877,24 @@ export function saveVideoFrame(
   return file;
 }
 
+export async function saveVideoFrameInRoom(
+  room: RoomSource,
+  id: string,
+  pngB64: string,
+  atSecs: number,
+  emit?: EmitFn,
+): Promise<FileMeta> {
+  const png = decodeBase64Strict(pngB64.trim());
+  if (png === null) throw new Error("That frame didn't arrive as valid image data — nothing was saved.");
+  if (!isPng(png)) throw new Error("That frame didn't arrive as a PNG — nothing was saved.");
+  const open = requireRoom(room);
+  const name = getFileName(open.db, id);
+  const still = availableName(open.db, frameName(name, atSecs));
+  const file = await createRoomFile(open, still, "image/png", png, null, "generated");
+  emitSafely(emit, "room-files-changed", undefined);
+  return file;
+}
+
 // -------------------------------------------------------------------- IPC
 
 /**
@@ -907,6 +927,6 @@ export function registerVideoIpc(
   ipcMain.handle(
     "save_video_frame",
     (_event: IpcMainInvokeEvent, args: { id: string; pngB64: string; atSecs: number }) =>
-      saveVideoFrame(room, args.id, args.pngB64, args.atSecs, deps.emit)
+      saveVideoFrameInRoom(room, args.id, args.pngB64, args.atSecs, deps.emit)
   );
 }

@@ -234,6 +234,7 @@ import { snapshotFileVersion } from "./db-host/versions.js";
 import { pinnedDb, type RoomSource } from "./jobs.js";
 import { clampBytesMarked } from "./textClamp.js";
 import type { ScriptManifest } from "../shared/apiTypes.js";
+import { createRoomFile, readRoomFile, writeRoomFile } from "./workspace/roomContent.js";
 
 export type { ScriptManifest };
 
@@ -914,6 +915,49 @@ export function materializeNamed(
   return out;
 }
 
+async function materializeInputsInRoom(
+  db: Database.Database,
+  roomPath: string,
+  ws: string,
+  inputs: readonly string[],
+  reserved: ReadonlySet<string>,
+): Promise<Materialized[]> {
+  const out: Materialized[] = [];
+  for (const want of inputs) {
+    let id: string;
+    let realName: string;
+    try { [id, realName] = findFileLike(db, want); } catch { continue; }
+    const safe = safeName(realName);
+    if (reserved.has(safe) || out.some((item) => item.name === safe)) continue;
+    const file = await readRoomFile({ db, path: roomPath }, id);
+    if (file.bytes === null) continue;
+    fs.writeFileSync(path.join(ws, safe), file.bytes);
+    out.push({ name: safe, sha: scriptFingerprint(file.bytes) });
+  }
+  return out;
+}
+
+async function materializeNamedInRoom(
+  db: Database.Database,
+  roomPath: string,
+  ws: string,
+  names: readonly string[],
+  already: ReadonlySet<string>,
+): Promise<Materialized[]> {
+  const out: Materialized[] = [];
+  for (const name of names) {
+    const safe = safeName(name);
+    if (already.has(safe) || out.some((item) => item.name === safe)) continue;
+    const meta = fileByExactName(db, name);
+    if (meta === null) continue;
+    const file = await readRoomFile({ db, path: roomPath }, meta.id);
+    if (file.bytes === null) continue;
+    fs.writeFileSync(path.join(ws, safe), file.bytes);
+    out.push({ name: safe, sha: scriptFingerprint(file.bytes) });
+  }
+  return out;
+}
+
 // ============================================================================
 // Execution
 // ============================================================================
@@ -1372,6 +1416,30 @@ function writeOutput(
   return { meta: insertFile(db, display, guessMime(display), bytes, text, "script"), replaced: false };
 }
 
+async function writeOutputInRoom(
+  db: Database.Database,
+  roomPath: string,
+  name: string,
+  bytes: Buffer,
+  cause: string,
+): Promise<{ meta: FileMeta; replaced: boolean }> {
+  const display = safeName(name);
+  const text = extractText(display, bytes);
+  const existing = fileByExactName(db, display);
+  if (existing !== null) {
+    return {
+      meta: await writeRoomFile({ db, path: roomPath }, existing.id, bytes, text, cause),
+      replaced: true,
+    };
+  }
+  return {
+    meta: await createRoomFile(
+      { db, path: roomPath }, display, guessMime(display), bytes, text, "script",
+    ),
+    replaced: false,
+  };
+}
+
 /** `statSync` without the throw — `null` when the path does not exist. */
 function statOrNull(p: string): fs.Stats | null {
   try {
@@ -1531,6 +1599,88 @@ export function importOutputs(
   return { imported, skipped };
 }
 
+/** Async twin used by workspace rooms so accepted output bytes land as normal files. */
+async function importOutputsInRoom(
+  db: Database.Database,
+  roomPath: string,
+  ws: string,
+  manifest: ScriptManifest,
+  materialized: readonly Materialized[],
+  scriptName: string,
+  cause: string,
+): Promise<{ imported: FileMeta[]; skipped: string[] }> {
+  const imported: FileMeta[] = [];
+  const skipped: string[] = [];
+  const handled = new Set<string>(materialized.map((item) => item.name));
+  handled.add(safeName(scriptName));
+  const declaredSeen = new Set<string>();
+
+  for (const want of manifest.outputs) {
+    const safe = safeName(want);
+    const filePath = path.join(ws, safe);
+    handled.add(safe);
+    if (declaredSeen.has(safe)) continue;
+    declaredSeen.add(safe);
+    const stat = statOrNull(filePath);
+    if (stat === null || !stat.isFile()) {
+      skipped.push(`${want}: the script did not write this declared output`);
+      continue;
+    }
+    if (stat.size > MAX_IMPORT_BYTES) {
+      skipped.push(`${want}: over the ${MAX_IMPORT_BYTES / 1024 / 1024}MB import cap`);
+      continue;
+    }
+    const bytes = fs.readFileSync(filePath);
+    if (materialized.some((item) => item.name === safe && item.sha === scriptFingerprint(bytes))) {
+      skipped.push(`${want}: unchanged from the room's copy — no new version was saved`);
+      continue;
+    }
+    imported.push((await writeOutputInRoom(db, roomPath, want, bytes, cause)).meta);
+  }
+
+  let newBytes = 0;
+  let newCount = 0;
+  let entries: string[];
+  try { entries = fs.readdirSync(ws); } catch { entries = []; }
+  const names = entries.filter((name) => statOrNull(path.join(ws, name))?.isFile() === true).sort();
+  for (const name of names) {
+    if (handled.has(name)) continue;
+    handled.add(name);
+    const filePath = path.join(ws, name);
+    const len = statOrNull(filePath)?.size ?? 0;
+    if (newCount >= MAX_NEW_FILES || newBytes + len > MAX_IMPORT_BYTES) {
+      skipped.push(`${name}: skipped (new-file import cap reached)`);
+      continue;
+    }
+    const bytes = fs.readFileSync(filePath);
+    newBytes += bytes.length;
+    newCount += 1;
+    const written = await writeOutputInRoom(db, roomPath, name, bytes, cause);
+    imported.push(written.meta);
+    if (written.replaced) {
+      skipped.push(
+        `${name}: a room file of that name already existed — the script's version was saved over it as a new version (undo via Time Machine); declare it in room-outputs to make that explicit`,
+      );
+    }
+  }
+
+  for (const item of materialized) {
+    const filePath = path.join(ws, item.name);
+    let bytes: Buffer;
+    try { bytes = fs.readFileSync(filePath); } catch { continue; }
+    if (!isModifiedUsedFile(item.sha, scriptFingerprint(bytes), item.name, manifest.outputs)) continue;
+    if (bytes.length > MAX_IMPORT_BYTES) {
+      skipped.push(`${item.name}: over the ${MAX_IMPORT_BYTES / 1024 / 1024}MB import cap — not saved back`);
+      continue;
+    }
+    imported.push((await writeOutputInRoom(db, roomPath, item.name, bytes, cause)).meta);
+    skipped.push(
+      `${item.name}: updated in place by the script — saved back as a new version (undo via Time Machine)`,
+    );
+  }
+  return { imported, skipped };
+}
+
 // ============================================================================
 // Runner core
 // ============================================================================
@@ -1604,8 +1754,10 @@ export async function runScriptProcess(
 ): Promise<ScriptRunReport> {
   // (a) Read the script bytes + name under the room pin; verify the consent
   //     hash.
-  const [scriptName, scriptBytesRaw] = getFileBytesNamed(requireRoom(deps, roomPath), scriptFileId);
-  const scriptBytes = scriptBytesRaw ?? Buffer.alloc(0);
+  const initialDb = requireRoom(deps, roomPath);
+  const scriptFile = await readRoomFile({ db: initialDb, path: roomPath }, scriptFileId);
+  const scriptName = scriptFile.name;
+  const scriptBytes = scriptFile.bytes ?? Buffer.alloc(0);
   if (scriptFingerprint(scriptBytes) !== consentedSha256) {
     // Aligns with the approval-gates policy: park, never silently run new
     // code. Distinguish the two cases so the message is actionable: an EMPTY
@@ -1635,7 +1787,7 @@ export async function runScriptProcess(
     // materialized afterwards may overwrite it — see `materializeInputs`.
     fs.writeFileSync(path.join(ws, safeScript), scriptBytes);
     const reserved = new Set<string>([safeScript]);
-    const declared = materializeInputs(room, ws, manifest.inputs, reserved);
+    const declared = await materializeInputsInRoom(room, roomPath, ws, manifest.inputs, reserved);
     // Auto-materialize any room file whose exact name appears in the script
     // text (e.g. `read_csv('ETF Tracker — AI Full Stack.csv')`), even if it
     // was never declared as a room-input — so scripts "just work". Read-only
@@ -1645,7 +1797,10 @@ export async function runScriptProcess(
     const roomNames = listFiles(room).map((f) => f.name);
     const referenced = referencedRoomFiles(text, roomNames, MAX_AUTO_MATERIALIZE);
     const already = new Set<string>([...declared.map((m) => m.name), safeScript]);
-    const materialized = [...declared, ...materializeNamed(room, ws, referenced, already)];
+    const materialized = [
+      ...declared,
+      ...await materializeNamedInRoom(room, roomPath, ws, referenced, already),
+    ];
 
     // (d/e/f/g) Spawn + watch + drain + import back.
     report = await runAndImport(
@@ -1771,7 +1926,12 @@ async function runAndImport(
   // (g) exit 0 → import back, room-pinned.
   const cause = `Script ran — ${scriptName}`;
   const room = requireRoom(deps, roomPath);
-  const { imported, skipped } = importOutputs(room, ws, manifest, materialized, scriptName, cause);
+  const workspaceRoom = room.prepare(
+    "SELECT 1 FROM meta WHERE key = 'room_kind' AND value = 'workspace-folder'",
+  ).get() !== undefined;
+  const { imported, skipped } = workspaceRoom
+    ? await importOutputsInRoom(room, roomPath, ws, manifest, materialized, scriptName, cause)
+    : importOutputs(room, ws, manifest, materialized, scriptName, cause);
   if (healed.length > 0) {
     // The consent card's "Installs" row is the script's DECLARED list, so
     // these were downloaded from PyPI and executed without ever being named to

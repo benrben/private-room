@@ -72,6 +72,7 @@ import { extensionOf, isUnicodeWhitespace } from "./editMatchExtraction.js";
 import { extractText, storeFileBytes } from "./editMatch.js";
 import { docxReplaceText } from "./editMatchDocx.js";
 import type { OpenRoom } from "./turnEngine.js";
+import { readRoomFile, writeRoomFile } from "./workspace/roomContent.js";
 
 // ------------------------------------------------------------- room/emit plumbing
 
@@ -93,6 +94,12 @@ function openDb(room: RoomSource): Database.Database {
     throw new Error(NO_ROOM_OPEN);
   }
   return open.db;
+}
+
+function openRoom(room: RoomSource): OpenRoom {
+  const open = room.currentRoom();
+  if (open === null) throw new Error(NO_ROOM_OPEN);
+  return open;
 }
 
 /** `let _ = app.emit(...)` — a best-effort UI notification that must never
@@ -295,6 +302,33 @@ export function updateDocxText(db: Database.Database, id: string, content: strin
   return meta;
 }
 
+/** Workspace-aware Save path used by IPC; legacy helper above remains source-compatible. */
+export async function updateDocxTextInRoom(
+  open: OpenRoom,
+  id: string,
+  content: string,
+  emit?: EmitFn,
+): Promise<FileMeta> {
+  const file = await readRoomFile(open, id);
+  const bytes = file.bytes ?? Buffer.alloc(0);
+  if (extensionOf(file.name) !== "docx") throw new Error(`"${file.name}" is not a Word document.`);
+  if (file.extractedText === null) {
+    throw new Error(`"${file.name}" has no readable text, so there is nothing to edit.`);
+  }
+  const patched = applyParagraphEdits(bytes, file.extractedText, content);
+  const meta = patched === null
+    ? getFileMeta(open.db, id)
+    : await writeRoomFile(
+        open,
+        id,
+        patched,
+        extractText(file.name, patched),
+        "You edited the document",
+      );
+  emitSafely(emit, "room-files-changed", undefined);
+  return meta;
+}
+
 /**
  * Registers {@link updateDocxText} on the `update_docx_text` channel — the
  * Rust `#[tauri::command]` name `src/api.ts`'s `invoke("update_docx_text", …)`
@@ -315,6 +349,6 @@ export function registerDocxEditIpc(
   ipcMain.handle(
     "update_docx_text",
     (_event: IpcMainInvokeEvent, args: { id: string; content: string }) =>
-      updateDocxText(openDb(room), args.id, args.content, emit)
+      updateDocxTextInRoom(openRoom(room), args.id, args.content, emit)
   );
 }

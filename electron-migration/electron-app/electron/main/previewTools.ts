@@ -89,6 +89,7 @@ import type { IpcMain, IpcMainInvokeEvent } from "electron";
 import type Database from "better-sqlite3-multiple-ciphers";
 import { CancelFlag } from "./cancel.js";
 import { getFileFull } from "./db-host/files.js";
+import { readRoomFile } from "./workspace/roomContent.js";
 import { sidecarJsonCancellable } from "./sidecarJsonCancellable.js";
 import type { OpenRoom } from "./turnEngine.js";
 import type { QuickLookPreview } from "../shared/apiTypes.js";
@@ -105,12 +106,10 @@ export interface RoomSource {
  * `execTool.ts` already spell it. */
 const NO_ROOM_OPEN = "No room is open.";
 
-function openDb(room: RoomSource): Database.Database {
+function openRoom(room: RoomSource): OpenRoom {
   const open = room.currentRoom();
-  if (open === null) {
-    throw new Error(NO_ROOM_OPEN);
-  }
-  return open.db;
+  if (open === null) throw new Error(NO_ROOM_OPEN);
+  return open;
 }
 
 /**
@@ -177,6 +176,19 @@ export async function quicklookPreview(
   return png === null ? null : { pngB64: png.toString("base64") };
 }
 
+/** Workspace-aware command path; legacy callers keep the synchronous DB helper above. */
+export async function quicklookPreviewInRoom(
+  open: OpenRoom,
+  id: string,
+  render: PreviewRenderFn = previewRenderNotImplemented,
+): Promise<QuickLookPreview | null> {
+  const file = await readRoomFile(open, id);
+  const bytes = file.bytes ?? Buffer.alloc(0);
+  if (bytes.length === 0) return null;
+  const png = await render(file.name, bytes);
+  return png === null ? null : { pngB64: png.toString("base64") };
+}
+
 /**
  * Registers {@link quicklookPreview} on the `quicklook_preview` channel —
  * the Rust `#[tauri::command]` name `src/api.ts`'s `invoke("quicklook_preview",
@@ -197,6 +209,6 @@ export function registerPreviewIpc(
   ipcMain.handle(
     "quicklook_preview",
     (_event: IpcMainInvokeEvent, args: { id: string }) =>
-      quicklookPreview(openDb(room), args.id, render)
+      quicklookPreviewInRoom(openRoom(room), args.id, render)
   );
 }

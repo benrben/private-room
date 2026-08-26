@@ -72,6 +72,7 @@ import { getFileBytesNamed } from "./db-host/files.js";
 import { storeFileBytes } from "./editMatch.js";
 import { setCellInBytes } from "./editMatchCells.js";
 import type { OpenRoom } from "./turnEngine.js";
+import { readRoomFile, writeRoomFile } from "./workspace/roomContent.js";
 
 // ------------------------------------------------------------- room/emit plumbing
 
@@ -94,6 +95,12 @@ function openDb(room: RoomSource): Database.Database {
     throw new Error(NO_ROOM_OPEN);
   }
   return open.db;
+}
+
+function openRoom(room: RoomSource): OpenRoom {
+  const open = room.currentRoom();
+  if (open === null) throw new Error(NO_ROOM_OPEN);
+  return open;
 }
 
 /** `let _ = window.emit(...)` — a best-effort UI notification that must never
@@ -157,6 +164,23 @@ export function setCell(
   emitSafely(emit, "file-updated", id);
 }
 
+export async function setCellInRoom(
+  open: OpenRoom,
+  id: string,
+  sheet: string | null,
+  cell: string,
+  value: string,
+  emit?: EmitFn,
+): Promise<void> {
+  const file = await readRoomFile(open, id);
+  if (file.bytes === null) throw new Error("File has no stored content.");
+  const result = setCellInBytes(file.name, file.bytes, sheet, cell, value);
+  if (!result.ok) throw new Error(result.error);
+  await writeRoomFile(open, id, result.bytes, result.text, "You edited");
+  emitSafely(emit, "room-files-changed", undefined);
+  emitSafely(emit, "file-updated", id);
+}
+
 /**
  * Registers {@link setCell} on the `set_cell` channel — the Rust
  * `#[tauri::command]` name `src/api.ts`'s `invoke("set_cell", …)` already
@@ -178,6 +202,6 @@ export function registerSpreadsheetIpc(
   ipcMain.handle(
     "set_cell",
     (_event: IpcMainInvokeEvent, args: { id: string; sheet: string | null; cell: string; value: string }) =>
-      setCell(openDb(room), args.id, args.sheet, args.cell, args.value, emit)
+      setCellInRoom(openRoom(room), args.id, args.sheet, args.cell, args.value, emit)
   );
 }
