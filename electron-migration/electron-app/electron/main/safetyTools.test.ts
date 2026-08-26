@@ -51,7 +51,11 @@ import {
   versionContent,
   type SafetyRoomSource,
 } from "./safetyTools.js";
-import { createWorkspaceRoom } from "./workspace/roomLayout.js";
+import {
+  createWorkspaceRoom,
+  openWorkspaceRoom,
+  readWorkspaceMarker,
+} from "./workspace/roomLayout.js";
 import { WorkspaceService } from "./workspace/workspaceService.js";
 
 let tmpDir: string;
@@ -779,6 +783,77 @@ describe("registerSafetyIpc", () => {
     expect(readFileSync(path.join(roomPath, "notes.txt"), "utf8")).toBe("old normal bytes");
     await listener(handle, "delete_file_version")({}, { versionId });
     expect(dbListFileVersions(db, file.fileId).some((version) => version.id === versionId)).toBe(false);
+  });
+
+  it("streams workspace exports and duplicates into a new normal-file room identity", async () => {
+    tmpDir = mkdtempSync(path.join(os.tmpdir(), "safety-workspace-copy-"));
+    roomPath = path.join(tmpDir, "Workspace Room");
+    const created = createWorkspaceRoom(roomPath, "correct horse battery staple", "Workspace Room");
+    db = created.db;
+    const workspace = new WorkspaceService(db, roomPath);
+    const source = path.join(tmpDir, "source.txt");
+    writeFileSync(source, "normal file bytes", "utf8");
+    const file = await workspace.importFile(source, "Research/notes.txt");
+    const handle = vi.fn();
+    registerSafetyIpc({ handle }, {
+      currentRoom: () => ({
+        conn: db,
+        path: roomPath,
+        password: "correct horse battery staple",
+        workspace,
+        descriptor: created.descriptor,
+      }),
+    });
+
+    const exported = path.join(tmpDir, "exported.txt");
+    await listener(handle, "export_file")({}, { id: file.fileId, destPath: exported });
+    expect(readFileSync(exported, "utf8")).toBe("normal file bytes");
+    const exportDir = path.join(tmpDir, "all");
+    mkdirSync(exportDir);
+    await expect(listener(handle, "export_all")({}, { destDir: exportDir })).resolves.toBe(1);
+    expect(readFileSync(path.join(exportDir, "notes.txt"), "utf8")).toBe("normal file bytes");
+
+    const duplicatePath = path.join(tmpDir, "Workspace Copy");
+    await listener(handle, "duplicate_room")(
+      {},
+      { destPath: duplicatePath, newPassword: "different password" },
+    );
+    expect(readWorkspaceMarker(duplicatePath).roomId).not.toBe(created.descriptor.roomId);
+    const copy = openWorkspaceRoom(duplicatePath, "different password");
+    try {
+      const copied = copy.db.prepare(
+        "SELECT original_bytes, relative_path FROM files WHERE id = ?",
+      ).get(file.fileId) as { original_bytes: Buffer | null; relative_path: string };
+      expect(copied).toEqual({ original_bytes: null, relative_path: "Research/notes.txt" });
+      expect(readFileSync(path.join(duplicatePath, "Research", "notes.txt"), "utf8"))
+        .toBe("normal file bytes");
+    } finally {
+      copy.db.close();
+    }
+  });
+
+  it("changes a workspace password against its private database path", async () => {
+    tmpDir = mkdtempSync(path.join(os.tmpdir(), "safety-workspace-password-"));
+    roomPath = path.join(tmpDir, "Workspace Room");
+    const created = createWorkspaceRoom(roomPath, "correct horse battery staple", "Workspace Room");
+    db = created.db;
+    const workspace = new WorkspaceService(db, roomPath);
+    const handle = vi.fn();
+    registerSafetyIpc({ handle }, {
+      currentRoom: () => ({
+        conn: db,
+        path: roomPath,
+        password: "correct horse battery staple",
+        workspace,
+        descriptor: created.descriptor,
+      }),
+    });
+    await listener(handle, "change_password")(
+      {},
+      { current: "correct horse battery staple", newPassword: "new workspace password" },
+    );
+    expect(() => verifyPassword(created.descriptor.dbPath, "correct horse battery staple")).toThrow();
+    expect(() => verifyPassword(created.descriptor.dbPath, "new workspace password")).not.toThrow();
   });
 
   it("change_password calls onPasswordChanged after a successful rotation", async () => {

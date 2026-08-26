@@ -102,8 +102,11 @@
 import type Database from "better-sqlite3-multiple-ciphers";
 import type { IpcMain, IpcMainInvokeEvent } from "electron";
 import koffi from "koffi";
-import { existsSync, statSync, unlinkSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { createWriteStream, existsSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { rm } from "node:fs/promises";
+import { basename, dirname, join } from "node:path";
+import { randomUUID } from "node:crypto";
+import { pipeline } from "node:stream/promises";
 import type { FileVersion, Provenance, VersionContent } from "../shared/apiTypes.js";
 import { checkpointCkPaths } from "./db-host/checkpoints.js";
 import {
@@ -134,6 +137,8 @@ import { deleteEntry as keychainDeleteEntry, has as keychainHas, store as keycha
 import { mediaKind } from "./peaksTools.js";
 import { clampBytes } from "./textClamp.js";
 import type { WorkspaceService } from "./workspace/workspaceService.js";
+import { createSealedPackage, importSealedPackage } from "./workspace/sealedPackage.js";
+import type { RoomDescriptor } from "./workspace/types.js";
 
 function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
@@ -567,6 +572,24 @@ export function exportFile(db: Database.Database, id: string, destPath: string):
   }
 }
 
+async function exportWorkspaceFile(
+  db: Database.Database,
+  workspace: WorkspaceService,
+  id: string,
+  destPath: string,
+): Promise<void> {
+  // Resolve the row before opening the destination. A missing/trashed file
+  // must never leave an empty export behind.
+  const stream = workspace.readStream(id);
+  try {
+    await pipeline(stream, createWriteStream(destPath));
+  } catch (error) {
+    await rm(destPath, { force: true }).catch(() => undefined);
+    throw new Error(`Could not save the file: ${errMsg(error)}`);
+  }
+  if (fileOriginUrl(db, id) !== null) markAsDownloaded(destPath);
+}
+
 /** ADD-1: export every file into `destDir`, never overwriting. Returns the
  * number written. Ported from `export_all_core` (the async
  * `block_in_place`-wrapped `export_all` — see this file's module doc on why
@@ -600,6 +623,26 @@ export async function exportAll(db: Database.Database, destDir: string): Promise
   return written;
 }
 
+async function exportAllWorkspace(
+  db: Database.Database,
+  workspace: WorkspaceService,
+  destDir: string,
+): Promise<number> {
+  if (!existsSync(destDir) || !statSync(destDir).isDirectory()) {
+    throw new Error("Choose a folder to export into.");
+  }
+  const files = listFiles(db);
+  let written = 0;
+  for (const file of files) {
+    const name = uniqueExportName(safeExportName(file.name), (candidate) =>
+      existsSync(join(destDir, candidate))
+    );
+    await exportWorkspaceFile(db, workspace, file.id, join(destDir, name));
+    written += 1;
+  }
+  return written;
+}
+
 // ============================================================================
 // SEC-4: change password
 // ============================================================================
@@ -626,19 +669,29 @@ export async function changePasswordCore(
   db: Database.Database,
   roomPath: string,
   currentPassword: string,
-  newPassword: string
+  newPassword: string,
+  paths: {
+    databasePath?: string;
+    biometricPath?: string;
+    recoveryPath?: string;
+    checkpointsPath?: string;
+  } = {},
 ): Promise<string | null> {
-  verifyPassword(roomPath, currentPassword);
+  const databasePath = paths.databasePath ?? roomPath;
+  const biometricPath = paths.biometricPath ?? roomPath;
+  const recoveryPath = paths.recoveryPath ?? roomPath;
+  const checkpointsPath = paths.checkpointsPath ?? roomPath;
+  verifyPassword(databasePath, currentPassword);
   rekey(db, newPassword);
   // ADD-11: keep Touch ID working after a password change. Chosen behavior:
   // UPDATE the Keychain entry with the new password. If that somehow fails,
   // delete the stale entry so Touch ID can never hand back the old password.
-  if (keychainHas(roomPath)) {
+  if (keychainHas(biometricPath)) {
     try {
-      keychainStore(roomPath, newPassword);
+      keychainStore(biometricPath, newPassword);
     } catch {
       try {
-        keychainDeleteEntry(roomPath);
+        keychainDeleteEntry(biometricPath);
       } catch {
         // best-effort, matching Rust's own swallowed `let _ = ...delete(...)`
       }
@@ -648,12 +701,12 @@ export async function changePasswordCore(
   // hand back the fresh code; if re-wrapping fails, delete the stale sidecar
   // so the unlock gate never offers a code that cannot work.
   let newCode: string | null = null;
-  if (hasRecovery(roomPath)) {
+  if (hasRecovery(recoveryPath)) {
     try {
-      newCode = await writeRecovery(roomPath, newPassword);
+      newCode = await writeRecovery(recoveryPath, newPassword);
     } catch {
       try {
-        await removeRecovery(roomPath);
+        await removeRecovery(recoveryPath);
       } catch {
         // best-effort
       }
@@ -666,7 +719,7 @@ export async function changePasswordCore(
   // re-keyed and refusing now would be worse — but it is reported, never
   // swallowed into a false "all clean".
   let stranded = 0;
-  for (const ck of checkpointCkPaths(roomPath)) {
+  for (const ck of checkpointCkPaths(checkpointsPath)) {
     try {
       rekeyCopy(ck, currentPassword, newPassword);
     } catch {
@@ -693,7 +746,8 @@ export async function changePassword(
   roomPath: string,
   currentPassword: string,
   newPassword: string,
-  isRollingBack?: () => boolean
+  isRollingBack?: () => boolean,
+  paths?: Parameters<typeof changePasswordCore>[4],
 ): Promise<string | null> {
   if ([...newPassword].length < MIN_ROOM_PASSWORD_CHARS) {
     throw new Error("Password must be at least 8 characters.");
@@ -701,7 +755,7 @@ export async function changePassword(
   if (isRollingBack?.()) {
     throw new Error(ROLLBACK_BUSY);
   }
-  return changePasswordCore(db, roomPath, currentPassword, newPassword);
+  return changePasswordCore(db, roomPath, currentPassword, newPassword, paths);
 }
 
 // ============================================================================
@@ -750,6 +804,38 @@ export async function duplicateRoom(
   duplicateRoomCore(db, roomPassword, destPath, newPassword);
 }
 
+async function duplicateWorkspaceRoom(
+  workspace: WorkspaceService,
+  roomId: string,
+  roomPassword: string,
+  destPath: string,
+  newPassword: string | null,
+): Promise<void> {
+  if (newPassword !== null && [...newPassword].length < MIN_ROOM_PASSWORD_CHARS) {
+    throw new Error("Password must be at least 8 characters.");
+  }
+  if (existsSync(destPath)) throw new Error("A file or folder already exists at that location.");
+  const packagePath = join(dirname(destPath), `.${basename(destPath)}.${randomUUID()}.duplicate.arcelle`);
+  try {
+    await createSealedPackage(
+      workspace,
+      roomId,
+      roomPassword,
+      packagePath,
+      roomPassword,
+      "duplicate",
+    );
+    await importSealedPackage(
+      packagePath,
+      roomPassword,
+      destPath,
+      newPassword ?? roomPassword,
+    );
+  } finally {
+    await rm(packagePath, { force: true }).catch(() => undefined);
+  }
+}
+
 // ============================================================================
 // SEC-7: compact room
 // ============================================================================
@@ -794,6 +880,8 @@ export interface SafetyOpenRoom {
   path: string;
   password: string;
   workspace?: WorkspaceService;
+  descriptor?: RoomDescriptor;
+  readOnly?: boolean;
 }
 
 export interface SafetyRoomSource {
@@ -876,25 +964,55 @@ export function registerSafetyIpc(
     emitSafely(deps.emit, "room-files-changed", undefined);
     emitSafely(deps.emit, "file-updated", fileId);
   });
-  handle("export_file", (args: { id: string; destPath: string }) =>
-    exportFile(openRoomOrThrow(room).conn, args.id, args.destPath)
-  );
-  handle("export_all", (args: { destDir: string }) => exportAll(openRoomOrThrow(room).conn, args.destDir));
+  handle("export_file", (args: { id: string; destPath: string }) => {
+    const open = openRoomOrThrow(room);
+    return open.workspace === undefined
+      ? exportFile(open.conn, args.id, args.destPath)
+      : exportWorkspaceFile(open.conn, open.workspace, args.id, args.destPath);
+  });
+  handle("export_all", (args: { destDir: string }) => {
+    const open = openRoomOrThrow(room);
+    return open.workspace === undefined
+      ? exportAll(open.conn, args.destDir)
+      : exportAllWorkspace(open.conn, open.workspace, args.destDir);
+  });
   handle("change_password", async (args: { current: string; newPassword: string }) => {
     const open = openRoomOrThrow(room);
+    if (open.readOnly === true) throw new Error("This workspace is read-only because another Arcelle process owns the writer lease.");
+    const databasePath = open.descriptor?.dbPath ?? open.path;
     const code = await changePassword(
       open.conn,
-      open.path,
+      databasePath,
       args.current,
       args.newPassword,
-      deps.isRollingBack
+      deps.isRollingBack,
+      open.workspace === undefined ? undefined : {
+        databasePath,
+        biometricPath: open.path,
+        recoveryPath: databasePath,
+        checkpointsPath: open.path,
+      },
     );
     deps.onPasswordChanged?.(args.newPassword);
     return code;
   });
   handle("duplicate_room", (args: { destPath: string; newPassword: string | null }) => {
     const open = openRoomOrThrow(room);
-    return duplicateRoom(open.conn, open.password, args.destPath, args.newPassword);
+    if (open.readOnly === true) throw new Error("This workspace is read-only because another Arcelle process owns the writer lease.");
+    if (open.workspace === undefined || open.descriptor?.kind !== "workspace-folder") {
+      return duplicateRoom(open.conn, open.password, args.destPath, args.newPassword);
+    }
+    return duplicateWorkspaceRoom(
+      open.workspace,
+      open.descriptor.roomId,
+      open.password,
+      args.destPath,
+      args.newPassword,
+    );
   });
-  handle("compact_room", () => compactRoom(openRoomOrThrow(room).conn));
+  handle("compact_room", () => {
+    const open = openRoomOrThrow(room);
+    if (open.readOnly === true) throw new Error("This workspace is read-only because another Arcelle process owns the writer lease.");
+    return compactRoom(open.conn);
+  });
 }
