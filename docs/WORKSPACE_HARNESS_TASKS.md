@@ -14,10 +14,10 @@ Legend:
 - [x] Add the shared 16-agent manifest.
 - [x] Record all eight existing graph shapes.
 - [x] Add workspace and harness feature flags.
-- [ ] Inventory every remaining direct read of `files.original_bytes`.
-- [ ] Inventory every remaining direct write of `files.original_bytes`.
-- [ ] Build a provider-by-feature parity matrix.
-- [ ] Add legacy, large-file, recording, workflow, privacy and checkpoint fixtures.
+- [x] Inventory every remaining direct read of `files.original_bytes`.
+- [x] Inventory every remaining direct write of `files.original_bytes`.
+- [x] Build a provider-by-feature parity matrix.
+- [x] Add legacy, large-file, recording, workflow, privacy and checkpoint fixtures.
 - [ ] Generate provider definitions from the shared manifest instead of keeping parallel definitions.
 
 ## Phase B: content abstraction

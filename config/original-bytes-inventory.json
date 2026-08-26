@@ -1,0 +1,102 @@
+{
+  "version": 1,
+  "scope": [
+    "electron-migration/electron-app/electron/main",
+    "electron-migration/electron-app/cli",
+    "sidecar/arcelle_sidecar",
+    "src"
+  ],
+  "entries": [
+    {
+      "path": "electron-migration/electron-app/cli/roomai.ts",
+      "access": ["read"],
+      "category": "legacy-export-boundary",
+      "workspaceCurrentBytesAllowed": false,
+      "note": "The CLI extracts legacy sealed-room blobs. It does not open a workspace folder."
+    },
+    {
+      "path": "electron-migration/electron-app/electron/main/db-host/files.ts",
+      "access": ["read", "write"],
+      "category": "legacy-blob-store",
+      "workspaceCurrentBytesAllowed": false,
+      "note": "These are the legacy blob primitives used by BlobContentStore. Higher layers must choose the room content abstraction before calling them."
+    },
+    {
+      "path": "electron-migration/electron-app/electron/main/db-host/recordings.ts",
+      "access": ["documentation-reference"],
+      "category": "hybrid-recording-abstraction",
+      "workspaceCurrentBytesAllowed": false,
+      "note": "The hybrid recording path documents and enforces that recovered workspace WAV bytes stay out of the legacy blob column."
+    },
+    {
+      "path": "electron-migration/electron-app/electron/main/db-host/schema.sql",
+      "access": ["schema"],
+      "category": "compatibility-schema",
+      "workspaceCurrentBytesAllowed": false,
+      "note": "The nullable column remains for old rooms. Workspace rows must keep it NULL."
+    },
+    {
+      "path": "electron-migration/electron-app/electron/main/db-host/versions.ts",
+      "access": ["read"],
+      "category": "legacy-version-boundary",
+      "workspaceCurrentBytesAllowed": false,
+      "note": "Legacy blob version snapshots read this column. WorkspaceService uses encrypted content objects instead."
+    },
+    {
+      "path": "electron-migration/electron-app/electron/main/recBridge.ts",
+      "access": ["documentation-reference"],
+      "category": "hybrid-recording-abstraction",
+      "workspaceCurrentBytesAllowed": false,
+      "note": "The hybrid transcript edit path documents that workspace snapshots must not copy current audio into the legacy blob column."
+    },
+    {
+      "path": "electron-migration/electron-app/electron/main/workspace/conversion.ts",
+      "access": ["read", "clear"],
+      "category": "legacy-conversion-boundary",
+      "workspaceCurrentBytesAllowed": false,
+      "note": "Conversion streams source blobs, verifies them, and clears the column only in the new workspace copy."
+    },
+    {
+      "path": "electron-migration/electron-app/electron/main/workspace/roomContent.ts",
+      "access": ["documentation-reference"],
+      "category": "compatibility-abstraction",
+      "workspaceCurrentBytesAllowed": false,
+      "note": "The reference documents the invariant; workspace reads and writes are routed to WorkspaceService."
+    },
+    {
+      "path": "electron-migration/electron-app/electron/main/workspace/sealedPackage.ts",
+      "access": ["clear"],
+      "category": "sealed-import-boundary",
+      "workspaceCurrentBytesAllowed": false,
+      "note": "Sealed import projects current files into normal files and explicitly stores NULL in workspace rows."
+    },
+    {
+      "path": "electron-migration/electron-app/electron/main/workspace/storageUsage.ts",
+      "access": ["read"],
+      "category": "legacy-storage-accounting",
+      "workspaceCurrentBytesAllowed": false,
+      "note": "This aggregate reports bytes still owned by the legacy blob store."
+    },
+    {
+      "path": "electron-migration/electron-app/electron/main/workspace/workspaceService.ts",
+      "access": ["write-null"],
+      "category": "workspace-projection",
+      "workspaceCurrentBytesAllowed": false,
+      "note": "All workspace inserts write NULL. Current bytes are written only to normal files."
+    }
+  ],
+  "knownIndirectBlobAssumptions": [
+    {
+      "path": "electron-migration/electron-app/electron/main/editMatch.ts",
+      "reason": "The agent edit matcher still reads and overwrites through legacy blob primitives without a workspace branch."
+    },
+    {
+      "path": "electron-migration/electron-app/electron/main/organizeTools.ts",
+      "reason": "File merge and organization helpers still contain blob-only content reads and writes."
+    },
+    {
+      "path": "electron-migration/electron-app/electron/main/filePass.ts",
+      "reason": "Whole-file pass materialization and generated output still use legacy blob helpers without the room content abstraction."
+    }
+  ]
+}

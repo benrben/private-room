@@ -1,0 +1,70 @@
+{
+  "version": 1,
+  "statuses": ["implemented", "partial", "missing", "not-applicable"],
+  "providers": ["codex", "claude", "ollama-local", "ollama-cloud", "openrouter"],
+  "features": {
+    "normalized-events": {
+      "codex": { "status": "implemented", "evidence": ["electron-migration/electron-app/electron/main/harness/codexAppServer.ts"] },
+      "claude": { "status": "implemented", "evidence": ["electron-migration/electron-app/electron/main/harness/claudeAgentSdk.ts"] },
+      "ollama-local": { "status": "partial", "evidence": ["sidecar/arcelle_sidecar/deep_harness.py"], "gap": "Deep mode still uses the older sidecar event wire, not the Electron normalized event stream." },
+      "ollama-cloud": { "status": "partial", "evidence": ["sidecar/arcelle_sidecar/deep_harness.py"], "gap": "Deep mode still uses the older sidecar event wire, not the Electron normalized event stream." },
+      "openrouter": { "status": "partial", "evidence": ["sidecar/arcelle_sidecar/deep_harness.py"], "gap": "Deep mode still uses the older sidecar event wire, not the Electron normalized event stream." }
+    },
+    "streaming": {
+      "codex": { "status": "implemented", "evidence": ["electron-migration/electron-app/electron/main/harness/codexAppServer.ts"] },
+      "claude": { "status": "implemented", "evidence": ["electron-migration/electron-app/electron/main/harness/claudeAgentSdk.ts"] },
+      "ollama-local": { "status": "implemented", "evidence": ["sidecar/arcelle_sidecar/deep_harness.py"] },
+      "ollama-cloud": { "status": "implemented", "evidence": ["sidecar/arcelle_sidecar/deep_harness.py"] },
+      "openrouter": { "status": "implemented", "evidence": ["sidecar/arcelle_sidecar/deep_harness.py"] }
+    },
+    "cancellation": {
+      "codex": { "status": "implemented", "evidence": ["electron-migration/electron-app/electron/main/harness/codexAppServer.ts"] },
+      "claude": { "status": "implemented", "evidence": ["electron-migration/electron-app/electron/main/harness/claudeAgentSdk.ts"] },
+      "ollama-local": { "status": "partial", "evidence": ["sidecar/arcelle_sidecar/deep_harness.py"], "gap": "Unit coverage exists, but end-to-end Deep-mode cancellation is not a release-gate test yet." },
+      "ollama-cloud": { "status": "partial", "evidence": ["sidecar/arcelle_sidecar/deep_harness.py"], "gap": "Unit coverage exists, but end-to-end Deep-mode cancellation is not a release-gate test yet." },
+      "openrouter": { "status": "partial", "evidence": ["sidecar/arcelle_sidecar/deep_harness.py"], "gap": "Unit coverage exists, but end-to-end Deep-mode cancellation is not a release-gate test yet." }
+    },
+    "interactive-approvals": {
+      "codex": { "status": "implemented", "evidence": ["electron-migration/electron-app/electron/main/harness/codexAppServer.ts"] },
+      "claude": { "status": "implemented", "evidence": ["electron-migration/electron-app/electron/main/harness/claudeAgentSdk.ts"] },
+      "ollama-local": { "status": "partial", "evidence": ["electron-migration/electron-app/electron/main/harness/deepWorkspaceBridge.ts"], "gap": "Workspace permission is fixed for the run; Deep tool calls do not yet use the normalized approval cards." },
+      "ollama-cloud": { "status": "partial", "evidence": ["electron-migration/electron-app/electron/main/harness/deepWorkspaceBridge.ts"], "gap": "Workspace permission is fixed for the run; Deep tool calls do not yet use the normalized approval cards." },
+      "openrouter": { "status": "partial", "evidence": ["electron-migration/electron-app/electron/main/harness/deepWorkspaceBridge.ts"], "gap": "Workspace permission is fixed for the run; Deep tool calls do not yet use the normalized approval cards." }
+    },
+    "write-baseline-and-rollback": {
+      "codex": { "status": "implemented", "evidence": ["electron-migration/electron-app/electron/main/harness/runProtection.ts"] },
+      "claude": { "status": "implemented", "evidence": ["electron-migration/electron-app/electron/main/harness/runProtection.ts"] },
+      "ollama-local": { "status": "partial", "evidence": ["electron-migration/electron-app/electron/main/harness/deepWorkspaceBridge.ts"], "gap": "The protected write bridge exists, but the sidecar Deep-run lifecycle is not yet fully driven by the unified Electron orchestrator." },
+      "ollama-cloud": { "status": "partial", "evidence": ["electron-migration/electron-app/electron/main/harness/deepWorkspaceBridge.ts"], "gap": "The protected write bridge exists, but the sidecar Deep-run lifecycle is not yet fully driven by the unified Electron orchestrator." },
+      "openrouter": { "status": "partial", "evidence": ["electron-migration/electron-app/electron/main/harness/deepWorkspaceBridge.ts"], "gap": "The protected write bridge exists, but the sidecar Deep-run lifecycle is not yet fully driven by the unified Electron orchestrator." }
+    },
+    "workspace-isolation": {
+      "codex": { "status": "implemented", "evidence": ["electron-migration/electron-app/electron/main/harness/seatbelt.ts"] },
+      "claude": { "status": "implemented", "evidence": ["electron-migration/electron-app/electron/main/harness/seatbelt.ts"] },
+      "ollama-local": { "status": "implemented", "evidence": ["sidecar/arcelle_sidecar/deep_harness.py"] },
+      "ollama-cloud": { "status": "implemented", "evidence": ["sidecar/arcelle_sidecar/deep_harness.py"] },
+      "openrouter": { "status": "implemented", "evidence": ["sidecar/arcelle_sidecar/deep_harness.py"] }
+    },
+    "cloud-redacted-mirror": {
+      "codex": { "status": "implemented", "evidence": ["electron-migration/electron-app/electron/main/harness/cloudMirror.ts"] },
+      "claude": { "status": "implemented", "evidence": ["electron-migration/electron-app/electron/main/harness/cloudMirror.ts"] },
+      "ollama-local": { "status": "not-applicable", "evidence": ["sidecar/arcelle_sidecar/privacy.py"] },
+      "ollama-cloud": { "status": "partial", "evidence": ["electron-migration/electron-app/electron/main/harness/cloudMirror.ts"], "gap": "The mirror is not yet the workspace passed to every Deep cloud run." },
+      "openrouter": { "status": "partial", "evidence": ["electron-migration/electron-app/electron/main/harness/cloudMirror.ts"], "gap": "The mirror is not yet the workspace passed to every Deep cloud run." }
+    },
+    "shared-sixteen-specialists": {
+      "codex": { "status": "missing", "evidence": ["config/agent-manifest.json"], "gap": "Codex delegation definitions are not generated from the manifest." },
+      "claude": { "status": "missing", "evidence": ["config/agent-manifest.json"], "gap": "Claude subagent definitions are not generated from the manifest." },
+      "ollama-local": { "status": "implemented", "evidence": ["sidecar/arcelle_sidecar/deep_harness.py"] },
+      "ollama-cloud": { "status": "implemented", "evidence": ["sidecar/arcelle_sidecar/deep_harness.py"] },
+      "openrouter": { "status": "implemented", "evidence": ["sidecar/arcelle_sidecar/deep_harness.py"] }
+    },
+    "capability-probe-and-safe-fallback": {
+      "codex": { "status": "partial", "evidence": ["electron-migration/electron-app/electron/main/harness/controller.ts"], "gap": "The native probe exists; the restricted codex exec fallback is not implemented." },
+      "claude": { "status": "partial", "evidence": ["electron-migration/electron-app/electron/main/harness/controller.ts"], "gap": "The native probe exists; the restricted Claude CLI fallback is not implemented." },
+      "ollama-local": { "status": "implemented", "evidence": ["sidecar/arcelle_sidecar/deep_harness.py"] },
+      "ollama-cloud": { "status": "implemented", "evidence": ["sidecar/arcelle_sidecar/deep_harness.py"] },
+      "openrouter": { "status": "implemented", "evidence": ["sidecar/arcelle_sidecar/deep_harness.py"] }
+    }
+  }
+}
