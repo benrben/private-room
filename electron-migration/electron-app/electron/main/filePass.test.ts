@@ -44,7 +44,8 @@
  */
 
 import { createHash, randomUUID } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { Readable } from "node:stream";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -58,6 +59,8 @@ import { getJob } from "./db-host/jobs.js";
 import { resetBaseUrlOverrideForTests, resolvedBaseUrl, setBaseUrlOverride } from "./engineRouting.js";
 import { sliceUtf8, smartFilter } from "./extractionWindow.js";
 import { planDispatch, type RoomSource, type Step, type StepResult } from "./jobs.js";
+import { createWorkspaceRoom } from "./workspace/roomLayout.js";
+import { WorkspaceService } from "./workspace/workspaceService.js";
 import type { SidecarPostOutcome } from "./sidecarJsonCancellable.js";
 import {
   buildPassSteps,
@@ -97,13 +100,13 @@ afterEach(() => {
  * given path, swappable at will so "the room swapped mid-run" can point
  * `roomPath` at a path the source does NOT currently hold. */
 class TestRoomSource implements RoomSource {
-  private room: { db: Database.Database; path: string } | null = null;
+  private room: { db: Database.Database; path: string; workspace?: WorkspaceService } | null = null;
 
-  open(db: Database.Database, roomPath: string): void {
-    this.room = { db, path: roomPath };
+  open(db: Database.Database, roomPath: string, workspace?: WorkspaceService): void {
+    this.room = { db, path: roomPath, workspace };
   }
 
-  current(): { db: Database.Database; path: string } | null {
+  current(): { db: Database.Database; path: string; workspace?: WorkspaceService } | null {
     return this.room;
   }
 }
@@ -395,6 +398,37 @@ describe("executePassStep: publish", () => {
     // The publish step's own artifact carries the file id that makes it so.
     const recorded = loadArtifact(db, job, publish.id)?.fileId;
     expect(recorded).toBe(m1.id);
+  });
+
+  it("publishes and replays a workspace pass as one normal versioned file", async () => {
+    tmpDir = mkdtempSync(path.join(os.tmpdir(), "file-pass-workspace-"));
+    const roomPath = path.join(tmpDir, "Room");
+    const created = createWorkspaceRoom(roomPath, "correct horse battery staple", "Room");
+    openDb = created.db;
+    const workspace = new WorkspaceService(created.db, roomPath);
+    const source = await workspace.createFile("book.txt", Readable.from(["source"]), "upload");
+    const rooms = new TestRoomSource();
+    rooms.open(created.db, roomPath, workspace);
+    const plan = { ...planFor("merge", [[0, 4]], 4), fileId: source.fileId };
+    const steps = buildPassSteps(1, "merge", "local_llm");
+    const job = createJob(created.db, "file_pass", "Full pass", plan, steps.length);
+    storeArtifact(created.db, job, 0, art("notes", false));
+    storeArtifact(created.db, job, 1, art("<h2>Section</h2>", false));
+    const publish = steps.at(-1)!;
+
+    const first = await runStep(rooms, job, roomPath, plan, "text", publish, new CancelFlag());
+    const second = await runStep(rooms, job, roomPath, plan, "text", publish, new CancelFlag());
+    expect(first.result.ok).toBe(true);
+    expect(second.result.ok).toBe(true);
+    expect(second.meta?.id).toBe(first.meta?.id);
+    const row = created.db.prepare(
+      "SELECT relative_path, original_bytes, storage_kind FROM files WHERE id = ?",
+    ).get(first.meta!.id) as { relative_path: string; original_bytes: Buffer | null; storage_kind: string };
+    expect(row.storage_kind).toBe("workspace");
+    expect(row.original_bytes).toBeNull();
+    expect(readFileSync(path.join(roomPath, row.relative_path), "utf8")).toContain("<h2>Section</h2>");
+    expect(created.db.prepare("SELECT count(*) AS n FROM file_versions WHERE file_id = ?")
+      .get(first.meta!.id)).toEqual({ n: 1 });
   });
 
   it("stitch_publish_body_is_byte_exact", async () => {

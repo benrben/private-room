@@ -96,6 +96,7 @@ import {
   pinnedDb,
   runPlan,
   type Lane,
+  type RoomHandle,
   type RoomSource,
   type Step,
   type StepResult,
@@ -111,6 +112,7 @@ import {
 } from "./db-host/files.js";
 import { snapshotFileVersion } from "./db-host/versions.js";
 import { Artifact } from "./artifactBuilder.js";
+import { writeRoomFile } from "./workspace/roomContent.js";
 import { htmlDocument } from "./docsHtml.js";
 import { resolvedBaseUrl } from "./engineRouting.js";
 import { byteLength, partitionWindows, sliceUtf8, smartFilter } from "./extractionWindow.js";
@@ -409,6 +411,12 @@ function requireRoomDb(rooms: RoomSource, roomPath: string): Database.Database {
   return db;
 }
 
+function requireRoom(rooms: RoomSource, roomPath: string): RoomHandle {
+  const room = rooms.current();
+  if (room === null || room.path !== roomPath) throw new Error(ROOM_GONE);
+  return room;
+}
+
 /** `store_file_bytes` (`commands/files.rs`) — snapshot the file's current
  * state into history, then overwrite it. Small enough to inline rather than
  * pull in the rest of `files.rs`, which this batch does not otherwise need. */
@@ -483,7 +491,7 @@ export async function executePassStep(
       case "compose":
         return await executeComposeStep(deps, jobId, roomPath, plan, model, step, cancel, post);
       case "publish":
-        return executePublishStep(deps, jobId, roomPath, plan, step, cancel, published, n);
+        return await executePublishStep(deps, jobId, roomPath, plan, step, cancel, published, n);
       default:
         return { ok: false, error: `unknown pass step kind: ${step.kind}` };
     }
@@ -677,7 +685,7 @@ async function executeComposeStep(
   return { ok: true };
 }
 
-function executePublishStep(
+async function executePublishStep(
   deps: FilePassStepDeps,
   jobId: string,
   roomPath: string,
@@ -686,7 +694,7 @@ function executePublishStep(
   cancel: CancelFlag,
   published: PublishedRef,
   n: number
-): StepResult {
+): Promise<StepResult> {
   // Owner replacement #3: the commit gate, at the moment of the commit. Every
   // other cancel check on this path lives inside the sidecar POST — i.e. it
   // guards a MODEL CALL. Publish makes no model call at all: it gathers the
@@ -698,7 +706,8 @@ function executePublishStep(
   if (stopped(cancel)) {
     return { ok: false, error: "STOPPED" };
   }
-  const db = requireRoomDb(deps.rooms, roomPath);
+  const room = requireRoom(deps.rooms, roomPath);
+  const db = room.db;
 
   // Honest coverage: count skipped map windows straight from the rows.
   let skipped = 0;
@@ -719,7 +728,7 @@ function executePublishStep(
   // minting a second identical one.
   const prior = loadArtifact(db, jobId, step.id)?.fileId ?? null;
 
-  const writeDeliverable = (name: string, mime: string, content: string): FileMeta => {
+  const writeDeliverable = async (name: string, mime: string, content: string): Promise<FileMeta> => {
     // Owner replacement #3, at the moment of the commit — the gate above
     // guards the DECISION; the stitch/merge between there and here is real
     // work, and the re-run branch below writes straight through
@@ -737,7 +746,17 @@ function executePublishStep(
         priorExists = false;
       }
       if (priorExists) {
-        storeFileBytes(db, prior, Buffer.from(content, "utf8"), content, `Full pass re-run — ${plan.fileName}`);
+        if (room.workspace !== undefined) {
+          await writeRoomFile(
+            { db, path: roomPath },
+            prior,
+            Buffer.from(content, "utf8"),
+            content,
+            `Full pass re-run — ${plan.fileName}`,
+          );
+        } else {
+          storeFileBytes(db, prior, Buffer.from(content, "utf8"), content, `Full pass re-run — ${plan.fileName}`);
+        }
         // Room map: a replay rewrites the same file, so its provenance has to
         // be (re)stated here too — the insert branch below is skipped on
         // this path.
@@ -750,12 +769,14 @@ function executePublishStep(
     // the commit leaves nothing behind, and a SECOND pass over the same
     // source becomes a version of the first deliverable rather than a
     // "Full pass — lease.pdf (2).html".
-    const written = Artifact.new(name, mime, content)
+    const artifact = Artifact.new(name, mime, content)
       .by("Full pass")
       .duringRun(jobId)
       .fromFiles([plan.fileId])
-      .cancelWith(cancel)
-      .commit(db);
+      .cancelWith(cancel);
+    const written = room.workspace === undefined
+      ? artifact.commit(db)
+      : await artifact.commitToWorkspace(room.workspace);
     // Room map: this deliverable IS the pass's source file, rewritten.
     setDerivedFrom(db, written.meta.id, plan.fileId);
     return written.meta;
@@ -781,7 +802,7 @@ function executePublishStep(
     }
     body += `---\n\n_${coverage}_\n`;
     const name = `Full pass — ${plan.fileName}.md`;
-    meta = writeDeliverable(name, "text/markdown", body);
+    meta = await writeDeliverable(name, "text/markdown", body);
   } else {
     // Sectioned: concatenate each section's composed HTML in order. Rust:
     // `.as_array().map(..).unwrap_or_default()` — an absent or misshapen
@@ -804,7 +825,7 @@ function executePublishStep(
     const name = `Full pass — ${plan.fileName}.html`;
     const body = `${htmlBody}\n<hr/>\n<p><em>${coverage}</em></p>`;
     const content = htmlDocument(name, body);
-    meta = writeDeliverable(name, "text/html", content);
+    meta = await writeDeliverable(name, "text/html", content);
   }
 
   // Record what was written BEFORE the runner's checkpoint, so a replay from
