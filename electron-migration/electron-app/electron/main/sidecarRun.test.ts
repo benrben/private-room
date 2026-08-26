@@ -67,10 +67,10 @@ describe("buildRunRequestBody", () => {
     mcp: { url: "http://127.0.0.1:1/mcp", token: "tok" },
   };
 
-  it("never sends a routing key -- omitted, not sent as null", () => {
+  it("omits routing when the host has no decision", () => {
     // RunRequest.routing is nullable, but omitting the KEY entirely is what
     // keeps "we have no routing decision" and "routing is off" from being
-    // spelled the same on the wire. Porting sticky_lanes is out of scope.
+    // spelled the same on the wire.
     expect(Object.prototype.hasOwnProperty.call(buildRunRequestBody(base), "routing")).toBe(false);
   });
 
@@ -109,6 +109,7 @@ describe("buildRunRequestBody", () => {
         workspaceWrite: true,
         baselineRunId: "run-1",
       },
+      routing: { write: true },
       messages: [{ role: "user", content: "hi" }],
       temperature: 0.4,
       ollamaBaseUrl: "http://127.0.0.1:9999",
@@ -134,6 +135,7 @@ describe("buildRunRequestBody", () => {
         workspace_write: true,
         baseline_run_id: "run-1",
       },
+      routing: { write: true },
       web_enabled: true,
       max_rounds: 5,
       turn_max_rounds: 10,

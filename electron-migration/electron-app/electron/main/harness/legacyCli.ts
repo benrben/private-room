@@ -116,7 +116,7 @@ function globRegex(pattern: string): RegExp {
 }
 
 /** Filesystem projection used only for a redacted runtime mirror. */
-function mirrorBackend(root: string, writeEnabled: boolean): WorkspaceCalls {
+export function createMirrorWorkspaceBackend(root: string, writeEnabled: boolean): WorkspaceCalls {
   const absolute = async (value: unknown): Promise<{ relative: string; absolute: string }> => {
     const relative = relativeArg(value);
     await assertNoSymlinkParents(root, relative);
@@ -272,7 +272,7 @@ export class RestrictedLegacyCliRuntime implements HarnessRuntime {
     const isRealWorkspace = realRoot !== null && path.resolve(context.workspacePath) === path.resolve(realRoot);
     const backend = isRealWorkspace
       ? createWorkspaceMcpBridge(this.state, context.writeEnabled)
-      : mirrorBackend(context.workspacePath, context.writeEnabled);
+      : createMirrorWorkspaceBackend(context.workspacePath, context.writeEnabled);
     const events = new AsyncEventQueue<HarnessEvent>();
     const activeChildren = new Set<HarnessRun>();
     let parentCancelled = false;

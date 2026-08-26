@@ -849,6 +849,15 @@ export interface RunViaSidecarRequest {
   /** Defaults to `RunRequest.ollama_base_url`'s own pydantic default. */
   ollamaBaseUrl?: string;
   mcp: RunViaSidecarMcp;
+  /** Host-authoritative routing decisions. Classic callers may omit this and
+   * keep using the sidecar's deterministic text router. */
+  routing?: {
+    write?: boolean;
+    ui?: boolean;
+    jobs?: boolean;
+    skills?: boolean;
+    connectors?: boolean;
+  };
   webEnabled?: boolean;
   maxRounds?: number | null;
   /** Whole-ask runaway net across the delegation tree. */
@@ -882,11 +891,9 @@ export interface RunViaSidecarRequest {
  * claim. Serializing a caller-shaped object straight to JSON would ship
  * whatever that object happened to hold and never say so.
  *
- * `routing` is not a key at all — omitted, not sent as `null`. Python reads
- * its own default (`None`) either way, but omitting it keeps "we have no
- * routing decision to hand over" and "we decided routing is off" from being
- * spelled the same, so the future batch that starts sending real decisions
- * only has to add the key here.
+ * `routing` remains omitted when the caller has no host decision. Deep
+ * Harness sends its explicit write permission because that UI decision,
+ * protected by a completed rollback baseline, must beat prompt inference.
  */
 export function buildRunRequestBody(req: RunViaSidecarRequest): Record<string, unknown> {
   return {
@@ -902,6 +909,7 @@ export function buildRunRequestBody(req: RunViaSidecarRequest): Record<string, u
       workspace_write: req.mcp.workspaceWrite ?? false,
       baseline_run_id: req.mcp.baselineRunId ?? "",
     },
+    ...(req.routing === undefined ? {} : { routing: req.routing }),
     web_enabled: req.webEnabled ?? false,
     max_rounds: req.maxRounds ?? null,
     turn_max_rounds: req.turnMaxRounds ?? null,

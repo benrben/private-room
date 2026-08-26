@@ -1,3 +1,4 @@
+import path from "node:path";
 import type { EventSender } from "../turn.js";
 import { TurnId } from "../turn.js";
 import { resolvedBaseUrl } from "../engineRouting.js";
@@ -15,6 +16,7 @@ import { runViaSidecar, type SidecarOutcome } from "../sidecar.js";
 import { AsyncEventQueue } from "./eventQueue.js";
 import { safeProviderFailure } from "./failureSafety.js";
 import { createDeepWorkspaceBridgeGrant } from "./deepWorkspaceBridge.js";
+import { createMirrorWorkspaceBackend } from "./legacyCli.js";
 import type {
   ApprovalDecision,
   HarnessContext,
@@ -61,6 +63,7 @@ export class DeepAgentRuntime implements HarnessRuntime {
     private readonly emit: EventSender,
     private readonly services?: LiveAppServices,
     private readonly runSidecar: typeof runViaSidecar = runViaSidecar,
+    private readonly mirrorBackend: typeof createMirrorWorkspaceBackend = createMirrorWorkspaceBackend,
   ) {}
 
   available(): Promise<boolean> {
@@ -133,6 +136,17 @@ export class DeepAgentRuntime implements HarnessRuntime {
       output.push({ type: "run_started", runId: context.runId, harness: this.name });
       try {
         const grant = createDeepWorkspaceBridgeGrant(this.state, context.runId, context.writeEnabled);
+        const realRoot = this.state.room?.descriptor?.kind === "workspace-folder"
+          ? this.state.room.descriptor.rootPath
+          : null;
+        // Deep Agents access files through MCP rather than a raw cwd. When
+        // Cloud Privacy supplies a redacted mirror, the MCP backend must point
+        // at that mirror too; otherwise a cloud tool can bypass placeholder
+        // validation and mutate the real workspace directly.
+        const workspace = realRoot !== null
+          && path.resolve(context.workspacePath) === path.resolve(realRoot)
+          ? grant.workspace
+          : this.mirrorBackend(context.workspacePath, context.writeEnabled);
         const cloud = context.provider !== "ollama-local";
         const scope = cloud ? { kind: "CloudEngine" as const } : { kind: "LocalEngine" as const };
         const dispatcher = roomServerDispatcherFactory(this.state, this.emit, this.services)(
@@ -140,7 +154,7 @@ export class DeepAgentRuntime implements HarnessRuntime {
           scope,
           WEB_LANES_ALL,
           {
-            workspace: grant.workspace,
+            workspace,
             privacyBypass: context.privacyMode === "cloud-direct",
           },
         );
@@ -170,6 +184,10 @@ export class DeepAgentRuntime implements HarnessRuntime {
               token: bridge.token,
               ...grant.wireAuthority,
             },
+            // The UI's explicit Allow file changes choice is authoritative.
+            // Prompt keyword inference must not silently remove a granted,
+            // baseline-protected write capability.
+            routing: { write: context.writeEnabled },
             webEnabled: false,
             runId: context.runId,
             provider,

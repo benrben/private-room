@@ -72,7 +72,36 @@ describe("DeepAgentRuntime", () => {
     }));
     const started = await runtime.startTurn(context(true), { text: "edit notes" });
     for await (const _event of started.events) { /* drain */ }
-    expect(request).toMatchObject({ mcp: { workspaceWrite: true, baselineRunId: "run-1" } });
+    expect(request).toMatchObject({
+      mcp: { workspaceWrite: true, baselineRunId: "run-1" },
+      routing: { write: true },
+    });
+  });
+
+  it("binds cloud Deep file tools to the redacted mirror instead of the real room", async () => {
+    let request: RunViaSidecarRequest | null = null;
+    const mirrorFactory = vi.fn(() => ({ call: vi.fn(async () => ({})) }));
+    const runtime = new DeepAgentRuntime(
+      state(),
+      () => {},
+      undefined,
+      vi.fn(async (req) => {
+        request = req;
+        return { kind: "done" as const, text: "done", usage: null, plan: null };
+      }),
+      mirrorFactory,
+    );
+    const started = await runtime.startTurn({
+      ...context(true),
+      provider: "ollama-cloud",
+      model: "gpt-oss:120b-cloud",
+      privacyMode: "cloud-redacted",
+      workspacePath: "/private/redacted-mirror",
+    }, { text: "please make the requested change" });
+    for await (const _event of started.events) { /* drain */ }
+
+    expect(mirrorFactory).toHaveBeenCalledWith("/private/redacted-mirror", true);
+    expect(request).toMatchObject({ routing: { write: true } });
   });
 
   it("does not forward raw sidecar failures into normalized events", async () => {
