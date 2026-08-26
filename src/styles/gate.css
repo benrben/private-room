@@ -74,6 +74,90 @@
   position: relative;
 }
 
+/* A sealed manifest is still part of the unlock gate, but its paths need a
+   reading-width sheet rather than the password form's narrow column. */
+.gate-card:has(> .sealed-inspection) {
+  width: min(100%, 46rem);
+}
+.sealed-inspection {
+  text-align: left;
+  border: var(--stroke-w) solid var(--sketch);
+  border-radius: var(--radius-lg);
+  padding: var(--sp-5);
+  background: var(--raised);
+}
+.sealed-inspection-title {
+  margin: 0 0 var(--sp-4);
+  font-family: var(--mono);
+  font-size: var(--fs-card);
+  overflow-wrap: anywhere;
+}
+.sealed-inspection-meta {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--sp-2) var(--sp-5);
+  margin: 0 0 var(--sp-4);
+}
+.sealed-inspection-meta > div {
+  min-width: 0;
+}
+.sealed-inspection-meta dt {
+  color: var(--muted);
+  font-size: var(--fs-meta);
+}
+.sealed-inspection-meta dd {
+  margin: 2px 0 0;
+  color: var(--text-strong);
+  overflow-wrap: anywhere;
+}
+.sealed-inspection-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  margin: var(--sp-4) 0 var(--sp-2);
+}
+.sealed-file-list {
+  max-height: min(42vh, 24rem);
+  overflow: auto;
+  list-style: none;
+  margin: 0 0 var(--sp-4);
+  padding: 0;
+  border-block: 1px solid var(--line);
+}
+.sealed-file-list li + li {
+  border-top: 1px solid var(--line-soft);
+}
+.sealed-file-list label {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-2);
+  cursor: pointer;
+}
+.sealed-file-path {
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  overflow-wrap: anywhere;
+}
+.sealed-file-size {
+  color: var(--muted);
+  font-size: var(--fs-meta);
+  white-space: nowrap;
+}
+.sealed-inspection-actions {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+@media (max-width: 620px) {
+  .sealed-inspection-meta,
+  .sealed-inspection-actions {
+    grid-template-columns: 1fr;
+  }
+}
+
 /* ----- the start screen: a two-column cover -----
    Column one is the masthead and the promise; column two is what you came to
    do. Auto-placement does the work: every child defaults into column one and

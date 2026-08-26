@@ -11,6 +11,7 @@ import {
   hasRecoveryKey,
   openRoomWithRecovery,
   type WorkspaceOperationProgressEvent,
+  type SealedPackageInspection,
 } from "./api";
 import Workspace from "./Workspace";
 import { Logomark } from "./icons";
@@ -30,6 +31,7 @@ import { CreateScreen } from "./screens/CreateScreen";
 import { UnlockScreen } from "./screens/UnlockScreen";
 import { RecoveryModal } from "./screens/RecoveryModal";
 import { WorkspaceOperationProgress } from "./screens/WorkspaceOperationProgress";
+import { SealedInspectionScreen } from "./screens/SealedInspectionScreen";
 import {
   SealLockingOverlay,
   SealUnlockingOverlay,
@@ -112,6 +114,7 @@ export default function App() {
   const [workspaceOperations, setWorkspaceOperations] = useState<
     WorkspaceOperationProgressEvent[]
   >([]);
+  const [sealedInspection, setSealedInspection] = useState<SealedPackageInspection | null>(null);
   const workspaceOperationTimers = useRef(new Map<string, number>());
 
   // Navigation epoch: bumped on every goTo. In-flight unlock/create
@@ -148,6 +151,7 @@ export default function App() {
     setHasRecovery(false);
     setRecoveryMode(false);
     setRecoveryInput("");
+    setSealedInspection(null);
     setScreen(next);
   }, []);
 
@@ -571,9 +575,9 @@ export default function App() {
     }
   }
 
-  async function handleImportSealed(packagePath: string) {
+  async function handleInspectSealed(packagePath: string) {
     if (!password) {
-      setError("Enter the sealed backup password before importing it.");
+      setError("Enter the sealed backup password before inspecting it.");
       return;
     }
     setBusy(true);
@@ -581,18 +585,65 @@ export default function App() {
     const epoch = navEpochRef.current;
     try {
       const packageInfo = await api.inspectSealedPackage(packagePath, password);
-      const sourceName = packagePath.split(/[\\/]/).pop()?.replace(/\.arcelle$/i, "") || "Imported Room";
-      const destinationPath = await api.chooseSavePath({
-        title: "Choose the new workspace folder",
-        defaultPath: `${sourceName} Workspace`,
-      });
-      if (!destinationPath || navEpochRef.current !== epoch) return;
+      if (navEpochRef.current !== epoch) return;
+      setSealedInspection(packageInfo);
+    } catch (e) {
+      console.error("sealed inspection failed:", e);
+      setError(unlockMessage(String(e)));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleExtractSealed(packagePath: string, fileIds: string[]) {
+    const sourceName = packagePath.split(/[\\/]/).pop()?.replace(/\.arcelle$/i, "") || "Backup";
+    const destinationPath = await api.chooseSavePath({
+      title: "Choose a new folder for the extracted files",
+      defaultPath: `${sourceName} Extracted Files`,
+    }).catch((reason) => {
+      setError(unlockMessage(String(reason)));
+      return null;
+    });
+    if (!destinationPath) return;
+    setBusy(true);
+    setError("");
+    const epoch = navEpochRef.current;
+    try {
+      const result = await api.extractSealedFiles(packagePath, password, fileIds, destinationPath);
+      if (navEpochRef.current !== epoch) return;
+      await message(
+        `Extracted ${result.fileCount} file${result.fileCount === 1 ? "" : "s"} into a new normal folder.`,
+        { title: "Files extracted", kind: "info" },
+      ).catch(() => {});
+    } catch (e) {
+      console.error("sealed extraction failed:", e);
+      setError(unlockMessage(String(e)));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleImportSealed(packagePath: string) {
+    const sourceName = packagePath.split(/[\\/]/).pop()?.replace(/\.arcelle$/i, "") || "Imported Room";
+    const destinationPath = await api.chooseSavePath({
+      title: "Choose the new workspace folder",
+      defaultPath: `${sourceName} Workspace`,
+    }).catch((reason) => {
+      setError(unlockMessage(String(reason)));
+      return null;
+    });
+    if (!destinationPath) return;
+    setBusy(true);
+    setError("");
+    const epoch = navEpochRef.current;
+    try {
+      if (navEpochRef.current !== epoch) return;
       await api.importSealedPackage(packagePath, password, destinationPath);
       if (navEpochRef.current !== epoch) return;
       const info = await api.openRoom(destinationPath, password);
       if (navEpochRef.current !== epoch) return;
       await message(
-        `Imported ${packageInfo.fileCount} file${packageInfo.fileCount === 1 ? "" : "s"} and private history into a new workspace.`,
+        `Imported ${sealedInspection?.fileCount ?? 0} file${sealedInspection?.fileCount === 1 ? "" : "s"} and private history into a new workspace.`,
         { title: "Sealed backup imported", kind: "info" },
       ).catch(() => {});
       enterRoom(info);
@@ -762,7 +813,19 @@ export default function App() {
           />
         )}
 
-        {screen.kind === "unlock" && (
+        {screen.kind === "unlock" && sealedInspection && (
+          <SealedInspectionScreen
+            path={screen.path}
+            inspection={sealedInspection}
+            busy={busy}
+            error={error}
+            onExtract={(fileIds) => void handleExtractSealed(screen.path, fileIds)}
+            onImport={() => void handleImportSealed(screen.path)}
+            onBack={() => { setSealedInspection(null); setError(""); }}
+          />
+        )}
+
+        {screen.kind === "unlock" && !sealedInspection && (
           <UnlockScreen
             path={screen.path}
             recoveryMode={recoveryMode}
@@ -779,7 +842,7 @@ export default function App() {
             onRecoveryUnlock={() => handleRecoveryUnlock(screen.path)}
             onTouchId={() => handleTouchId(screen.path)}
             onConvertLegacy={() => handleConvertLegacy(screen.path)}
-            onImportSealed={() => handleImportSealed(screen.path)}
+            onInspectSealed={() => handleInspectSealed(screen.path)}
             onEnterRecoveryMode={() => {
               setRecoveryMode(true);
               setPassword("");

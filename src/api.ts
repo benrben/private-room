@@ -140,6 +140,23 @@ export interface RoomStorageUsage {
   totalOnDiskBytes: number;
 }
 
+export interface SealedFileEntry {
+  fileId: string;
+  relativePath: string;
+  sizeBytes: number;
+  sha256: string;
+}
+
+export interface SealedPackageInspection {
+  version: number;
+  purpose: string;
+  createdAt: string;
+  roomId: string;
+  fileCount: number;
+  objectCount: number;
+  files: SealedFileEntry[];
+}
+
 export interface WorkspaceWatcherStatus {
   state: "starting" | "healthy" | "error";
   lastReconciledAt: string | null;
@@ -209,14 +226,17 @@ export const api = {
     fileCount: number;
     objectCount: number;
   }>("create_sealed_package", { destinationPath, exportPassword, purpose }),
-  inspectSealedPackage: (packagePath: string, password: string) => invoke<{
-    version: number;
-    purpose: string;
-    createdAt: string;
-    roomId: string;
-    fileCount: number;
-    objectCount: number;
-  }>("inspect_sealed_package", { packagePath, password }),
+  inspectSealedPackage: (packagePath: string, password: string) =>
+    invoke<SealedPackageInspection>("inspect_sealed_package", { packagePath, password }),
+  extractSealedFiles: (
+    packagePath: string,
+    password: string,
+    fileIds: string[],
+    destinationPath: string,
+  ) => invoke<{ destinationPath: string; fileCount: number }>(
+    "extract_sealed_files",
+    { packagePath, password, fileIds, destinationPath },
+  ),
   importSealedPackage: (
     packagePath: string,
     packagePassword: string,

@@ -33,6 +33,7 @@ import type { WorkspaceOperationProgressSink } from "../shared/workspaceProgress
 import { convertLegacyRoomToWorkspace } from "./workspace/conversion.js";
 import {
   createSealedPackage,
+  extractSealedFiles,
   importSealedPackage,
   inspectSealedPackage,
 } from "./workspace/sealedPackage.js";
@@ -122,6 +123,21 @@ export function registerRoomManagerIpc(
     "inspect_sealed_package",
     (args: { packagePath: string; password: string }) =>
       inspectSealedPackage(args.packagePath, args.password),
+  );
+  handle(
+    "extract_sealed_files",
+    (args: { packagePath: string; password: string; fileIds: string[]; destinationPath: string }) => {
+      if (state.room !== null) throw new Error("Lock the open room before extracting a sealed package.");
+      if (!Array.isArray(args.fileIds) || !args.fileIds.every((id) => typeof id === "string")) {
+        throw new Error("The sealed extraction selection is invalid.");
+      }
+      return extractSealedFiles(
+        args.packagePath,
+        args.password,
+        args.fileIds,
+        args.destinationPath,
+      );
+    },
   );
   ipcMain.handle(
     "import_sealed_package",

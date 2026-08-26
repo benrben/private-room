@@ -125,6 +125,7 @@ const ALL_COMMANDS_TYPED: { [K in keyof Commands]: true } = {
   export_skill_folder: true,
   export_sketch_png: true,
   export_sketch_svg: true,
+  extract_sealed_files: true,
   feedback_draft: true,
   file_versions_kept: true,
   front_page: true,

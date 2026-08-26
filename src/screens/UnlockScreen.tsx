@@ -17,7 +17,7 @@ type UnlockScreenProps = {
   onRecoveryUnlock: () => void;
   onTouchId: () => void;
   onConvertLegacy: () => void;
-  onImportSealed: () => void;
+  onInspectSealed: () => void;
   onEnterRecoveryMode: () => void;
   onExitRecoveryMode: () => void;
   onBack: () => void;
@@ -39,7 +39,7 @@ export function UnlockScreen({
   onRecoveryUnlock,
   onTouchId,
   onConvertLegacy,
-  onImportSealed,
+  onInspectSealed,
   onEnterRecoveryMode,
   onExitRecoveryMode,
   onBack,
@@ -140,9 +140,9 @@ export function UnlockScreen({
                   type="button"
                   className="subtle recovery-forgot"
                   disabled={busy}
-                  onClick={() => onImportSealed()}
+                  onClick={() => onInspectSealed()}
                 >
-                  Import sealed backup as a workspace…
+                  Inspect sealed backup…
                 </button>
               )}
             </>

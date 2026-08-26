@@ -1652,6 +1652,7 @@ const EXPECTED_CHANNELS = [
   "convert_legacy_room",
   "create_sealed_package",
   "inspect_sealed_package",
+  "extract_sealed_files",
   "import_sealed_package",
   "open_room",
   "open_room_with_recovery",

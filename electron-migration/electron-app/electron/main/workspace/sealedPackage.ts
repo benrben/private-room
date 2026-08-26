@@ -35,6 +35,22 @@ export interface SealedPackageInfo {
   objectCount: number;
 }
 
+export interface SealedFileEntry {
+  fileId: string;
+  relativePath: string;
+  sizeBytes: number;
+  sha256: string;
+}
+
+export interface SealedPackageInspection extends SealedPackageInfo {
+  files: SealedFileEntry[];
+}
+
+export interface SealedExtractionResult {
+  destinationPath: string;
+  fileCount: number;
+}
+
 export interface SealedImportResult {
   destinationPath: string;
   roomId: string;
@@ -166,25 +182,57 @@ function numericMeta(db: Database.Database, key: string): number {
   return value;
 }
 
-export function inspectSealedPackage(packagePath: string, password: string): SealedPackageInfo {
+function sealedPackageInfo(db: Database.Database): SealedPackageInfo {
+  const version = numericMeta(db, "version");
+  if (version !== PACKAGE_VERSION) throw new Error("This sealed package version is not supported.");
+  const purpose = packageMeta(db, "purpose");
+  const createdAt = packageMeta(db, "created_at");
+  const roomId = packageMeta(db, "room_id");
+  if (purpose === null || createdAt === null || roomId === null) {
+    throw new Error("The sealed package metadata is incomplete.");
+  }
+  return {
+    version,
+    purpose,
+    createdAt,
+    roomId,
+    fileCount: numericMeta(db, "file_count"),
+    objectCount: numericMeta(db, "object_count"),
+  };
+}
+
+/** Read and validate the public file manifest without returning file bytes. */
+function sealedFileEntries(db: Database.Database, expectedCount: number): SealedFileEntry[] {
+  const rows = db.prepare(
+    "SELECT file_id, relative_path, size_bytes, sha256 FROM sealed_files ORDER BY relative_path COLLATE NOCASE, file_id",
+  ).all() as SealedFileRow[];
+  if (rows.length !== expectedCount) throw new Error("The sealed package item count is incorrect.");
+  const seenPaths = new Set<string>();
+  return rows.map((row) => {
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(row.file_id)) {
+      throw new Error("The sealed package contains an invalid file identifier.");
+    }
+    if (!Number.isSafeInteger(row.size_bytes) || row.size_bytes < 0 || !/^[0-9a-f]{64}$/i.test(row.sha256)) {
+      throw new Error("The sealed package file manifest is damaged.");
+    }
+    const relativePath = normalizeRelativePath(row.relative_path);
+    const key = pathKey(relativePath);
+    if (seenPaths.has(key)) throw new Error("The sealed package contains colliding file paths.");
+    seenPaths.add(key);
+    return {
+      fileId: row.file_id,
+      relativePath,
+      sizeBytes: row.size_bytes,
+      sha256: row.sha256.toLowerCase(),
+    };
+  });
+}
+
+export function inspectSealedPackage(packagePath: string, password: string): SealedPackageInspection {
   const db = openRoomReadonly(packagePath, password);
   try {
-    const version = numericMeta(db, "version");
-    if (version !== PACKAGE_VERSION) throw new Error("This sealed package version is not supported.");
-    const purpose = packageMeta(db, "purpose");
-    const createdAt = packageMeta(db, "created_at");
-    const roomId = packageMeta(db, "room_id");
-    if (purpose === null || createdAt === null || roomId === null) {
-      throw new Error("The sealed package metadata is incomplete.");
-    }
-    return {
-      version,
-      purpose,
-      createdAt,
-      roomId,
-      fileCount: numericMeta(db, "file_count"),
-      objectCount: numericMeta(db, "object_count"),
-    };
+    const info = sealedPackageInfo(db);
+    return { ...info, files: sealedFileEntries(db, info.fileCount) };
   } finally {
     db.close();
   }
@@ -412,6 +460,66 @@ async function restoreChunksToFile(
   if (offset !== expectedSize || hash.digest("hex") !== expectedHash) {
     await rm(destination, { force: true });
     throw new Error("The sealed package failed while restoring a file.");
+  }
+}
+
+/** Extract selected current files into a new normal folder without opening or
+ * mutating the private database snapshot stored in the package. */
+export async function extractSealedFiles(
+  packagePath: string,
+  password: string,
+  fileIds: string[],
+  destinationPath: string,
+): Promise<SealedExtractionResult> {
+  if (fileIds.length === 0) throw new Error("Select at least one file to extract.");
+  const wanted = new Set(fileIds);
+  if (wanted.size !== fileIds.length) throw new Error("The extraction selection contains duplicate files.");
+  if (wanted.size > 10_000) throw new Error("Extract at most 10,000 files at one time.");
+  const source = path.resolve(packagePath);
+  const destination = path.resolve(destinationPath);
+  if (source === destination) throw new Error("Choose a different destination for the extracted files.");
+  if (await lstat(destination).then(() => true, () => false)) {
+    throw new Error("A file or folder already exists at the extraction destination.");
+  }
+
+  const db = openRoomReadonly(source, password);
+  const tempRoot = path.join(
+    path.dirname(destination),
+    `.${path.basename(destination)}.${randomUUID()}.extract.tmp`,
+  );
+  try {
+    const info = sealedPackageInfo(db);
+    const manifest = sealedFileEntries(db, info.fileCount);
+    const selected = manifest.filter((entry) => wanted.has(entry.fileId));
+    if (selected.length !== wanted.size) {
+      throw new Error("One or more selected files are not in this sealed package.");
+    }
+    await mkdir(tempRoot, { mode: 0o700 });
+    for (const entry of selected) {
+      await restoreChunksToFile(
+        db,
+        entry.fileId,
+        "sealed_file_chunks",
+        "file_id",
+        resolveWorkspacePath(tempRoot, entry.relativePath),
+        entry.sizeBytes,
+        entry.sha256,
+      );
+    }
+    await syncDirectory(tempRoot);
+    // Re-check immediately before the atomic publish. `rename` keeps readers
+    // from observing the partly restored temporary tree.
+    if (await lstat(destination).then(() => true, () => false)) {
+      throw new Error("A file or folder already exists at the extraction destination.");
+    }
+    await rename(tempRoot, destination);
+    await syncDirectory(path.dirname(destination));
+    return { destinationPath: destination, fileCount: selected.length };
+  } catch (error) {
+    await rm(tempRoot, { recursive: true, force: true });
+    throw error;
+  } finally {
+    db.close();
   }
 }
 

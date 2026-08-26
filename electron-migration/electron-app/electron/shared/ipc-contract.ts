@@ -147,7 +147,22 @@ export interface Commands {
       roomId: string;
       fileCount: number;
       objectCount: number;
+      files: Array<{
+        fileId: string;
+        relativePath: string;
+        sizeBytes: number;
+        sha256: string;
+      }>;
     };
+  };
+  extract_sealed_files: {
+    args: {
+      packagePath: string;
+      password: string;
+      fileIds: string[];
+      destinationPath: string;
+    };
+    result: { destinationPath: string; fileCount: number };
   };
   import_sealed_package: {
     args: {
