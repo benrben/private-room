@@ -158,10 +158,11 @@ test("with no page open the shield claims nothing and stops 'checking'", () => {
 });
 
 test("privacy copy names both sides of the ephemeral/durable line", () => {
-  // "Nothing is saved" in the toolbar against "kept inside your room" in the
-  // journal was the contradiction. One sentence, used by both surfaces.
+  // Browser session data is ephemeral. Saved files are normal workspace files,
+  // while the private journal remains in the encrypted room database.
   assert.match(privacy.EPHEMERAL_VS_ROOM, /clear when the last private page closes/);
-  assert.match(privacy.EPHEMERAL_VS_ROOM, /stay in this\s+encrypted room/);
+  assert.match(privacy.EPHEMERAL_VS_ROOM, /files you choose to save stay in the workspace/);
+  assert.match(privacy.EPHEMERAL_VS_ROOM, /Journal stays in encrypted private room state/);
 });
 
 test("the browser never lets private be mistaken for anonymous", () => {
