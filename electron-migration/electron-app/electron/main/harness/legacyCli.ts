@@ -47,7 +47,7 @@ export class AsyncWriteGate {
   }
 }
 
-interface WorkspaceCalls {
+export interface WorkspaceCalls {
   call(operation: string, args: Record<string, unknown>): Promise<Record<string, unknown>>;
 }
 function result(payload: Record<string, unknown>): ToolCallResult {
@@ -55,14 +55,18 @@ function result(payload: Record<string, unknown>): ToolCallResult {
   return { isError, content: [{ type: "text", text: JSON.stringify(payload) }] };
 }
 
-class WorkspaceDispatcher implements ToolDispatcher {
+export class WorkspaceDispatcher implements ToolDispatcher {
   constructor(
     private readonly backend: WorkspaceCalls,
     private readonly writeGate: AsyncWriteGate,
     private readonly delegate?: (agentId: string, task: string) => Promise<Record<string, unknown>>,
+    private readonly base?: ToolDispatcher,
   ) {}
-  listTools(_scope: ToolScope): ToolSpec[] { return this.delegate === undefined ? TOOLS : [...TOOLS, DELEGATE_TOOL]; }
-  async callTool(_scope: ToolScope, name: string, args: Record<string, unknown>): Promise<ToolCallResult> {
+  listTools(scope: ToolScope): ToolSpec[] {
+    const tools = this.base?.listTools(scope) ?? TOOLS;
+    return this.delegate === undefined ? tools : [...tools, DELEGATE_TOOL];
+  }
+  async callTool(scope: ToolScope, name: string, args: Record<string, unknown>): Promise<ToolCallResult> {
     if (name === DELEGATE_TOOL.name && this.delegate !== undefined) {
       const agentId = typeof args.agent_id === "string" ? args.agent_id.trim() : "";
       const task = typeof args.task === "string" ? args.task.trim() : "";
@@ -71,6 +75,12 @@ class WorkspaceDispatcher implements ToolDispatcher {
       catch (error) { return result({ error: error instanceof Error ? error.message : String(error) }); }
     }
     const operation = name.startsWith("workspace_") ? name.slice("workspace_".length) : "";
+    if (this.base !== undefined) {
+      const call = () => this.base!.callTool(scope, name, args);
+      return ["write", "edit", "delete"].includes(operation)
+        ? this.writeGate.run(call)
+        : call();
+    }
     if (!TOOLS.some((tool) => tool.name === name)) return result({ error: `unknown tool: ${name}` });
     const call = () => this.backend.call(operation, args);
     return result(["write", "edit", "delete"].includes(operation) ? await this.writeGate.run(call) : await call());
@@ -199,6 +209,8 @@ export interface LegacyCliRuntimeOptions {
   /** Internal shared gates used by delegated children of one parent run. */
   writeGate?: AsyncWriteGate;
   specialistGate?: AsyncWriteGate;
+  /** Full Arcelle MCP catalog, while the CLI still sees no real filesystem. */
+  baseDispatcher?: (context: HarnessContext, workspace: WorkspaceCalls) => ToolDispatcher;
 }
 
 /**
@@ -273,8 +285,13 @@ export class RestrictedLegacyCliRuntime implements HarnessRuntime {
     const token = randomUUID();
     const bridge = new McpBridge({
       token,
-      scope: { kind: "ExternalAgent" },
-      dispatcher: new WorkspaceDispatcher(backend, this.writeGate, delegate),
+      scope: { kind: "CloudEngine" },
+      dispatcher: new WorkspaceDispatcher(
+        backend,
+        this.writeGate,
+        delegate,
+        this.options.baseDispatcher?.(context, backend),
+      ),
     });
     await bridge.listen(0);
     const configPath = path.join(isolated, "mcp-room.json");

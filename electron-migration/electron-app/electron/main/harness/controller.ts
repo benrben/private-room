@@ -6,6 +6,8 @@ import { activePolicy, type PolicyState } from "../privacy.js";
 import type { RoomManagerState } from "../roomManager.js";
 import type { LiveAppServices } from "../liveAppServices.js";
 import { runsOnThisMac } from "../capabilities.js";
+import { roomServerDispatcherFactory } from "../roomServerLive.js";
+import { WEB_LANES_ALL } from "../toolSpecs.js";
 import {
   workspaceHarnessCapabilities,
   workspaceHarnessFlag,
@@ -14,7 +16,11 @@ import {
 import { ClaudeAgentSdkRuntime } from "./claudeAgentSdk.js";
 import { CloudRedactedMirror } from "./cloudMirror.js";
 import { CodexAppServerRuntime } from "./codexAppServer.js";
-import { RestrictedLegacyCliRuntime, RuntimeWithFallback } from "./legacyCli.js";
+import {
+  RestrictedLegacyCliRuntime,
+  RuntimeWithFallback,
+  type LegacyCliRuntimeOptions,
+} from "./legacyCli.js";
 import { DeepAgentRuntime } from "./deepAgentRuntime.js";
 import { HarnessOrchestrator, type HarnessFinalStatus } from "./orchestrator.js";
 import { RunProtection, type RollbackResult } from "./runProtection.js";
@@ -94,14 +100,22 @@ export class HarnessController {
     private readonly emit: EventSender,
     options: HarnessControllerOptions = {},
   ) {
+    const fallbackDispatcher = roomServerDispatcherFactory(state, emit, options.services);
+    const fallbackOptions: LegacyCliRuntimeOptions = {
+      baseDispatcher: (context, workspace) =>
+        fallbackDispatcher(false, { kind: "CloudEngine" }, WEB_LANES_ALL, {
+          workspace,
+          privacyBypass: context.privacyMode === "cloud-direct",
+        }),
+    };
     this.runtimes = {
       codex: options.runtimes?.codex ?? new RuntimeWithFallback(
         new CodexAppServerRuntime(),
-        new RestrictedLegacyCliRuntime("codex", state),
+        new RestrictedLegacyCliRuntime("codex", state, fallbackOptions),
       ),
       claude: options.runtimes?.claude ?? new RuntimeWithFallback(
         new ClaudeAgentSdkRuntime(),
-        new RestrictedLegacyCliRuntime("claude", state),
+        new RestrictedLegacyCliRuntime("claude", state, fallbackOptions),
       ),
       "ollama-local": options.runtimes?.["ollama-local"] ?? new DeepAgentRuntime(state, emit, options.services),
       "ollama-cloud": options.runtimes?.["ollama-cloud"] ?? new DeepAgentRuntime(state, emit, options.services),
