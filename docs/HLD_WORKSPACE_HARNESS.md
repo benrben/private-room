@@ -279,6 +279,22 @@ Normalized events include run start, agent start, plan updates, text deltas, too
 
 The UI reads only normalized events.
 
+The live Electron controller owns room-derived paths. A renderer can choose a
+provider, model, privacy mode and write permission, but it cannot supply an
+absolute workspace path. The controller publishes normalized events on one
+typed `harness-event` channel and keeps provider-specific output out of the UI.
+
+Provider completion is provisional. Arcelle first applies an approved redacted
+mirror write-back, runs the full workspace reconciliation, records final file
+hashes, and only then sends the final `run_completed` event. Room lock cancels
+and drains harness runs while the encrypted database is still open.
+
+Native direct mode is fail-closed. The current `.arcelle` Seatbelt canary does
+not prove that a CLI process cannot read another path outside the room. Until a
+stronger outside-workspace isolation test passes, the controller reports native
+Codex and Claude as unavailable and refuses to start them. A feature flag alone
+cannot bypass this security gate.
+
 ### Shared agent manifest
 
 `config/agent-manifest.json` defines all 16 specialists and their graph shape, tools, file permission, model capability, timeout policy, privacy inheritance and instructions. Provider adapters generate their own runtime definitions from this file.

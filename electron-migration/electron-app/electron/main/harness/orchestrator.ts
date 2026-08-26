@@ -12,6 +12,8 @@ import type {
 } from "./types.js";
 
 export interface StartHarnessTurn {
+  /** Supplied by the trusted controller when it must prepare an exposure first. */
+  runId?: string;
   roomId: string;
   provider: string;
   model: string;
@@ -27,13 +29,27 @@ export interface StartHarnessTurn {
 interface ActiveRun {
   run: HarnessRun;
   runtime: HarnessRuntime;
+  writeEnabled: boolean;
+}
+
+export type HarnessFinalStatus = "completed" | "cancelled" | "failed";
+
+export interface HarnessRunLifecycle {
+  beforeFinish?(
+    runId: string,
+    status: HarnessFinalStatus,
+    emit: (event: HarnessEvent) => void,
+  ): Promise<HarnessFinalStatus | void>;
 }
 
 export class HarnessOrchestrator {
   private readonly runtimes = new Map<string, HarnessRuntime>();
   private readonly active = new Map<string, ActiveRun>();
 
-  constructor(private readonly protection: RunProtection | null) {}
+  constructor(
+    private readonly protection: RunProtection | null,
+    private readonly lifecycle: HarnessRunLifecycle = {},
+  ) {}
 
   register(provider: string, runtime: HarnessRuntime): void {
     this.runtimes.set(provider, runtime);
@@ -47,7 +63,12 @@ export class HarnessOrchestrator {
     if (input.writeEnabled && this.active.size > 0) {
       throw new Error("Another agent run currently holds the room write lease.");
     }
-    const runId = randomUUID();
+    if (!input.writeEnabled && [...this.active.values()].some((entry) => entry.writeEnabled)) {
+      throw new Error("A write-enabled agent run currently holds the room write lease.");
+    }
+    const runId = input.runId ?? randomUUID();
+    if (!/^[A-Za-z0-9_-]{1,100}$/.test(runId)) throw new Error("The agent run ID is invalid.");
+    if (this.active.has(runId)) throw new Error("That agent run ID is already active.");
     const context: HarnessContext = {
       runId,
       roomId: input.roomId,
@@ -67,24 +88,43 @@ export class HarnessOrchestrator {
       if (this.protection !== null) await this.protection.finish(runId, "failed");
       throw error;
     }
-    this.active.set(runId, { run, runtime });
+    this.active.set(runId, { run, runtime, writeEnabled: input.writeEnabled });
     const output = new AsyncEventQueue<HarnessEvent>();
     void (async () => {
-      let final: "completed" | "cancelled" | "failed" = "failed";
+      let final: HarnessFinalStatus = "failed";
+      let failure = "The agent harness ended without a completion event.";
       try {
         for await (const event of run.events) {
-          output.push(event);
+          // A provider terminal event is provisional until cloud write-back
+          // and the mandatory filesystem reconciliation both succeed.
           if (event.type === "run_completed") final = event.status;
-          else if (event.type === "run_failed") final = "failed";
+          else if (event.type === "run_failed") {
+            final = "failed";
+            failure = event.error;
+          } else output.push(event);
         }
       } finally {
-        this.active.delete(runId);
+        try {
+          const lifecycleStatus = await this.lifecycle.beforeFinish?.(
+            runId,
+            final,
+            (event) => output.push(event),
+          );
+          if (lifecycleStatus !== undefined) final = lifecycleStatus;
+        } catch (error) {
+          final = "failed";
+          failure = `Run finalization failed: ${error instanceof Error ? error.message : String(error)}`;
+        }
         if (this.protection !== null) {
           try { await this.protection.finish(runId, final); }
           catch (error) {
-            output.push({ type: "run_failed", runId, error: `Post-run reconciliation failed: ${error instanceof Error ? error.message : String(error)}` });
+            final = "failed";
+            failure = `Post-run reconciliation failed: ${error instanceof Error ? error.message : String(error)}`;
           }
         }
+        this.active.delete(runId);
+        if (final === "failed") output.push({ type: "run_failed", runId, error: failure });
+        else output.push({ type: "run_completed", runId, status: final });
         output.end();
       }
     })();
@@ -101,6 +141,10 @@ export class HarnessOrchestrator {
     const active = this.active.get(runId);
     if (active === undefined) return;
     await active.run.cancel();
+  }
+
+  activeRunIds(): string[] {
+    return [...this.active.keys()];
   }
 
   rollback(runId: string): Promise<RollbackResult> {

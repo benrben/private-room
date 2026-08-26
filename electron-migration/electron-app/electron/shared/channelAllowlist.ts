@@ -148,6 +148,13 @@ const ALL_COMMANDS_TYPED: { [K in keyof Commands]: true } = {
   grounding_model_for_room: true,
   handoff_chat: true,
   has_recovery_key: true,
+  harness_approve: true,
+  harness_cancel: true,
+  harness_capabilities: true,
+  harness_cloud_writeback: true,
+  harness_restore_baseline_copies: true,
+  harness_rollback: true,
+  harness_start: true,
   import_audio_bytes: true,
   import_files: true,
   import_sealed_package: true,
@@ -435,6 +442,7 @@ const ALL_EVENTS_TYPED: { [K in keyof EventPayloads]: true } = {
   // above is what surfaced it: a hand-copied 59-entry list type-checks against
   // nothing and would have shipped the gap silently.
   "pull-progress": true,
+  "harness-event": true,
 };
 
 /** Runtime array of every valid `invoke()` channel name. */

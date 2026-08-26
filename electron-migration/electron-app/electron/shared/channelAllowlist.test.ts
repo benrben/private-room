@@ -26,7 +26,7 @@ describe("channelAllowlist command names", () => {
     // `open_url`/`open_path`/`reveal_item_in_dir` (plugin-opener), and
     // `quit_guard_confirm` (plugin-process's `exit(0)`, which finished a held
     // quit), plus the 3 Electron updater/version host commands.
-    expect(ALL_COMMAND_NAMES.length).toBe(314);
+    expect(ALL_COMMAND_NAMES.length).toBe(321);
   });
 
   it("COMMAND_CHANNEL_SET agrees with ALL_COMMAND_NAMES", () => {
@@ -87,7 +87,7 @@ describe("channelAllowlist event names", () => {
     // `channelAllowlist.ts` is checked against the actual `EventPayloads`
     // type, so the true count is whatever TypeScript accepted. Pinned here so
     // a future contract edit is a deliberate, noticed change.
-    expect(ALL_EVENT_NAMES.length).toBe(60);
+    expect(ALL_EVENT_NAMES.length).toBe(61);
   });
 
   it("EVENT_CHANNEL_SET agrees with ALL_EVENT_NAMES", () => {

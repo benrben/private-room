@@ -102,6 +102,7 @@ import type {
   RoomServerStatus,
   RoomRole,
 } from "./apiTypes.js";
+import type { ApprovalDecision, PrivacyMode } from "./harnessTypes.js";
 
 export interface Commands {
   // ---- chunk 1 --------------------------------------------------------
@@ -1002,6 +1003,43 @@ export interface Commands {
   };
   /** Download, verify, install and relaunch the update found by the feed. */
   updater_install: { args: Record<string, never>; result: void };
+
+  // ---- unified provider-neutral agent harness ------------------------
+  harness_capabilities: {
+    args: Record<string, never>;
+    result: {
+      flags: Record<string, boolean>;
+      roomFormat: "workspace-folder" | "sealed-db" | null;
+      outsideWorkspaceIsolation: boolean;
+      providers: Record<string, { enabled: boolean; installed: boolean; reason: string | null }>;
+    };
+  };
+  harness_start: {
+    args: {
+      provider: "codex" | "claude";
+      model: string;
+      privacyMode: PrivacyMode;
+      writeEnabled: boolean;
+      text: string;
+      threadId?: string;
+      systemPrompt?: string;
+    };
+    result: { runId: string };
+  };
+  harness_approve: {
+    args: { runId: string; requestId: string; decision: ApprovalDecision };
+    result: void;
+  };
+  harness_cancel: { args: { runId: string }; result: void };
+  harness_cloud_writeback: { args: { runId: string; approved: boolean }; result: void };
+  harness_rollback: {
+    args: { runId: string };
+    result: { restored: string[]; removedCreated: string[]; conflicts: string[] };
+  };
+  harness_restore_baseline_copies: {
+    args: { runId: string; relativePaths: string[] };
+    result: string[];
+  };
 }
 
 // merged: 291 commands total (chunk 1: 37, chunk 2: 36, chunk 3: 36,

@@ -436,6 +436,10 @@ export interface RoomManagerDeps {
   stopRecordingAndWait?: (timeoutMs: number) => Promise<void>;
   /** The same engine, told to stop with NO wait — the teardown path. */
   stopRecordingNoWait?: () => void;
+  /** Unified native/deep harnesses must stop before the encrypted room DB closes. */
+  stopHarnessRuns?: (timeoutMs: number) => Promise<void>;
+  /** Best-effort cancellation for forced synchronous teardown paths. */
+  stopHarnessRunsNoWait?: () => void;
 
   /** D9 (the Leash): restart the room's persistent MCP server if its toggle
    * was left on. REQUIRED — see {@link spawnRoomServerIfEnabledNotImplemented}. */
@@ -1417,6 +1421,10 @@ export async function drainInflight(
     );
   }
 
+  if (deps.stopHarnessRuns) {
+    await deps.stopHarnessRuns(10_000);
+  }
+
   // HLT-7: if an answer is streaming, cancel it and wait briefly for its
   // save-partial phase, so the swap never races the DB shut.
   const askCount = state.cancel.cancels.size;
@@ -1504,6 +1512,8 @@ export function teardownOpenRoom(state: RoomManagerState, deps: RoomManagerDeps)
       "recBridge.ts has no single global live-session slot to stop yet"
     );
   }
+
+  deps.stopHarnessRunsNoWait?.();
 
   // BROWSE-1: the private browser must not outlive the room. A LIVE page left
   // floating over a locked room would still be showing whatever the room was

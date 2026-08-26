@@ -255,6 +255,7 @@ import { registerChatTurnSurfaceIpc } from "../chatTurnSurfaceIpc.js";
 import { createWorkflowAgentRun } from "../workflowAgentRun.js";
 import { registerAgentUiSurfaceIpc } from "../agentUiSurfaceIpc.js";
 import { registerCreativeJobSurfaceIpc } from "../creativeJobSurfaceIpc.js";
+import { registerHarnessSurfaceIpc } from "../harnessSurfaceIpc.js";
 import { createLiveAutoIndex } from "../autoIndexLive.js";
 import { refreshMcpConnections, type LiveAppServices } from "../liveAppServices.js";
 import {
@@ -289,7 +290,7 @@ import { ALL_COMMAND_NAMES } from "../../shared/channelAllowlist.js";
  * `registry.test.ts`), NOT hand-maintained here — a hardcoded count is exactly
  * the kind of claim that goes quietly wrong (one candidate shipped
  * `moduleCount: 30` next to 31 real calls, with a test asserting the 30). */
-export const WIRED_MODULE_COUNT = 43;
+export const WIRED_MODULE_COUNT = 44;
 
 // ============================================================================
 // The honest gap list (see module doc, point 2)
@@ -781,6 +782,7 @@ export function registerAllIpc(opts: RegisterAllIpcOptions): RegisterAllIpcResul
     deps,
     emit,
   );
+  registerHarnessSurfaceIpc(recordingIpcMain, state, deps, userDataDir, emit);
   deps.scheduleAutoIndex = createLiveAutoIndex(state, deps, emit);
 
   // ---- standalone channels with no room dependency ----

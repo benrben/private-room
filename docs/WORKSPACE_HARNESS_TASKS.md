@@ -114,7 +114,9 @@ Legend:
 - [x] Add run baseline records and end-of-run comparison.
 - [x] Add conflict-safe automatic rollback rules.
 - [x] Add the shared agent manifest.
-- [ ] Register the orchestrator in the live Electron bootstrap.
+- [x] Register the orchestrator in the live Electron bootstrap.
+- [x] Expose typed start, approval, cancellation, rollback and capability IPC.
+- [x] Emit one provider-neutral `harness-event` stream to the renderer.
 - [ ] Route the current agent UI through normalized events.
 - [ ] Generate all provider-specific specialists from the manifest.
 - [ ] Add `arcelle_delegate` child runs and normalized child events.
@@ -140,7 +142,7 @@ Legend:
 - [ ] Prove outside-workspace read isolation for native direct mode.
 - [ ] Add mass-change pause at more than 20 paths.
 - [ ] Test cancellation and descendant-process cleanup with real CLIs.
-- [ ] Disable native mode automatically when any isolation test fails.
+- [x] Disable native mode automatically when any isolation test fails.
 
 ## Phase I: Deep Harness
 
@@ -191,7 +193,7 @@ Legend:
 - [x] Apply safe text writes atomically.
 - [ ] Route structured changes through Arcelle MCP tools.
 - [x] Record cloud provenance.
-- [ ] Delete mirrors after success, failure, cancellation and startup crash cleanup.
+- [x] Delete mirrors after success, failure, cancellation and startup crash cleanup.
 - [ ] Add clear privacy-enabled and privacy-disabled UI text.
 
 ## Phase L: hardening and release
