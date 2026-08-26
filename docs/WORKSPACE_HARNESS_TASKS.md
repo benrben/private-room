@@ -18,7 +18,7 @@ Legend:
 - [x] Inventory every remaining direct write of `files.original_bytes`.
 - [x] Build a provider-by-feature parity matrix.
 - [x] Add legacy, large-file, recording, workflow, privacy and checkpoint fixtures.
-- [ ] Generate provider definitions from the shared manifest instead of keeping parallel definitions.
+- [x] Generate provider definitions from the shared manifest instead of keeping parallel definitions.
 
 ## Phase B: content abstraction
 

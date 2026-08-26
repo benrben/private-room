@@ -87,16 +87,28 @@
   ],
   "knownIndirectBlobAssumptions": [
     {
-      "path": "electron-migration/electron-app/electron/main/editMatch.ts",
-      "reason": "The agent edit matcher still reads and overwrites through legacy blob primitives without a workspace branch."
+      "path": "electron-migration/electron-app/electron/main/browser/saved.ts",
+      "reason": "Browser page and selection capture still inserts Markdown and HTML through legacy blob primitives; its dependency contract has no WorkspaceService."
     },
     {
-      "path": "electron-migration/electron-app/electron/main/organizeTools.ts",
-      "reason": "File merge and organization helpers still contain blob-only content reads and writes."
+      "path": "electron-migration/electron-app/electron/main/browserSurfaceIpc.ts",
+      "reason": "Finished browser downloads and readable web imports still insert bytes directly into the legacy database store."
     },
     {
-      "path": "electron-migration/electron-app/electron/main/filePass.ts",
-      "reason": "Whole-file pass materialization and generated output still use legacy blob helpers without the room content abstraction."
+      "path": "electron-migration/electron-app/electron/main/chatCommandsGenerate.ts",
+      "reason": "Several command paths, including on-demand transcription caching and generated text output, still call legacy byte readers and writers without a workspace branch."
+    },
+    {
+      "path": "electron-migration/electron-app/electron/main/sketchCommands.ts",
+      "reason": "Drawing load, save, snapshot and export operations still use legacy blob primitives."
+    },
+    {
+      "path": "electron-migration/electron-app/electron/main/summarizeTools.ts",
+      "reason": "Room summary overwrite, creation and legacy-summary trash still use the legacy database file store."
+    },
+    {
+      "path": "electron-migration/electron-app/electron/main/creativeJobSurfaceIpc.ts",
+      "reason": "Creative image and video jobs still read references and publish generated media through legacy blob primitives."
     }
   ]
 }
