@@ -57,6 +57,62 @@ describe("workspace path safety", () => {
 });
 
 describe("workspace room storage", () => {
+  it("serializes same-file writes across service instances before checking the expected hash", async () => {
+    const parent = await temporaryRoot();
+    const workspaceRoot = path.join(parent, "Concurrent Write Room");
+    const { db } = createWorkspaceRoom(
+      workspaceRoot,
+      "correct horse battery staple",
+      "Concurrent Write Room",
+    );
+    const canvas = new WorkspaceService(db, workspaceRoot);
+    const external = new WorkspaceService(db, workspaceRoot);
+    try {
+      const before = '{"version":1,"elements":[]}';
+      const after = '{"version":1,"elements":[{"id":"e1"}]}';
+      const created = await canvas.createFile(
+        "Converted.sketch",
+        Readable.from([Buffer.from(before)]),
+        "migration",
+      );
+      const delayed = (text: string, milliseconds: number) => Readable.from(
+        (async function* delayedContent() {
+          await new Promise((resolve) => setTimeout(resolve, milliseconds));
+          yield Buffer.from(text);
+        })(),
+      );
+
+      // Reproduces the installed-app race: the converted canvas's first
+      // autosave is a slow no-op while an external/agent save, based on the
+      // same original document, writes the actual edit. Without a process-wide
+      // per-file queue both hash checks pass and the slow old bytes rename last.
+      const [autosave, agentSave] = await Promise.allSettled([
+        canvas.writeAtomic(
+          created.fileId,
+          delayed(before, 75),
+          created.sha256 ?? undefined,
+        ),
+        external.writeAtomic(
+          created.fileId,
+          delayed(after, 5),
+          created.sha256 ?? undefined,
+        ),
+      ]);
+
+      expect(autosave.status).toBe("fulfilled");
+      expect(agentSave.status).toBe("fulfilled");
+      expect(await readFile(path.join(workspaceRoot, "Converted.sketch"), "utf8"))
+        .toBe(after);
+      const completed = db.prepare(
+        `SELECT count(*) AS n FROM fs_operations
+         WHERE file_id = ? AND operation_type = 'write' AND phase = 'completed'`,
+      ).get(created.fileId) as { n: number };
+      expect(completed.n).toBe(2);
+    } finally {
+      db.close();
+    }
+  });
+
   it("stores live bytes as normal files and private history as encrypted objects", async () => {
     const parent = await temporaryRoot();
     const workspaceRoot = path.join(parent, "Customer Project");

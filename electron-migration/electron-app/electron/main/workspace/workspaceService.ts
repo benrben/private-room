@@ -50,6 +50,37 @@ export class ContentConflictError extends Error {
   }
 }
 
+/** One process can reach the same normal file through several service
+ * instances (renderer autosave, native-agent reconciliation, MCP and the
+ * compatibility layer all construct handles independently). Optimistic hash
+ * checks only work when check + temporary write + rename are one serialized
+ * operation: without this queue, two callers can both verify the old hash and
+ * the slower, older write can rename last.
+ *
+ * Keyed by stable file id as well as room root so unrelated files retain full
+ * concurrency. Entries remove themselves after the final queued writer. */
+const FILE_WRITE_QUEUES = new Map<string, Promise<void>>();
+
+async function serializeFileWrite<T>(
+  rootPath: string,
+  fileId: string,
+  write: () => Promise<T>,
+): Promise<T> {
+  const key = `${path.resolve(rootPath)}\0${fileId}`;
+  const previous = FILE_WRITE_QUEUES.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => { release = resolve; });
+  const queued = previous.catch(() => undefined).then(() => current);
+  FILE_WRITE_QUEUES.set(key, queued);
+  await previous.catch(() => undefined);
+  try {
+    return await write();
+  } finally {
+    release();
+    if (FILE_WRITE_QUEUES.get(key) === queued) FILE_WRITE_QUEUES.delete(key);
+  }
+}
+
 function mimeForName(name: string): string {
   const extension = path.extname(name).toLocaleLowerCase("en-US");
   return ({
@@ -390,6 +421,16 @@ export class WorkspaceService {
   }
 
   async writeAtomic(
+    fileId: string,
+    content: Readable,
+    expectedHash?: string,
+    agentRunId: string | null = null,
+  ): Promise<WriteResult> {
+    return serializeFileWrite(this.rootPath, fileId, () =>
+      this.writeAtomicUnlocked(fileId, content, expectedHash, agentRunId));
+  }
+
+  private async writeAtomicUnlocked(
     fileId: string,
     content: Readable,
     expectedHash?: string,
