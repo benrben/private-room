@@ -1,0 +1,5 @@
+{
+  "title": "Codex app-server collaboration fixture",
+  "methods": ["thread/start", "turn/start", "turn/interrupt", "item/started", "item/completed", "turn/completed", "item/tool/call"],
+  "itemTypes": ["commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall", "collabToolCall"]
+}

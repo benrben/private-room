@@ -6,6 +6,7 @@ import { promisify } from "node:util";
 import readline from "node:readline";
 import { AsyncEventQueue } from "./eventQueue.js";
 import { codexAgentInstructions } from "./agentManifest.js";
+import { inspectCodexSchemaDirectory, type CodexSchemaCompatibility } from "./codexSchema.js";
 import {
   spawnWithNativeWorkspaceSandbox,
   terminateNativeProcessTree,
@@ -65,6 +66,7 @@ function collabStatuses(item: Record<string, unknown>): Array<[string, string]> 
 
 export class CodexAppServerRuntime implements HarnessRuntime {
   readonly name = "codex-app-server" as const;
+  private compatibility: CodexSchemaCompatibility | null = null;
   constructor(private readonly executable = process.env.ARCELLE_CODEX_PATH ?? "codex") {}
 
   async available(): Promise<boolean> {
@@ -79,12 +81,19 @@ export class CodexAppServerRuntime implements HarnessRuntime {
         ["app-server", "generate-json-schema", "--out", schemaRoot],
         { timeout: 10_000 },
       );
-      return (await readdir(schemaRoot)).some((name) => name.endsWith(".json"));
+      if (!(await readdir(schemaRoot)).some((name) => name.endsWith(".json") || name === "v1" || name === "v2")) return false;
+      this.compatibility = await inspectCodexSchemaDirectory(schemaRoot);
+      return this.compatibility.compatible;
     } catch {
+      this.compatibility = null;
       return false;
     } finally {
       await rm(schemaRoot, { recursive: true, force: true });
     }
+  }
+
+  installedSchemaCompatibility(): CodexSchemaCompatibility | null {
+    return this.compatibility === null ? null : { ...this.compatibility, missingMethods: [...this.compatibility.missingMethods] };
   }
 
   async verifyExposure(workspacePath: string, runtimePath: string, writeEnabled: boolean): Promise<boolean> {

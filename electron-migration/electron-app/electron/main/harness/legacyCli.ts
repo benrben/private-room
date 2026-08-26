@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { lstat, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { AsyncEventQueue } from "./eventQueue.js";
-import { codexAgentInstructions } from "./agentManifest.js";
+import { codexAgentInstructions, loadAgentManifest, type SharedAgentDefinition } from "./agentManifest.js";
 import { parseClaudeJsonResult, parseCodexJsonStream } from "../externalAdvisor.js";
 import { McpBridge, type ToolCallResult, type ToolDispatcher, type ToolScope, type ToolSpec } from "../mcpBridge.js";
 import type { RoomManagerState } from "../roomManager.js";
@@ -14,13 +14,38 @@ import {
   terminateNativeProcessTree,
   verifyNativeHarnessExecutable,
 } from "./seatbelt.js";
-import type { HarnessContext, HarnessInput, HarnessRun, HarnessRuntime } from "./types.js";
+import type { HarnessContext, HarnessEvent, HarnessInput, HarnessRun, HarnessRuntime } from "./types.js";
 
 const TOOLS: ToolSpec[] = ["list", "read", "write", "edit", "delete", "glob", "grep"].map((operation) => ({
   name: `workspace_${operation}`,
   description: `${operation} normal files through Arcelle's restricted workspace service.`,
   inputSchema: { type: "object", additionalProperties: true },
 }));
+
+const DELEGATE_TOOL: ToolSpec = {
+  name: "arcelle_delegate",
+  description: "Run one Arcelle specialist as a child of this agent run. Read specialists may run in parallel; write specialists are serialized.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      agent_id: { type: "string", description: "Specialist id from the Arcelle specialist catalog." },
+      task: { type: "string", description: "A complete task for the specialist." },
+    },
+    required: ["agent_id", "task"],
+    additionalProperties: false,
+  },
+};
+
+export class AsyncWriteGate {
+  private tail: Promise<void> = Promise.resolve();
+  async run<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = this.tail;
+    let release!: () => void;
+    this.tail = new Promise<void>((resolve) => { release = resolve; });
+    await previous;
+    try { return await operation(); } finally { release(); }
+  }
+}
 
 interface WorkspaceCalls {
   call(operation: string, args: Record<string, unknown>): Promise<Record<string, unknown>>;
@@ -31,12 +56,24 @@ function result(payload: Record<string, unknown>): ToolCallResult {
 }
 
 class WorkspaceDispatcher implements ToolDispatcher {
-  constructor(private readonly backend: WorkspaceCalls) {}
-  listTools(_scope: ToolScope): ToolSpec[] { return TOOLS; }
+  constructor(
+    private readonly backend: WorkspaceCalls,
+    private readonly writeGate: AsyncWriteGate,
+    private readonly delegate?: (agentId: string, task: string) => Promise<Record<string, unknown>>,
+  ) {}
+  listTools(_scope: ToolScope): ToolSpec[] { return this.delegate === undefined ? TOOLS : [...TOOLS, DELEGATE_TOOL]; }
   async callTool(_scope: ToolScope, name: string, args: Record<string, unknown>): Promise<ToolCallResult> {
+    if (name === DELEGATE_TOOL.name && this.delegate !== undefined) {
+      const agentId = typeof args.agent_id === "string" ? args.agent_id.trim() : "";
+      const task = typeof args.task === "string" ? args.task.trim() : "";
+      if (agentId === "" || task === "") return result({ error: "arcelle_delegate requires agent_id and task." });
+      try { return result(await this.delegate(agentId, task)); }
+      catch (error) { return result({ error: error instanceof Error ? error.message : String(error) }); }
+    }
     const operation = name.startsWith("workspace_") ? name.slice("workspace_".length) : "";
     if (!TOOLS.some((tool) => tool.name === name)) return result({ error: `unknown tool: ${name}` });
-    return result(await this.backend.call(operation, args));
+    const call = () => this.backend.call(operation, args);
+    return result(["write", "edit", "delete"].includes(operation) ? await this.writeGate.run(call) : await call());
   }
 }
 
@@ -159,6 +196,9 @@ export interface LegacyCliRuntimeOptions {
   executable?: string;
   spawn?: typeof spawnWithNativeWorkspaceSandbox;
   available?: () => boolean;
+  /** Internal shared gates used by delegated children of one parent run. */
+  writeGate?: AsyncWriteGate;
+  specialistGate?: AsyncWriteGate;
 }
 
 /**
@@ -171,17 +211,23 @@ export class RestrictedLegacyCliRuntime implements HarnessRuntime {
   private readonly executable: string;
   private readonly spawn: typeof spawnWithNativeWorkspaceSandbox;
   private readonly availableProbe: () => boolean;
+  private readonly writeGate: AsyncWriteGate;
+  private readonly specialistGate: AsyncWriteGate;
+  private readonly options: LegacyCliRuntimeOptions;
 
   constructor(
     private readonly provider: "codex" | "claude",
     private readonly state: RoomManagerState,
     options: LegacyCliRuntimeOptions = {},
   ) {
+    this.options = options;
     this.executable = options.executable ?? (provider === "codex"
       ? process.env.ARCELLE_CODEX_PATH ?? "codex"
       : process.env.ARCELLE_CLAUDE_PATH ?? "claude");
     this.spawn = options.spawn ?? spawnWithNativeWorkspaceSandbox;
     this.availableProbe = options.available ?? (() => spawnSync(this.executable, ["--version"], { stdio: "ignore", timeout: 5_000 }).status === 0);
+    this.writeGate = options.writeGate ?? new AsyncWriteGate();
+    this.specialistGate = options.specialistGate ?? new AsyncWriteGate();
   }
 
   async available(): Promise<boolean> { return this.availableProbe(); }
@@ -211,8 +257,25 @@ export class RestrictedLegacyCliRuntime implements HarnessRuntime {
     const backend = isRealWorkspace
       ? createWorkspaceMcpBridge(this.state, context.writeEnabled)
       : mirrorBackend(context.workspacePath, context.writeEnabled);
+    const events = new AsyncEventQueue<HarnessEvent>();
+    const activeChildren = new Set<HarnessRun>();
+    let parentCancelled = false;
+    const delegate = (context.delegationDepth ?? 0) > 0 ? undefined : async (agentId: string, task: string) => {
+      if (parentCancelled) throw new Error("The parent run was cancelled.");
+      const specialist = loadAgentManifest().agents.find((agent) => agent.id === agentId);
+      if (specialist === undefined || specialist.id === "chat.answer") throw new Error("That Arcelle specialist is not available for delegation.");
+      if (specialist.permission === "write" && !context.writeEnabled) {
+        throw new Error("A write specialist cannot run inside a read-only parent run.");
+      }
+      const execute = () => this.runDelegatedChild(context, specialist, task, events, activeChildren);
+      return specialist.permission === "write" ? this.specialistGate.run(execute) : execute();
+    };
     const token = randomUUID();
-    const bridge = new McpBridge({ token, scope: { kind: "ExternalAgent" }, dispatcher: new WorkspaceDispatcher(backend) });
+    const bridge = new McpBridge({
+      token,
+      scope: { kind: "ExternalAgent" },
+      dispatcher: new WorkspaceDispatcher(backend, this.writeGate, delegate),
+    });
     await bridge.listen(0);
     const configPath = path.join(isolated, "mcp-room.json");
     await writeFile(configPath, JSON.stringify({ mcpServers: { room: { type: "http", url: bridge.url, headers: { Authorization: `Bearer ${token}` } } } }), { mode: 0o600 });
@@ -235,7 +298,6 @@ export class RestrictedLegacyCliRuntime implements HarnessRuntime {
       await bridge.stop();
       throw error;
     }
-    const events = new AsyncEventQueue<import("./types.js").HarnessEvent>();
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
     let terminal = false;
@@ -268,9 +330,67 @@ export class RestrictedLegacyCliRuntime implements HarnessRuntime {
     child.stdin.end(prompt, "utf8");
     return {
       events,
-      cancel: async () => { terminateNativeProcessTree(child); },
+      cancel: async () => {
+        parentCancelled = true;
+        await Promise.allSettled([...activeChildren].map((run) => run.cancel()));
+        terminateNativeProcessTree(child);
+      },
       approve: async () => { throw new Error("Restricted CLI fallback does not request provider approvals."); },
     };
+  }
+
+  private async runDelegatedChild(
+    parent: HarnessContext,
+    specialist: SharedAgentDefinition,
+    task: string,
+    output: AsyncEventQueue<HarnessEvent>,
+    activeChildren: Set<HarnessRun>,
+  ): Promise<Record<string, unknown>> {
+    const suffix = randomUUID();
+    const agentId = specialist.id;
+    output.push({ type: "agent_started", runId: parent.runId, agentId, label: specialist.label });
+    const runtime = new RestrictedLegacyCliRuntime(this.provider, this.state, {
+      ...this.options,
+      writeGate: this.writeGate,
+      specialistGate: this.specialistGate,
+    });
+    const child = await runtime.startTurn({
+      ...parent,
+      runId: `${parent.runId}-child-${suffix}`,
+      runtimePath: path.join(parent.runtimePath, "children", suffix),
+      writeEnabled: specialist.permission === "write",
+      systemPrompt: [
+        specialist.instructions,
+        `You are Arcelle specialist ${specialist.id}. Graph policy: ${specialist.graph}.`,
+        `Allowed Arcelle tools: ${specialist.tools.join(", ") || "none"}.`,
+        specialist.permission === "read" ? "This child is read-only." : "All writes must use the Arcelle workspace tools.",
+      ].join("\n"),
+      delegationDepth: (parent.delegationDepth ?? 0) + 1,
+    }, { text: task });
+    activeChildren.add(child);
+    let text = "";
+    let failure: string | null = null;
+    try {
+      for await (const event of child.events) {
+        if (event.type === "text_delta") {
+          text += event.text;
+          output.push({ type: "text_delta", runId: parent.runId, text: event.text, agentId });
+        } else if (event.type === "usage_updated") {
+          output.push({ ...event, runId: parent.runId });
+        } else if (event.type === "tool_started" || event.type === "tool_completed" || event.type === "approval_requested") {
+          output.push({ ...event, runId: parent.runId });
+        } else if (event.type === "run_failed") {
+          failure = event.error;
+        } else if (event.type === "run_completed" && event.status === "cancelled") {
+          failure = "The delegated specialist was cancelled.";
+        }
+      }
+    } finally {
+      activeChildren.delete(child);
+      output.push({ type: "agent_completed", runId: parent.runId, agentId });
+    }
+    if (failure !== null) throw new Error(failure);
+    return { agent_id: agentId, text };
   }
 }
 

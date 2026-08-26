@@ -21,6 +21,8 @@ export interface HarnessContext {
   /** True only after the private-path and sandbox self-tests pass. */
   exposureVerified: boolean;
   systemPrompt?: string;
+  /** Internal fallback recursion guard. Child specialists cannot delegate again. */
+  delegationDepth?: number;
 }
 
 export interface HarnessInput {

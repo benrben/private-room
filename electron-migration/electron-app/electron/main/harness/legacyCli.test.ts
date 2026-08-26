@@ -9,7 +9,7 @@ import { createRoomManagerState } from "../roomManager.js";
 import { createWorkspaceRoom } from "../workspace/roomLayout.js";
 import { WorkspaceService } from "../workspace/workspaceService.js";
 import type { NativeWorkspaceSandbox } from "./seatbelt.js";
-import { RestrictedLegacyCliRuntime, RuntimeWithFallback } from "./legacyCli.js";
+import { AsyncWriteGate, RestrictedLegacyCliRuntime, RuntimeWithFallback } from "./legacyCli.js";
 import type { HarnessContext, HarnessRun, HarnessRuntime } from "./types.js";
 
 const roots: string[] = [];
@@ -26,6 +26,28 @@ function fakeChild(stdoutText: string): ChildProcessWithoutNullStreams {
     child.emit("exit", 0, null);
   });
   return child as unknown as ChildProcessWithoutNullStreams;
+}
+
+function controllableChild(onKill?: () => void): { child: ChildProcessWithoutNullStreams; stdout: PassThrough; stderr: PassThrough } {
+  const stdin = new PassThrough();
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+  const child = Object.assign(new EventEmitter(), {
+    stdin,
+    stdout,
+    stderr,
+    pid: 2_000_001,
+    kill: (signal: NodeJS.Signals = "SIGTERM") => {
+      onKill?.();
+      queueMicrotask(() => child.emit("exit", null, signal));
+      return true;
+    },
+  });
+  return { child: child as unknown as ChildProcessWithoutNullStreams, stdout, stderr };
+}
+
+function codexAnswer(text: string): string {
+  return `${JSON.stringify({ type: "item.completed", item: { type: "agent_message", text } })}\n${JSON.stringify({ type: "turn.completed", usage: { input_tokens: 2, output_tokens: 1 } })}\n`;
 }
 
 async function fixture() {
@@ -77,6 +99,137 @@ describe("RestrictedLegacyCliRuntime", () => {
       expect(args.join(" ")).toContain("mcp_servers.room.url");
       expect(events).toContainEqual({ type: "text_delta", runId: "run-1", text: "done" });
       expect(events.at(-1)).toEqual({ type: "run_completed", runId: "run-1", status: "completed" });
+    } finally {
+      f.created.db.close();
+    }
+  });
+
+  it("exposes arcelle_delegate as a normalized child run with inherited context", async () => {
+    const f = await fixture();
+    let spawned = 0;
+    try {
+      const runtime = new RestrictedLegacyCliRuntime("codex", f.state, {
+        executable: "/fake/codex",
+        available: () => true,
+        spawn: (options, args) => {
+          spawned += 1;
+          if (spawned === 2) return fakeChild(codexAnswer("specialist answer"));
+          const process = controllableChild();
+          queueMicrotask(() => {
+            void (async () => {
+              const urlFlag = args.find((arg) => arg.startsWith("mcp_servers.room.url="));
+              const url = urlFlag?.match(/"(http[^"]+)"/)?.[1];
+              if (url === undefined) throw new Error("missing test MCP URL");
+              const response = await fetch(url, {
+                method: "POST",
+                headers: {
+                  Authorization: `Bearer ${options.env?.ARCELLE_ROOM_MCP_TOKEN ?? ""}`,
+                  "Content-Type": "application/json",
+                },
+                body: JSON.stringify({
+                  jsonrpc: "2.0",
+                  id: 1,
+                  method: "tools/call",
+                  params: { name: "arcelle_delegate", arguments: { agent_id: "chat.web", task: "research this" } },
+                }),
+              });
+              const body = await response.json() as { result?: { content?: Array<{ text?: string }> } };
+              const delegated = body.result?.content?.[0]?.text ?? "missing";
+              process.stdout.end(codexAnswer(`main received ${delegated}`));
+              process.stderr.end();
+              (process.child as unknown as EventEmitter).emit("exit", 0, null);
+            })();
+          });
+          return process.child;
+        },
+      });
+      const run = await runtime.startTurn({
+        runId: "parent", roomId: f.created.descriptor.roomId, provider: "codex", model: "gpt-test",
+        workspacePath: f.roomPath, runtimePath: path.join(f.root, "runtime-delegate"), privacyMode: "cloud-direct",
+        writeEnabled: true, exposureVerified: true,
+      }, { text: "delegate" });
+      const events = [];
+      for await (const event of run.events) events.push(event);
+      expect(spawned).toBe(2);
+      expect(events).toContainEqual({ type: "agent_started", runId: "parent", agentId: "chat.web", label: "Web agent" });
+      expect(events).toContainEqual({ type: "text_delta", runId: "parent", text: "specialist answer", agentId: "chat.web" });
+      expect(events).toContainEqual({ type: "agent_completed", runId: "parent", agentId: "chat.web" });
+      expect(events.at(-1)).toEqual({ type: "run_completed", runId: "parent", status: "completed" });
+    } finally {
+      f.created.db.close();
+    }
+  });
+
+  it("serializes write leases while allowing work outside the gate to proceed", async () => {
+    const gate = new AsyncWriteGate();
+    const sequence: string[] = [];
+    let releaseFirst!: () => void;
+    const first = gate.run(async () => {
+      sequence.push("first-start");
+      await new Promise<void>((resolve) => { releaseFirst = resolve; });
+      sequence.push("first-end");
+    });
+    const second = gate.run(async () => { sequence.push("second"); });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(sequence).toEqual(["first-start"]);
+    sequence.push("parallel-read");
+    releaseFirst();
+    await Promise.all([first, second]);
+    expect(sequence).toEqual(["first-start", "parallel-read", "first-end", "second"]);
+  });
+
+  it("inherits cancellation into an active delegated CLI child", async () => {
+    const f = await fixture();
+    let spawned = 0;
+    let parentKilled = false;
+    let childKilled = false;
+    let childReady!: () => void;
+    const childStarted = new Promise<void>((resolve) => { childReady = resolve; });
+    try {
+      const runtime = new RestrictedLegacyCliRuntime("codex", f.state, {
+        executable: "/fake/codex",
+        available: () => true,
+        spawn: (options, args) => {
+          spawned += 1;
+          if (spawned === 2) {
+            const delegated = controllableChild(() => { childKilled = true; });
+            childReady();
+            return delegated.child;
+          }
+          const parent = controllableChild(() => { parentKilled = true; });
+          queueMicrotask(() => {
+            const urlFlag = args.find((arg) => arg.startsWith("mcp_servers.room.url="));
+            const url = urlFlag?.match(/"(http[^"]+)"/)?.[1];
+            if (url === undefined) return;
+            void fetch(url, {
+              method: "POST",
+              headers: {
+                Authorization: `Bearer ${options.env?.ARCELLE_ROOM_MCP_TOKEN ?? ""}`,
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify({
+                jsonrpc: "2.0", id: 1, method: "tools/call",
+                params: { name: "arcelle_delegate", arguments: { agent_id: "chat.web", task: "wait" } },
+              }),
+            }).catch(() => undefined);
+          });
+          return parent.child;
+        },
+      });
+      const run = await runtime.startTurn({
+        runId: "cancel-parent", roomId: f.created.descriptor.roomId, provider: "codex", model: "gpt-test",
+        workspacePath: f.roomPath, runtimePath: path.join(f.root, "runtime-cancel"), privacyMode: "cloud-direct",
+        writeEnabled: true, exposureVerified: true,
+      }, { text: "delegate and wait" });
+      const events: Array<{ type: string; [key: string]: unknown }> = [];
+      const draining = (async () => { for await (const event of run.events) events.push(event); })();
+      await childStarted;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await run.cancel();
+      await draining;
+      expect(childKilled).toBe(true);
+      expect(parentKilled).toBe(true);
+      expect(events.at(-1)).toEqual({ type: "run_completed", runId: "cancel-parent", status: "cancelled" });
     } finally {
       f.created.db.close();
     }

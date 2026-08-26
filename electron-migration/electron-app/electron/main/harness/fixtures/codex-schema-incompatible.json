@@ -1,0 +1,4 @@
+{
+  "title": "Incompatible app-server fixture",
+  "methods": ["thread/start", "turn/start", "item/started", "turn/completed"]
+}

@@ -1,0 +1,5 @@
+{
+  "title": "Codex app-server legacy core fixture",
+  "methods": ["thread/start", "turn/start", "turn/interrupt", "item/started", "item/completed", "turn/completed"],
+  "itemTypes": ["commandExecution", "fileChange", "mcpToolCall"]
+}

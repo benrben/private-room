@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
@@ -90,7 +90,9 @@ describe("native workspace Seatbelt", () => {
   });
 
   it.runIf(process.platform !== "win32")("terminates the native harness process group", async () => {
-    const child = spawn("/bin/sh", ["-c", "sleep 30 & wait"], {
+    const f = await fixture();
+    const grandchildPidPath = path.join(f.runtimePath, "grandchild.pid");
+    const child = spawn("/bin/sh", ["-c", `sleep 30 & echo $! > "${grandchildPidPath}"; wait`], {
       detached: true,
       stdio: "ignore",
     });
@@ -98,8 +100,21 @@ describe("native workspace Seatbelt", () => {
       child.once("spawn", resolve);
       child.once("error", reject);
     });
+    let grandchildPid = 0;
+    for (let attempt = 0; attempt < 100 && grandchildPid === 0; attempt += 1) {
+      grandchildPid = Number(await readFile(grandchildPidPath, "utf8").catch(() => "0"));
+      if (grandchildPid === 0) await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(grandchildPid).toBeGreaterThan(0);
     expect(terminateNativeProcessTree(child)).toBe(true);
     await new Promise<void>((resolve) => child.once("exit", () => resolve()));
     expect(child.exitCode === null || child.signalCode === "SIGTERM").toBe(true);
+    let grandchildAlive = true;
+    for (let attempt = 0; attempt < 100 && grandchildAlive; attempt += 1) {
+      try { process.kill(grandchildPid, 0); }
+      catch { grandchildAlive = false; }
+      if (grandchildAlive) await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(grandchildAlive).toBe(false);
   });
 });
