@@ -11,15 +11,19 @@
 
 import { randomUUID } from "node:crypto";
 import { mkdtempSync, promises as fs, rmSync } from "node:fs";
+import { Readable } from "node:stream";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type Database from "better-sqlite3-multiple-ciphers";
 import { createRoom } from "./db-host/open.js";
+import { createWorkspaceRoom } from "./workspace/roomLayout.js";
+import { WorkspaceService } from "./workspace/workspaceService.js";
 import { insertFile, updateFileContent } from "./db-host/files.js";
 import { encodeWav, SAMPLE_RATE } from "./recFormat.js";
 import {
   audioPeaks,
+  audioPeaksForRoom,
   cacheKey,
   clampBuckets,
   clearPeaks,
@@ -520,6 +524,31 @@ describe("audioPeaks", () => {
     const result = await audioPeaks(db, cache, id, 2, fakeDecode);
     expect(result.duration).toBeCloseTo(4 / 8000, 6);
     expect(result.peaks).toEqual(new Array(64).fill(1));
+  });
+
+  it("reads workspace audio from the normal file and keeps original_bytes NULL", async () => {
+    tmpDir = mkdtempSync(path.join(os.tmpdir(), "peaks-workspace-"));
+    const workspacePath = path.join(tmpDir, "Room");
+    const created = createWorkspaceRoom(workspacePath, "correct horse battery staple", "Room");
+    try {
+      const workspace = new WorkspaceService(created.db, workspacePath);
+      const bytes = encodeWav(new Float32Array(400).fill(0.5));
+      const entry = await workspace.createFile("call.wav", Readable.from([bytes]), "recording");
+      created.db.prepare("UPDATE files SET mime_type = 'audio/wav' WHERE id = ?").run(entry.fileId);
+
+      const result = await audioPeaksForRoom(
+        { db: created.db, path: workspacePath, workspace },
+        createPeakCache(),
+        entry.fileId,
+        64,
+      );
+      expect(result.peaks).toHaveLength(64);
+      expect(result.silent).toBe(false);
+      expect(created.db.prepare("SELECT original_bytes FROM files WHERE id = ?").get(entry.fileId))
+        .toEqual({ original_bytes: null });
+    } finally {
+      created.db.close();
+    }
   });
 });
 

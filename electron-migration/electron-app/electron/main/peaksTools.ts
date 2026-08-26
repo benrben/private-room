@@ -152,6 +152,7 @@ import { promisify } from "node:util";
 import type Database from "better-sqlite3-multiple-ciphers";
 import type { AudioPeaks } from "../shared/apiTypes.js";
 import type { OpenRoom } from "./turnEngine.js";
+import { readRoomFile } from "./workspace/roomContent.js";
 import { getFileFull, getFileMeta } from "./db-host/files.js";
 import { extensionOf } from "./editMatchExtraction.js";
 import { decodeWav, SAMPLE_RATE } from "./recFormat.js";
@@ -629,6 +630,43 @@ export async function audioPeaks(
   return computed;
 }
 
+/** Hybrid-room entry point: metadata stays in SQLCipher, while workspace
+ * audio bytes are streamed from the normal file instead of the nullable
+ * legacy blob column. */
+export async function audioPeaksForRoom(
+  room: OpenRoom,
+  cache: PeakCache,
+  id: string,
+  bucketsArg: number | null | undefined,
+  decode: DecodeToPcmFn = decodeAudioBytes,
+): Promise<AudioPeaks> {
+  const buckets = clampBuckets(bucketsArg);
+  const size = getFileMeta(room.db, id).sizeBytes;
+  const key = cacheKey(id, buckets, size);
+  const hit = cache.map.get(key);
+  if (hit !== undefined) return clonePeaks(hit);
+
+  const file = await readRoomFile({ db: room.db, path: room.path }, id);
+  const bytes = file.bytes ?? Buffer.alloc(0);
+  if (bytes.length === 0) throw new Error("This file has no audio to draw.");
+  const ext = extensionOf(file.name);
+  const kind = mediaKind(file.mimeType ?? "", ext);
+  if (kind === null) throw new Error("This file is not audio or video.");
+
+  let computed: AudioPeaks;
+  try {
+    const { samples, sampleRate } = await decode(bytes, ext, kind);
+    const duration = sampleRate > 0 ? samples.length / sampleRate : 0;
+    const peaks = envelope(samples, buckets);
+    computed = { peaks, duration, silent: isSilent(peaks) };
+  } catch (e) {
+    throw new Error(describeDecodeError(errMessage(e)));
+  }
+  if (cache.map.size >= MAX_CACHED) cache.map.clear();
+  cache.map.set(key, clonePeaks(computed));
+  return computed;
+}
+
 /**
  * Registers {@link audioPeaks} on the `audio_peaks` channel — the Rust
  * `#[tauri::command]` name (and `../shared/ipc-contract.ts`'s already-pinned
@@ -651,7 +689,10 @@ export function registerPeaksIpc(
 ): void {
   ipcMain.handle(
     "audio_peaks",
-    (_event: IpcMainInvokeEvent, args: { id: string; buckets: number | null }) =>
-      audioPeaks(openDb(room), cache, args.id, args.buckets, decode)
+    (_event: IpcMainInvokeEvent, args: { id: string; buckets: number | null }) => {
+      const open = room.currentRoom();
+      if (open === null) throw new Error(NO_ROOM_OPEN);
+      return audioPeaksForRoom(open, cache, args.id, args.buckets, decode);
+    }
   );
 }
