@@ -33,7 +33,7 @@ Legend:
 - [ ] Route recordings and recording recovery through `ContentStore`.
 - [ ] Route workflow and Studio outputs through `ContentStore`.
 - [ ] Route every Room MCP file tool through `ContentStore`.
-- [ ] Remove all higher-layer assumptions that current bytes live in SQLCipher.
+- [x] Remove all higher-layer assumptions that current bytes live in SQLCipher.
 
 ## Phase C: workspace database and services
 
@@ -207,7 +207,7 @@ Legend:
 - [x] Test power loss at every journal phase.
 - [x] Test database corruption while normal files remain safe.
 - [x] Test password change and recovery.
-- [ ] Test large video, recording and generated artifacts.
+- [x] Test large video, recording and generated artifacts.
 - [x] Test Unicode, case collisions, long paths and symlinks.
 - [ ] Test iCloud, Dropbox, network drives and offline placeholders.
 - [x] Test two-process and duplicate-room conflicts.
@@ -217,4 +217,4 @@ Legend:
 
 ## Current release gate
 
-The current branch is an implementation foundation, not general availability. Workspace room creation, the main text-file paths, explicit resumable legacy conversion, verified sealed export/import and checkpoint restore, and conflict-safe baseline copies work. Legacy compatibility remains. Native and Deep harness drivers exist behind flags. Cloud mirrors, complete byte-path migration, live orchestrator UI wiring and final security tests are still required.
+The current branch is an implementation foundation, not general availability. Workspace room creation, the audited current-byte paths, explicit resumable legacy conversion, verified sealed export/import and checkpoint restore, and conflict-safe baseline copies work. Legacy compatibility remains. Native and Deep harness drivers exist behind flags. Complete cloud-mirror enforcement, live orchestrator UI wiring and final security tests are still required.

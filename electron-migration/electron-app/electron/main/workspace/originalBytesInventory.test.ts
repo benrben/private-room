@@ -63,8 +63,10 @@ describe("files.original_bytes production inventory", () => {
     }
   });
 
-  it("keeps indirect legacy-blob callers visible until their cutover is complete", () => {
-    expect(inventory.knownIndirectBlobAssumptions.length).toBeGreaterThan(0);
+  it("keeps any indirect legacy-blob callers visible until their cutover is complete", () => {
+    expect(Array.isArray(inventory.knownIndirectBlobAssumptions)).toBe(true);
+    expect(new Set(inventory.knownIndirectBlobAssumptions.map((gap) => gap.path)).size)
+      .toBe(inventory.knownIndirectBlobAssumptions.length);
     for (const gap of inventory.knownIndirectBlobAssumptions) {
       expect(existsSync(path.join(repoRoot, gap.path)), gap.path).toBe(true);
       expect(gap.reason.trim(), gap.path).not.toBe("");

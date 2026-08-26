@@ -97,6 +97,8 @@ Browser captures and imports, `#transcribe` and `#research`, drawings and drawin
 
 Chat image/audio attachments, knowledge-command artifacts, saved streamed answers, and Story cast thumbnails now use normal workspace files too.
 
+Turn image attachment preparation, script fingerprint/manifest checks, and retrieval extraction/legacy-text repair now use the room content abstraction as well. Retrieval results are committed only when the normal file's captured SHA-256 is still current. The audited list of known higher-level blob assumptions is now empty. Synchronous blob helpers remain only as explicit legacy sealed-room implementations.
+
 ## Acceptance fixture map
 
 The tests use real SQLCipher databases and real filesystem paths. They do not use a fake in-memory file service.
@@ -116,9 +118,8 @@ The parity matrix is complete. Product parity is not complete.
 
 Main blockers:
 
-1. Route the remaining turn attachment preparation, script consent/manifest, and retrieval backfill paths through workspace storage. The exact source files are recorded in `config/original-bytes-inventory.json`.
-2. Connect Deep Harness runs to the same normalized Electron event and approval lifecycle.
-3. Guarantee redacted mirrors for every cloud Deep Harness run.
-4. Finish the full Electron suite, synced-folder and security release tests.
+1. Connect Deep Harness runs to the same normalized Electron event and approval lifecycle.
+2. Guarantee redacted mirrors for every cloud Deep Harness run.
+3. Finish the full Electron suite, synced-folder and security release tests.
 
 General availability must stay disabled until these blockers and the unchecked tasks in `WORKSPACE_HARNESS_TASKS.md` are complete.

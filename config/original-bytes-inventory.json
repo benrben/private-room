@@ -85,18 +85,5 @@
       "note": "All workspace inserts write NULL. Current bytes are written only to normal files."
     }
   ],
-  "knownIndirectBlobAssumptions": [
-    {
-      "path": "electron-migration/electron-app/electron/main/gatherContext.ts",
-      "reason": "Turn attachment preparation still reads attached image bytes synchronously from the legacy blob store."
-    },
-    {
-      "path": "electron-migration/electron-app/electron/main/scriptConsent.ts",
-      "reason": "Script fingerprints, manifests and approval checks still read script bytes through legacy blob helpers."
-    },
-    {
-      "path": "electron-migration/electron-app/electron/main/retrievalBackfill.ts",
-      "reason": "Background extraction and text-repair jobs still enumerate and rewrite content through legacy blob helpers instead of hash-checked workspace reads."
-    }
-  ]
+  "knownIndirectBlobAssumptions": []
 }
