@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -71,16 +72,39 @@ async function fixture() {
 describe("HarnessController", () => {
   it("runs local Ollama through the unified lifecycle without native-process isolation", async () => {
     const f = await fixture();
-    const events: Array<{ type?: string; status?: string }> = [];
+    const events: Array<{ type?: string; status?: string; runId?: string }> = [];
     const workspaceProgress: WorkspaceOperationProgressEvent[] = [];
+    let terminalRuntimePresent: boolean | undefined;
+    let complete!: () => void;
+    const completed = new Promise<void>((resolve) => { complete = resolve; });
     try {
+      const runtime = new EditingRuntime();
       const controller = new HarnessController(f.state, f.root, (event, payload) => {
-        events.push(payload as { type?: string; status?: string });
+        const row = payload as { type?: string; status?: string; runId?: string };
+        events.push(row);
         if (event === "workspace-operation-progress") {
           workspaceProgress.push(payload as WorkspaceOperationProgressEvent);
         }
+        if (event === "harness-event" && row.type === "run_completed" && row.runId) {
+          terminalRuntimePresent = existsSync(path.join(
+            f.root,
+            "Arcelle Runtime",
+            f.created.descriptor.roomId,
+            row.runId,
+          ));
+          complete();
+        }
       }, {
-        runtimes: { "ollama-local": new EditingRuntime() },
+        // Keep this unit test hermetic. Capability reporting covers every
+        // provider, so leaving the other four defaults here probes installed
+        // Codex/Claude processes and generates a schema under full-suite load.
+        runtimes: {
+          codex: runtime,
+          claude: runtime,
+          "ollama-local": runtime,
+          "ollama-cloud": runtime,
+          openrouter: runtime,
+        },
         flag: () => true,
         outsideWorkspaceIsolation: false,
       });
@@ -93,10 +117,9 @@ describe("HarnessController", () => {
         writeEnabled: true,
         text: "edit",
       });
-      for (let count = 0; count < 100 && !events.some((event) => event.type === "run_completed"); count += 1) {
-        await new Promise((resolve) => setTimeout(resolve, 10));
-      }
+      await completed;
       expect(events.find((event) => event.type === "run_completed")?.status).toBe("completed");
+      expect(terminalRuntimePresent).toBe(false);
       expect(workspaceProgress.filter((event) => event.phase === "snapshotting").map((event) => event.completed))
         .toEqual([0, 1]);
       expect(workspaceProgress.at(-1)).toMatchObject({
@@ -104,6 +127,44 @@ describe("HarnessController", () => {
       });
       expect(await readFile(path.join(f.roomPath, "notes.txt"), "utf8")).toContain("Reviewed");
     } finally {
+      f.created.db.close();
+    }
+  });
+
+  it("probes independent harness providers concurrently", async () => {
+    const f = await fixture();
+    let probesStarted = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    class GatedRuntime extends EditingRuntime {
+      override async available(): Promise<boolean> {
+        probesStarted += 1;
+        await gate;
+        return true;
+      }
+    }
+    try {
+      const runtime = new GatedRuntime();
+      const controller = new HarnessController(f.state, f.root, () => undefined, {
+        runtimes: {
+          codex: runtime,
+          claude: runtime,
+          "ollama-local": runtime,
+          "ollama-cloud": runtime,
+          openrouter: runtime,
+        },
+        flag: () => true,
+        outsideWorkspaceIsolation: false,
+      });
+      const checking = controller.capabilities();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(probesStarted).toBe(5);
+      release();
+      await expect(checking).resolves.toMatchObject({
+        providers: { "ollama-local": { enabled: true, installed: true } },
+      });
+    } finally {
+      release();
       f.created.db.close();
     }
   });

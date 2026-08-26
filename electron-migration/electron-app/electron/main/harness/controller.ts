@@ -216,16 +216,27 @@ export class HarnessController {
       }
       return { enabled: reason === null, installed, reason };
     };
+    // Provider probes may execute installed CLIs and their sandbox self-tests.
+    // They are independent, so running them serially makes one slow/missing
+    // executable hold every other provider's result behind it (and can turn a
+    // diagnostics refresh into the sum of all probe timeouts).
+    const [codex, claude, ollamaLocal, ollamaCloud, openrouter] = await Promise.all([
+      provider("codex", "codex_app_server"),
+      provider("claude", "claude_agent_sdk"),
+      deepProvider("ollama-local"),
+      deepProvider("ollama-cloud"),
+      deepProvider("openrouter"),
+    ]);
     return {
       flags,
       roomFormat: this.state.room?.descriptor?.kind ?? null,
       outsideWorkspaceIsolation: this.isolationProven,
       providers: {
-        codex: await provider("codex", "codex_app_server"),
-        claude: await provider("claude", "claude_agent_sdk"),
-        "ollama-local": await deepProvider("ollama-local"),
-        "ollama-cloud": await deepProvider("ollama-cloud"),
-        openrouter: await deepProvider("openrouter"),
+        codex,
+        claude,
+        "ollama-local": ollamaLocal,
+        "ollama-cloud": ollamaCloud,
+        openrouter,
       },
     };
   }
@@ -310,12 +321,22 @@ export class HarnessController {
         exposureVerified: true,
       });
       const pump = (async () => {
+        let terminal: HarnessEvent | null = null;
         try {
-          for await (const event of started.events) this.emit("harness-event", event);
+          for await (const event of started.events) {
+            // A terminal event is a lifecycle promise to the renderer: once it
+            // paints Done/Failed/Stopped, the private run directory and mirror
+            // must already be gone. Buffer the one terminal event until cleanup
+            // completes so callers cannot race a room close, test teardown, or
+            // the next run against a still-removing runtime tree.
+            if (event.type === "run_completed" || event.type === "run_failed") terminal = event;
+            else this.emit("harness-event", event);
+          }
         } finally {
-          this.pumps.delete(runId);
           await this.removeRunRuntime(runId);
+          this.pumps.delete(runId);
         }
+        if (terminal !== null) this.emit("harness-event", terminal);
       })();
       this.pumps.set(runId, pump);
       return runId;
@@ -460,6 +481,12 @@ export class HarnessController {
     const runRoot = this.runRoots.get(runId);
     this.runRoots.delete(runId);
     if (this.mirrors.has(runId)) await this.removeMirror(runId);
-    else if (runRoot !== undefined) await rm(runRoot, { recursive: true, force: true });
+    else if (runRoot !== undefined) {
+      // macOS can briefly report ENOTEMPTY while a just-exited provider's file
+      // descriptors settle. Node only retries recursive removal when
+      // maxRetries is explicit; keep this bounded and local to the per-run
+      // directory rather than leaking a transient cleanup race to the UI.
+      await rm(runRoot, { recursive: true, force: true, maxRetries: 3, retryDelay: 25 });
+    }
   }
 }
