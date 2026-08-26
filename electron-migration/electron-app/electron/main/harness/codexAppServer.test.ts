@@ -78,6 +78,47 @@ function probeChild(
   return child as unknown as ChildProcessWithoutNullStreams;
 }
 
+function completingTurnChild(
+  requests: Array<Record<string, unknown>>,
+): ChildProcessWithoutNullStreams {
+  const stdin = new PassThrough();
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+  const child = Object.assign(new EventEmitter(), {
+    stdin,
+    stdout,
+    stderr,
+    pid: 987_655,
+    kill: (signal: NodeJS.Signals = "SIGTERM") => {
+      queueMicrotask(() => child.emit("exit", null, signal));
+      return true;
+    },
+  });
+  stdin.on("data", (chunk) => {
+    for (const line of chunk.toString().split("\n").filter(Boolean)) {
+      const message = JSON.parse(line) as Record<string, unknown>;
+      requests.push(message);
+      const id = message.id;
+      if (id === undefined) continue;
+      if (message.method === "initialize") {
+        queueMicrotask(() => stdout.write(`${JSON.stringify({ id, result: { userAgent: "fake" } })}\n`));
+      } else if (message.method === "thread/start") {
+        queueMicrotask(() => stdout.write(`${JSON.stringify({ id, result: { thread: { id: "thread-1" } } })}\n`));
+      } else if (message.method === "turn/start") {
+        queueMicrotask(() => {
+          stdout.write(`${JSON.stringify({ id, result: { turn: { id: "turn-1" } } })}\n`);
+          setImmediate(() => stdout.write(`${JSON.stringify({
+            method: "turn/completed",
+            params: { turn: { id: "turn-1", status: "completed" } },
+          })}\n`));
+        });
+      }
+    }
+  });
+  stdin.on("finish", () => queueMicrotask(() => child.emit("exit", 0, null)));
+  return child as unknown as ChildProcessWithoutNullStreams;
+}
+
 describe("Codex app-server compatibility probe", () => {
   it("creates a private runtime home with only auth and config", async () => {
     const fixture = await codexHomeFixture();
@@ -185,6 +226,51 @@ exit 2`);
     await run.cancel();
     for await (const _event of run.events) { /* drain terminal cleanup */ }
     expect(kills).toContain("SIGTERM");
+  });
+
+  it.each([
+    { writeEnabled: false, threadSandbox: "read-only", turnSandbox: { type: "readOnly" } },
+    {
+      writeEnabled: true,
+      threadSandbox: "workspace-write",
+      turnSandbox: { type: "workspaceWrite", networkAccess: false },
+    },
+  ])("uses current Codex request enums when writeEnabled=$writeEnabled", async ({
+    writeEnabled,
+    threadSandbox,
+    turnSandbox,
+  }) => {
+    const fixture = await codexHomeFixture();
+    const requests: Array<Record<string, unknown>> = [];
+    const runtime = new CodexAppServerRuntime(
+      "codex",
+      (() => completingTurnChild(requests)) as never,
+      100,
+      fixture.sourceHome,
+    );
+    const run = await runtime.startTurn({
+      runId: `run-${writeEnabled ? "write" : "read"}`,
+      roomId: "room-1",
+      provider: "codex",
+      model: "test-model",
+      workspacePath: fixture.workspacePath,
+      runtimePath: fixture.runtimePath,
+      privacyMode: "cloud-direct",
+      writeEnabled,
+      exposureVerified: true,
+    }, { text: "Review notes.md." });
+    for await (const _event of run.events) { /* wait for the complete protocol */ }
+
+    const threadStart = requests.find((message) => message.method === "thread/start");
+    expect(threadStart?.params).toMatchObject({
+      approvalPolicy: "on-request",
+      sandbox: threadSandbox,
+    });
+    const turnStart = requests.find((message) => message.method === "turn/start");
+    expect(turnStart?.params).toMatchObject({
+      approvalPolicy: "on-request",
+      sandboxPolicy: turnSandbox,
+    });
   });
 
   it.runIf(installedCodex && nativeWorkspaceSandboxSupported())(

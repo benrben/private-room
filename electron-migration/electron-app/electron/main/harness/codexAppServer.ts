@@ -414,8 +414,8 @@ export class CodexAppServerRuntime implements HarnessRuntime {
           ? await request("thread/start", {
               model: context.model || undefined,
               cwd: context.workspacePath,
-              approvalPolicy: "unlessTrusted",
-              sandbox: context.writeEnabled ? "workspaceWrite" : "readOnly",
+              approvalPolicy: "on-request",
+              sandbox: context.writeEnabled ? "workspace-write" : "read-only",
               ephemeral: true,
             })
           : await request("thread/resume", { threadId: input.threadId, cwd: context.workspacePath });
@@ -432,7 +432,7 @@ export class CodexAppServerRuntime implements HarnessRuntime {
           threadId,
           input: [{ type: "text", text: prompt }],
           cwd: context.workspacePath,
-          approvalPolicy: "unlessTrusted",
+          approvalPolicy: "on-request",
           sandboxPolicy: context.writeEnabled
             ? { type: "workspaceWrite", writableRoots: [context.workspacePath], networkAccess: false }
             : { type: "readOnly" },
