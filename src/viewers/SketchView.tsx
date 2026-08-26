@@ -449,7 +449,10 @@ export default function SketchView({ fileId, text }: Props) {
       dropRevealTimers();
       // The one moment work can be lost: unmounting inside the idle window.
       if (dirty.current) {
-        void persist(docRef.current);
+        // An external-file refresh can be the reason for this unmount. Its new
+        // bytes intentionally make this stale optimistic write conflict; that
+        // safe refusal is not an unhandled renderer error.
+        void persist(docRef.current).catch(() => undefined);
       }
     },
     [dropRevealTimers, persist],

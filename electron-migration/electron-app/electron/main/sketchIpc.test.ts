@@ -88,6 +88,33 @@ describe("registerSketchIpc", () => {
     expect(row.extracted_text).toContain("hi");
   });
 
+  it("refreshes an open viewer for external saves but not its own autosave", async () => {
+    freshRoom();
+    const handle = vi.fn();
+    const emit = vi.fn();
+    registerSketchIpc({ handle }, roomSource(true), emit);
+    const meta = (await listener(handle, "create_sketch")({}, { name: "Flow" })) as { id: string };
+    const first =
+      '{"version":1,"width":1600,"height":1000,"seq":1,"elements":[' +
+      '{"id":"e1","type":"rect","x":10,"y":10,"w":80,"h":60,"ink":"blue"}]}';
+    emit.mockClear();
+
+    await listener(handle, "save_sketch")({}, {
+      id: meta.id,
+      doc: first,
+      snapshot: false,
+      editorAutosave: true,
+    });
+    expect(emit).not.toHaveBeenCalled();
+
+    await listener(handle, "save_sketch")({}, {
+      id: meta.id,
+      doc: first.replace('"blue"', '"green"'),
+      snapshot: false,
+    });
+    expect(emit).toHaveBeenCalledExactlyOnceWith("file-updated", meta.id);
+  });
+
   it("threads a supplied emit callback through to room-files-changed", async () => {
     freshRoom();
     const handle = vi.fn();

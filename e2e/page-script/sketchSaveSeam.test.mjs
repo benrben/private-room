@@ -17,6 +17,7 @@ import { dirname, join } from "node:path";
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, "../..");
 const VIEW = readFileSync(join(root, "src/viewers/SketchView.tsx"), "utf8");
+const API = readFileSync(join(root, "src/api.ts"), "utf8");
 
 /** The body of a `const <name> = ...` declaration, up to the next one. */
 function block(name, chars = 1400) {
@@ -84,7 +85,7 @@ test("workspace sketch writes and the close flush are serialized", () => {
   assert.match(persist, /saveChain\.current = write;/);
   assert.match(block("flush", 1600), /await persist\(next\);/);
   const cleanup = VIEW.slice(VIEW.indexOf("// A drawing has no Save button"), VIEW.indexOf("// ------------------------------------------------- the agent drawing here"));
-  assert.match(cleanup, /void persist\(docRef\.current\);/);
+  assert.match(cleanup, /void persist\(docRef\.current\)\.catch\(\(\) => undefined\);/);
   assert.doesNotMatch(cleanup, /void api\.saveSketch\(/);
 });
 
@@ -98,6 +99,7 @@ test("a sketch save carries the exact document it was based on", () => {
   assert.match(persist, /persistedDoc\.current/);
   assert.match(persist, /api\.saveSketch\([\s\S]*persistedDoc\.current/);
   assert.match(persist, /persistedDoc\.current = serialized;/);
+  assert.match(API, /save_sketch[\s\S]*editorAutosave: true/);
   const drawn = VIEW.slice(VIEW.indexOf(".onSketchDrawn"), VIEW.indexOf(".onSketchDrawn") + 1800);
   assert.match(drawn, /persistedDoc\.current = e\.doc;/);
 });

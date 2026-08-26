@@ -27,6 +27,11 @@ export interface RollbackResult {
 
 export interface RunChangeSummary {
   changedPaths: string[];
+  changedFiles: Array<{
+    fileId: string;
+    relativePath: string;
+    change: "created" | "modified" | "moved" | "deleted";
+  }>;
   count: number;
 }
 
@@ -168,7 +173,7 @@ export class RunProtection {
       "SELECT write_enabled, baseline_completed FROM agent_runs WHERE run_id = ?",
     ).get(runId) as { write_enabled: number; baseline_completed: number } | undefined;
     if (run?.write_enabled !== 1 || run.baseline_completed !== 1) {
-      return { changedPaths: [], count: 0 };
+      return { changedPaths: [], changedFiles: [], count: 0 };
     }
     await this.workspace.reconcile();
     // A terminal harness event is not final until changed normal files have a
@@ -211,11 +216,24 @@ export class RunProtection {
       ).run(runId, now.id, now.relative_path, now.content_sha256);
     }
     const changes = this.workspace.db.prepare(
-      `SELECT coalesce(final_path, baseline_path) AS path FROM agent_run_files
+      `SELECT file_id, coalesce(final_path, baseline_path) AS path, change_type
+       FROM agent_run_files
        WHERE run_id = ? AND change_type IN ('created', 'modified', 'moved', 'deleted')
        ORDER BY path`,
-    ).all(runId) as Array<{ path: string }>;
-    return { changedPaths: changes.map((row) => row.path), count: changes.length };
+    ).all(runId) as Array<{
+      file_id: string;
+      path: string;
+      change_type: "created" | "modified" | "moved" | "deleted";
+    }>;
+    return {
+      changedPaths: changes.map((row) => row.path),
+      changedFiles: changes.map((row) => ({
+        fileId: row.file_id,
+        relativePath: row.path,
+        change: row.change_type,
+      })),
+      count: changes.length,
+    };
   }
 
   async rollback(runId: string): Promise<RollbackResult> {

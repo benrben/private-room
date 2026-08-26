@@ -23,7 +23,11 @@ import {
 } from "./legacyCli.js";
 import { DeepAgentRuntime } from "./deepAgentRuntime.js";
 import { HarnessOrchestrator, type HarnessFinalStatus } from "./orchestrator.js";
-import { RunProtection, type RollbackResult } from "./runProtection.js";
+import {
+  RunProtection,
+  type RollbackResult,
+  type RunChangeSummary,
+} from "./runProtection.js";
 import { nativeWorkspaceSandboxSupported, verifyNativeHarnessExecutable } from "./seatbelt.js";
 import type {
   ApprovalDecision,
@@ -496,9 +500,16 @@ export class HarnessController {
     status: HarnessFinalStatus,
     send: (event: HarnessEvent) => void,
   ): Promise<HarnessFinalStatus> {
-    if (status !== "completed") return status;
+    // Reconciliation is also the authoritative change detector when provider
+    // hooks miss a write. Publish its stable file ids to the renderer before
+    // the terminal event, so an open viewer (especially an autosaving Sketch)
+    // reloads the bytes the agent actually left on disk. Failed/cancelled runs
+    // may leave reviewable changes too, so they need the same refresh.
     const summary = await protection.captureFinalState(runId);
-    if (summary.count <= 20) return status;
+    if (status !== "completed" || summary.count <= 20) {
+      this.refreshChangedFiles(summary);
+      return status;
+    }
     send({
       type: "approval_requested",
       runId,
@@ -510,9 +521,31 @@ export class HarnessController {
       this.pendingSafetyApprovals.set(runId, { resolve });
     });
     this.pendingSafetyApprovals.delete(runId);
-    if (approved) return status;
+    if (approved) {
+      this.refreshChangedFiles(summary);
+      return status;
+    }
     await protection.rollback(runId);
+    this.refreshChangedFiles(summary);
     return "cancelled";
+  }
+
+  private refreshChangedFiles(summary: RunChangeSummary): void {
+    if (summary.count === 0) return;
+    const room = this.state.room;
+    if (room?.workspace === undefined) return;
+    this.emit("room-files-changed", undefined);
+    const present = room.workspace.db.prepare(
+      "SELECT 1 FROM files WHERE id = ? AND trashed_at IS NULL",
+    );
+    for (const change of summary.changedFiles) {
+      // Deleted files have no content to reload. After a denied mass-change,
+      // this same check naturally includes restored baseline files and skips
+      // newly-created files that rollback moved to Arcelle trash.
+      if (present.get(change.fileId) !== undefined) {
+        this.emit("file-updated", change.fileId);
+      }
+    }
   }
 
   private async removeMirror(runId: string): Promise<void> {

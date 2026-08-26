@@ -57,7 +57,7 @@ async function fixture() {
   await writeFile(source, "Ben Reich signed", "utf8");
   const created = createWorkspaceRoom(roomPath, "correct horse battery staple", "Room");
   const workspace = new WorkspaceService(created.db, roomPath);
-  await workspace.importFile(source, "notes.txt");
+  const imported = await workspace.importFile(source, "notes.txt");
   const state = createRoomManagerState();
   state.room = {
     conn: created.db,
@@ -67,7 +67,7 @@ async function fixture() {
     descriptor: created.descriptor,
     workspace,
   };
-  return { root, roomPath, created, state };
+  return { root, roomPath, created, state, fileId: imported.fileId };
 }
 
 describe("HarnessController", () => {
@@ -110,6 +110,8 @@ describe("HarnessController", () => {
   it("runs local Ollama through the unified lifecycle without native-process isolation", async () => {
     const f = await fixture();
     const events: Array<{ type?: string; status?: string; runId?: string }> = [];
+    const emittedNames: string[] = [];
+    const updatedIds: string[] = [];
     const workspaceProgress: WorkspaceOperationProgressEvent[] = [];
     let terminalRuntimePresent: boolean | undefined;
     let complete!: () => void;
@@ -117,8 +119,10 @@ describe("HarnessController", () => {
     try {
       const runtime = new EditingRuntime();
       const controller = new HarnessController(f.state, f.root, (event, payload) => {
+        emittedNames.push(event);
+        if (event === "file-updated") updatedIds.push(String(payload));
         const row = payload as { type?: string; status?: string; runId?: string };
-        events.push(row);
+        if (event === "harness-event") events.push(row);
         if (event === "workspace-operation-progress") {
           workspaceProgress.push(payload as WorkspaceOperationProgressEvent);
         }
@@ -163,6 +167,12 @@ describe("HarnessController", () => {
         operation: "write-baseline", phase: "completed", status: "completed",
       });
       expect(await readFile(path.join(f.roomPath, "notes.txt"), "utf8")).toContain("Reviewed");
+      expect(emittedNames).toContain("room-files-changed");
+      expect(emittedNames).toContain("file-updated");
+      expect(updatedIds).toEqual([f.fileId]);
+      expect(emittedNames.indexOf("file-updated")).toBeLessThan(
+        emittedNames.lastIndexOf("harness-event"),
+      );
     } finally {
       f.created.db.close();
     }

@@ -13,9 +13,11 @@
  * Every handler is THIN: no logic of its own beyond resolving the open
  * room's `db`, forwarding arguments, and — for the three commands whose Rust
  * wrapper ends in `let _ = app.emit("room-files-changed", ())` — sending
- * that one broadcast. `save_sketch` deliberately sends none: its whole point
- * is to stay off the path that makes the Library, the gallery and the viewer
- * all re-read while the pointer is still down (see `writeSketch`'s doc).
+ * that one broadcast. The open canvas marks its own frequent `save_sketch`
+ * calls as `editorAutosave`, which stays off the path that makes the Library,
+ * gallery and viewer re-read while the pointer is still down. Other callers
+ * get a file-specific refresh: otherwise an open canvas can retry its obsolete
+ * document over bytes a tool has just committed.
  *
  * `RoomSource` reuses `recIpc.ts`'s own shape rather than inventing a second
  * "how do I reach the open room" convention — a future host-state batch
@@ -66,8 +68,15 @@ export function registerSketchIpc(ipcMain: Pick<IpcMain, "handle">, room: RoomSo
     emitSafely(emit, "room-files-changed", undefined);
     return meta;
   });
-  handle("save_sketch", async (args: { id: string; doc: string; snapshot: boolean; expectedDoc?: string }) => {
+  handle("save_sketch", async (args: {
+    id: string;
+    doc: string;
+    snapshot: boolean;
+    expectedDoc?: string;
+    editorAutosave?: boolean;
+  }) => {
     await writeSketchInRoom(openRoom(room), args.id, args.doc, args.snapshot, args.expectedDoc);
+    if (args.editorAutosave !== true) emitSafely(emit, "file-updated", args.id);
   });
   handle("export_sketch_svg", async (args: { id: string }) => {
     const meta = await exportSketchSvgInRoom(openRoom(room), args.id);

@@ -1219,9 +1219,11 @@ export const api = {
   // Drawings autosave several times a minute, so they do NOT go through
   // updateFileContent: that snapshots a version, reindexes and broadcasts
   // room-files-changed on every call. `snapshot` is true once per editing
-  // session, which is where version history actually belongs.
+  // session, which is where version history actually belongs. The host does
+  // not echo this canvas's own autosave back as an external-file refresh;
+  // every non-editor caller of the channel gets that refresh by default.
   saveSketch: (id: string, doc: string, snapshot: boolean, expectedDoc?: string): Promise<void> =>
-    invoke<void>("save_sketch", { id, doc, snapshot, expectedDoc }),
+    invoke<void>("save_sketch", { id, doc, snapshot, expectedDoc, editorAutosave: true }),
   exportSketchSvg: (id: string): Promise<FileMeta> =>
     invoke<FileMeta>("export_sketch_svg", { id }),
   /** …and as a flat picture, for everywhere that will not take a vector. */
