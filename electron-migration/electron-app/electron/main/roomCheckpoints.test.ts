@@ -40,6 +40,8 @@ import {
   chmodSync,
   existsSync,
   mkdtempSync,
+  readFileSync,
+  readdirSync,
   rmSync,
   statSync,
   unlinkSync,
@@ -47,6 +49,7 @@ import {
 } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
 import type Database from "better-sqlite3-multiple-ciphers";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -80,8 +83,10 @@ vi.mock("./db-host/checkpoints.js", async (importOriginal) => {
 import { getFileFull, insertFile, updateFileContent } from "./db-host/files.js";
 import { createRoom as dbCreateRoom, openRoom as dbOpenRoom } from "./db-host/open.js";
 import {
+  createRoom,
   createRoomManagerState,
   spawnRoomServerIfEnabledNotImplemented,
+  teardownOpenRoom,
   type RoomManagerDeps,
   type RoomManagerState,
 } from "./roomManager.js";
@@ -96,6 +101,7 @@ import {
   rollbackRoomCheckpoint,
   strandedCheckpointNames,
 } from "./roomCheckpoints.js";
+import { inspectSealedPackage } from "./workspace/sealedPackage.js";
 
 const PASSWORD = "correct horse battery staple";
 const OTHER_PASSWORD = "a totally different passphrase";
@@ -171,6 +177,51 @@ function openRoomState(
   state.room = { conn, path: roomPath, name: "QA Room", password: PASSWORD };
   return { state, deps: baseDeps(dir, overrides), dir, roomPath };
 }
+
+describe("workspace-folder checkpoints", () => {
+  it("packages normal files and restores through a verified sibling while keeping a backup", async () => {
+    const dir = freshDir();
+    const roomPath = path.join(dir, "Workspace Room");
+    const state = createRoomManagerState();
+    const deps = baseDeps(dir);
+    createRoom(state, deps, roomPath, PASSWORD, "Workspace Room", "workspace-folder");
+    try {
+      const room = state.room!;
+      const sourcePath = path.join(dir, "source.txt");
+      writeFileSync(sourcePath, "checkpoint content", "utf8");
+      const imported = await room.workspace!.importFile(sourcePath, "notes.txt");
+      const roomId = room.descriptor!.roomId;
+
+      const saved = await createRoomCheckpoint(state, "Before edit");
+      expect(inspectSealedPackage(
+        checkpointFilePath(checkpointsDir(roomPath), saved.id),
+        PASSWORD,
+      )).toMatchObject({ purpose: "checkpoint", roomId, fileCount: 1 });
+
+      await room.workspace!.writeAtomic(
+        imported.fileId,
+        Readable.from(Buffer.from("changed after checkpoint")),
+        imported.sha256 ?? undefined,
+      );
+      const info = await rollbackRoomCheckpoint(state, deps, saved.id, FAST);
+
+      expect(info.path).toBe(roomPath);
+      expect(readFileSync(path.join(roomPath, "notes.txt"), "utf8")).toBe("checkpoint content");
+      expect(state.room?.descriptor?.roomId).toBe(roomId);
+      expect(state.room?.conn.prepare(
+        "SELECT original_bytes, storage_kind FROM files WHERE relative_path = 'notes.txt'",
+      ).get()).toEqual({ original_bytes: null, storage_kind: "workspace" });
+
+      const backups = readdirSync(dir).filter((name) => name.includes(".before-checkpoint-") && name.endsWith(".backup"));
+      expect(backups).toHaveLength(1);
+      expect(readFileSync(path.join(dir, backups[0]!, "notes.txt"), "utf8"))
+        .toBe("changed after checkpoint");
+      expect(listRoomCheckpoints(state).entries.some((entry) => entry.auto)).toBe(true);
+    } finally {
+      teardownOpenRoom(state, deps);
+    }
+  });
+});
 
 /** Plant a real, valid `.roomck` encrypted under a DIFFERENT password, with a
  * manifest entry naming it — exactly what a `change_password` re-key that

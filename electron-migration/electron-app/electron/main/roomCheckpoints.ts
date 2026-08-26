@@ -195,7 +195,9 @@
  * `electron/shared/ipc-contract.ts`, which already declares all five.
  */
 
-import { existsSync, statSync, unlinkSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, renameSync, rmSync, statSync, unlinkSync } from "node:fs";
+import path from "node:path";
 import type { IpcMain, IpcMainInvokeEvent } from "electron";
 import type { CheckpointMeta, RoomInfo } from "../shared/apiTypes.js";
 import {
@@ -207,6 +209,8 @@ import {
   pruneAutoCheckpoints,
   readManifest,
   reconcile,
+  nowDate,
+  nowTimestamp,
   writeCheckpoint,
   writeManifest,
 } from "./db-host/checkpoints.js";
@@ -223,6 +227,11 @@ import {
   type RoomManagerState,
 } from "./roomManager.js";
 import { ROLLBACK_BUSY } from "./turnContext.js";
+import {
+  createSealedPackage,
+  importSealedPackage,
+  inspectSealedPackage,
+} from "./workspace/sealedPackage.js";
 
 /** Idea 9: the list command's payload — entries (newest first) plus the total
  * on-disk size, for the disk-growth warning. Ported from `CheckpointList`,
@@ -267,10 +276,56 @@ export function createCheckpointCore(
   auto: boolean
 ): CheckpointMeta {
   const room = requireRoom(state);
+  if (room.workspace !== undefined) {
+    throw new Error("Workspace checkpoints must be created through the asynchronous checkpoint command.");
+  }
   try {
     return writeCheckpoint(room.conn, checkpointsDir(room.path), name, auto);
   } catch (err) {
     throw humanizeStorageError(err, room.path);
+  }
+}
+
+async function createWorkspaceCheckpoint(
+  state: RoomManagerState,
+  name: string,
+  auto: boolean,
+): Promise<CheckpointMeta> {
+  const room = requireRoom(state);
+  if (room.workspace === undefined || room.descriptor?.kind !== "workspace-folder") {
+    throw new Error("This room is not a workspace folder.");
+  }
+  const dir = checkpointsDir(room.path);
+  try {
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+  } catch (error) {
+    throw new Error(`Could not create the checkpoints folder: ${errMsg(error)}`);
+  }
+  const manifest = reconcile(dir);
+  const id = randomUUID();
+  const payloadPath = checkpointFilePath(dir, id);
+  try {
+    await createSealedPackage(
+      room.workspace,
+      room.descriptor.roomId,
+      room.password,
+      payloadPath,
+      room.password,
+      "checkpoint",
+    );
+    const trimmed = name.trim();
+    const meta: CheckpointMeta = {
+      id,
+      name: trimmed.length > 0 ? trimmed : `Checkpoint — ${nowDate()}`,
+      createdAt: nowTimestamp(),
+      sizeBytes: statSync(payloadPath).size,
+      auto,
+    };
+    manifest.entries.push(meta);
+    writeManifest(dir, manifest);
+    return meta;
+  } catch (error) {
+    throw humanizeStorageError(error, room.path);
   }
 }
 
@@ -299,6 +354,9 @@ export async function createRoomCheckpoint(
 ): Promise<CheckpointMeta> {
   if (state.rollingBack) {
     throw new Error(ROLLBACK_BUSY);
+  }
+  if (requireRoom(state).workspace !== undefined) {
+    return createWorkspaceCheckpoint(state, name, false);
   }
   return createCheckpointCore(state, name, false);
 }
@@ -463,6 +521,115 @@ function checkpointPayloadPresent(ckPath: string): boolean {
   }
 }
 
+async function rollbackWorkspaceCheckpoint(
+  state: RoomManagerState,
+  deps: RoomManagerDeps,
+  id: string,
+  timing?: DrainTiming,
+): Promise<RoomInfo> {
+  const room = requireRoom(state);
+  if (room.workspace === undefined || room.descriptor?.kind !== "workspace-folder") {
+    throw new Error("This room is not a workspace folder.");
+  }
+  const roomPath = room.path;
+  const password = room.password;
+  const dir = checkpointsDir(roomPath);
+  const ckPath = checkpointFilePath(dir, id);
+  if (!checkpointPayloadPresent(ckPath)) throw new Error(CHECKPOINT_GONE);
+  const packageInfo = inspectSealedPackage(ckPath, password);
+  if (packageInfo.purpose !== "checkpoint" || packageInfo.roomId !== room.descriptor.roomId) {
+    throw new Error("That checkpoint does not belong to this workspace.");
+  }
+  if (state.rollingBack) throw new Error(ROLLBACK_BUSY);
+  state.rollingBack = true;
+
+  const parent = path.dirname(roomPath);
+  const base = path.basename(roomPath);
+  const restorePath = path.join(parent, `.${base}.${randomUUID()}.restore.tmp`);
+  const backupPath = path.join(parent, `.${base}.before-checkpoint-${randomUUID()}.backup`);
+  try {
+    const report = await drainInflight(state, deps, timing);
+    if (!report.asksDrained || !report.jobsDrained) throw new Error(DRAIN_NOT_CLEAN);
+    if (state.cancel.cancels.size > 0 || state.cancel.jobCancels.size > 0) {
+      throw new Error(DRAIN_NOT_CLEAN);
+    }
+    if (!checkpointPayloadPresent(ckPath)) throw new Error(CHECKPOINT_GONE);
+
+    const targetName = checkpointName(dir, id);
+    try {
+      await createWorkspaceCheckpoint(state, `Before rollback to "${targetName}"`, true);
+    } catch (error) {
+      throw new Error(`Could not take a safety copy before rolling back: ${errMsg(error)}`);
+    }
+    pruneAutoCheckpoints(dir, 3);
+
+    // Build and fully verify the replacement before moving the live folder.
+    try {
+      await importSealedPackage(ckPath, password, restorePath, password, {
+        preserveRoomIdentity: true,
+      });
+    } catch (error) {
+      rmSync(restorePath, { recursive: true, force: true });
+      throw new Error(`Could not prepare the checkpoint restore: ${errMsg(error)}`);
+    }
+
+    teardownOpenRoom(state, deps);
+    let originalMoved = false;
+    try {
+      renameSync(roomPath, backupPath);
+      originalMoved = true;
+      renameSync(restorePath, roomPath);
+    } catch (error) {
+      if (originalMoved && !existsSync(roomPath)) {
+        try { renameSync(backupPath, roomPath); } catch { /* reported below by reopen */ }
+      }
+      rmSync(restorePath, { recursive: true, force: true });
+      let reopenError: string | null = null;
+      try { openRoomImpl(state, deps, roomPath, password); } catch (reopen) { reopenError = errMsg(reopen); }
+      const detail = reopenError === null
+        ? "The original workspace was reopened."
+        : `The original workspace is at ${backupPath}, but reopening failed: ${reopenError}`;
+      throw new Error(`Could not replace the workspace with its checkpoint: ${errMsg(error)}. ${detail}`);
+    }
+
+    let info: RoomInfo;
+    try {
+      info = openRoomImpl(state, deps, roomPath, password);
+    } catch (error) {
+      // A verified restore that cannot open must not strand the user. Put the
+      // original folder back, then reopen it. The checkpoint payload remains.
+      const failedPath = path.join(parent, `.${base}.${randomUUID()}.failed-restore`);
+      let recoveryError: string | null = null;
+      try {
+        renameSync(roomPath, failedPath);
+        renameSync(backupPath, roomPath);
+        openRoomImpl(state, deps, roomPath, password);
+        rmSync(failedPath, { recursive: true, force: true });
+      } catch (recovery) {
+        recoveryError = errMsg(recovery);
+      }
+      if (recoveryError === null) {
+        throw new Error(`The checkpoint was prepared but could not be opened: ${errMsg(error)}. The original workspace was restored.`);
+      }
+      throw new Error(
+        `The checkpoint could not be opened (${errMsg(error)}), and automatic recovery also failed ` +
+          `(${recoveryError}). The original workspace backup is at ${backupPath}.`,
+      );
+    }
+
+    try {
+      deps.emit?.("room-rolled-back", info);
+      deps.emit?.("room-rollback-backup-created", { path: backupPath });
+    } catch {
+      // The restore is complete; notification failure cannot reverse it.
+    }
+    return info;
+  } finally {
+    state.rollingBack = false;
+    rmSync(restorePath, { recursive: true, force: true });
+  }
+}
+
 /**
  * Idea 9: roll the room back to a checkpoint. See this file's module doc for
  * the full eleven-step sequence and why each step is ordered where it is —
@@ -481,6 +648,10 @@ export async function rollbackRoomCheckpoint(
 ): Promise<RoomInfo> {
   if (!checkpointIdOk(id)) {
     throw new Error(NOT_A_CHECKPOINT_ID);
+  }
+
+  if (requireRoom(state).workspace !== undefined) {
+    return rollbackWorkspaceCheckpoint(state, deps, id, timing);
   }
 
   // Snapshot (path, password) from the OPEN room — the room holds the password

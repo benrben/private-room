@@ -523,17 +523,36 @@ export class WorkspaceService {
 
   private insertManifestEntry(entry: ManifestEntry): string {
     const fileId = randomUUID();
-    this.db.prepare(
-      `INSERT INTO files(
-         id, name, mime_type, size_bytes, source, original_bytes, storage_kind, relative_path,
-         path_key, content_sha256, mtime_ns, fs_identity, index_state, last_seen_at
-       ) VALUES (?, ?, ?, ?, 'external', NULL, 'workspace', ?, ?, ?, ?, ?, 'pending',
-         strftime('%Y-%m-%dT%H:%M:%SZ','now'))`,
-    ).run(
-      fileId, path.basename(entry.relativePath), mimeForName(entry.relativePath), entry.sizeBytes,
-      entry.relativePath, entry.pathKey, entry.sha256, entry.mtimeNs, entry.fsIdentity,
-    );
-    return fileId;
+    try {
+      this.db.prepare(
+        `INSERT INTO files(
+           id, name, mime_type, size_bytes, source, original_bytes, storage_kind, relative_path,
+           path_key, content_sha256, mtime_ns, fs_identity, index_state, last_seen_at
+         ) VALUES (?, ?, ?, ?, 'external', NULL, 'workspace', ?, ?, ?, ?, ?, 'pending',
+           strftime('%Y-%m-%dT%H:%M:%SZ','now'))`,
+      ).run(
+        fileId, path.basename(entry.relativePath), mimeForName(entry.relativePath), entry.sizeBytes,
+        entry.relativePath, entry.pathKey, entry.sha256, entry.mtimeNs, entry.fsIdentity,
+      );
+      return fileId;
+    } catch (error) {
+      // A watcher hint, an explicit rescan, and a trusted import may overlap.
+      // If another path won the insert race, keep its stable file ID and only
+      // refresh its projection. Do not turn a harmless duplicate scan into a
+      // UNIQUE-constraint failure.
+      const code = (error as { code?: unknown }).code;
+      if (typeof code === "string" && code.startsWith("SQLITE_CONSTRAINT")) {
+        const existing = this.db.prepare(
+          `SELECT id FROM files
+           WHERE storage_kind = 'workspace' AND trashed_at IS NULL AND path_key = ?`,
+        ).get(entry.pathKey) as { id: string } | undefined;
+        if (existing !== undefined) {
+          this.updateManifestRow(existing.id, entry, "ready");
+          return existing.id;
+        }
+      }
+      throw error;
+    }
   }
 
   /** Mark interrupted operations for reconciliation; no guessed destructive repair. */

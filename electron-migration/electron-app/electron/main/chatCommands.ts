@@ -67,7 +67,7 @@
  *     real `stripThinkSpans` and `capabilities.ts`'s real `declaredFor`/
  *     `Support` (this port's `is_cli_engine`-successor, per that module's own
  *     doc).
- *   - `#checkpoint` — over `roomCheckpoints.ts`'s real `createCheckpointCore`.
+ *   - `#checkpoint` — over `roomCheckpoints.ts`'s format-aware checkpoint command.
  *   - {@link watchStream} — the Stop/stall watchdog race, pure and fully
  *     ported (both Rust tests reproduced) — see its own doc for the one place
  *     the JS/Rust cancellation MODELS genuinely differ.
@@ -117,7 +117,7 @@
  * `OpenRoom{db,path}` view); {@link RunCommandDeps.checkpointState} is
  * `roomManager.ts`'s `RoomManagerState` (a `Room{conn,path,name,password}`
  * view), because `#checkpoint` reuses `roomCheckpoints.ts`'s real
- * `createCheckpointCore(state, name, auto)` verbatim rather than re-deriving a
+ * `createRoomCheckpoint(state, name)` rather than re-deriving a
  * third shape. Rust's `run_command` also touches the room lock twice (Phase 1's
  * `state.room.lock()` block, then `create_checkpoint_core`'s own
  * `state.with_room(...)`) — two acquisitions of ONE mutex, not two objects —
@@ -150,7 +150,7 @@ import { stripThinkSpans, listModels as listModelsReal } from "./engineRouting.j
 import { bestLocalDefault } from "./ollamaModels.js";
 import { generate as generateReal, chatStructured as chatStructuredReal } from "./ollamaGenerate.js";
 import { defaultProviderDeps, type ProviderDeps } from "./providers.js";
-import { createCheckpointCore } from "./roomCheckpoints.js";
+import { createRoomCheckpoint } from "./roomCheckpoints.js";
 import type { RoomManagerState } from "./roomManager.js";
 import { TurnId, type EventSender } from "./turn.js";
 import { createToolEffects, effectsJson, type ToolEffects } from "./execTool.js";
@@ -738,7 +738,7 @@ export interface RunCommandDeps {
    * FLAT" section for why this file does NOT call `registerRun`. */
   cancelState: CancelState;
   send: EventSender;
-  /** `#checkpoint`'s real target — `roomCheckpoints.ts`'s `createCheckpointCore`
+  /** `#checkpoint`'s real target — `roomCheckpoints.ts`'s `createRoomCheckpoint`
    * takes the full `RoomManagerState`, not the narrower `TurnRoomSource`. */
   checkpointState: RoomManagerState;
   /** Overridable for tests; defaults to `engineRouting.ts`'s real `listModels`. */
@@ -800,7 +800,7 @@ export async function runCommand(req: RunCommandRequest, deps: RunCommandDeps): 
     // the model, so short-circuit before the Ollama probe (a checkpoint must
     // work even with the local AI stopped). Rollback stays gated in Settings.
     if (req.command === "checkpoint") {
-      const meta = createCheckpointCore(deps.checkpointState, req.args.trim(), false);
+      const meta = await createRoomCheckpoint(deps.checkpointState, req.args.trim());
       const content = `Saved checkpoint **${meta.name}**. Roll back to it in Settings → Checkpoints.`;
       return persistAssistantReply(deps.room, req.chatId, content, [], null);
     }

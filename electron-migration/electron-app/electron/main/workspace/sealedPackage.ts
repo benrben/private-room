@@ -38,6 +38,11 @@ export interface SealedImportResult {
   objectCount: number;
 }
 
+export interface SealedImportOptions {
+  /** Checkpoint restore keeps the logical room identity stored in the package. */
+  preserveRoomIdentity?: boolean;
+}
+
 interface SealedFileRow {
   file_id: string;
   relative_path: string;
@@ -357,6 +362,7 @@ export async function importSealedPackage(
   packagePassword: string,
   destinationPath: string,
   workspacePassword = packagePassword,
+  options: SealedImportOptions = {},
 ): Promise<SealedImportResult> {
   const source = path.resolve(packagePath);
   const destination = path.resolve(destinationPath);
@@ -424,11 +430,11 @@ export async function importSealedPackage(
        DROP TABLE sealed_objects;
        DROP TABLE sealed_package_meta;`,
     );
-    const roomId = randomUUID();
+    const roomId = options.preserveRoomIdentity ? sourceInfo.roomId : randomUUID();
     setMeta(db, "room_kind", "workspace-folder");
     setMeta(db, "workspace_room_id", roomId);
     setMeta(db, "workspace_format_version", String(WORKSPACE_FORMAT_VERSION));
-    setMeta(db, "name", path.basename(destination));
+    if (!options.preserveRoomIdentity) setMeta(db, "name", path.basename(destination));
     if (workspacePassword !== packagePassword) rekey(db, workspacePassword);
     vacuum(db);
     const marker: WorkspaceMarker = {

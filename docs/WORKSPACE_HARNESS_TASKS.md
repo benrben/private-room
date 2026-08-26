@@ -102,8 +102,8 @@ Legend:
 - [x] Implement consistent sealed `.arcelle` creation.
 - [x] Verify schema, password, file count, size and hashes before publish.
 - [x] Import a sealed package into a new workspace.
-- [ ] Rebuild `.roomck` checkpoints with the same packager.
-- [ ] Restore through a verified sibling workspace and recoverable backup.
+- [x] Rebuild `.roomck` checkpoints with the same packager.
+- [x] Restore through a verified sibling workspace and recoverable backup.
 
 ## Phase G: unified harness foundation
 
@@ -213,4 +213,4 @@ Legend:
 
 ## Current release gate
 
-The current branch is an implementation foundation, not general availability. Workspace room creation, the main text-file paths, explicit resumable legacy conversion, verified sealed export and import, and conflict-safe baseline copies work. Legacy compatibility remains. Native and Deep harness drivers exist behind flags. Workspace checkpoint restore, cloud mirrors, complete byte-path migration, live orchestrator UI wiring and final security tests are still required.
+The current branch is an implementation foundation, not general availability. Workspace room creation, the main text-file paths, explicit resumable legacy conversion, verified sealed export/import and checkpoint restore, and conflict-safe baseline copies work. Legacy compatibility remains. Native and Deep harness drivers exist behind flags. Cloud mirrors, complete byte-path migration, live orchestrator UI wiring and final security tests are still required.
