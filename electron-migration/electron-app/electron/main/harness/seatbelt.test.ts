@@ -39,6 +39,9 @@ describe("native workspace Seatbelt", () => {
     });
     const canonicalWorkspace = await realpath(f.workspacePath);
     expect(profile).toContain('(deny file-read* file-write* (subpath "/Users")');
+    expect(profile).toContain('(allow file-read-metadata (literal "/var"))');
+    const broadDeny = profile.split("\n").find((line) => line.startsWith("(deny file-read* file-write*"));
+    expect(broadDeny).toContain('(subpath "/var")');
     expect(profile).toContain(`(allow file-write* (subpath "${canonicalWorkspace}"))`);
     expect(profile).toContain(`(deny file-read* file-write* (subpath "${path.join(canonicalWorkspace, ".arcelle")}"))`);
   });
@@ -63,6 +66,28 @@ describe("native workspace Seatbelt", () => {
       provider: "codex",
       writeEnabled: false,
     })).toBe(true);
+  });
+
+  it.runIf(nativeWorkspaceSandboxSupported())("allows /var symlink traversal without exposing its file data", async () => {
+    const f = await fixture();
+    const outside = path.join(f.root, "outside-via-var.txt");
+    await writeFile(outside, "outside", "utf8");
+    const canonicalOutside = await realpath(outside);
+    expect(canonicalOutside.startsWith("/private/var/")).toBe(true);
+    const aliasOutside = canonicalOutside.replace(/^\/private\/var/, "/var");
+    const profile = nativeWorkspaceSeatbeltProfile({
+      workspacePath: f.workspacePath,
+      runtimePath: f.runtimePath,
+      executable: "/bin/sh",
+      provider: "codex",
+      writeEnabled: false,
+    });
+    const result = spawnSync(
+      "/usr/bin/sandbox-exec",
+      ["-p", profile, "/bin/sh", "-c", 'test -d /var && ! cat "$1" >/dev/null 2>&1', "arcelle", aliasOutside],
+      { encoding: "utf8", timeout: 5_000 },
+    );
+    expect(result.status).toBe(0);
   });
 
   it.runIf(nativeWorkspaceSandboxSupported())("refuses an exposed workspace symlink", async () => {

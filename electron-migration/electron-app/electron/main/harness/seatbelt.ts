@@ -77,6 +77,10 @@ export function nativeWorkspaceSeatbeltProfile(options: NativeWorkspaceSandbox):
     `(allow file-read-metadata ${literalClauses(ancestorPaths([
       workspace, runtime, executable, ...providerRead, ...providerLiterals,
     ]))})`,
+    // macOS hostname resolution traverses the public /var symlink before it
+    // reaches /private/var. Metadata for the symlink itself is enough; file
+    // data and every write below /var remain covered by the broad deny above.
+    `(allow file-read-metadata (literal "/var"))`,
     `(allow file-read* ${clauses(["/Library/Apple", "/private/etc", "/private/var/db", "/dev"])})`,
     `(allow file-read* ${clauses([workspace, runtime, ...providerRead])} ${literalClauses(providerLiterals)})`,
     `(allow file-write* (subpath ${quoteSeatbelt(runtime)}))`,
