@@ -7,7 +7,7 @@
  * ones, not a hand-rolled stand-in for the browser core.
  */
 
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -15,6 +15,8 @@ import type Database from "better-sqlite3-multiple-ciphers";
 import type { BrowseJournalRow, PageMeta } from "../../shared/apiTypes.js";
 import { createRoom } from "../db-host/open.js";
 import { getFileMeta, getWebMeta, insertFileFromUrl, listFiles } from "../db-host/files.js";
+import { createWorkspaceRoom } from "../workspace/roomLayout.js";
+import { WorkspaceService } from "../workspace/workspaceService.js";
 import { Browser, type BrowserDeps } from "./browser.js";
 import type { CreatePageDeps, LivePage, WindowContentView } from "./webviewManager.js";
 import {
@@ -303,6 +305,38 @@ const ARTICLE_HTML =
   "it decides what the article on this page actually is.</p></article></body></html>";
 
 describe("captureAndSave", () => {
+  it("stores workspace captures as normal files and keeps current bytes out of SQLCipher", async () => {
+    tmpDir = mkdtempSync(path.join(os.tmpdir(), "browse-saved-workspace-"));
+    const root = path.join(tmpDir, "Room");
+    const { db } = createWorkspaceRoom(root, "correct horse battery staple", "Test Room");
+    const workspace = new WorkspaceService(db, root);
+    const browser = browserAnswering(db, {
+      ok: true,
+      title: "Workspace article",
+      url: "https://example.com/workspace",
+      text: "selected words",
+      html: "",
+      truncated: false,
+    });
+    const deps = recordingDeps(db, browser);
+    deps.workspace = workspace;
+    deps.roomPath = root;
+
+    await captureAndSave(deps, "selection");
+
+    const file = listFiles(db)[0]!;
+    expect(readFileSync(path.join(root, file.name), "utf8")).toContain("selected words");
+    const row = db.prepare(
+      "SELECT storage_kind, original_bytes, origin_url FROM files WHERE id = ?",
+    ).get(file.id) as { storage_kind: string; original_bytes: Buffer | null; origin_url: string };
+    expect(row).toMatchObject({
+      storage_kind: "workspace",
+      original_bytes: null,
+      origin_url: "https://example.com/workspace",
+    });
+    db.close();
+  });
+
   it("saves a whole page as a searchable Markdown file and a self-contained HTML twin", async () => {
     const db = freshRoom();
     const browser = browserAnswering(db, {

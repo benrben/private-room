@@ -23,6 +23,7 @@
  */
 
 import type Database from "better-sqlite3-multiple-ciphers";
+import type { WorkspaceService } from "../workspace/workspaceService.js";
 import type {
   BrowseClearScope,
   BrowseJournalRow,
@@ -85,6 +86,7 @@ export interface ChromeBrowser {
 export interface BrowseCommandsDeps {
   browser: ChromeBrowser;
   db: Database.Database | null;
+  workspace?: WorkspaceService;
   /** The open room's path on disk, for `scheduleAutoIndex`. */
   roomPath: string;
   scheduleAutoIndex(roomPath: string): void;

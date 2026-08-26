@@ -2,6 +2,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import { Readable } from "node:stream";
 import type { IpcMain, IpcMainInvokeEvent } from "electron";
 import type { RoomManagerDeps, RoomManagerState } from "./roomManager.js";
 import type { EventSender } from "./turn.js";
@@ -37,7 +38,13 @@ import { fetchImage, fetchPage, fetchPreview, fetchReadable, guessDownloadMime }
 import { searchForBrowser } from "./webSearch.js";
 import { generate } from "./ollamaGenerate.js";
 import { modelSetting } from "./gatherContext.js";
-import { availableName, insertFileFromUrl, type FileMeta } from "./db-host/files.js";
+import {
+  availableName,
+  getFileMeta,
+  insertFileFromUrl,
+  setFileExtractedText,
+  type FileMeta,
+} from "./db-host/files.js";
 import { safeFileName } from "./browser/downloads.js";
 
 export interface BrowserSurfaceHost {
@@ -76,11 +83,24 @@ export function registerBrowserSurfaceIpc(
   const importBytes = async (stagedPath: string, name: string, url: string): Promise<FileMeta> => {
     const room = state.room;
     if (!room) throw new Error("No room is open.");
-    const bytes = await fs.promises.readFile(stagedPath);
     const finalName = availableName(room.conn, safeFileName(name));
     const mime = guessDownloadMime(finalName);
-    const text = mime.startsWith("text/") ? bytes.toString("utf8") : null;
-    const meta = insertFileFromUrl(room.conn, finalName, mime, bytes, text, "web", url);
+    let meta: FileMeta;
+    if (room.workspace === undefined) {
+      const bytes = await fs.promises.readFile(stagedPath);
+      const text = mime.startsWith("text/") ? bytes.toString("utf8") : null;
+      meta = insertFileFromUrl(room.conn, finalName, mime, bytes, text, "web", url);
+    } else {
+      const text = mime.startsWith("text/") ? await fs.promises.readFile(stagedPath, "utf8") : null;
+      const content = text === null
+        ? fs.createReadStream(stagedPath)
+        : Readable.from([Buffer.from(text, "utf8")]);
+      const entry = await room.workspace.createFile(finalName, content, "web");
+      room.conn.prepare("UPDATE files SET mime_type = ?, origin_url = ? WHERE id = ?")
+        .run(mime, url, entry.fileId);
+      if (text !== null) setFileExtractedText(room.conn, entry.fileId, text);
+      meta = getFileMeta(room.conn, entry.fileId);
+    }
     afterImport();
     return meta;
   };
@@ -112,6 +132,7 @@ export function registerBrowserSurfaceIpc(
     browser,
     db: currentDb(),
     roomPath: state.room?.path ?? "",
+    ...(state.room?.workspace === undefined ? {} : { workspace: state.room.workspace }),
     // File rows and search chunks are committed synchronously by insertFile;
     // the optional AI-summary filler is wired with the job surface later.
     scheduleAutoIndex: (roomPath) => deps.scheduleAutoIndex?.(roomPath),
@@ -130,9 +151,21 @@ export function registerBrowserSurfaceIpc(
     const display = title.trim() || page.title || new URL(url).hostname;
     const name = availableName(room.conn, `${cleanTitle(display, "Web source")}.md`);
     const content = `# ${display}\n\nSource: ${url}\n\n${page.text}`;
-    const meta = insertFileFromUrl(
-      room.conn, name, "text/markdown", Buffer.from(content, "utf8"), content, "web", url,
-    );
+    const meta = room.workspace === undefined
+      ? insertFileFromUrl(
+          room.conn, name, "text/markdown", Buffer.from(content, "utf8"), content, "web", url,
+        )
+      : await room.workspace.createFile(
+          name,
+          Readable.from([Buffer.from(content, "utf8")]),
+          "web",
+        ).then((entry) => {
+          room.conn.prepare(
+            "UPDATE files SET mime_type = 'text/markdown', origin_url = ? WHERE id = ?",
+          ).run(url, entry.fileId);
+          setFileExtractedText(room.conn, entry.fileId, content);
+          return getFileMeta(room.conn, entry.fileId);
+        });
     afterImport();
     return meta;
   };

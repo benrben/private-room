@@ -47,8 +47,17 @@
  */
 
 import type Database from "better-sqlite3-multiple-ciphers";
+import { Readable } from "node:stream";
 import type { PageMeta } from "../../shared/apiTypes.js";
-import { availableName, currentDate, insertFileFromUrl, setWebMeta } from "../db-host/files.js";
+import {
+  availableName,
+  currentDate,
+  getFileMeta,
+  insertFileFromUrl,
+  setFileExtractedText,
+  setWebMeta,
+} from "../db-host/files.js";
+import type { WorkspaceService } from "../workspace/workspaceService.js";
 import { readPage } from "./article.js";
 
 // ---------------------------------------------------------------------------
@@ -79,6 +88,8 @@ export interface SaveCaptureBrowser {
 export interface CaptureAndSaveDeps {
   browser: SaveCaptureBrowser;
   db: Database.Database;
+  /** Present for folder rooms. Current bytes must be written here, never to SQLCipher. */
+  workspace?: WorkspaceService;
   /** The open room's path on disk — Rust's `room.path.clone()`, which is
    *  `schedule_auto_index`'s own argument. */
   roomPath: string;
@@ -139,15 +150,17 @@ export async function captureAndSave(
   // dressed up as one — see the reply this builds below.
   const body = extracted?.article ? extracted.article.markdown : text;
   const content = markdownPage(displayTitle, meta, saved, body);
-  const md = insertFileFromUrl(
-    db,
-    mdName,
-    "text/markdown",
-    Buffer.from(content, "utf8"),
-    content,
-    "web",
-    url,
-  );
+  const store = async (name: string, mime: string, bytes: Buffer, text: string | null) => {
+    if (deps.workspace === undefined) {
+      return insertFileFromUrl(db, name, mime, bytes, text, "web", url);
+    }
+    const entry = await deps.workspace.createFile(name, Readable.from([bytes]), "web");
+    db.prepare("UPDATE files SET mime_type = ?, origin_url = ? WHERE id = ?")
+      .run(mime, url, entry.fileId);
+    if (text !== null) setFileExtractedText(db, entry.fileId, text);
+    return getFileMeta(db, entry.fileId);
+  };
+  const md = await store(mdName, "text/markdown", Buffer.from(content, "utf8"), content);
   writeWebMeta(db, md.id, meta);
   const names = [md.name];
 
@@ -158,16 +171,13 @@ export async function captureAndSave(
       : // Nothing was extractable, so the capture itself is all there is — kept
         // verbatim rather than replaced by a prettier lie.
         html;
-    const twin = insertFileFromUrl(
-      db,
+    const twin = await store(
       htmlName,
       "text/html",
       Buffer.from(doc, "utf8"),
       // No chunks of its own: the Markdown copy carries the search text, and
       // indexing both would find the same page twice.
       null,
-      "web",
-      url,
     );
     writeWebMeta(db, twin.id, meta);
     names.push(twin.name);
