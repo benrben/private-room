@@ -62,6 +62,8 @@ import {
   passthroughPrepareImage,
   type PreparedImage,
 } from "./turnContext.js";
+import { readRoomFile } from "./workspace/roomContent.js";
+import type { WorkspaceService } from "./workspace/workspaceService.js";
 
 // --------------------------------------------------------- settings reads
 
@@ -141,6 +143,8 @@ export interface GatherContextDeps {
   connectedMcpServers?: () => readonly string[];
   /** `vision::prepare_image`. Default {@link passthroughPrepareImage}. */
   prepareImage?: (bytes: Buffer) => PreparedImage;
+  /** Trusted pre-read workspace image bytes. Internal to the async room wrapper. */
+  workspaceAttachmentBytes?: ReadonlyMap<string, Buffer | null>;
 }
 
 // ------------------------------------------------------------- attachments
@@ -167,7 +171,8 @@ interface AttachmentResult {
 function processAttachments(
   db: Database.Database,
   attachments: readonly string[],
-  prepareImage: (bytes: Buffer) => PreparedImage
+  prepareImage: (bytes: Buffer) => PreparedImage,
+  workspaceAttachmentBytes?: ReadonlyMap<string, Buffer | null>,
 ): AttachmentResult {
   const images: string[] = [];
   const attachedNotes: string[] = [];
@@ -182,9 +187,12 @@ function processAttachments(
     } catch {
       continue;
     }
-    const [name, mimeRaw, bytes, text] = row;
+    const [name, mimeRaw, blobBytes, text] = row;
     const mime = mimeRaw ?? "";
     if (isImage(mime)) {
+      const bytes = workspaceAttachmentBytes?.has(fileId)
+        ? workspaceAttachmentBytes.get(fileId) ?? null
+        : blobBytes;
       if (bytes === null) {
         attachedNotes.push(
           `(Attached image: ${name} — NOT sent: the room has no image data stored for it. Say so rather than describing it.)`
@@ -295,7 +303,12 @@ export function gatherContextAndSaveQuestion(
 
   const [contextChunks, contextFallback] = retrieveContext(db, effectiveQuestion, questionEmbedding);
 
-  const { images, attachedNotes, sources, firstImage, carried } = processAttachments(db, attachments, prepareImage);
+  const { images, attachedNotes, sources, firstImage, carried } = processAttachments(
+    db,
+    attachments,
+    prepareImage,
+    deps.workspaceAttachmentBytes,
+  );
 
   // Only credit files that genuinely matched the question: on the zero-score
   // fallback the chunks are just "recent content", so they must not appear as
@@ -425,4 +438,55 @@ export function gatherContextAndSaveQuestion(
     advisorsOn,
     advisorToolsOn,
   };
+}
+
+export interface GatherContextRoom {
+  db: Database.Database;
+  path: string;
+  workspace?: WorkspaceService;
+}
+
+/** Async folder-room wrapper. Text remains private indexed state; only image
+ * bytes are read from normal files before entering the stable synchronous
+ * prompt builder above. */
+export async function gatherContextAndSaveQuestionInRoom(
+  room: GatherContextRoom,
+  chatId: string,
+  question: string,
+  attachments: readonly string[],
+  questionEmbedding: readonly number[] | null,
+  viewing: string | null,
+  deps: GatherContextDeps = {},
+): Promise<QuestionContext> {
+  if (room.workspace === undefined) {
+    return gatherContextAndSaveQuestion(
+      room.db,
+      chatId,
+      question,
+      attachments,
+      questionEmbedding,
+      viewing,
+      deps,
+    );
+  }
+  const workspaceAttachmentBytes = new Map<string, Buffer | null>();
+  for (const fileId of attachments) {
+    try {
+      const [, mime] = getFileFull(room.db, fileId);
+      if (isImage(mime ?? "")) {
+        workspaceAttachmentBytes.set(fileId, (await readRoomFile(room, fileId)).bytes);
+      }
+    } catch {
+      workspaceAttachmentBytes.set(fileId, null);
+    }
+  }
+  return gatherContextAndSaveQuestion(
+    room.db,
+    chatId,
+    question,
+    attachments,
+    questionEmbedding,
+    viewing,
+    { ...deps, workspaceAttachmentBytes },
+  );
 }

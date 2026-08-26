@@ -8,6 +8,7 @@ import { randomUUID } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { Readable } from "node:stream";
 import type Database from "better-sqlite3-multiple-ciphers";
 import { afterEach, describe, expect, it } from "vitest";
 import { createChat } from "./db-host/chats.js";
@@ -21,11 +22,14 @@ import {
   advisorToolsEnabled,
   advisorsEnabled,
   gatherContextAndSaveQuestion,
+  gatherContextAndSaveQuestionInRoom,
   modelSetting,
   parseTemperature,
   webAccessEnabled,
 } from "./gatherContext.js";
 import { BASE_SYSTEM_PROMPT } from "./turnContext.js";
+import { createWorkspaceRoom } from "./workspace/roomLayout.js";
+import { WorkspaceService } from "./workspace/workspaceService.js";
 
 let tmpDir: string;
 
@@ -221,6 +225,32 @@ describe("gatherContextAndSaveQuestion", () => {
       width: 1000,
       height: 1000,
     });
+  });
+
+  it("reads an attached workspace image from its normal file", async () => {
+    tmpDir = mkdtempSync(path.join(os.tmpdir(), "gather-workspace-"));
+    const root = path.join(tmpDir, "Room");
+    const { db } = createWorkspaceRoom(root, "correct horse battery staple", "Room");
+    const workspace = new WorkspaceService(db, root);
+    const bytes = Buffer.from([4, 5, 6]);
+    const entry = await workspace.createFile("photo.png", Readable.from([bytes]), "upload");
+    db.prepare("UPDATE files SET mime_type = 'image/png' WHERE id = ?").run(entry.fileId);
+
+    const ctx = await gatherContextAndSaveQuestionInRoom(
+      { db, path: root, workspace },
+      randomUUID(),
+      "what is this?",
+      [entry.fileId],
+      null,
+      null,
+    );
+
+    expect(ctx.chatMessages.at(-1)?.images).toEqual([bytes.toString("base64")]);
+    const row = db.prepare("SELECT original_bytes FROM files WHERE id = ?").get(entry.fileId) as {
+      original_bytes: Buffer | null;
+    };
+    expect(row.original_bytes).toBeNull();
+    db.close();
   });
 
   it("says so instead of silently dropping more than MAX_ATTACHED_IMAGES", () => {

@@ -86,7 +86,7 @@ import {
   resolvedBaseUrl as resolvedBaseUrlReal,
 } from "./engineRouting.js";
 import {
-  gatherContextAndSaveQuestion,
+  gatherContextAndSaveQuestionInRoom,
   modelSetting,
   parseTemperature,
   type FirstImage,
@@ -610,8 +610,8 @@ export async function ask(req: AskRequest, deps: AskDeps): Promise<Message> {
     }
 
     // Phase 1 (locked): gather context, save the user message.
-    const ctx: QuestionContext = gatherContextAndSaveQuestion(
-      room.db,
+    const ctx: QuestionContext = await gatherContextAndSaveQuestionInRoom(
+      room,
       req.chatId,
       req.question,
       req.attachments,
