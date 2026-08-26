@@ -26,6 +26,10 @@ export interface RunChangeSummary {
   count: number;
 }
 
+/** Keep rollback/audit history useful without allowing it to grow forever. */
+export const AGENT_AUDIT_RETAIN_RUNS = 100;
+export const AGENT_AUDIT_RETAIN_DAYS = 90;
+
 export class RunProtection {
   private readonly writeRuns = new Set<string>();
   constructor(
@@ -83,6 +87,7 @@ export class RunProtection {
         `UPDATE agent_runs SET status = ?, completed_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
          WHERE run_id = ?`,
       ).run(status, runId);
+      await this.pruneAuditHistory();
       return;
     }
     await this.captureFinalState(runId);
@@ -91,6 +96,41 @@ export class RunProtection {
       `UPDATE agent_runs SET status = ?, completed_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
        WHERE run_id = ?`,
     ).run(status, runId);
+    await this.pruneAuditHistory();
+  }
+
+  /**
+   * Retain at least the newest 100 finished runs and every run from the last
+   * 90 days. Older baselines lose their references and are reclaimed only by
+   * the object store's reachability collector, so shared file versions and
+   * trash recovery objects can never be deleted by this policy.
+   */
+  async pruneAuditHistory(
+    retainRuns = AGENT_AUDIT_RETAIN_RUNS,
+    retainDays = AGENT_AUDIT_RETAIN_DAYS,
+  ): Promise<number> {
+    const count = Math.max(1, Math.floor(retainRuns));
+    const days = Math.max(1, Math.floor(retainDays));
+    const rows = this.workspace.db.prepare(
+      `SELECT run_id FROM agent_runs
+       WHERE completed_at IS NOT NULL
+         AND status NOT IN ('preparing', 'running')
+         AND completed_at < datetime('now', ?)
+       ORDER BY completed_at DESC, rowid DESC
+       LIMIT -1 OFFSET ?`,
+    ).all(`-${days} days`, count) as Array<{ run_id: string }>;
+    if (rows.length === 0) return 0;
+    this.workspace.db.transaction(() => {
+      for (const row of rows) {
+        this.workspace.db.prepare(
+          "DELETE FROM content_object_refs WHERE owner_type = 'agent_run' AND owner_id = ?",
+        ).run(row.run_id);
+        this.workspace.db.prepare("DELETE FROM agent_run_files WHERE run_id = ?").run(row.run_id);
+        this.workspace.db.prepare("DELETE FROM agent_runs WHERE run_id = ?").run(row.run_id);
+      }
+    })();
+    await this.workspace.objects.collectGarbage();
+    return rows.length;
   }
 
   /** Reconcile and persist a reviewable, idempotent change set. */

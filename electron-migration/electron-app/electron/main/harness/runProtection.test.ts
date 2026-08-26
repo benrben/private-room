@@ -15,6 +15,43 @@ afterEach(async () => {
 });
 
 describe("RunProtection conflict recovery", () => {
+  it("retains recent audit history and prunes only old runs beyond the count floor", async () => {
+    const parent = await mkdtemp(path.join(os.tmpdir(), "arcelle-run-retention-"));
+    roots.push(parent);
+    const workspaceRoot = path.join(parent, "Room");
+    const { db, descriptor } = createWorkspaceRoom(
+      workspaceRoot,
+      "correct horse battery staple",
+      "Room",
+    );
+    const workspace = new WorkspaceService(db, workspaceRoot);
+    try {
+      const insert = db.prepare(
+        `INSERT INTO agent_runs(
+           run_id, room_id, provider, harness, model, privacy_mode, status,
+           baseline_completed, started_at, completed_at
+         ) VALUES (?, ?, 'codex', 'codex-app-server', 'test', 'local', ?, 1,
+           datetime('now', ?), datetime('now', ?))`,
+      );
+      insert.run("old-1", descriptor.roomId, "completed", "-140 days", "-140 days");
+      insert.run("old-2", descriptor.roomId, "failed", "-130 days", "-130 days");
+      insert.run("old-3", descriptor.roomId, "cancelled", "-120 days", "-120 days");
+      insert.run("recent", descriptor.roomId, "completed", "-5 days", "-5 days");
+      db.prepare(
+        `INSERT INTO agent_runs(run_id, room_id, provider, harness, model, privacy_mode, status)
+         VALUES ('active', ?, 'codex', 'codex-app-server', 'test', 'local', 'running')`,
+      ).run(descriptor.roomId);
+
+      const protection = new RunProtection(workspace, descriptor.roomId);
+      expect(await protection.pruneAuditHistory(1, 90)).toBe(2);
+      const remaining = (db.prepare("SELECT run_id FROM agent_runs ORDER BY run_id").all() as Array<{ run_id: string }>)
+        .map((row) => row.run_id);
+      expect(remaining).toEqual(["active", "old-3", "recent"]);
+    } finally {
+      db.close();
+    }
+  });
+
   it("restores a protected baseline as a copy without overwriting a later user edit", async () => {
     const parent = await mkdtemp(path.join(os.tmpdir(), "arcelle-run-protection-"));
     roots.push(parent);
