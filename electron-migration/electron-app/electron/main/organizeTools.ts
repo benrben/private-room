@@ -819,6 +819,9 @@ export async function execCreateFileWorkspace(
       const existing = fileByExactName(db, SCRATCH_PAD_NAME);
       if (existing !== null) {
         if (content.trim() === "") return fail(`Nothing was generated for "${existing.name}" — it was left as it was.`);
+        if (opts.cancel?.load() ?? false) {
+          return fail(`Stopped before "${existing.name}" was rewritten — nothing was written to the room.`);
+        }
         const row = db.prepare("SELECT content_sha256 FROM files WHERE id = ?")
           .get(existing.id) as { content_sha256: string | null };
         await workspace.snapshotVersion(existing.id, "AI edit");
