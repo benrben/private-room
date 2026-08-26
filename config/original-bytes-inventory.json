@@ -87,20 +87,16 @@
   ],
   "knownIndirectBlobAssumptions": [
     {
-      "path": "electron-migration/electron-app/electron/main/chatCmds.ts",
-      "reason": "Chat attachment ingestion still inserts uploaded image and document bytes through legacy blob primitives."
+      "path": "electron-migration/electron-app/electron/main/gatherContext.ts",
+      "reason": "Turn attachment preparation still reads attached image bytes synchronously from the legacy blob store."
     },
     {
-      "path": "electron-migration/electron-app/electron/main/chatCommandsKnowledge.ts",
-      "reason": "Knowledge command artifacts still call the synchronous legacy Artifact.commit path instead of commitToWorkspace."
+      "path": "electron-migration/electron-app/electron/main/scriptConsent.ts",
+      "reason": "Script fingerprints, manifests and approval checks still read script bytes through legacy blob helpers."
     },
     {
-      "path": "electron-migration/electron-app/electron/main/turnEngine.ts",
-      "reason": "The streamed-answer save path still publishes generated notes through the legacy database file store."
-    },
-    {
-      "path": "electron-migration/electron-app/electron/main/storyTools.ts",
-      "reason": "Story and cast helpers still read generated image references through the legacy byte column."
+      "path": "electron-migration/electron-app/electron/main/retrievalBackfill.ts",
+      "reason": "Background extraction and text-repair jobs still enumerate and rewrite content through legacy blob helpers instead of hash-checked workspace reads."
     }
   ]
 }
