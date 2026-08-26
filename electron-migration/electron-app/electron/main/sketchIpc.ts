@@ -23,15 +23,14 @@
  */
 
 import type { IpcMain, IpcMainInvokeEvent } from "electron";
-import type Database from "better-sqlite3-multiple-ciphers";
 import type { OpenRoom } from "./turnEngine.js";
 import {
-  createSketch,
+  createSketchInRoom,
   type EmitFn,
   emitSafely,
-  exportSketchPng,
-  exportSketchSvg,
-  writeSketch,
+  exportSketchPngInRoom,
+  exportSketchSvgInRoom,
+  writeSketchInRoom,
 } from "./sketchCommands.js";
 
 /** The slice of room state every sketch IPC handler needs — `recIpc.ts`'s
@@ -42,12 +41,12 @@ export interface RoomSource {
 
 const NO_ROOM_OPEN = "No room is open.";
 
-function openDb(room: RoomSource): Database.Database {
+function openRoom(room: RoomSource): OpenRoom {
   const open = room.currentRoom();
   if (open === null) {
     throw new Error(NO_ROOM_OPEN);
   }
-  return open.db;
+  return open;
 }
 
 /**
@@ -62,21 +61,21 @@ export function registerSketchIpc(ipcMain: Pick<IpcMain, "handle">, room: RoomSo
     ipcMain.handle(channel, (_event: IpcMainInvokeEvent, ...args: A) => fn(...args));
   };
 
-  handle("create_sketch", (args: { name: string }) => {
-    const meta = createSketch(openDb(room), args.name);
+  handle("create_sketch", async (args: { name: string }) => {
+    const meta = await createSketchInRoom(openRoom(room), args.name);
     emitSafely(emit, "room-files-changed", undefined);
     return meta;
   });
-  handle("save_sketch", (args: { id: string; doc: string; snapshot: boolean }) => {
-    writeSketch(openDb(room), args.id, args.doc, args.snapshot);
+  handle("save_sketch", async (args: { id: string; doc: string; snapshot: boolean }) => {
+    await writeSketchInRoom(openRoom(room), args.id, args.doc, args.snapshot);
   });
-  handle("export_sketch_svg", (args: { id: string }) => {
-    const meta = exportSketchSvg(openDb(room), args.id);
+  handle("export_sketch_svg", async (args: { id: string }) => {
+    const meta = await exportSketchSvgInRoom(openRoom(room), args.id);
     emitSafely(emit, "room-files-changed", undefined);
     return meta;
   });
   handle("export_sketch_png", async (args: { id: string }) => {
-    const meta = await exportSketchPng(openDb(room), args.id);
+    const meta = await exportSketchPngInRoom(openRoom(room), args.id);
     emitSafely(emit, "room-files-changed", undefined);
     return meta;
   });

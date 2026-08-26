@@ -118,7 +118,13 @@ import {
   execOpenFile,
   execSearchRoom,
 } from "./fileTools.js";
-import { execDraw, execReadDrawing } from "./sketchCommands.js";
+import {
+  execDraw,
+  execDrawInRoom,
+  execReadDrawing,
+  execReadDrawingInRoom,
+  type SketchRoom,
+} from "./sketchCommands.js";
 import {
   agentDeleteMcp,
   agentListMcps,
@@ -306,6 +312,8 @@ export interface ExecToolDeps {
   /** The open room's connection, or `null` when no room is open (mirrors
    * `state.room.lock().unwrap().as_ref().ok_or("No room is open.")`). */
   db: Database.Database | null;
+  /** Live folder-room handle for tools that need the normal-file source of truth. */
+  currentRoom?: () => SketchRoom | null;
   /**
    * The Stop flag `tool_cancel_for` resolved for this call (`bridgeDispatcher.ts`
    * always computes and threads this through, matching the Rust source's
@@ -584,11 +592,15 @@ const NO_ROOM_OPEN = "No room is open.";
 /** `state.room.lock().unwrap().as_ref().ok_or("No room is open.")` as a value.
  * Every real arm below goes through this rather than reading `deps.db`
  * directly, so "no room is open" is one sentence in one place. */
-function requireRoom(deps: ExecToolDeps): { ok: true; db: Database.Database } | { ok: false; error: string } {
-  if (deps.db === null) {
+function requireRoom(deps: ExecToolDeps):
+  | { ok: true; db: Database.Database; room: SketchRoom | null }
+  | { ok: false; error: string } {
+  const live = deps.currentRoom?.() ?? null;
+  const db = live?.db ?? deps.db;
+  if (db === null) {
     return { ok: false, error: NO_ROOM_OPEN };
   }
-  return { ok: true, db: deps.db };
+  return { ok: true, db, room: live };
 }
 
 /** `let _ = window.emit(...)` — a best-effort UI notification that must never
@@ -1812,11 +1824,19 @@ export async function execTool(
     // `runsOnThisMac`/`activePolicy` — see `sketchCommands.ts`'s module doc.
     case "read_drawing": {
       const room = requireRoom(deps);
-      return room.ok ? execReadDrawing(room.db, args, effects) : fail(room.error);
+      return room.ok
+        ? room.room === null
+          ? execReadDrawing(room.db, args, effects)
+          : execReadDrawingInRoom(room.room, args, effects)
+        : fail(room.error);
     }
     case "draw": {
       const room = requireRoom(deps);
-      return room.ok ? execDraw(room.db, args, deps.emit) : fail(room.error);
+      return room.ok
+        ? room.room === null
+          ? execDraw(room.db, args, deps.emit)
+          : execDrawInRoom(room.room, args, deps.emit)
+        : fail(room.error);
     }
 
     // ------------------------------------------------------------------- studios

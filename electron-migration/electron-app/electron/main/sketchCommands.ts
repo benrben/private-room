@@ -43,6 +43,8 @@
  */
 
 import type Database from "better-sqlite3-multiple-ciphers";
+import path from "node:path";
+import { Readable } from "node:stream";
 import {
   availableName,
   type FileMeta,
@@ -54,6 +56,7 @@ import {
   listFiles,
   markSectionOnly,
   renameFile,
+  setFileExtractedText,
   updateFileContent,
 } from "./db-host/files.js";
 import { snapshotFileVersion } from "./db-host/versions.js";
@@ -78,6 +81,8 @@ import {
   toSvg,
 } from "./sketchDoc.js";
 import { toPng } from "./sketchRaster.js";
+import { createRoomFile, readRoomFile, writeRoomFile } from "./workspace/roomContent.js";
+import type { WorkspaceService } from "./workspace/workspaceService.js";
 
 // ------------------------------------------------------------------- shell
 
@@ -188,6 +193,54 @@ function insertSketch(db: Database.Database, name: string, doc: Sketch, source: 
   const unique = availableName(db, sketchName(name));
   const json = sketchToJson(doc);
   return insertFile(db, unique, SKETCH_MIME, Buffer.from(json, "utf8"), sketchExtractedText(doc), source);
+}
+
+export interface SketchRoom {
+  db: Database.Database;
+  path: string;
+  workspace?: WorkspaceService;
+}
+
+async function loadInRoom(room: SketchRoom, id: string): Promise<Sketch> {
+  const bytes = (await readRoomFile(room, id)).bytes;
+  return sketchFromJson(bytes === null ? "" : bytes.toString("utf8"));
+}
+
+async function insertSketchInRoom(
+  room: SketchRoom,
+  name: string,
+  doc: Sketch,
+  source: string,
+): Promise<FileMeta> {
+  const unique = availableName(room.db, sketchName(name));
+  const json = sketchToJson(doc);
+  return createRoomFile(
+    room,
+    unique,
+    SKETCH_MIME,
+    Buffer.from(json, "utf8"),
+    sketchExtractedText(doc),
+    source,
+  );
+}
+
+async function renameSketchInRoom(room: SketchRoom, id: string, name: string): Promise<void> {
+  if (room.workspace === undefined) {
+    renameFile(room.db, id, name);
+    return;
+  }
+  const row = room.db.prepare(
+    "SELECT relative_path, content_sha256 FROM files WHERE id = ? AND trashed_at IS NULL",
+  ).get(id) as { relative_path: string | null; content_sha256: string | null } | undefined;
+  if (row?.relative_path === null || row?.relative_path === undefined) {
+    throw new Error("That drawing is no longer in this room.");
+  }
+  const parent = path.posix.dirname(row.relative_path);
+  await room.workspace.move(
+    id,
+    parent === "." ? name : path.posix.join(parent, name),
+    row.content_sha256 ?? undefined,
+  );
 }
 
 // --------------------------------------------------------------- resolving
@@ -346,6 +399,32 @@ function drawTarget(db: Database.Database, name: string): [string, string, boole
   throw new Error(r.message);
 }
 
+async function takeEmptySketchInRoom(room: SketchRoom, name: string): Promise<[string, string] | null> {
+  for (const [id] of listSketches(room.db)) {
+    try {
+      if ((await loadInRoom(room, id)).elements.length !== 0) continue;
+      const wanted = availableName(room.db, sketchName(name));
+      await renameSketchInRoom(room, id, wanted);
+      return [id, wanted];
+    } catch {
+      // A drawing that cannot be read is not a blank page to claim.
+    }
+  }
+  return null;
+}
+
+async function drawTargetInRoom(room: SketchRoom, name: string): Promise<[string, string, boolean]> {
+  if (room.workspace === undefined) return drawTarget(room.db, name);
+  const resolved = resolveNamed(room.db, name);
+  if (resolved.ok) return [resolved.id, resolved.name, false];
+  if (resolved.kind !== "not_found") throw new Error(resolved.message);
+  const taken = await takeEmptySketchInRoom(room, name);
+  if (taken !== null) return [taken[0], taken[1], false];
+  const meta = await insertSketchInRoom(room, name, defaultSketch(), "generated");
+  markSectionOnly(room.db, meta.id, "sketch");
+  return [meta.id, meta.name, true];
+}
+
 // ---------------------------------------------------------------------------
 // Commands the page calls
 // ---------------------------------------------------------------------------
@@ -367,6 +446,13 @@ export function createSketch(db: Database.Database, name: string): FileMeta {
   const meta = insertSketch(db, name, defaultSketch(), "upload");
   markSectionOnly(db, meta.id, "sketch");
   return getFileMeta(db, meta.id);
+}
+
+export async function createSketchInRoom(room: SketchRoom, name: string): Promise<FileMeta> {
+  if (room.workspace === undefined) return createSketch(room.db, name);
+  const meta = await insertSketchInRoom(room, name, defaultSketch(), "upload");
+  markSectionOnly(room.db, meta.id, "sketch");
+  return getFileMeta(room.db, meta.id);
 }
 
 /**
@@ -397,6 +483,30 @@ export function writeSketch(db: Database.Database, id: string, doc: string, snap
   updateFileContent(db, id, Buffer.from(doc, "utf8"), sketchExtractedText(parsed));
 }
 
+export async function writeSketchInRoom(
+  room: SketchRoom,
+  id: string,
+  doc: string,
+  snapshot: boolean,
+): Promise<void> {
+  if (room.workspace === undefined) {
+    writeSketch(room.db, id, doc, snapshot);
+    return;
+  }
+  const parsed = sketchFromJson(doc);
+  const row = room.db.prepare(
+    "SELECT content_sha256 FROM files WHERE id = ? AND storage_kind = 'workspace' AND trashed_at IS NULL",
+  ).get(id) as { content_sha256: string | null } | undefined;
+  if (row === undefined) throw new Error("That drawing is no longer in this room.");
+  if (snapshot) await room.workspace.snapshotVersion(id, "Before you drew");
+  await room.workspace.writeAtomic(
+    id,
+    Readable.from([Buffer.from(doc, "utf8")]),
+    row.content_sha256 ?? undefined,
+  );
+  setFileExtractedText(room.db, id, sketchExtractedText(parsed));
+}
+
 /**
  * Flatten a drawing into a standalone `.svg` room file.
  *
@@ -424,6 +534,23 @@ export function exportSketchSvg(db: Database.Database, id: string): FileMeta {
   return insertFile(db, unique, "image/svg+xml", svgBytes, extractText(unique, svgBytes), "generated");
 }
 
+export async function exportSketchSvgInRoom(room: SketchRoom, id: string): Promise<FileMeta> {
+  if (room.workspace === undefined) return exportSketchSvg(room.db, id);
+  const name = getFileName(room.db, id);
+  const doc = await loadInRoom(room, id);
+  const stem = trimEndMatches(name, `.${SKETCH_EXT}`);
+  const svgBytes = Buffer.from(toSvg(doc), "utf8");
+  const unique = availableName(room.db, `${stem}.svg`);
+  return createRoomFile(
+    room,
+    unique,
+    "image/svg+xml",
+    svgBytes,
+    extractText(unique, svgBytes),
+    "generated",
+  );
+}
+
 /**
  * Flatten a drawing into a standalone `.png` room file.
  *
@@ -444,6 +571,24 @@ export async function exportSketchPng(db: Database.Database, id: string): Promis
   // came from — a flat image nobody can find again is a dead end.
   const text = sketchExtractedText(doc);
   return insertFile(db, unique, "image/png", png, rustTrim(text) === "" ? null : text, "generated");
+}
+
+export async function exportSketchPngInRoom(room: SketchRoom, id: string): Promise<FileMeta> {
+  if (room.workspace === undefined) return exportSketchPng(room.db, id);
+  const name = getFileName(room.db, id);
+  const doc = await loadInRoom(room, id);
+  const stem = trimEndMatches(name, `.${SKETCH_EXT}`);
+  const png = await toPng(doc);
+  const unique = availableName(room.db, `${stem}.png`);
+  const text = sketchExtractedText(doc);
+  return createRoomFile(
+    room,
+    unique,
+    "image/png",
+    png,
+    rustTrim(text) === "" ? null : text,
+    "generated",
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -547,6 +692,47 @@ export async function execReadDrawing(
   return ok(out);
 }
 
+export async function execReadDrawingInRoom(
+  room: SketchRoom,
+  args: Record<string, unknown>,
+  effects: SketchToolEffects,
+): Promise<SketchToolOutcome> {
+  if (room.workspace === undefined) return execReadDrawing(room.db, args, effects);
+  const name = asString(args.name);
+  let real: string;
+  let doc: Sketch;
+  let model: string | null;
+  try {
+    const [id, resolvedName] = resolve(room.db, name);
+    real = resolvedName;
+    doc = await loadInRoom(room, id);
+    model = modelSetting(room.db);
+  } catch (e) {
+    return fail(errMessage(e));
+  }
+
+  let out = describe(doc, real);
+  if (doc.elements.length > 0 && layoutReport(doc).length === 0) {
+    out += "\nNothing measures wrong: no overlaps, nothing off the page, every shape labelled.\n";
+  }
+  if (!effects.visionChat || doc.elements.length === 0) return ok(out);
+  const localChat = model === null || runsOnThisMac(model);
+  if (!localChat && activePolicy() !== null) {
+    out +=
+      "\n(Not showing you the picture: this room's privacy door keeps images on this Mac. " +
+      "The measurements above describe the same drawing.)";
+    return ok(out);
+  }
+  try {
+    const png = await toPng(doc);
+    effects.pendingImages.push(png.toString("base64"));
+    out += "\nThe drawing is attached as a picture — look at it before you change anything.";
+  } catch (e) {
+    out += `\n(The picture could not be drawn: ${errMessage(e)})`;
+  }
+  return ok(out);
+}
+
 /**
  * Draw on a room sketch.
  *
@@ -615,6 +801,64 @@ export function execDraw(db: Database.Database, args: Record<string, unknown>, e
     for (const n of notes.slice(0, 8)) {
       msg += `- ${n}\n`;
     }
+    msg += DRAW_FOLLOWUP;
+  }
+  return ok(msg);
+}
+
+export async function execDrawInRoom(
+  room: SketchRoom,
+  args: Record<string, unknown>,
+  emit?: EmitFn,
+): Promise<SketchToolOutcome> {
+  if (room.workspace === undefined) return execDraw(room.db, args, emit);
+  const name = rustTrim(asString(args.name));
+  const script = asString(args.script);
+  if (name === "") return fail("Say which sketch to draw on — a new name starts a new drawing.");
+
+  let id: string;
+  let real: string;
+  let created: boolean;
+  let outcome: ScriptOutcome;
+  let doc: Sketch;
+  try {
+    [id, real, created] = await drawTargetInRoom(room, name);
+    doc = await loadInRoom(room, id);
+    const applied = applyScript(doc, script);
+    if (!applied.ok) return fail(applied.error);
+    outcome = applied.value;
+    if (!scriptOutcomeIsEmpty(outcome)) {
+      const json = sketchToJson(doc);
+      await writeRoomFile(
+        room,
+        id,
+        Buffer.from(json, "utf8"),
+        sketchExtractedText(doc),
+        "The assistant drew",
+      );
+    }
+  } catch (e) {
+    return fail(errMessage(e));
+  }
+
+  emitSafely(emit, "agent-open-file", { id });
+  emitSafely(emit, "sketch-drawn", {
+    fileId: id,
+    name: real,
+    added: outcome.added,
+    changed: outcome.changed,
+    removed: outcome.removed,
+    steps: outcome.steps,
+    doc: sketchToJson(doc),
+  });
+  emitSafely(emit, "room-files-changed", undefined);
+
+  const opened = created ? `Started "${real}" and ` : "";
+  let msg = `${opened}${scriptOutcomeSummary(outcome)} on "${real}". The page now holds ${doc.elements.length} thing(s).`;
+  const notes = layoutReport(doc);
+  if (notes.length > 0) {
+    msg += "\n\nWorth fixing:\n";
+    for (const note of notes.slice(0, 8)) msg += `- ${note}\n`;
     msg += DRAW_FOLLOWUP;
   }
   return ok(msg);

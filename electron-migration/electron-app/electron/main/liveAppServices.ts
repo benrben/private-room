@@ -160,6 +160,11 @@ export function applyLiveAppServices(
   const queue = services.roomDeps.jobQueue;
   return {
     ...base,
+    currentRoom: () => state.room === null ? null : {
+      db: state.room.conn,
+      path: state.room.path,
+      ...(state.room.workspace === undefined ? {} : { workspace: state.room.workspace }),
+    },
     routes,
     ...(queue === undefined ? {} : {
       downloadJob: { ...queue, ...engineDeps },
