@@ -200,6 +200,7 @@ export function applyLiveAppServices(
             row.size_bytes,
             meta.mimeType,
             async () => openRoom.workspace!.readStream(id),
+            async (start, end) => openRoom.workspace!.readStream(id, { start, end }),
           );
         } else {
           const bytes = getFileBytes(state.room.conn, id);

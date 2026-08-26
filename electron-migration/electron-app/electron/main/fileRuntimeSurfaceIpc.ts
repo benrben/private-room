@@ -166,20 +166,33 @@ export function registerFileRuntimeSurfaceIpc(
     for (const filePath of Array.isArray(paths) ? paths.filter((v): v is string => typeof v === "string") : []) {
       try {
         const open = room();
-        const bytes = await fs.promises.readFile(filePath);
         const name = availableName(open.conn, path.basename(filePath));
         const mime = guessDownloadMime(name);
-        const extracted = await extractDocumentText(name, bytes);
-        const meta = open.workspace === undefined
-          ? insertFile(open.conn, name, mime, bytes, extracted, "import")
-          : await open.workspace.importFile(filePath, name).then((entry) => {
+        let meta: ReturnType<typeof insertFile>;
+        if (open.workspace !== undefined && (mime.startsWith("audio/") || mime.startsWith("video/"))) {
+          // Media has no document text to extract and is not an OCR candidate.
+          // Import it directly as a stream instead of allocating the entire
+          // recording or video in the Electron main-process heap.
+          meta = await open.workspace.importFile(filePath, name).then((entry) => {
             open.conn.prepare(
-              "UPDATE files SET mime_type = ?, extracted_text = ? WHERE id = ?",
-            ).run(mime, extracted, entry.fileId);
+              "UPDATE files SET mime_type = ? WHERE id = ?",
+            ).run(mime, entry.fileId);
             return getFileMeta(open.conn, entry.fileId);
           });
+        } else {
+          const bytes = await fs.promises.readFile(filePath);
+          const extracted = await extractDocumentText(name, bytes);
+          meta = open.workspace === undefined
+            ? insertFile(open.conn, name, mime, bytes, extracted, "import")
+            : await open.workspace.importFile(filePath, name).then((entry) => {
+              open.conn.prepare(
+                "UPDATE files SET mime_type = ?, extracted_text = ? WHERE id = ?",
+              ).run(mime, extracted, entry.fileId);
+              return getFileMeta(open.conn, entry.fileId);
+            });
+          if (!extracted || extracted.trim() === "") startOcr(open.path, meta.id, name, mime, bytes);
+        }
         report.imported.push(meta);
-        if (!extracted || extracted.trim() === "") startOcr(open.path, meta.id, name, mime, bytes);
       } catch (error) {
         report.errors.push(`${path.basename(filePath)}: ${error instanceof Error ? error.message : String(error)}`);
       }
@@ -219,6 +232,7 @@ export function registerFileRuntimeSurfaceIpc(
           row.size_bytes,
           mime,
           async () => open.workspace!.readStream(id),
+          async (start, end) => open.workspace!.readStream(id, { start, end }),
         );
         return buildFileContent(
           open.conn,

@@ -262,9 +262,12 @@ export class WorkspaceService {
     }
   }
 
-  readStream(fileId: string): Readable {
+  readStream(fileId: string, range?: { start: number; end: number }): Readable {
     const row = this.fileRow(fileId);
-    return createReadStream(resolveWorkspacePath(this.rootPath, row.relative_path));
+    const filePath = resolveWorkspacePath(this.rootPath, row.relative_path);
+    return range === undefined
+      ? createReadStream(filePath)
+      : createReadStream(filePath, { start: range.start, end: range.end });
   }
 
   async readBuffer(fileId: string): Promise<Buffer> {

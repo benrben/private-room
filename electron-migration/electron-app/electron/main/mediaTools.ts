@@ -114,6 +114,9 @@ export interface StagedMedia {
   /** Workspace files stay on disk and are opened only when the protocol asks
    * for bytes. Blob rooms leave this undefined and keep using `bytes`. */
   openStream?: () => Promise<Readable>;
+  /** Optional seekable factory. Workspace files use this so a late video
+   * range does not read and discard every byte before the requested span. */
+  openRange?: (start: number, end: number) => Promise<Readable>;
   sizeBytes?: number;
 }
 
@@ -184,6 +187,7 @@ export function stageMediaStream(
   sizeBytes: number,
   mime: string,
   openStream: () => Promise<Readable>,
+  openRange?: (start: number, end: number) => Promise<Readable>,
 ): string {
   const seq = streams.next++;
   const token = `${seq}-${randomUUID()}`;
@@ -204,6 +208,7 @@ export function stageMediaStream(
     mime,
     seq,
     openStream,
+    openRange,
     sizeBytes,
   });
   return token;
@@ -500,7 +505,9 @@ export async function mediaStreamingResponse(
     };
   }
   const [start, end] = parsed;
-  const stream = await staged.openStream();
+  const stream = staged.openRange === undefined
+    ? await staged.openStream()
+    : await staged.openRange(start, end);
   return {
     status: 206,
     headers: [
@@ -508,6 +515,8 @@ export async function mediaStreamingResponse(
       ["Content-Length", String(end - start + 1)],
       ["Content-Range", `bytes ${start}-${end}/${len}`],
     ],
-    body: await rangeStream(stream, start, end),
+    body: staged.openRange === undefined
+      ? await rangeStream(stream, start, end)
+      : await rangeStream(stream, 0, end - start),
   };
 }
