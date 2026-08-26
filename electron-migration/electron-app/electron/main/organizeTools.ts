@@ -104,6 +104,7 @@ import {
 } from "./db-host/artifacts.js";
 import {
   merge,
+  MAX_BULK_FILES,
   organize,
   organizeSentence,
   trashNamed,
@@ -941,20 +942,30 @@ export async function execOrganizeFilesWorkspace(
     return fail("organize_files needs at least one entry in files, make_folders or remove_folders.");
   }
   const report: OrganizeReport = {
-    moved: [], renamed: [], foldersMade: [], foldersRemoved: [], failed: [], capped: 0,
+    moved: [],
+    renamed: [],
+    foldersMade: [],
+    foldersRemoved: [],
+    failed: [],
+    capped:
+      Math.max(0, entries.length - MAX_BULK_FILES) +
+      Math.max(0, make.length - MAX_BULK_FILES) +
+      Math.max(0, remove.length - MAX_BULK_FILES),
   };
-  // WorkspaceService creates destination directories as part of a controlled
-  // file move. Empty-folder-only changes remain explicit failures instead of
-  // bypassing the service with raw filesystem calls.
-  for (const folder of make) {
-    if (!entries.some((entry) => entry.folder?.trim().toLowerCase() === folder.trim().toLowerCase())) {
-      report.failed.push({ name: folder, error: "empty workspace folders are not created by a file tool" });
+  for (const rawFolder of make.slice(0, MAX_BULK_FILES)) {
+    const folder = rawFolder.trim();
+    if (folder === "" || meansTopLevel(folder)) continue;
+    try {
+      const state = await workspace.directoryState(folder);
+      if (state.exists) continue;
+      if (dryRun || await workspace.createDirectory(folder)) {
+        report.foldersMade.push(`"${state.relativePath}"`);
+      }
+    } catch (error) {
+      report.failed.push({ name: folder, error: errMessage(error) });
     }
   }
-  for (const folder of remove) {
-    report.failed.push({ name: folder, error: "folder removal needs the workspace directory service" });
-  }
-  for (const entry of entries) {
+  for (const entry of entries.slice(0, MAX_BULK_FILES)) {
     try {
       const [id, realName] = findFileLikeQualified(db, entry.name ?? "");
       const row = workspaceRow(db, id);
@@ -983,11 +994,35 @@ export async function execOrganizeFilesWorkspace(
       report.failed.push({ name: entry.name ?? "", error: errMessage(error) });
     }
   }
+  for (const rawFolder of remove.slice(0, MAX_BULK_FILES)) {
+    const folder = rawFolder.trim();
+    if (folder === "") continue;
+    if (meansTopLevel(folder)) {
+      report.failed.push({ name: folder, error: "the workspace top level cannot be removed" });
+      continue;
+    }
+    try {
+      const state = await workspace.directoryState(folder);
+      if (!state.exists) {
+        report.failed.push({ name: folder, error: "no folder by that path" });
+      } else if (!state.empty) {
+        report.failed.push({ name: folder, error: "the folder is not empty" });
+      } else if (dryRun || await workspace.removeDirectory(folder)) {
+        report.foldersRemoved.push(`"${state.relativePath}"`);
+      }
+    } catch (error) {
+      report.failed.push({ name: folder, error: errMessage(error) });
+    }
+  }
   if (!dryRun) {
-    effects.wrote ||= report.moved.length > 0 || report.renamed.length > 0;
+    effects.wrote ||=
+      report.moved.length > 0 ||
+      report.renamed.length > 0 ||
+      report.foldersMade.length > 0 ||
+      report.foldersRemoved.length > 0;
     emitSafely(emit, "room-files-changed", undefined);
   }
-  return ok(organizeSentence(report, dryRun));
+  return ok(organizeSentence(report, dryRun, ""));
 }
 
 export async function execMergeFilesWorkspace(

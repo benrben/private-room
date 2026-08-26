@@ -380,7 +380,11 @@ function freshReport(capped: number): OrganizeReport {
  * receipt is not merely bad manners — it is what the verifier catches, and a
  * run that over-claims gets retried instead of finishing.
  */
-export function organizeSentence(report: OrganizeReport, dryRun: boolean): string {
+export function organizeSentence(
+  report: OrganizeReport,
+  dryRun: boolean,
+  removedFolderNote = " — their files went to the top level",
+): string {
   const verb = (n: number, past: string, future: string): string =>
     dryRun ? `would ${future} ${n}` : `${past} ${n}`;
   const parts: string[] = [];
@@ -394,9 +398,7 @@ export function organizeSentence(report: OrganizeReport, dryRun: boolean): strin
     parts.push(`created folder(s) ${report.foldersMade.join(", ")}`);
   }
   if (report.foldersRemoved.length > 0) {
-    parts.push(
-      `removed folder(s) ${report.foldersRemoved.join(", ")} — their files went to the top level`
-    );
+    parts.push(`removed folder(s) ${report.foldersRemoved.join(", ")}${removedFolderNote}`);
   }
   let out: string;
   if (parts.length === 0) {

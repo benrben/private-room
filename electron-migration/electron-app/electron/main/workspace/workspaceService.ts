@@ -1,7 +1,7 @@
 import type Database from "better-sqlite3-multiple-ciphers";
 import { createHash, randomUUID } from "node:crypto";
 import { createReadStream, createWriteStream } from "node:fs";
-import { chmod, lstat, mkdir, open, rename, rm } from "node:fs/promises";
+import { chmod, lstat, mkdir, open, readdir, rename, rm, rmdir } from "node:fs/promises";
 import path from "node:path";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -33,6 +33,14 @@ export interface WorkspaceVersionSnapshot {
   text: string | null;
   recMeta: string | null;
   provenance: string | null;
+}
+
+export interface WorkspaceDirectoryState {
+  relativePath: string;
+  exists: boolean;
+  empty: boolean;
+  /** Used internally to refuse removal if another process replaced the directory. */
+  fsIdentity: string | null;
 }
 
 export class ContentConflictError extends Error {
@@ -138,6 +146,120 @@ export class WorkspaceService {
       throw new ContentConflictError(expectedHash, actual);
     }
     return actual;
+  }
+
+  /** Inspect a normal workspace directory without exposing an absolute path. */
+  async directoryState(directoryPath: string): Promise<WorkspaceDirectoryState> {
+    const relativePath = normalizeRelativePath(directoryPath);
+    const destination = resolveWorkspacePath(this.rootPath, relativePath);
+    await assertNoSymlinkSegments(this.rootPath, relativePath, true);
+    let stat: Awaited<ReturnType<typeof lstat>>;
+    try {
+      stat = await lstat(destination, { bigint: true });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        return { relativePath, exists: false, empty: true, fsIdentity: null };
+      }
+      throw error;
+    }
+    if (stat.isSymbolicLink()) throw new Error("Symlinks are not allowed in managed room paths.");
+    if (!stat.isDirectory()) throw new Error("A normal file already exists at that folder path.");
+    let entries: string[];
+    try {
+      entries = await readdir(destination);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        return { relativePath, exists: false, empty: true, fsIdentity: null };
+      }
+      throw error;
+    }
+    return {
+      relativePath,
+      exists: true,
+      empty: entries.length === 0,
+      fsIdentity: `${stat.dev}:${stat.ino}:${stat.birthtimeNs}`,
+    };
+  }
+
+  /** Create a normal workspace directory. Existing directories are an idempotent no-op. */
+  async createDirectory(directoryPath: string): Promise<boolean> {
+    const before = await this.directoryState(directoryPath);
+    if (before.exists) return false;
+    const destination = resolveWorkspacePath(this.rootPath, before.relativePath);
+    const operationId = this.prepareOperation(
+      "create_directory", null, null, before.relativePath, null, null,
+    );
+    try {
+      const createdPath = await mkdir(destination, { recursive: true });
+      await assertNoSymlinkSegments(this.rootPath, before.relativePath);
+      const after = await this.directoryState(before.relativePath);
+      if (!after.exists) throw new Error("The folder was not created.");
+      await syncDirectory(path.dirname(destination));
+      this.updateOperation(operationId, "filesystem_committed");
+      this.updateOperation(operationId, "database_committed");
+      this.updateOperation(operationId, "completed");
+      return createdPath !== undefined;
+    } catch (error) {
+      this.updateOperation(
+        operationId,
+        "failed",
+        undefined,
+        error instanceof Error ? error.message : String(error),
+      );
+      throw error;
+    }
+  }
+
+  /** Remove one normal workspace directory, but only while it is still empty. */
+  async removeDirectory(directoryPath: string): Promise<boolean> {
+    const before = await this.directoryState(directoryPath);
+    if (!before.exists) return false;
+    if (!before.empty) throw new Error("The folder is not empty and was not removed.");
+    const destination = resolveWorkspacePath(this.rootPath, before.relativePath);
+    const operationId = this.prepareOperation(
+      "remove_directory", null, before.relativePath, null, null, null,
+    );
+    try {
+      const current = await this.directoryState(before.relativePath);
+      if (!current.exists) {
+        this.updateOperation(operationId, "filesystem_committed");
+        this.updateOperation(operationId, "database_committed");
+        this.updateOperation(operationId, "completed");
+        return false;
+      }
+      if (current.fsIdentity !== before.fsIdentity) {
+        throw new Error("The folder changed before it could be removed.");
+      }
+      if (!current.empty) throw new Error("The folder is not empty and was not removed.");
+      try {
+        await rmdir(destination);
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code === "ENOENT") {
+          this.updateOperation(operationId, "filesystem_committed");
+          this.updateOperation(operationId, "database_committed");
+          this.updateOperation(operationId, "completed");
+          return false;
+        }
+        if (code === "ENOTEMPTY" || code === "EEXIST") {
+          throw new Error("The folder is not empty and was not removed.");
+        }
+        throw error;
+      }
+      await syncDirectory(path.dirname(destination));
+      this.updateOperation(operationId, "filesystem_committed");
+      this.updateOperation(operationId, "database_committed");
+      this.updateOperation(operationId, "completed");
+      return true;
+    } catch (error) {
+      this.updateOperation(
+        operationId,
+        "failed",
+        undefined,
+        error instanceof Error ? error.message : String(error),
+      );
+      throw error;
+    }
   }
 
   readStream(fileId: string): Readable {

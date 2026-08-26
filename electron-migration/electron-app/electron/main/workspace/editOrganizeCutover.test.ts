@@ -10,6 +10,7 @@ import {
   execCreateFileWorkspace,
   execMergeFilesWorkspace,
   execMoveFileWorkspace,
+  execOrganizeFilesWorkspace,
   execRenameFileWorkspace,
   execTrashFilesWorkspace,
 } from "../organizeTools.js";
@@ -138,6 +139,65 @@ describe("workspace edit and organize cutover", () => {
       const rows = db.prepare("SELECT original_bytes FROM files WHERE storage_kind = 'workspace'")
         .all() as Array<{ original_bytes: Buffer | null }>;
       expect(rows.every((row) => row.original_bytes === null)).toBe(true);
+    } finally { db.close(); }
+  });
+
+  it("creates and removes empty workspace folders without touching private storage", async () => {
+    const { root, db, workspace } = await fixture();
+    const effects = createToolEffects();
+    try {
+      const created = await execOrganizeFilesWorkspace(
+        db,
+        workspace,
+        { make_folders: ["Empty", "Research/Nested"] },
+        effects,
+      );
+      expect(created).toMatchObject({ ok: true });
+      expect(created.ok && created.text).toContain('created folder(s) "Empty", "Research/Nested"');
+      expect((await workspace.directoryState("Empty")).exists).toBe(true);
+      expect((await workspace.directoryState("Research/Nested")).exists).toBe(true);
+      expect(effects.wrote).toBe(true);
+
+      const note = await workspace.createFile("Research/Nested/note.md", Readable.from(["keep"]), "fixture");
+      const refused = await execOrganizeFilesWorkspace(
+        db,
+        workspace,
+        { remove_folders: ["Research/Nested"] },
+        effects,
+      );
+      expect(refused.ok && refused.text).toMatch(/not empty/i);
+      expect(await readFile(path.join(root, "Research/Nested/note.md"), "utf8")).toBe("keep");
+
+      await workspace.trash(note.fileId, note.sha256 ?? undefined);
+      const removed = await execOrganizeFilesWorkspace(
+        db,
+        workspace,
+        { remove_folders: ["Empty", "Research/Nested"] },
+        effects,
+      );
+      expect(removed.ok && removed.text).toContain('removed folder(s) "Empty", "Research/Nested"');
+      expect(removed.ok && removed.text).not.toContain("files went to the top level");
+      expect((await workspace.directoryState("Empty")).exists).toBe(false);
+      expect((await workspace.directoryState("Research/Nested")).exists).toBe(false);
+      expect((db.prepare("SELECT count(*) AS n FROM files WHERE original_bytes IS NOT NULL").get() as { n: number }).n)
+        .toBe(0);
+    } finally { db.close(); }
+  });
+
+  it("previews empty-folder changes without mutating the workspace", async () => {
+    const { root, db, workspace } = await fixture();
+    const effects = createToolEffects();
+    try {
+      const preview = await execOrganizeFilesWorkspace(
+        db,
+        workspace,
+        { make_folders: ["Preview Only"], dry_run: true },
+        effects,
+      );
+      expect(preview.ok && preview.text).toMatch(/PREVIEW ONLY/i);
+      expect((await workspace.directoryState("Preview Only")).exists).toBe(false);
+      expect(effects.wrote).toBe(false);
+      await expect(readFile(path.join(root, "Preview Only"))).rejects.toThrow();
     } finally { db.close(); }
   });
 });

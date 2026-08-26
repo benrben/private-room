@@ -117,6 +117,41 @@ describe("workspace room storage", () => {
     }
   });
 
+  it("creates and removes only safe empty normal directories with journal records", async () => {
+    const parent = await temporaryRoot();
+    const workspaceRoot = path.join(parent, "Directory Room");
+    const { db } = createWorkspaceRoom(workspaceRoot, "correct horse battery staple", "Directory Room");
+    const workspace = new WorkspaceService(db, workspaceRoot);
+    try {
+      expect(await workspace.createDirectory("Archive/Empty")).toBe(true);
+      expect(await workspace.createDirectory("Archive/Empty")).toBe(false);
+      expect(await workspace.directoryState("Archive/Empty")).toMatchObject({ exists: true, empty: true });
+
+      const note = await workspace.createFile("Archive/Empty/note.md", Readable.from(["kept"]), "fixture");
+      await expect(workspace.removeDirectory("Archive/Empty")).rejects.toThrow(/not empty/i);
+      expect(await readFile(path.join(workspaceRoot, "Archive/Empty/note.md"), "utf8")).toBe("kept");
+      await workspace.trash(note.fileId, note.sha256 ?? undefined);
+      expect(await workspace.removeDirectory("Archive/Empty")).toBe(true);
+      expect(await workspace.removeDirectory("Archive/Empty")).toBe(false);
+
+      await expect(workspace.createDirectory("../escape")).rejects.toThrow(/leave the room/i);
+      await expect(workspace.createDirectory(".arcelle/escape")).rejects.toThrow(/private/i);
+      await symlink(os.tmpdir(), path.join(workspaceRoot, "linked"));
+      await expect(workspace.createDirectory("linked/escape")).rejects.toThrow(/symlink/i);
+      await expect(workspace.removeDirectory("linked")).rejects.toThrow(/symlink/i);
+
+      expect(db.prepare(
+        `SELECT operation_type, phase FROM fs_operations
+         WHERE operation_type IN ('create_directory', 'remove_directory') ORDER BY created_at, rowid`,
+      ).all()).toEqual([
+        { operation_type: "create_directory", phase: "completed" },
+        { operation_type: "remove_directory", phase: "completed" },
+      ]);
+    } finally {
+      db.close();
+    }
+  });
+
   it("keeps ten unpinned encrypted versions, preserves pinned versions, and restores them", async () => {
     const parent = await temporaryRoot();
     const workspaceRoot = path.join(parent, "History Room");
