@@ -8,7 +8,7 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -16,6 +16,8 @@ import type Database from "better-sqlite3-multiple-ciphers";
 import { getFileBytes } from "./db-host/files.js";
 import { createRoom } from "./db-host/open.js";
 import { createRoomManagerState, type RoomManagerState } from "./roomManager.js";
+import { createWorkspaceRoom } from "./workspace/roomLayout.js";
+import { WorkspaceService } from "./workspace/workspaceService.js";
 import { MAX_DOWNLOAD_BYTES } from "./web.js";
 import {
   checkPasteSize,
@@ -25,7 +27,9 @@ import {
   enqueueSttNotImplemented,
   getMessages,
   importAudioBytes,
+  importAudioBytesHybrid,
   importImageBytes,
+  importImageBytesHybrid,
   listChats,
   registerChatIpc,
   renameChat,
@@ -144,6 +148,39 @@ describe("chat CRUD commands", () => {
 const PNG_B64 = Buffer.from([0x89, 0x50, 0x4e, 0x47]).toString("base64");
 
 describe("importImageBytes", () => {
+  it("stores pasted image and audio bytes as normal workspace files", async () => {
+    tmpDir = mkdtempSync(path.join(os.tmpdir(), "chat-cmds-workspace-"));
+    const root = path.join(tmpDir, "Workspace");
+    const { db } = createWorkspaceRoom(root, "correct horse battery staple", "Workspace");
+    const state = createRoomManagerState();
+    state.room = {
+      conn: db,
+      path: root,
+      name: "Workspace",
+      password: "correct horse battery staple",
+      workspace: new WorkspaceService(db, root),
+    };
+    const jobs: JobMeta[] = [];
+
+    const image = await importImageBytesHybrid(state, "shot.png", PNG_B64);
+    const audio = await importAudioBytesHybrid(
+      state,
+      { enqueueStt: (job) => jobs.push(job) },
+      "note.m4a",
+      PNG_B64,
+    );
+
+    expect(readFileSync(path.join(root, "shot.png"))).toEqual(Buffer.from(PNG_B64, "base64"));
+    expect(readFileSync(path.join(root, "note.m4a"))).toEqual(Buffer.from(PNG_B64, "base64"));
+    const rows = db.prepare(
+      "SELECT original_bytes FROM files WHERE id IN (?, ?)",
+    ).all(image.id, audio.id) as Array<{ original_bytes: Buffer | null }>;
+    expect(rows.every((row) => row.original_bytes === null)).toBe(true);
+    expect(jobs).toHaveLength(1);
+    expect(jobs[0]).toMatchObject({ id: audio.id, name: "note.m4a", roomPath: root });
+    db.close();
+  });
+
   it("stores the decoded bytes as an uploaded file, mime guessed from the name", () => {
     const { state, conn } = openRoomState("image");
     const meta = importImageBytes(state, "shot.png", PNG_B64);
@@ -333,7 +370,7 @@ describe("registerChatIpc", () => {
     expect(() => handlers.get("list_chats")!()).toThrow("No room is open.");
   });
 
-  it("forwards arguments faithfully and reaches the real DB logic", () => {
+  it("forwards arguments faithfully and reaches the real DB logic", async () => {
     const { state } = openRoomState("ipc");
     const handlers = registerForTest(state);
 
@@ -345,7 +382,7 @@ describe("registerChatIpc", () => {
 
     expect(handlers.get("get_messages")!({ chatId: chat.id })).toEqual([]);
 
-    const meta = handlers.get("import_image_bytes")!({ name: "shot.png", b64: PNG_B64 }) as {
+    const meta = await handlers.get("import_image_bytes")!({ name: "shot.png", b64: PNG_B64 }) as {
       id: string;
       mimeType: string;
     };
@@ -355,11 +392,11 @@ describe("registerChatIpc", () => {
     expect(handlers.get("list_chats")!()).toEqual([]);
   });
 
-  it("threads its ChatCmdsDeps into import_audio_bytes", () => {
+  it("threads its ChatCmdsDeps into import_audio_bytes", async () => {
     const { state } = openRoomState("ipc-audio-deps");
     const jobs: JobMeta[] = [];
     const handlers = registerForTest(state, { enqueueStt: (job) => jobs.push(job) });
-    handlers.get("import_audio_bytes")!({ name: "note.m4a", b64: PNG_B64 });
+    await handlers.get("import_audio_bytes")!({ name: "note.m4a", b64: PNG_B64 });
     expect(jobs).toHaveLength(1);
     expect(jobs[0]?.mime).toBe("audio/mp4");
   });

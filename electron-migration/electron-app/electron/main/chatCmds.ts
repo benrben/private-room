@@ -94,10 +94,11 @@
 
 import type { IpcMain, IpcMainInvokeEvent } from "electron";
 import { createChat as dbCreateChat, deleteChat as dbDeleteChat, listChats as dbListChats, renameChat as dbRenameChat, type Chat } from "./db-host/chats.js";
-import { insertFile, type FileMeta } from "./db-host/files.js";
+import { availableName, insertFile, type FileMeta } from "./db-host/files.js";
 import { deleteMessage as dbDeleteMessage, listMessages as dbListMessages, type Message } from "./db-host/messages.js";
 import { humanizeStorageError, NO_ROOM_OPEN, type Room, type RoomManagerState } from "./roomManager.js";
 import { MAX_DOWNLOAD_BYTES } from "./web.js";
+import { createRoomFile } from "./workspace/roomContent.js";
 
 // ============================================================================
 // with_room
@@ -330,6 +331,32 @@ export function importImageBytes(state: RoomManagerState, name: string, b64: str
   });
 }
 
+/** Folder-room form used by live IPC. The sealed-room function above remains
+ * synchronous for compatibility with its direct callers and tests. */
+export async function importImageBytesHybrid(
+  state: RoomManagerState,
+  name: string,
+  b64: string,
+): Promise<FileMeta> {
+  checkPasteSize(b64.length, name);
+  const room = requireRoom(state);
+  if (room.workspace === undefined) return importImageBytes(state, name, b64);
+  const bytes = decodeBase64Strict(b64);
+  if (bytes === null) throw new Error("Could not read the pasted image: not valid base64.");
+  try {
+    return await createRoomFile(
+      { db: room.conn, path: room.path },
+      availableName(room.conn, name),
+      guessImageMime(name),
+      bytes,
+      null,
+      "upload",
+    );
+  } catch (error) {
+    throw humanizeStorageError(error, room.path);
+  }
+}
+
 /** ADD-18: store a voice note recorded inside the room, then transcribe it in
  * the background exactly like an imported recording — the room ends up with
  * BOTH the audio file and its searchable timestamped transcript (once
@@ -357,6 +384,37 @@ export function importAudioBytes(
   const epoch = state.roomEpoch;
   const enqueueStt = deps.enqueueStt ?? enqueueSttNotImplemented;
   enqueueStt({ id: meta.id, name, mime, ext, roomPath, epoch });
+  return meta;
+}
+
+export async function importAudioBytesHybrid(
+  state: RoomManagerState,
+  deps: ChatCmdsDeps,
+  name: string,
+  b64: string,
+): Promise<FileMeta> {
+  checkPasteSize(b64.length, name);
+  const bytes = decodeBase64Strict(b64);
+  if (bytes === null) throw new Error("Could not read the recording: not valid base64.");
+  const room = requireRoom(state);
+  if (room.workspace === undefined) return importAudioBytes(state, deps, name, b64);
+  const ext = extensionOf(name);
+  const mime = audioMimeFor(ext, name);
+  let meta: FileMeta;
+  try {
+    meta = await createRoomFile(
+      { db: room.conn, path: room.path },
+      availableName(room.conn, name),
+      mime,
+      bytes,
+      null,
+      "upload",
+    );
+  } catch (error) {
+    throw humanizeStorageError(error, room.path);
+  }
+  const enqueueStt = deps.enqueueStt ?? enqueueSttNotImplemented;
+  enqueueStt({ id: meta.id, name: meta.name, mime, ext, roomPath: room.path, epoch: state.roomEpoch });
   return meta;
 }
 
@@ -389,10 +447,10 @@ export function registerChatIpc(
     renameChat(state, args.id, args.title)
   );
   handle("delete_message", (args: { id: string }): void => deleteMessage(state, args.id));
-  handle("import_image_bytes", (args: { name: string; b64: string }): FileMeta =>
-    importImageBytes(state, args.name, args.b64)
+  handle("import_image_bytes", (args: { name: string; b64: string }): Promise<FileMeta> =>
+    importImageBytesHybrid(state, args.name, args.b64)
   );
-  handle("import_audio_bytes", (args: { name: string; b64: string }): FileMeta =>
-    importAudioBytes(state, deps, args.name, args.b64)
+  handle("import_audio_bytes", (args: { name: string; b64: string }): Promise<FileMeta> =>
+    importAudioBytesHybrid(state, deps, args.name, args.b64)
   );
 }
