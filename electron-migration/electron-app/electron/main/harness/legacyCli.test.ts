@@ -339,6 +339,32 @@ describe("RestrictedLegacyCliRuntime", () => {
     await fallback.startTurn({} as HarnessContext, { text: "x" });
     expect(calls).toEqual(["fallback"]);
   });
+
+  it("keeps the exposure-verified fallback when rich startup probing fails", async () => {
+    const calls: string[] = [];
+    const runtime = (
+      name: "rich" | "fallback",
+      harness: "codex-app-server" | "legacy-cli",
+      exposure: boolean,
+    ): HarnessRuntime => ({
+      name: harness,
+      available: async () => true,
+      verifyExposure: async () => exposure,
+      startTurn: async (): Promise<HarnessRun> => {
+        calls.push(name);
+        async function* events() { /* no events */ }
+        return { events: events(), cancel: async () => undefined, approve: async () => undefined };
+      },
+    });
+    const selected = new RuntimeWithFallback(
+      runtime("rich", "codex-app-server", false),
+      runtime("fallback", "legacy-cli", true),
+    );
+    const context = { runtimePath: "/runtime/run-1" } as HarnessContext;
+    await expect(selected.verifyExposure("/workspace", context.runtimePath, false)).resolves.toBe(true);
+    await selected.startTurn(context, { text: "x" });
+    expect(calls).toEqual(["fallback"]);
+  });
 });
 
 function createdRoomId(value: string): string { return value; }

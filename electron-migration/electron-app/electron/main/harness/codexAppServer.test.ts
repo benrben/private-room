@@ -1,11 +1,14 @@
-import { chmod, cp, mkdtemp, rm, writeFile } from "node:fs/promises";
-import { spawnSync } from "node:child_process";
+import { EventEmitter } from "node:events";
+import { chmod, cp, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
+import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { CodexAppServerRuntime } from "./codexAppServer.js";
 import { inspectCodexSchemaDirectory } from "./codexSchema.js";
+import { nativeWorkspaceSandboxSupported } from "./seatbelt.js";
 
 const roots: string[] = [];
 const installedCodex = spawnSync(process.env.ARCELLE_CODEX_PATH ?? "codex", ["--version"], { stdio: "ignore" }).status === 0;
@@ -21,6 +24,38 @@ async function fakeCodex(body: string): Promise<string> {
   await writeFile(executable, `#!/bin/sh\nset -eu\n${body}\n`, "utf8");
   await chmod(executable, 0o700);
   return executable;
+}
+
+function probeChild(
+  behavior: "initialize" | "exit" | "hang",
+  writes: string[],
+  kills: NodeJS.Signals[],
+): ChildProcessWithoutNullStreams {
+  const stdin = new PassThrough();
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+  const child = Object.assign(new EventEmitter(), {
+    stdin,
+    stdout,
+    stderr,
+    pid: 987_654,
+    kill: (signal: NodeJS.Signals = "SIGTERM") => {
+      kills.push(signal);
+      queueMicrotask(() => child.emit("exit", null, signal));
+      return true;
+    },
+  });
+  stdin.on("data", (chunk) => {
+    writes.push(chunk.toString());
+    if (behavior === "initialize") {
+      stdout.write(`${JSON.stringify({ id: "arcelle-capability", result: { userAgent: "fake" } })}\n`);
+    }
+  });
+  // Raw diagnostics may contain private paths/content. The probe must drain
+  // them without returning or retaining them.
+  stderr.write("SECRET /Users/person/private-room\n");
+  if (behavior === "exit") queueMicrotask(() => child.emit("exit", 1, null));
+  return child as unknown as ChildProcessWithoutNullStreams;
 }
 
 describe("Codex app-server compatibility probe", () => {
@@ -49,6 +84,50 @@ exit 2`);
     expect(runtime.installedSchemaCompatibility()).toMatchObject({ compatible: true });
     expect(runtime.installedSchemaCompatibility()?.files).toBeGreaterThan(0);
   });
+
+  it("requires a real initialized app-server, not a successful help command", async () => {
+    const writes: string[] = [];
+    const kills: NodeJS.Signals[] = [];
+    const child = probeChild("initialize", writes, kills);
+    const spawn = ((_options: unknown, args: string[]) => {
+      expect(args).toEqual(["app-server", "--listen", "stdio://"]);
+      return child;
+    }) as never;
+    const runtime = new CodexAppServerRuntime("codex", spawn, 100);
+    await expect(runtime.verifyExposure("/workspace/SECRET-room", "/runtime", false)).resolves.toBe(true);
+    expect(writes).toHaveLength(1);
+    expect(writes[0]).toContain('"method":"initialize"');
+    expect(writes[0]).not.toContain("/workspace/SECRET-room");
+    expect(writes[0]).not.toContain("SECRET /Users/person/private-room");
+    expect(kills).toContain("SIGTERM");
+  });
+
+  it.each(["exit", "hang"] as const)("fails closed when app-server %s before initialization", async (behavior) => {
+    const writes: string[] = [];
+    const kills: NodeJS.Signals[] = [];
+    const runtime = new CodexAppServerRuntime(
+      "codex",
+      (() => probeChild(behavior, writes, kills)) as never,
+      10,
+    );
+    await expect(runtime.verifyExposure("/workspace", "/runtime", false)).resolves.toBe(false);
+    if (behavior === "hang") expect(kills).toContain("SIGTERM");
+  });
+
+  it.runIf(installedCodex && nativeWorkspaceSandboxSupported())(
+    "rejects the installed app-server when real sandbox initialization cannot complete",
+    async () => {
+      const root = await mkdtemp(path.join(os.tmpdir(), "arcelle-codex-live-probe-"));
+      roots.push(root);
+      const workspacePath = path.join(root, "workspace");
+      const runtimePath = path.join(root, "runtime");
+      await mkdir(path.join(workspacePath, ".arcelle"), { recursive: true });
+      await mkdir(runtimePath, { recursive: true });
+      const runtime = new CodexAppServerRuntime();
+      await expect(runtime.verifyExposure(workspacePath, runtimePath, false)).resolves.toBe(false);
+    },
+    15_000,
+  );
 
   it("accepts legacy core and current collaboration schema fixtures", async () => {
     const fixtureRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures");

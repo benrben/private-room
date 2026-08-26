@@ -15,7 +15,7 @@ import {
   terminateNativeProcessTree,
   verifyNativeHarnessExecutable,
 } from "./seatbelt.js";
-import type { HarnessContext, HarnessEvent, HarnessInput, HarnessRun, HarnessRuntime } from "./types.js";
+import type { HarnessContext, HarnessEvent, HarnessInput, HarnessName, HarnessRun, HarnessRuntime } from "./types.js";
 
 const TOOLS: ToolSpec[] = ["list", "read", "write", "edit", "delete", "glob", "grep"].map((operation) => ({
   name: `workspace_${operation}`,
@@ -419,15 +419,39 @@ export class RestrictedLegacyCliRuntime implements HarnessRuntime {
 /** Select rich structured mode when available, otherwise the restricted CLI. */
 export class RuntimeWithFallback implements HarnessRuntime {
   readonly name;
+  private readonly exposureSelections = new Map<string, HarnessRuntime>();
   constructor(private readonly primary: HarnessRuntime, private readonly fallback: HarnessRuntime) {
     this.name = primary.name;
   }
   async available(): Promise<boolean> { return (await this.primary.available()) || this.fallback.available(); }
   async verifyExposure(workspacePath: string, runtimePath: string, writeEnabled: boolean): Promise<boolean> {
-    const selected = await this.primary.available() ? this.primary : this.fallback;
-    return selected.verifyExposure?.(workspacePath, runtimePath, writeEnabled) ?? false;
+    this.exposureSelections.delete(runtimePath);
+    if (
+      await this.primary.available()
+      && await this.primary.verifyExposure?.(workspacePath, runtimePath, writeEnabled) === true
+    ) {
+      this.exposureSelections.set(runtimePath, this.primary);
+      return true;
+    }
+    if (
+      await this.fallback.available()
+      && await this.fallback.verifyExposure?.(workspacePath, runtimePath, writeEnabled) === true
+    ) {
+      this.exposureSelections.set(runtimePath, this.fallback);
+      return true;
+    }
+    return false;
+  }
+  /** Which verified runtime a capability probe selected; consumes probe state. */
+  consumeVerifiedHarness(runtimePath: string): HarnessName | null {
+    const selected = this.exposureSelections.get(runtimePath);
+    this.exposureSelections.delete(runtimePath);
+    return selected?.name ?? null;
   }
   async startTurn(context: HarnessContext, input: HarnessInput): Promise<HarnessRun> {
+    const verified = this.exposureSelections.get(context.runtimePath);
+    this.exposureSelections.delete(context.runtimePath);
+    if (verified !== undefined) return verified.startTurn(context, input);
     return (await this.primary.available() ? this.primary : this.fallback).startTurn(context, input);
   }
 }

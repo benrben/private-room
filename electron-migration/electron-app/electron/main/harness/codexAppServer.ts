@@ -11,7 +11,7 @@ import { safeProviderFailure } from "./failureSafety.js";
 import {
   spawnWithNativeWorkspaceSandbox,
   terminateNativeProcessTree,
-  verifyNativeHarnessExecutable,
+  type NativeWorkspaceSandbox,
 } from "./seatbelt.js";
 import type {
   ApprovalDecision,
@@ -23,6 +23,7 @@ import type {
 } from "./types.js";
 
 const execFileAsync = promisify(execFile);
+type SandboxSpawn = typeof spawnWithNativeWorkspaceSandbox;
 
 interface RpcMessage {
   id?: number | string;
@@ -68,7 +69,11 @@ function collabStatuses(item: Record<string, unknown>): Array<[string, string]> 
 export class CodexAppServerRuntime implements HarnessRuntime {
   readonly name = "codex-app-server" as const;
   private compatibility: CodexSchemaCompatibility | null = null;
-  constructor(private readonly executable = process.env.ARCELLE_CODEX_PATH ?? "codex") {}
+  constructor(
+    private readonly executable = process.env.ARCELLE_CODEX_PATH ?? "codex",
+    private readonly sandboxSpawn: SandboxSpawn = spawnWithNativeWorkspaceSandbox,
+    private readonly startupProbeTimeoutMs = 5_000,
+  ) {}
 
   async available(): Promise<boolean> {
     const schemaRoot = await mkdtemp(path.join(os.tmpdir(), "arcelle-codex-schema-"));
@@ -98,13 +103,91 @@ export class CodexAppServerRuntime implements HarnessRuntime {
   }
 
   async verifyExposure(workspacePath: string, runtimePath: string, writeEnabled: boolean): Promise<boolean> {
-    return verifyNativeHarnessExecutable({
+    const options: NativeWorkspaceSandbox = {
       workspacePath,
       runtimePath,
       executable: this.executable,
       provider: "codex",
       writeEnabled,
-    }, ["app-server", "--help"]);
+    };
+    let child;
+    try {
+      child = this.sandboxSpawn(
+        options,
+        ["app-server", "--listen", "stdio://"],
+        {
+          cwd: workspacePath,
+          env: { ...process.env, CODEX_INTERNAL_ORIGINATOR_OVERRIDE: "arcelle" },
+        },
+      );
+    } catch {
+      return false;
+    }
+
+    // The help command only proves the executable can be loaded. Newer Codex
+    // releases initialize config and SQLite after app-server startup, so the
+    // real capability boundary is a successful JSON-RPC initialize response
+    // under this exact Seatbelt profile. Drain but never retain stderr: it may
+    // contain provider paths, credentials, or room-derived diagnostics.
+    child.stderr.on("data", () => undefined);
+    const lines = readline.createInterface({ input: child.stdout });
+    let ready = false;
+    let exited = false;
+    let settle!: () => void;
+    const lifecycle = new Promise<void>((resolve) => { settle = resolve; });
+    child.once("error", () => { exited = true; settle(); });
+    child.once("exit", () => { exited = true; settle(); });
+    lines.on("line", (line) => {
+      try {
+        const message = JSON.parse(line) as RpcMessage;
+        if (message.id === "arcelle-capability" && message.error === undefined) {
+          ready = true;
+          settle();
+        }
+      } catch {
+        // Non-protocol stdout cannot establish capability.
+      }
+    });
+    try {
+      child.stdin.write(`${JSON.stringify({
+        id: "arcelle-capability",
+        method: "initialize",
+        params: {
+          clientInfo: { name: "arcelle-capability", title: "Arcelle", version: "0.25.0" },
+          capabilities: { experimentalApi: false },
+        },
+      })}\n`);
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([
+        lifecycle,
+        new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, this.startupProbeTimeoutMs);
+          timer.unref?.();
+        }),
+      ]);
+      if (timer !== undefined) clearTimeout(timer);
+    } catch {
+      ready = false;
+    } finally {
+      lines.close();
+      if (!exited) terminateNativeProcessTree(child, "SIGTERM", 250);
+      if (!exited) {
+        let cleanupTimer: ReturnType<typeof setTimeout> | undefined;
+        await Promise.race([
+          lifecycle,
+          new Promise<void>((resolve) => {
+            cleanupTimer = setTimeout(resolve, 1_000);
+            cleanupTimer.unref?.();
+          }),
+        ]);
+        if (cleanupTimer !== undefined) clearTimeout(cleanupTimer);
+      }
+      if (!exited) terminateNativeProcessTree(child, "SIGKILL", -1);
+      child.stdin.destroy();
+      child.stdout.destroy();
+      child.stderr.destroy();
+    }
+    return ready;
   }
 
   async startTurn(context: HarnessContext, input: HarnessInput): Promise<HarnessRun> {
