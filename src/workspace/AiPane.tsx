@@ -52,6 +52,7 @@ import {
 } from "../shell/activity";
 import {
   registerHarnessRun,
+  mergeHarnessHistory,
   resolveHarnessApproval,
   type HarnessUiRun,
 } from "./harnessUi";
@@ -829,18 +830,24 @@ function HarnessRunner({ s, runs }: { s: WSState; runs: HarnessUiRun[] }) {
     if (!text || starting) return;
     setStarting(true);
     try {
+      const requestedModel = model.trim() || "default";
+      const privacyMode = provider === "ollama-local"
+        ? "local"
+        : s.privacyOn
+          ? "cloud-redacted"
+          : "cloud-direct";
       const result = await api.harnessStart({
         provider,
-        model: model.trim() || "default",
-        privacyMode: provider === "ollama-local"
-          ? "local"
-          : s.privacyOn
-            ? "cloud-redacted"
-            : "cloud-direct",
+        model: requestedModel,
+        privacyMode,
         writeEnabled,
         text,
       });
-      s.setHarnessRuns((current) => registerHarnessRun(current, result.runId, provider));
+      s.setHarnessRuns((current) => registerHarnessRun(current, result.runId, provider, {
+        model: requestedModel,
+        privacyMode,
+        writeEnabled,
+      }));
       setPrompt("");
     } catch (error) {
       s.pushToast("error", `Couldn't start the workspace agent: ${String(error)}`);
@@ -884,6 +891,8 @@ function HarnessRunner({ s, runs }: { s: WSState; runs: HarnessUiRun[] }) {
           ? `Restored ${count} changes. ${result.conflicts.length} newer file changes were kept.`
           : `Restored ${count} agent file changes.`,
       );
+      const history = await api.harnessListRuns();
+      s.setHarnessRuns((runs) => mergeHarnessHistory(runs, history));
       api.listFiles().then(s.setFiles).catch(() => {});
     } catch (error) {
       s.pushToast("error", `Couldn't roll back this run: ${String(error)}`);
@@ -902,6 +911,9 @@ function HarnessRunner({ s, runs }: { s: WSState; runs: HarnessUiRun[] }) {
         `Restored ${created.length} baseline ${created.length === 1 ? "copy" : "copies"}.`,
       );
       api.listFiles().then(s.setFiles).catch(() => {});
+      api.harnessListRuns()
+        .then((history) => s.setHarnessRuns((runs) => mergeHarnessHistory(runs, history)))
+        .catch(() => {});
     } catch (error) {
       s.pushToast("error", `Couldn't restore baseline copies: ${String(error)}`);
     } finally {
@@ -972,7 +984,10 @@ function HarnessRunner({ s, runs }: { s: WSState; runs: HarnessUiRun[] }) {
 
       {runs.map((run) => {
         const live = run.status === "starting" || run.status === "running" || run.status === "waiting";
-        const conflicts = restoreConflicts[run.runId] ?? [];
+        const persistedConflicts = run.changes
+          .filter((change) => change.rollbackState === "conflict")
+          .map((change) => change.relativePath);
+        const conflicts = restoreConflicts[run.runId] ?? persistedConflicts;
         return (
           <article className="activity-row harness-run" key={run.runId}>
             <div className="activity-row-head">
@@ -985,10 +1000,18 @@ function HarnessRunner({ s, runs }: { s: WSState; runs: HarnessUiRun[] }) {
                           : "Workspace agent"
               }</span>
               <StateTape
-                word={run.status === "completed" ? "Done" : run.status === "failed" ? "Failed" : run.status === "cancelled" ? "Stopped" : run.status === "waiting" ? "Waiting" : "Running"}
-                mark={run.status === "completed" ? "nb-sem-done" : run.status === "failed" ? "nb-sem-urgent" : run.status === "running" ? "nb-sem-linked" : "nb-sem-pending"}
+                word={run.status === "completed" ? "Done" : run.status === "failed" ? "Failed" : run.status === "cancelled" ? "Stopped" : run.status === "interrupted" ? "Interrupted" : run.status === "rolled_back" ? "Rolled back" : run.status === "waiting" ? "Waiting" : "Running"}
+                mark={run.status === "completed" || run.status === "rolled_back" ? "nb-sem-done" : run.status === "failed" || run.status === "interrupted" ? "nb-sem-urgent" : run.status === "running" ? "nb-sem-linked" : "nb-sem-pending"}
               />
             </div>
+            <div className="activity-copy">
+              {[run.harness, run.model, run.privacyMode].filter(Boolean).join(" · ")}
+              {` · Started ${new Date(run.startedAt).toLocaleString()}`}
+              {run.completedAt ? ` · Finished ${new Date(run.completedAt).toLocaleString()}` : ""}
+            </div>
+            {run.status === "interrupted" && (
+              <div className="activity-copy">The app closed before this run finished. Its recorded file changes remain reviewable and protected by the saved baseline.</div>
+            )}
             {run.plan && <div className="activity-copy"><strong>Plan:</strong> {run.plan}</div>}
             {run.currentTool && <div className="activity-copy">Using {run.currentTool}…</div>}
             {run.text && <pre className="harness-output">{run.text}</pre>}
@@ -1013,7 +1036,7 @@ function HarnessRunner({ s, runs }: { s: WSState; runs: HarnessUiRun[] }) {
             {(run.inputTokens > 0 || run.outputTokens > 0) && <div className="activity-copy">{run.inputTokens.toLocaleString()} input · {run.outputTokens.toLocaleString()} output tokens{run.costUsd != null ? ` · $${run.costUsd.toFixed(4)}` : ""}</div>}
             <div className="harness-actions">
               {live && <button className="subtle danger" onClick={() => void api.harnessCancel(run.runId).catch((error) => s.pushToast("error", String(error)))}>Stop</button>}
-              {!live && run.changes.length > 0 && <button className="subtle" disabled={rollbackBusy === run.runId} onClick={() => void rollback(run)}>{rollbackBusy === run.runId ? "Restoring…" : "Roll back file changes"}</button>}
+              {!live && run.writeEnabled && run.baselineCompleted && run.rollbackStatus === "none" && run.changes.length > 0 && <button className="subtle" disabled={rollbackBusy === run.runId} onClick={() => void rollback(run)}>{rollbackBusy === run.runId ? "Restoring…" : "Roll back file changes"}</button>}
             </div>
             {conflicts.length > 0 && (
               <div className="harness-conflicts" data-agent-blocked="true">

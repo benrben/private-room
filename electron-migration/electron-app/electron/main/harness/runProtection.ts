@@ -7,6 +7,7 @@ import { WorkspaceService } from "../workspace/workspaceService.js";
 import type { HarnessContext } from "./types.js";
 import type { WorkspaceOperationProgressSink } from "../../shared/workspaceProgress.js";
 import { WorkspaceOperationReporter } from "../workspace/operationProgress.js";
+import type { HarnessHistoryRun } from "../../shared/harnessTypes.js";
 
 interface RunFileRow {
   file_id: string;
@@ -15,6 +16,7 @@ interface RunFileRow {
   baseline_object_id: string | null;
   final_path: string | null;
   final_hash: string | null;
+  rollback_state: string | null;
 }
 
 export interface RollbackResult {
@@ -63,8 +65,9 @@ export class RunProtection {
     await this.workspace.reconcile();
     this.workspace.db.prepare(
       `INSERT INTO agent_runs(
-         run_id, room_id, provider, harness, model, privacy_mode, status, baseline_completed
-       ) VALUES (?, ?, ?, ?, ?, ?, 'preparing', 0)`,
+         run_id, room_id, provider, harness, model, privacy_mode, status,
+         write_enabled, baseline_completed
+       ) VALUES (?, ?, ?, ?, ?, ?, 'preparing', ?, 0)`,
     ).run(
       context.runId,
       this.roomId,
@@ -72,6 +75,7 @@ export class RunProtection {
       context.provider === "codex" ? "codex-app-server" : context.provider === "claude" ? "claude-agent-sdk" : "arcelle-deep",
       context.model,
       context.privacyMode,
+      context.writeEnabled ? 1 : 0,
     );
     if (!context.writeEnabled) {
       this.workspace.db.prepare("UPDATE agent_runs SET baseline_completed = 1, status = 'running' WHERE run_id = ?")
@@ -160,7 +164,12 @@ export class RunProtection {
 
   /** Reconcile and persist a reviewable, idempotent change set. */
   async captureFinalState(runId: string): Promise<RunChangeSummary> {
-    if (!this.writeRuns.has(runId)) return { changedPaths: [], count: 0 };
+    const run = this.workspace.db.prepare(
+      "SELECT write_enabled, baseline_completed FROM agent_runs WHERE run_id = ?",
+    ).get(runId) as { write_enabled: number; baseline_completed: number } | undefined;
+    if (run?.write_enabled !== 1 || run.baseline_completed !== 1) {
+      return { changedPaths: [], count: 0 };
+    }
     await this.workspace.reconcile();
     // A terminal harness event is not final until changed normal files have a
     // hash-matched extraction/search state. Failed extraction is recorded per
@@ -211,11 +220,15 @@ export class RunProtection {
 
   async rollback(runId: string): Promise<RollbackResult> {
     const run = this.workspace.db.prepare(
-      "SELECT baseline_completed FROM agent_runs WHERE run_id = ?",
-    ).get(runId) as { baseline_completed: number } | undefined;
-    if (run?.baseline_completed !== 1) throw new Error("This run has no complete rollback baseline.");
+      "SELECT baseline_completed, write_enabled FROM agent_runs WHERE run_id = ?",
+    ).get(runId) as { baseline_completed: number; write_enabled: number } | undefined;
+    if (run?.baseline_completed !== 1 || run.write_enabled !== 1) {
+      throw new Error("This run has no complete rollback baseline.");
+    }
+    this.workspace.db.prepare("UPDATE agent_run_files SET rollback_state = NULL WHERE run_id = ?").run(runId);
     const rows = this.workspace.db.prepare(
-      `SELECT file_id, baseline_path, baseline_hash, baseline_object_id, final_path, final_hash
+      `SELECT file_id, baseline_path, baseline_hash, baseline_object_id, final_path, final_hash,
+              rollback_state
        FROM agent_run_files WHERE run_id = ?`,
     ).all(runId) as RunFileRow[];
     const result: RollbackResult = { restored: [], removedCreated: [], conflicts: [] };
@@ -228,8 +241,10 @@ export class RunProtection {
         if (row.final_hash !== null && currentHash === row.final_hash) {
           await this.workspace.trash(row.file_id, currentHash);
           result.removedCreated.push(row.final_path);
+          this.setRollbackState(runId, row.file_id, "removed");
         } else {
           result.conflicts.push(row.final_path);
+          this.setRollbackState(runId, row.file_id, "conflict");
         }
         continue;
       }
@@ -239,8 +254,9 @@ export class RunProtection {
         const finalPath = resolveWorkspacePath(this.workspace.rootPath, row.final_path);
         if (existsSync(finalPath)) {
           const currentHash = await sha256File(finalPath);
-          if (row.final_hash !== null && currentHash !== row.final_hash) {
+          if (row.final_hash === null || currentHash !== row.final_hash) {
             result.conflicts.push(row.final_path);
+            this.setRollbackState(runId, row.file_id, "conflict");
             continue;
           }
           if (finalPath !== baselinePath) await rm(finalPath);
@@ -250,11 +266,13 @@ export class RunProtection {
         const currentHash = await sha256File(baselinePath);
         if (row.final_path !== row.baseline_path && currentHash !== row.baseline_hash) {
           result.conflicts.push(row.baseline_path);
+          this.setRollbackState(runId, row.file_id, "conflict");
           continue;
         }
       }
       await this.workspace.objects.restoreTo(row.baseline_object_id, baselinePath);
       result.restored.push(row.baseline_path);
+      this.setRollbackState(runId, row.file_id, "restored");
     }
     await this.workspace.reconcile();
     await this.reindexChanged();
@@ -275,9 +293,10 @@ export class RunProtection {
     if (wanted.size === 0) return [];
     if (wanted.size > 100) throw new Error("Restore at most 100 baseline copies at one time.");
     const rows = this.workspace.db.prepare(
-      `SELECT baseline_path, final_path, baseline_object_id
+      `SELECT file_id, baseline_path, final_path, baseline_object_id
        FROM agent_run_files WHERE run_id = ? AND baseline_object_id IS NOT NULL`,
     ).all(runId) as Array<{
+      file_id: string;
       baseline_path: string | null;
       final_path: string | null;
       baseline_object_id: string;
@@ -295,8 +314,108 @@ export class RunProtection {
       const copyPath = this.availableBaselineCopyPath(row.baseline_path);
       await this.workspace.createFileFromObject(row.baseline_object_id, copyPath, "rollback-copy");
       restored.push(copyPath);
+      this.workspace.db.prepare(
+        `UPDATE agent_run_files SET rollback_state = 'copied'
+         WHERE run_id = ? AND file_id = ?`,
+      ).run(runId, row.file_id);
+    }
+    const remaining = this.workspace.db.prepare(
+      "SELECT count(*) AS n FROM agent_run_files WHERE run_id = ? AND rollback_state = 'conflict'",
+    ).get(runId) as { n: number };
+    if (remaining.n === 0) {
+      this.workspace.db.prepare(
+        "UPDATE agent_runs SET rollback_status = 'completed' WHERE run_id = ?",
+      ).run(runId);
     }
     return restored;
+  }
+
+  recordHarness(runId: string, harness: string): void {
+    this.workspace.db.prepare("UPDATE agent_runs SET harness = ? WHERE run_id = ?").run(harness, runId);
+  }
+
+  /** Recover process-local statuses, then return the encrypted durable audit. */
+  async listHistory(
+    activeRunIds: readonly string[] = [],
+    recoverStale = true,
+  ): Promise<HarnessHistoryRun[]> {
+    const active = new Set(activeRunIds);
+    const stale = recoverStale ? this.workspace.db.prepare(
+      `SELECT run_id, write_enabled, baseline_completed FROM agent_runs
+       WHERE status IN ('preparing', 'running')`,
+    ).all() as Array<{ run_id: string; write_enabled: number; baseline_completed: number }> : [];
+    for (const row of stale) {
+      if (active.has(row.run_id)) continue;
+      if (row.write_enabled === 1 && row.baseline_completed === 1) {
+        // A process crash cannot emit final provider events. Capture the
+        // filesystem as found now so rollback keeps the same optimistic hash
+        // safety it has for normally completed runs.
+        await this.captureFinalState(row.run_id).catch(() => undefined);
+      }
+      this.workspace.db.prepare(
+        `UPDATE agent_runs SET status = 'interrupted',
+           completed_at = coalesce(completed_at, strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+         WHERE run_id = ? AND status IN ('preparing', 'running')`,
+      ).run(row.run_id);
+    }
+
+    const runs = this.workspace.db.prepare(
+      `SELECT run_id, provider, harness, model, privacy_mode, status,
+              write_enabled, baseline_completed, rollback_status,
+              started_at, completed_at
+       FROM agent_runs
+       ORDER BY started_at DESC, rowid DESC
+       LIMIT ?`,
+    ).all(AGENT_AUDIT_RETAIN_RUNS) as Array<{
+      run_id: string;
+      provider: string;
+      harness: string;
+      model: string;
+      privacy_mode: HarnessHistoryRun["privacyMode"];
+      status: string;
+      write_enabled: number;
+      baseline_completed: number;
+      rollback_status: string;
+      started_at: string;
+      completed_at: string | null;
+    }>;
+    const fileRows = this.workspace.db.prepare(
+      `SELECT file_id, coalesce(final_path, baseline_path) AS relative_path,
+              change_type, rollback_state
+       FROM agent_run_files
+       WHERE run_id = ? AND change_type IN ('created', 'modified', 'moved', 'deleted')
+       ORDER BY relative_path`,
+    );
+    return runs.map((run) => ({
+      runId: run.run_id,
+      provider: run.provider,
+      harness: run.harness,
+      model: run.model,
+      privacyMode: run.privacy_mode,
+      status: run.status,
+      writeEnabled: run.write_enabled === 1,
+      baselineCompleted: run.baseline_completed === 1,
+      rollbackStatus: run.rollback_status,
+      startedAt: run.started_at,
+      completedAt: run.completed_at,
+      changes: (fileRows.all(run.run_id) as Array<{
+        file_id: string;
+        relative_path: string;
+        change_type: string;
+        rollback_state: string | null;
+      }>).map((file) => ({
+        fileId: file.file_id,
+        relativePath: file.relative_path,
+        change: file.change_type,
+        rollbackState: file.rollback_state,
+      })),
+    }));
+  }
+
+  private setRollbackState(runId: string, fileId: string, state: string): void {
+    this.workspace.db.prepare(
+      "UPDATE agent_run_files SET rollback_state = ? WHERE run_id = ? AND file_id = ?",
+    ).run(state, runId, fileId);
   }
 
   private availableBaselineCopyPath(relativePath: string): string {

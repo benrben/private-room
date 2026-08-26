@@ -57,7 +57,12 @@ export interface HarnessCapabilities {
   outsideWorkspaceIsolation: boolean;
   providers: Record<
     string,
-    { enabled: boolean; installed: boolean; reason: string | null }
+    {
+      enabled: boolean;
+      installed: boolean;
+      reason: string | null;
+      harness: HarnessName | null;
+    }
   >;
 }
 
@@ -65,6 +70,28 @@ export interface HarnessRollbackResult {
   restored: string[];
   removedCreated: string[];
   conflicts: string[];
+}
+
+export interface HarnessHistoryChange {
+  fileId: string;
+  relativePath: string;
+  change: string;
+  rollbackState: string | null;
+}
+
+export interface HarnessHistoryRun {
+  runId: string;
+  provider: string;
+  harness: string;
+  model: string;
+  privacyMode: HarnessPrivacyMode;
+  status: string;
+  writeEnabled: boolean;
+  baselineCompleted: boolean;
+  rollbackStatus: string;
+  startedAt: string;
+  completedAt: string | null;
+  changes: HarnessHistoryChange[];
 }
 
 /** Live, provider-neutral progress for long workspace storage operations. */

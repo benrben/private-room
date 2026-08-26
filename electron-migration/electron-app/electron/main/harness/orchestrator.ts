@@ -11,6 +11,7 @@ import type {
   HarnessRuntime,
   PrivacyMode,
 } from "./types.js";
+import type { HarnessHistoryRun } from "../../shared/harnessTypes.js";
 
 export interface StartHarnessTurn {
   /** Supplied by the trusted controller when it must prepare an exposure first. */
@@ -165,5 +166,20 @@ export class HarnessOrchestrator {
     if (this.active.has(runId)) throw new Error("Stop the agent run before restoring its baseline.");
     if (this.protection === null) throw new Error("Rollback is unavailable for this room format.");
     return this.protection.restoreBaselineAsCopies(runId, relativePaths);
+  }
+
+  listHistory(
+    additionalActiveRunIds: readonly string[] = [],
+    recoverStale = true,
+  ): Promise<HarnessHistoryRun[]> {
+    if (this.protection === null) return Promise.resolve([]);
+    return this.protection.listHistory(
+      [...new Set([...this.activeRunIds(), ...additionalActiveRunIds])],
+      recoverStale,
+    );
+  }
+
+  recordHarness(runId: string, harness: string): void {
+    this.protection?.recordHarness(runId, harness);
   }
 }

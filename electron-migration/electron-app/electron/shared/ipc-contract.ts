@@ -102,7 +102,7 @@ import type {
   RoomServerStatus,
   RoomRole,
 } from "./apiTypes.js";
-import type { ApprovalDecision, PrivacyMode } from "./harnessTypes.js";
+import type { ApprovalDecision, HarnessHistoryRun, PrivacyMode } from "./harnessTypes.js";
 
 export interface Commands {
   // ---- chunk 1 --------------------------------------------------------
@@ -1013,7 +1013,12 @@ export interface Commands {
       flags: Record<string, boolean>;
       roomFormat: "workspace-folder" | "sealed-db" | null;
       outsideWorkspaceIsolation: boolean;
-      providers: Record<string, { enabled: boolean; installed: boolean; reason: string | null }>;
+      providers: Record<string, {
+        enabled: boolean;
+        installed: boolean;
+        reason: string | null;
+        harness: import("./harnessTypes.js").HarnessName | null;
+      }>;
     };
   };
   harness_start: {
@@ -1034,6 +1039,7 @@ export interface Commands {
   };
   harness_cancel: { args: { runId: string }; result: void };
   harness_cloud_writeback: { args: { runId: string; approved: boolean }; result: void };
+  harness_list_runs: { args: Record<string, never>; result: HarnessHistoryRun[] };
   harness_rollback: {
     args: { runId: string };
     result: { restored: string[]; removedCreated: string[]; conflicts: string[] };

@@ -28,9 +28,11 @@ import { nativeWorkspaceSandboxSupported, verifyNativeHarnessExecutable } from "
 import type {
   ApprovalDecision,
   HarnessEvent,
+  HarnessName,
   HarnessRuntime,
   PrivacyMode,
 } from "./types.js";
+import type { HarnessHistoryRun } from "../../shared/harnessTypes.js";
 
 export type HarnessProvider = "codex" | "claude" | "ollama-local" | "ollama-cloud" | "openrouter";
 
@@ -48,7 +50,12 @@ export interface HarnessCapabilityReport {
   flags: Record<WorkspaceHarnessFlag, boolean>;
   roomFormat: "workspace-folder" | "sealed-db" | null;
   outsideWorkspaceIsolation: boolean;
-  providers: Record<string, { enabled: boolean; installed: boolean; reason: string | null }>;
+  providers: Record<string, {
+    enabled: boolean;
+    installed: boolean;
+    reason: string | null;
+    harness: HarnessName | null;
+  }>;
 }
 
 interface MirrorRun {
@@ -181,6 +188,7 @@ export class HarnessController {
       const installed = flags[providerFlag] ? await this.runtimes[name].available() : false;
       const room = this.state.room;
       let sandboxReady = false;
+      let harness: HarnessRuntime["name"] | null = null;
       if (
         flags.unified_harness
         && flags[providerFlag]
@@ -192,7 +200,12 @@ export class HarnessController {
       ) {
         const probePath = path.join(this.runtimeRoot(), room.descriptor.roomId, `capability-${randomUUID()}`);
         await mkdir(probePath, { recursive: true, mode: 0o700 });
-        try { sandboxReady = await this.verifyExposure(room.descriptor.rootPath, name, probePath, false); }
+        try {
+          sandboxReady = await this.verifyExposure(room.descriptor.rootPath, name, probePath, false);
+          harness = this.runtimes[name] instanceof RuntimeWithFallback
+            ? this.runtimes[name].consumeVerifiedHarness(probePath)
+            : sandboxReady ? this.runtimes[name].name : null;
+        }
         finally { await rm(probePath, { recursive: true, force: true }); }
       }
       let reason: string | null = null;
@@ -202,7 +215,10 @@ export class HarnessController {
       else if (!installed) reason = `The ${name} agent runtime is not installed.`;
       else if (room?.descriptor?.kind !== "workspace-folder") reason = "Open a workspace room to run the sandbox capability test.";
       else if (!sandboxReady) reason = `The ${name} runtime failed its sandbox capability test.`;
-      return { enabled: sandboxReady, installed, reason };
+      else if (harness === "legacy-cli") {
+        reason = `The native ${name} harness failed its startup test. Arcelle will use the restricted CLI fallback.`;
+      }
+      return { enabled: sandboxReady, installed, reason, harness };
     };
     const deepProvider = async (name: "ollama-local" | "ollama-cloud" | "openrouter") => {
       const installed = flags.deep_agent_harness ? await this.runtimes[name].available() : false;
@@ -214,7 +230,12 @@ export class HarnessController {
       else if (room?.descriptor?.kind !== "workspace-folder" || room.workspace === undefined) {
         reason = "Open a workspace room to use the Deep Harness.";
       }
-      return { enabled: reason === null, installed, reason };
+      return {
+        enabled: reason === null,
+        installed,
+        reason,
+        harness: reason === null ? this.runtimes[name].name : null,
+      };
     };
     // Provider probes may execute installed CLIs and their sandbox self-tests.
     // They are independent, so running them serially makes one slow/missing
@@ -324,6 +345,7 @@ export class HarnessController {
         let terminal: HarnessEvent | null = null;
         try {
           for await (const event of started.events) {
+            if (event.type === "run_started") orchestrator.recordHarness(runId, event.harness);
             // A terminal event is a lifecycle promise to the renderer: once it
             // paints Done/Failed/Stopped, the private run directory and mirror
             // must already be gone. Buffer the one terminal event until cleanup
@@ -370,13 +392,25 @@ export class HarnessController {
   }
 
   rollback(runId: string): Promise<RollbackResult> {
-    if (this.orchestrator === null) throw new Error("No harness history is available for this room.");
-    return this.orchestrator.rollback(runId);
+    return this.ensureOrchestrator().rollback(runId);
   }
 
   restoreBaselineAsCopies(runId: string, paths: string[]): Promise<string[]> {
-    if (this.orchestrator === null) throw new Error("No harness history is available for this room.");
-    return this.orchestrator.restoreBaselineAsCopies(runId, paths);
+    return this.ensureOrchestrator().restoreBaselineAsCopies(runId, paths);
+  }
+
+  listHistory(): Promise<HarnessHistoryRun[]> {
+    const room = this.state.room;
+    if (room?.workspace === undefined || room.descriptor?.kind !== "workspace-folder") {
+      return Promise.resolve([]);
+    }
+    // `runRoots` includes the baseline/runtime preparation window before the
+    // orchestrator marks a run active. A concurrent refresh must not recover
+    // that genuinely live row as interrupted.
+    return this.ensureOrchestrator().listHistory(
+      [...this.runRoots.keys()],
+      room.readOnly !== true,
+    );
   }
 
   async stopAll(timeoutMs = 10_000): Promise<void> {

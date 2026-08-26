@@ -11,7 +11,7 @@ import { WSActions } from "./actions";
 import { ownerOf as ownsEvent } from "./runIdentity";
 import { applyRecState } from "./recSession";
 import { startRecordingTransport } from "./recordingTransport";
-import { applyHarnessEvent } from "./harnessUi";
+import { applyHarnessEvent, mergeHarnessHistory } from "./harnessUi";
 
 /** How many of the assistant's organization changes Activity keeps. A record of
  * this session, not an archive — the transcript is where every one of them is
@@ -81,6 +81,9 @@ export function useWorkspaceEffects(
       // bars.
       void a.refreshScripts();
       void a.refreshSkills();
+      api.harnessListRuns()
+        .then((history) => s.setHarnessRuns((runs) => mergeHarnessHistory(runs, history)))
+        .catch(readFailed("workspace agent history"));
       a.refreshAi();
       a.loadFrontPage(true);
       api.warmModel().catch(() => {});
@@ -438,6 +441,11 @@ export function useWorkspaceEffects(
       }
       if (event.type === "run_failed") {
         s.pushToast("error", `Agent run failed: ${event.error}`);
+      }
+      if (event.type === "run_failed" || event.type === "run_completed") {
+        api.harnessListRuns()
+          .then((history) => s.setHarnessRuns((runs) => mergeHarnessHistory(runs, history)))
+          .catch(() => {});
       }
     });
     a.refreshWebAccess();

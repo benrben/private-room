@@ -16,6 +16,66 @@ afterEach(async () => {
 });
 
 describe("RunProtection conflict recovery", () => {
+  it("recovers a stale write run into durable history and rolls it back after restart", async () => {
+    const parent = await mkdtemp(path.join(os.tmpdir(), "arcelle-run-history-"));
+    roots.push(parent);
+    const workspaceRoot = path.join(parent, "Room");
+    const source = path.join(parent, "source.txt");
+    await writeFile(source, "before agent", "utf8");
+    const { db, descriptor } = createWorkspaceRoom(
+      workspaceRoot,
+      "correct horse battery staple",
+      "Room",
+    );
+    const workspace = new WorkspaceService(db, workspaceRoot);
+    try {
+      await workspace.importFile(source, "notes.txt");
+      const context: HarnessContext = {
+        runId: "stale-run",
+        roomId: descriptor.roomId,
+        provider: "codex",
+        model: "gpt-test",
+        workspacePath: workspaceRoot,
+        runtimePath: path.join(parent, "runtime"),
+        privacyMode: "cloud-direct",
+        writeEnabled: true,
+        exposureVerified: true,
+      };
+      const firstProcess = new RunProtection(workspace, descriptor.roomId);
+      await firstProcess.createBaseline(context);
+      firstProcess.recordHarness(context.runId, "legacy-cli");
+      await writeFile(path.join(workspaceRoot, "notes.txt"), "agent edit", "utf8");
+
+      const restarted = new RunProtection(workspace, descriptor.roomId);
+      expect((await restarted.listHistory([], false))[0]?.status).toBe("running");
+      const history = await restarted.listHistory();
+      expect(history).toHaveLength(1);
+      expect(history[0]).toMatchObject({
+        runId: "stale-run",
+        provider: "codex",
+        harness: "legacy-cli",
+        model: "gpt-test",
+        privacyMode: "cloud-direct",
+        status: "interrupted",
+        writeEnabled: true,
+        baselineCompleted: true,
+        rollbackStatus: "none",
+        changes: [{ relativePath: "notes.txt", change: "modified", rollbackState: null }],
+      });
+
+      await expect(restarted.rollback(context.runId)).resolves.toMatchObject({
+        restored: ["notes.txt"], conflicts: [],
+      });
+      expect(await readFile(path.join(workspaceRoot, "notes.txt"), "utf8")).toBe("before agent");
+      expect((await restarted.listHistory())[0]).toMatchObject({
+        status: "rolled_back", rollbackStatus: "completed",
+        changes: [{ rollbackState: "restored" }],
+      });
+    } finally {
+      db.close();
+    }
+  });
+
   it("retains recent audit history and prunes only old runs beyond the count floor", async () => {
     const parent = await mkdtemp(path.join(os.tmpdir(), "arcelle-run-retention-"));
     roots.push(parent);
@@ -95,11 +155,15 @@ describe("RunProtection conflict recovery", () => {
       await protection.finish(context.runId, "completed");
 
       await writeFile(path.join(workspaceRoot, "notes.txt"), "later user edit", "utf8");
-      const rollback = await protection.rollback(context.runId);
+      // New instance = new app process. Neither operation may depend on the
+      // old in-memory writeRuns/orchestrator state.
+      const restarted = new RunProtection(workspace, descriptor.roomId);
+      const rollback = await restarted.rollback(context.runId);
       expect(rollback.conflicts).toEqual(["notes.txt"]);
       expect(await readFile(path.join(workspaceRoot, "notes.txt"), "utf8")).toBe("later user edit");
 
-      const copies = await protection.restoreBaselineAsCopies(context.runId, rollback.conflicts);
+      const secondRestart = new RunProtection(workspace, descriptor.roomId);
+      const copies = await secondRestart.restoreBaselineAsCopies(context.runId, rollback.conflicts);
       expect(copies).toEqual(["notes (baseline).txt"]);
       expect(await readFile(path.join(workspaceRoot, copies[0]!), "utf8")).toBe("before agent");
       expect(await readFile(path.join(workspaceRoot, "notes.txt"), "utf8")).toBe("later user edit");
@@ -111,6 +175,7 @@ describe("RunProtection conflict recovery", () => {
         source: "rollback-copy",
         relative_path: "notes (baseline).txt",
       });
+      expect((await secondRestart.listHistory())[0]?.rollbackStatus).toBe("completed");
     } finally {
       db.close();
     }

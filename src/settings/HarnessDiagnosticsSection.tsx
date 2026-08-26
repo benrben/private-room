@@ -47,8 +47,11 @@ export default function HarnessDiagnosticsSection() {
                   {provider.enabled ? "Ready" : provider.installed ? "Blocked" : "Missing"}
                 </span>
                 <span>
-                  <strong>{PROVIDER_LABELS[id] ?? id}</strong>
-                  {!provider.enabled && <> — {provider.reason ?? "capability test failed"}</>}
+                  <strong>{provider.harness === "legacy-cli"
+                    ? `${id === "codex" ? "Codex" : id === "claude" ? "Claude" : id} restricted CLI`
+                    : PROVIDER_LABELS[id] ?? id}</strong>
+                  {provider.reason && <> — {provider.reason}</>}
+                  {!provider.enabled && !provider.reason && <> — capability test failed</>}
                 </span>
               </div>
             ))}

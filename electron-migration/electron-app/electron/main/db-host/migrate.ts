@@ -355,6 +355,7 @@ export function migrate(db: Database.Database): void {
        model TEXT NOT NULL,
        privacy_mode TEXT NOT NULL,
        status TEXT NOT NULL,
+       write_enabled INTEGER NOT NULL DEFAULT 0,
        baseline_completed INTEGER NOT NULL DEFAULT 0,
        rollback_status TEXT NOT NULL DEFAULT 'none',
        started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
@@ -369,11 +370,25 @@ export function migrate(db: Database.Database): void {
        final_path TEXT,
        final_hash TEXT,
        change_type TEXT,
+       rollback_state TEXT,
        PRIMARY KEY (run_id, file_id)
      );
      CREATE INDEX IF NOT EXISTS idx_agent_run_files_object
        ON agent_run_files(baseline_object_id);`,
   );
+  if (!columnExists(db, "agent_runs", "write_enabled")) {
+    db.exec("ALTER TABLE agent_runs ADD COLUMN write_enabled INTEGER NOT NULL DEFAULT 0");
+    // Older write runs already have baseline rows. This preserves their
+    // rollback affordance; an old empty-room run cannot be distinguished and
+    // stays read-only-safe rather than being guessed writable.
+    db.exec(
+      `UPDATE agent_runs SET write_enabled = 1
+       WHERE EXISTS (SELECT 1 FROM agent_run_files f WHERE f.run_id = agent_runs.run_id)`,
+    );
+  }
+  if (!columnExists(db, "agent_run_files", "rollback_state")) {
+    db.exec("ALTER TABLE agent_run_files ADD COLUMN rollback_state TEXT");
+  }
 
   // Room map: file→file provenance, plus one-off recovery from finished
   // file_pass jobs (their plan names the source, their publish artifact names

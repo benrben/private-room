@@ -46,6 +46,7 @@ export function registerHarnessSurfaceIpc(
     ipcMain.handle(channel, (_event: IpcMainInvokeEvent, args: unknown) => fn(args));
   };
   handle("harness_capabilities", () => controller.capabilities());
+  handle("harness_list_runs", () => controller.listHistory());
   handle("harness_start", (args) => controller.start(startRequest(args)).then((runId) => ({ runId })));
   handle("harness_approve", (args) => {
     const row = args as Record<string, unknown>;

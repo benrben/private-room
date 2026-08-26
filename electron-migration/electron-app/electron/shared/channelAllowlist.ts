@@ -152,6 +152,7 @@ const ALL_COMMANDS_TYPED: { [K in keyof Commands]: true } = {
   harness_cancel: true,
   harness_capabilities: true,
   harness_cloud_writeback: true,
+  harness_list_runs: true,
   harness_restore_baseline_copies: true,
   harness_rollback: true,
   harness_start: true,

@@ -128,6 +128,7 @@ import type {
   HarnessPrivacyMode,
   HarnessProvider,
   HarnessRollbackResult,
+  HarnessHistoryRun,
   WorkspaceOperationProgressEvent,
 } from "./apiTypes";
 
@@ -242,6 +243,7 @@ export const api = {
     invoke<WorkspaceWatcherStatus>("set_workspace_watcher_polling", { enabled }),
   harnessCapabilities: () =>
     invoke<HarnessCapabilities>("harness_capabilities", {}),
+  harnessListRuns: () => invoke<HarnessHistoryRun[]>("harness_list_runs", {}),
   harnessStart: (request: {
     provider: HarnessProvider;
     model: string;

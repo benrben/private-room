@@ -8,6 +8,7 @@ import { createRoomManagerState } from "../roomManager.js";
 import { createWorkspaceRoom } from "../workspace/roomLayout.js";
 import { WorkspaceService } from "../workspace/workspaceService.js";
 import { HarnessController } from "./controller.js";
+import { RuntimeWithFallback } from "./legacyCli.js";
 import type { HarnessContext, HarnessRun, HarnessRuntime } from "./types.js";
 import type { WorkspaceOperationProgressEvent } from "../../shared/workspaceProgress.js";
 
@@ -192,6 +193,49 @@ describe("HarnessController", () => {
     }
   });
 
+  it("reports and enables the restricted fallback when native startup probing fails", async () => {
+    const f = await fixture();
+    const probeRuntime = (
+      name: HarnessRuntime["name"],
+      exposure: boolean,
+    ): HarnessRuntime => ({
+      name,
+      available: async () => true,
+      verifyExposure: async () => exposure,
+      startTurn: async () => {
+        async function* events() { /* not used */ }
+        return { events: events(), cancel: async () => undefined, approve: async () => undefined };
+      },
+    });
+    try {
+      const fallback = new RuntimeWithFallback(
+        probeRuntime("codex-app-server", false),
+        probeRuntime("legacy-cli", true),
+      );
+      const available = probeRuntime("legacy-cli", true);
+      const controller = new HarnessController(f.state, f.root, () => undefined, {
+        runtimes: {
+          codex: fallback,
+          claude: available,
+          "ollama-local": available,
+          "ollama-cloud": available,
+          openrouter: available,
+        },
+        flag: () => true,
+        outsideWorkspaceIsolation: true,
+      });
+      const capabilities = await controller.capabilities();
+      expect(capabilities.providers.codex).toMatchObject({
+        enabled: true,
+        installed: true,
+        harness: "legacy-cli",
+        reason: expect.stringMatching(/native codex harness failed.*restricted CLI fallback/i),
+      });
+    } finally {
+      f.created.db.close();
+    }
+  });
+
   it("applies a redacted mirror edit locally before the terminal event", async () => {
     const f = await fixture();
     const emitted: Array<{ event: string; payload: unknown }> = [];
@@ -241,9 +285,17 @@ describe("HarnessController", () => {
   it("reports provider capability from the real per-provider sandbox probe", async () => {
     const f = await fixture();
     try {
-      const runtime = new EditingRuntime();
+      const backing = new EditingRuntime();
+      const runtime = (name: HarnessRuntime["name"]): HarnessRuntime => ({
+        name,
+        available: () => backing.available(),
+        startTurn: (context) => backing.startTurn(context),
+      });
       const controller = new HarnessController(f.state, f.root, () => undefined, {
-        runtimes: { codex: runtime, claude: runtime },
+        runtimes: {
+          codex: runtime("codex-app-server"),
+          claude: runtime("claude-agent-sdk"),
+        },
         flag: () => true,
         outsideWorkspaceIsolation: true,
         verifyExposure: async (_workspace, provider) => provider === "codex",

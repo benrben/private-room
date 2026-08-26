@@ -2,6 +2,29 @@ export type HarnessName = "codex-app-server" | "claude-agent-sdk" | "arcelle-dee
 export type PrivacyMode = "local" | "cloud-direct" | "cloud-redacted";
 export type ApprovalDecision = "allow-once" | "allow-run" | "deny" | "cancel";
 
+export interface HarnessHistoryChange {
+  fileId: string;
+  relativePath: string;
+  change: string;
+  rollbackState: string | null;
+}
+
+/** Durable provider-neutral run history read from the encrypted room DB. */
+export interface HarnessHistoryRun {
+  runId: string;
+  provider: string;
+  harness: string;
+  model: string;
+  privacyMode: PrivacyMode;
+  status: string;
+  writeEnabled: boolean;
+  baselineCompleted: boolean;
+  rollbackStatus: string;
+  startedAt: string;
+  completedAt: string | null;
+  changes: HarnessHistoryChange[];
+}
+
 /** Provider-neutral event shape used by the main process and renderer. */
 export type HarnessEvent =
   | { type: "run_started"; runId: string; harness: HarnessName }

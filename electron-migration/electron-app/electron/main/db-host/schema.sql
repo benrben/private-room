@@ -311,6 +311,7 @@ CREATE TABLE IF NOT EXISTS agent_runs (
   model TEXT NOT NULL,
   privacy_mode TEXT NOT NULL,
   status TEXT NOT NULL,
+  write_enabled INTEGER NOT NULL DEFAULT 0,
   baseline_completed INTEGER NOT NULL DEFAULT 0,
   rollback_status TEXT NOT NULL DEFAULT 'none',
   started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
@@ -325,6 +326,7 @@ CREATE TABLE IF NOT EXISTS agent_run_files (
   final_path TEXT,
   final_hash TEXT,
   change_type TEXT,
+  rollback_state TEXT,
   PRIMARY KEY (run_id, file_id)
 );
 CREATE INDEX IF NOT EXISTS idx_agent_run_files_object
