@@ -41,6 +41,19 @@ describe("workspace path safety", () => {
     await symlink(os.tmpdir(), path.join(root, "escape"));
     await expect(assertNoSymlinkSegments(root, "escape/file.txt", true)).rejects.toThrow(/symlink/i);
   });
+
+  it("rejects a symlink used as the workspace root", async () => {
+    const parent = await temporaryRoot();
+    const realRoot = path.join(parent, "Real Room");
+    const aliasRoot = path.join(parent, "Room Alias");
+    const { db } = createWorkspaceRoom(realRoot, "correct horse battery staple", "Real Room");
+    try {
+      await symlink(realRoot, aliasRoot);
+      expect(() => new WorkspaceService(db, aliasRoot)).toThrow(/symlink.*root/i);
+    } finally {
+      db.close();
+    }
+  });
 });
 
 describe("workspace room storage", () => {

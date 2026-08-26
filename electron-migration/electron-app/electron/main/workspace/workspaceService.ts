@@ -1,6 +1,6 @@
 import type Database from "better-sqlite3-multiple-ciphers";
 import { createHash, randomUUID } from "node:crypto";
-import { createReadStream, createWriteStream } from "node:fs";
+import { createReadStream, createWriteStream, lstatSync } from "node:fs";
 import { chmod, lstat, mkdir, open, readdir, rename, rm, rmdir } from "node:fs/promises";
 import path from "node:path";
 import { Readable, Transform } from "node:stream";
@@ -104,6 +104,9 @@ export class WorkspaceService {
     readonly rootPath: string,
     readonly privateRoot = path.join(rootPath, ".arcelle"),
   ) {
+    if (lstatSync(rootPath).isSymbolicLink()) {
+      throw new Error("A workspace room cannot use a symlink as its root folder.");
+    }
     this.objects = new ContentObjectStore(db, privateRoot);
   }
 
