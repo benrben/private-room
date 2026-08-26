@@ -87,7 +87,7 @@ describe("workspace harness security review", () => {
         "security-test",
       );
       const document = await workspace.createFile(
-        "contract.pdf",
+        `${SECRET} contract.pdf`,
         Readable.from([Buffer.from([0x25, 0x50, 0x44, 0x46, 0, 1, 2, 3])]),
         "security-test",
       );
@@ -98,10 +98,11 @@ describe("workspace harness security review", () => {
       const files = await readRegularFiles(mirror.workspacePath);
       const exposed = Buffer.concat(files.map(({ bytes }) => bytes)).toString("utf8");
       expect(exposed).not.toContain(SECRET);
+      expect(files.map(({ relativePath }) => relativePath).join("\n")).not.toContain(SECRET);
       expect(exposed).not.toContain("AQIDBA==");
       expect(files.some(({ relativePath }) => relativePath.toLocaleLowerCase("en-US").includes(".arcelle")))
         .toBe(false);
-      await expect(lstat(path.join(mirror.workspacePath, "contract.pdf"))).rejects.toThrow();
+      await expect(lstat(path.join(mirror.workspacePath, `${SECRET} contract.pdf`))).rejects.toThrow();
     } finally {
       await mirror.cleanup();
       created.db.close();

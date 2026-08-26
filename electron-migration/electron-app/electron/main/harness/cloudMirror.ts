@@ -25,8 +25,33 @@ export interface MirrorRedactionPolicy {
 interface EditableMirrorFile {
   fileId: string;
   relativePath: string;
+  mirrorPath: string;
   expectedHash: string;
   baselineText: string;
+}
+
+function safeRedactedPathSegment(value: string): string {
+  const safe = value.replace(/[\\/\0]/g, "_").normalize("NFC").trim();
+  return safe === "" || safe === "." || safe === ".." ? "_protected" : safe;
+}
+
+function redactedRelativePath(
+  relativePath: string,
+  redactor: Redactor,
+  occupied: Set<string>,
+): { relativePath: string; entitiesHidden: number } {
+  const report = emptyPrivacyReport();
+  const segments = relativePath.split("/").map((segment) =>
+    safeRedactedPathSegment(redactor.redact(segment, report))
+  );
+  let candidate = normalizeRelativePath(segments.join("/"));
+  const extension = path.posix.extname(candidate);
+  const stem = candidate.slice(0, candidate.length - extension.length);
+  for (let suffix = 2; occupied.has(pathKey(candidate)); suffix += 1) {
+    candidate = `${stem} (${suffix})${extension}`;
+  }
+  occupied.add(pathKey(candidate));
+  return { relativePath: candidate, entitiesHidden: report.entitiesHidden };
 }
 
 export interface CloudMirrorInfo {
@@ -148,7 +173,16 @@ export class CloudRedactedMirror {
       size_bytes: number;
       extracted_text: string | null;
     }>;
-    const occupiedPaths = rows.map((row) => pathKey(row.relative_path));
+    const allocatedPaths = new Set<string>();
+    const mirrorPaths = new Map<string, string>();
+    let entitiesHidden = 0;
+    for (const row of rows) {
+      const original = normalizeRelativePath(row.relative_path);
+      const redacted = redactedRelativePath(original, this.policy.redactor, allocatedPaths);
+      mirrorPaths.set(row.id, redacted.relativePath);
+      entitiesHidden += redacted.entitiesHidden;
+    }
+    const occupiedPaths = [...allocatedPaths];
     for (let suffix = 1; suffix <= 10_000; suffix += 1) {
       const candidate = suffix === 1 ? "_Arcelle Companions" : `_Arcelle Companions (${suffix})`;
       const candidateKey = pathKey(candidate);
@@ -159,9 +193,9 @@ export class CloudRedactedMirror {
     }
     let companionFiles = 0;
     let imagesBlocked = 0;
-    let entitiesHidden = 0;
     for (const row of rows) {
       const relativePath = normalizeRelativePath(row.relative_path);
+      const mirrorPath = mirrorPaths.get(row.id)!;
       const extension = path.posix.extname(relativePath).toLocaleLowerCase("en-US");
       if (isTextPath(relativePath) && row.size_bytes <= MAX_EDITABLE_TEXT_BYTES) {
         const bytes = await this.workspace.readBuffer(row.id);
@@ -169,27 +203,28 @@ export class CloudRedactedMirror {
         const report = emptyPrivacyReport();
         const redacted = this.policy.redactor.redact(stripEmbeddedImages(decodeTextBytes(bytes)), report);
         entitiesHidden += report.entitiesHidden;
-        await privateWrite(resolveWorkspacePath(this.workspacePath, relativePath), redacted);
-        this.editable.set(pathKey(relativePath), {
+        await privateWrite(resolveWorkspacePath(this.workspacePath, mirrorPath), redacted);
+        this.editable.set(pathKey(mirrorPath), {
           fileId: row.id,
           relativePath,
+          mirrorPath,
           expectedHash: row.content_sha256,
           baselineText: redacted,
         });
         continue;
       }
 
-      const companionPath = normalizeRelativePath(path.posix.join(this.companionRoot, `${relativePath}.txt`));
+      const companionPath = normalizeRelativePath(path.posix.join(this.companionRoot, `${mirrorPath}.txt`));
       let companion: string;
       if (IMAGE_EXTENSIONS.has(extension)) {
         imagesBlocked += 1;
-        companion = `Image blocked by Cloud Privacy\nOriginal path: ${relativePath}\nNo pixel data is present in this mirror.\n`;
+        companion = `Image blocked by Cloud Privacy\nMirror path: ${mirrorPath}\nNo pixel data is present in this mirror.\n`;
       } else if (row.extracted_text !== null) {
         const report = emptyPrivacyReport();
         companion = this.policy.redactor.redact(stripEmbeddedImages(row.extracted_text), report);
         entitiesHidden += report.entitiesHidden;
       } else {
-        companion = `Binary file not exposed by Cloud Privacy\nOriginal path: ${relativePath}\nUse an approved Arcelle tool for structured changes.\n`;
+        companion = `Binary file not exposed by Cloud Privacy\nMirror path: ${mirrorPath}\nUse an approved Arcelle tool for structured changes.\n`;
       }
       await privateWrite(resolveWorkspacePath(this.workspacePath, companionPath), companion);
       companionFiles += 1;
@@ -213,7 +248,7 @@ export class CloudRedactedMirror {
     const edited = new Map<string, string>();
     for (const [key, entry] of this.editable) {
       if (!manifest.has(key)) continue; // Mirror deletion does not delete the real file.
-      edited.set(key, await readFile(resolveWorkspacePath(this.workspacePath, entry.relativePath), "utf8"));
+      edited.set(key, await readFile(resolveWorkspacePath(this.workspacePath, entry.mirrorPath), "utf8"));
     }
     const createdPaths = [...manifest.values()]
       .filter((entry) => !this.editable.has(entry.pathKey) && !entry.relativePath.startsWith(`${this.companionRoot}/`));
@@ -224,7 +259,10 @@ export class CloudRedactedMirror {
       edited.set(entry.pathKey, await readFile(resolveWorkspacePath(this.workspacePath, entry.relativePath), "utf8"));
     }
 
-    const editedAll = [...edited.values()].join("\n");
+    const editedAll = [
+      ...edited.values(),
+      ...[...manifest.values()].map((entry) => entry.relativePath),
+    ].join("\n");
     const unknown = unknownPlaceholders(editedAll, knownTokens, labels);
     if (unknown.length > 0) {
       throw new Error(`Cloud output contains unknown or damaged protected placeholders: ${unknown.join(", ")}`);
@@ -254,12 +292,13 @@ export class CloudRedactedMirror {
         updated.push(baseline.relativePath);
       } else {
         const entry = manifest.get(key)!;
+        const restoredPath = normalizeRelativePath(this.policy.redactor.restore(entry.relativePath));
         await this.workspace.createFile(
-          entry.relativePath,
+          restoredPath,
           Readable.from([Buffer.from(restored, "utf8")]),
           "cloud-mirror",
         );
-        created.push(entry.relativePath);
+        created.push(restoredPath);
       }
     }
     return { updated, created, requiresReview: [] };
