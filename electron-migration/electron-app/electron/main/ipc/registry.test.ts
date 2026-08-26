@@ -179,6 +179,10 @@ function build(): Built {
         showItemInFolder: (p: string) => {
           shellCalls.push(["showItemInFolder", p]);
         },
+        trashItem: (p: string) => {
+          shellCalls.push(["trashItem", p]);
+          return Promise.resolve();
+        },
       },
       openWithApp: (app: string, target: string) => {
         shellCalls.push(["openWithApp", [app, target]]);

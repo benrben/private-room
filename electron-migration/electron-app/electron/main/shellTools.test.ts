@@ -31,6 +31,7 @@ function fakeDeps(openPathResult = ""): ShellDeps & {
   openExternal: ReturnType<typeof vi.fn>;
   openPathFn: ReturnType<typeof vi.fn>;
   showItemInFolder: ReturnType<typeof vi.fn>;
+  trashItem: ReturnType<typeof vi.fn>;
   openWithAppFn: ReturnType<typeof vi.fn>;
 } {
   const openExternal = vi.fn(() => Promise.resolve());
@@ -38,7 +39,7 @@ function fakeDeps(openPathResult = ""): ShellDeps & {
   const showItemInFolder = vi.fn();
   const openWithAppFn = vi.fn(() => Promise.resolve());
   return {
-    shell: { openExternal, openPath: openPathFn, showItemInFolder },
+    shell: { openExternal, openPath: openPathFn, showItemInFolder, trashItem: vi.fn(() => Promise.resolve()) },
     openWithApp: openWithAppFn,
     openExternal,
     openPathFn,

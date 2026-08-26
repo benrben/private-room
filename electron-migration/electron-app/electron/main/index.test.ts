@@ -278,6 +278,7 @@ function fakeElectron(overrides?: {
       openExternal: vi.fn(() => Promise.resolve()),
       openPath: vi.fn(() => Promise.resolve("")),
       showItemInFolder: vi.fn(),
+      trashItem: vi.fn(() => Promise.resolve()),
     } as unknown as BootstrapElectron["shell"],
   };
   return fake;
