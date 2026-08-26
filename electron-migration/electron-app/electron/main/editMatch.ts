@@ -78,6 +78,7 @@ import { fuzzyFind, normalizeNeedle } from "./editMatchFuzzy.js";
 import { docxReplaceText, extractDocx } from "./editMatchDocx.js";
 import { findSectionRangeHtml, htmlEscape, htmlReplaceText, stripHtml } from "./editMatchHtml.js";
 import { setCellInBytes } from "./editMatchCells.js";
+import type { WorkspaceService } from "./workspace/workspaceService.js";
 
 // ---------------------------------------------------------------- result plumbing
 
@@ -1182,6 +1183,87 @@ export function planSingleEdit(db: Database.Database, edit: PreviewEdit): Planne
   ];
 }
 
+/** Workspace form of `planSingleEdit`: metadata/name resolution stays in the
+ * encrypted DB, while current bytes are streamed from the normal file. */
+export async function planSingleEditWorkspace(
+  db: Database.Database,
+  workspace: WorkspaceService,
+  edit: PreviewEdit,
+): Promise<PlannedWrite[]> {
+  if (edit.oldText === "") {
+    throw new EditError("old_text is required — copy the exact text to replace.", "not_found");
+  }
+  let id: string;
+  let realName: string;
+  try { [id, realName] = findFileLike(db, edit.name); }
+  catch (error) { throw new EditError(errMessage(error), "not_found"); }
+  const original = await workspace.readBuffer(id);
+  const computed = computeEditBytes(realName, original, edit.oldText, edit.newText, edit.all, {
+    prefixContext: edit.prefixContext,
+    suffixContext: edit.suffixContext,
+    occurrence: edit.occurrence,
+    section: edit.section,
+  });
+  const preview = previewPair(realName, original, computed.bytes);
+  return [{
+    fileId: id, realName, newBytes: computed.bytes, renameTo: null,
+    method: computed.method, count: computed.count, staleness: hashBytes(original),
+    ...preview,
+  }];
+}
+
+export async function planWriteFileWorkspace(
+  db: Database.Database,
+  workspace: WorkspaceService,
+  name: string,
+  content: string,
+): Promise<PlannedWrite[]> {
+  let id: string;
+  let realName: string;
+  try { [id, realName] = findFileLike(db, name); }
+  catch (error) { throw new EditError(errMessage(error), "not_found"); }
+  const ext = extensionOf(realName);
+  if (!isTextExtension(ext) && ext !== "html" && ext !== "htm") {
+    throw new EditError(
+      `"${realName}" is not a plain-text file — write_file only rewrites text or HTML files. ` +
+        "Use edit_file (docx), set_cells (spreadsheets), or create_file.",
+      "wrong_type",
+    );
+  }
+  const original = await workspace.readBuffer(id);
+  const newBytes = Buffer.from(content, "utf8");
+  return [{
+    fileId: id, realName, newBytes, renameTo: null, method: null,
+    count: [...content].length, staleness: hashBytes(original),
+    ...previewPair(realName, original, newBytes),
+  }];
+}
+
+export async function planSetCellsWorkspace(
+  db: Database.Database,
+  workspace: WorkspaceService,
+  name: string,
+  sheet: string | null,
+  updates: ReadonlyArray<readonly [string, string]>,
+): Promise<PlannedWrite[]> {
+  let id: string;
+  let realName: string;
+  try { [id, realName] = findFileLike(db, name); }
+  catch (error) { throw new EditError(errMessage(error), "not_found"); }
+  const original = await workspace.readBuffer(id);
+  let bytes = original;
+  for (const [cell, value] of updates) {
+    const changed = setCellInBytes(realName, bytes, sheet, cell, value);
+    if (!changed.ok) throw new EditError(changed.error, "error");
+    bytes = changed.bytes;
+  }
+  return [{
+    fileId: id, realName, newBytes: bytes, renameTo: null, method: null,
+    count: updates.length, staleness: hashBytes(original),
+    ...previewPair(realName, original, bytes),
+  }];
+}
+
 // ------------------------------------------------------------------ batch (Idea 7)
 
 /** Ported from `edit_match::MAX_BATCH_EDITS`. */
@@ -1307,7 +1389,11 @@ export function parseBatchOps(args: Record<string, unknown>): BatchOp[] {
  * `edit_match::plan_batch`; throws a plain `Error` where Rust returns
  * `Result<_, String>`.
  */
-export function planBatch(db: Database.Database, ops: readonly BatchOp[]): PlannedWrite[] {
+function planBatchWithLoader(
+  db: Database.Database,
+  ops: readonly BatchOp[],
+  loadBytes: (id: string) => Buffer | null,
+): PlannedWrite[] {
   const n = ops.length;
   if (n === 0) {
     throw new Error("No edits given — pass edits: [{name, old_text, new_text} | {name, new_name}].");
@@ -1350,7 +1436,7 @@ export function planBatch(db: Database.Database, ops: readonly BatchOp[]): Plann
     if (entry.bytes === null) {
       let loaded: Buffer | null;
       try {
-        loaded = getFileBytes(db, id);
+        loaded = loadBytes(id);
       } catch (e) {
         throw new Error(`Edit ${i + 1} of ${n} (${entry.realName}): ${errMessage(e)}`);
       }
@@ -1419,6 +1505,26 @@ export function planBatch(db: Database.Database, ops: readonly BatchOp[]): Plann
     }
   }
   return plans;
+}
+
+export function planBatch(db: Database.Database, ops: readonly BatchOp[]): PlannedWrite[] {
+  return planBatchWithLoader(db, ops, (id) => getFileBytes(db, id));
+}
+
+export async function planBatchWorkspace(
+  db: Database.Database,
+  workspace: WorkspaceService,
+  ops: readonly BatchOp[],
+): Promise<PlannedWrite[]> {
+  const bytes = new Map<string, Buffer>();
+  for (const op of ops) {
+    if (op.op !== "edit") continue;
+    let id: string;
+    try { [id] = findFileLike(db, op.name); }
+    catch (error) { throw new Error(errMessage(error)); }
+    if (!bytes.has(id)) bytes.set(id, await workspace.readBuffer(id));
+  }
+  return planBatchWithLoader(db, ops, (id) => bytes.get(id) ?? null);
 }
 
 // ------------------------------------------------- reference entry points (tests)

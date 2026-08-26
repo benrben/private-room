@@ -12,7 +12,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type Database from "better-sqlite3-multiple-ciphers";
 import { createRoom } from "./db-host/open.js";
 import { insertFile } from "./db-host/files.js";
@@ -52,6 +52,27 @@ function deps(overrides: Partial<ExecToolDeps> = {}): ExecToolDeps {
 function effects(): ToolEffects {
   return createToolEffects();
 }
+
+describe("live workspace organize dispatch", () => {
+  it("offers every byte-changing organize arm to runtimeTool before the legacy DB path", async () => {
+    const db = freshRoom();
+    const runtimeTool = vi.fn(async (name: string) => ({ ok: true as const, text: `live:${name}` }));
+    const calls: Array<[string, Record<string, unknown>]> = [
+      ["create_file", { name: "n.md", content: "x" }],
+      ["rename_file", { name: "n.md", new_name: "m.md" }],
+      ["move_file", { name: "n.md", folder: "Archive" }],
+      ["organize_files", { files: [{ name: "n.md", folder: "Archive" }] }],
+      ["trash_files", { names: ["n.md"] }],
+      ["merge_files", { names: ["a.md", "b.md"], into: "out.md" }],
+    ];
+    for (const [name, args] of calls) {
+      await expect(execTool(name, args, effects(), deps({ db, runtimeTool })))
+        .resolves.toEqual({ ok: true, text: `live:${name}` });
+    }
+    expect(runtimeTool.mock.calls.map(([name]) => name)).toEqual(calls.map(([name]) => name));
+    db.close();
+  });
+});
 
 // ----------------------------------------------------- the exhaustive coverage test
 

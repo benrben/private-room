@@ -11,14 +11,19 @@ import {
   countBatchOps,
   parseBatchOps,
   planBatch,
+  planBatchWorkspace,
   planSetCells,
+  planSetCellsWorkspace,
   planSingleEdit,
+  planSingleEditWorkspace,
   planWriteFile,
+  planWriteFileWorkspace,
   type PlannedWrite,
   type PreviewEdit,
 } from "./editMatch.js";
 import { gatedWrite } from "./editGate.js";
-import { availableName, findFileLike, insertFileFromUrl } from "./db-host/files.js";
+import { availableName, findFileLike, getFileMeta, insertFileFromUrl, setFileExtractedText } from "./db-host/files.js";
+import { Readable } from "node:stream";
 import { createJob, getJob, listJobs, setJobStatus } from "./db-host/jobs.js";
 import { agentListScripts, clampScriptOutput, scriptOutput } from "./scriptConsent.js";
 import { createScriptBytesApprovalRequester, runScriptFile } from "./scriptSurfaceIpc.js";
@@ -44,6 +49,14 @@ import { driveFilePass } from "./filePass.js";
 import { locateInImage } from "./visionTools.js";
 import { webAccessEnabled } from "./browser/webAccess.js";
 import { outboundUrlHides } from "./privacy.js";
+import {
+  execCreateFileWorkspace,
+  execMergeFilesWorkspace,
+  execMoveFileWorkspace,
+  execOrganizeFilesWorkspace,
+  execRenameFileWorkspace,
+  execTrashFilesWorkspace,
+} from "./organizeTools.js";
 
 function ok(text: string): ToolOutcome { return { ok: true, text }; }
 function fail(error: unknown): ToolOutcome {
@@ -170,8 +183,34 @@ export function createLiveRuntimeTool(options: LiveRuntimeToolOptions) {
     try {
       const room = state.room;
       if (!room) throw new Error("No room is open.");
-      const gated = { rooms: { currentRoom: () => state.room ? { db: state.room.conn, path: state.room.path } : null }, editPending: state.editPending, emit };
+      const gated = {
+        rooms: {
+          currentRoom: () => state.room ? {
+            db: state.room.conn,
+            path: state.room.path,
+            ...(state.room.workspace === undefined ? {} : { workspace: state.room.workspace }),
+          } : null,
+        },
+        editPending: state.editPending,
+        emit,
+      };
       switch (name) {
+        case "create_file":
+          if (room.workspace === undefined) return null;
+          return execCreateFileWorkspace(room.conn, room.workspace, args, effects, {
+            runId: null,
+            emit,
+          });
+        case "rename_file":
+          return room.workspace === undefined ? null : execRenameFileWorkspace(room.conn, room.workspace, args, effects, emit);
+        case "move_file":
+          return room.workspace === undefined ? null : execMoveFileWorkspace(room.conn, room.workspace, args, effects, emit);
+        case "organize_files":
+          return room.workspace === undefined ? null : execOrganizeFilesWorkspace(room.conn, room.workspace, args, effects, emit);
+        case "trash_files":
+          return room.workspace === undefined ? null : execTrashFilesWorkspace(room.conn, room.workspace, args, effects, emit);
+        case "merge_files":
+          return room.workspace === undefined ? null : execMergeFilesWorkspace(room.conn, room.workspace, args, effects, emit);
         case "mark_image": {
           const [fileId, realName] = findFileLike(room.conn, str(args.image_name));
           const existing = effects.boxes;
@@ -197,8 +236,14 @@ export function createLiveRuntimeTool(options: LiveRuntimeToolOptions) {
             suffixContext: typeof args.suffix_context === "string" ? args.suffix_context : undefined,
             occurrence, section: typeof args.section === "string" ? args.section : undefined,
           };
-          if (args.dry_run === true) return ok(dryRunSummary(planSingleEdit(room.conn, edit)));
-          const result = await gatedWrite("edit_file", "AI edit", gated, effects, (db) => planSingleEdit(db, edit));
+          if (args.dry_run === true) {
+            const plans = room.workspace === undefined
+              ? planSingleEdit(room.conn, edit)
+              : await planSingleEditWorkspace(room.conn, room.workspace, edit);
+            return ok(dryRunSummary(plans));
+          }
+          const result = await gatedWrite("edit_file", "AI edit", gated, effects, (db, workspace) =>
+            workspace === undefined ? planSingleEdit(db, edit) : planSingleEditWorkspace(db, workspace, edit));
           if (result.kind === "declined") return ok(result.message);
           if (result.kind === "error") return fail(result.error.message);
           const plan = result.plans[0]!;
@@ -207,9 +252,15 @@ export function createLiveRuntimeTool(options: LiveRuntimeToolOptions) {
         }
         case "edit_files": {
           const ops = parseBatchOps(args);
-          if (args.dry_run === true) return ok(dryRunSummary(planBatch(room.conn, ops)));
+          if (args.dry_run === true) {
+            const plans = room.workspace === undefined
+              ? planBatch(room.conn, ops)
+              : await planBatchWorkspace(room.conn, room.workspace, ops);
+            return ok(dryRunSummary(plans));
+          }
           const counts = countBatchOps(ops);
-          const result = await gatedWrite("edit_files", `AI edit (batch ${randomUUID().slice(0, 8)})`, gated, effects, (db) => planBatch(db, ops));
+          const result = await gatedWrite("edit_files", `AI edit (batch ${randomUUID().slice(0, 8)})`, gated, effects, (db, workspace) =>
+            workspace === undefined ? planBatch(db, ops) : planBatchWorkspace(db, workspace, ops));
           if (result.kind === "declined") return ok(result.message);
           if (result.kind === "error") return fail(result.error.message);
           const total = counts.edits + counts.renames;
@@ -217,7 +268,10 @@ export function createLiveRuntimeTool(options: LiveRuntimeToolOptions) {
           return ok(`Applied ${total} change(s) across ${result.plans.length} file(s) atomically.`);
         }
         case "write_file": {
-          const result = await gatedWrite("write_file", "AI rewrite", gated, effects, (db) => planWriteFile(db, str(args.name), str(args.content)));
+          const result = await gatedWrite("write_file", "AI rewrite", gated, effects, (db, workspace) =>
+            workspace === undefined
+              ? planWriteFile(db, str(args.name), str(args.content))
+              : planWriteFileWorkspace(db, workspace, str(args.name), str(args.content)));
           if (result.kind === "declined") return ok(result.message);
           return result.kind === "error" ? fail(result.error.message) : ok(writeSummary(result.plans[0]!));
         }
@@ -233,7 +287,10 @@ export function createLiveRuntimeTool(options: LiveRuntimeToolOptions) {
             return [cell, typeof row.value === "string" ? row.value : JSON.stringify(row.value)] as [string, string];
           });
           if (updates.length === 0) throw new Error("No cells given — pass updates: [{cell, value}, …].");
-          const result = await gatedWrite("set_cells", "AI cell change", gated, effects, (db) => planSetCells(db, str(args.name), typeof args.sheet === "string" ? args.sheet : null, updates));
+          const result = await gatedWrite("set_cells", "AI cell change", gated, effects, (db, workspace) =>
+            workspace === undefined
+              ? planSetCells(db, str(args.name), typeof args.sheet === "string" ? args.sheet : null, updates)
+              : planSetCellsWorkspace(db, workspace, str(args.name), typeof args.sheet === "string" ? args.sheet : null, updates));
           if (result.kind === "declined") return ok(result.message);
           return result.kind === "error" ? fail(result.error.message) : ok(`Set ${updates.map(([c, v]) => `${c}=${v}`).join(", ")} in "${result.plans[0]!.realName}".`);
         }
@@ -255,7 +312,14 @@ export function createLiveRuntimeTool(options: LiveRuntimeToolOptions) {
           }
           const name = availableName(room.conn, `${title.replace(/[\\/:*?"<>|]/g, "-").slice(0, 100) || "Web source"}.md`);
           const content = `# ${title}\n\nSource: ${url}\n\n${text}`;
-          const meta = insertFileFromUrl(room.conn, name, "text/markdown", Buffer.from(content), content, "web", url);
+          const meta = room.workspace === undefined
+            ? insertFileFromUrl(room.conn, name, "text/markdown", Buffer.from(content), content, "web", url)
+            : await room.workspace.createFile(name, Readable.from([Buffer.from(content)]), "web").then((entry) => {
+                setFileExtractedText(room.conn, entry.fileId, content);
+                room.conn.prepare("UPDATE files SET origin_url = ?, mime_type = 'text/markdown' WHERE id = ?")
+                  .run(url, entry.fileId);
+                return getFileMeta(room.conn, entry.fileId);
+              });
           emit("room-files-changed", {});
           effects.wrote = true;
           return ok(`Saved "${meta.name}" into the room.`);

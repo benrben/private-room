@@ -140,13 +140,16 @@
  */
 
 import { randomUUID } from "node:crypto";
+import path from "node:path";
+import { Readable } from "node:stream";
 import type { IpcMain, IpcMainInvokeEvent } from "electron";
 import type Database from "better-sqlite3-multiple-ciphers";
-import { getFileBytes, getFileName } from "./db-host/files.js";
+import { getFileBytes, getFileName, setFileExtractedText } from "./db-host/files.js";
 import { getSetting } from "./db-host/settings.js";
-import { EditError, commitPlans, hashBytes, type PlannedWrite } from "./editMatch.js";
+import { EditError, commitPlans, extractText, hashBytes, type PlannedWrite } from "./editMatch.js";
 import type { EditDecision } from "./roomManager.js";
 import type { ToolEffects } from "./execTool.js";
+import type { WorkspaceService } from "./workspace/workspaceService.js";
 
 // ------------------------------------------------------------- room/emit plumbing
 
@@ -158,6 +161,7 @@ import type { ToolEffects } from "./execTool.js";
 export interface OpenRoom {
   db: Database.Database;
   path: string;
+  workspace?: WorkspaceService;
 }
 
 /** The slice of the (not-yet-ported) `AppState` {@link gatedWrite} needs:
@@ -411,6 +415,107 @@ export function applyWithStaleness(db: Database.Database, plans: readonly Planne
   }
 }
 
+function strictText(bytes: Buffer): string | null {
+  try { return new TextDecoder("utf-8", { fatal: true }).decode(bytes); }
+  catch { return null; }
+}
+
+/** Workspace phase-3 commit. Every file is preflighted before the first
+ * mutation, every byte write has an expected-hash guard, and every outgoing
+ * head is stored in the encrypted object-backed version history. */
+export async function applyWorkspaceWithStaleness(
+  db: Database.Database,
+  workspace: WorkspaceService,
+  plans: readonly PlannedWrite[],
+  cause: string,
+): Promise<void> {
+  const current = new Map<string, { relativePath: string; hash: string }>();
+  for (const plan of plans) {
+    const row = db.prepare(
+      `SELECT name, relative_path FROM files
+       WHERE id = ? AND storage_kind = 'workspace' AND trashed_at IS NULL`,
+    ).get(plan.fileId) as { name: string; relative_path: string } | undefined;
+    if (row === undefined || row.name !== plan.realName) {
+      throw new EditError(
+        `"${plan.realName}" was renamed or removed while the approval was pending; ` +
+          "nothing was applied. Look it up again and retry.",
+        "stale",
+      );
+    }
+    const bytes = await workspace.readBuffer(plan.fileId);
+    const hash = hashBytes(bytes).toString("hex");
+    if (plan.staleness !== null && hash !== plan.staleness.toString("hex")) {
+      throw new EditError(
+        `"${plan.realName}" changed while the approval was pending; nothing was applied. ` +
+          "Read it again and retry.",
+        "stale",
+      );
+    }
+    current.set(plan.fileId, { relativePath: row.relative_path, hash });
+  }
+
+  const versions = new Map<string, string>();
+  for (const plan of plans) {
+    if (plan.newBytes !== null) versions.set(plan.fileId, await workspace.snapshotVersion(plan.fileId, cause));
+  }
+  const applied: Array<{ plan: PlannedWrite; finalHash: string; renamed: boolean }> = [];
+  try {
+    for (const plan of plans) {
+      const before = current.get(plan.fileId)!;
+      let expectedHash = before.hash;
+      let recorded = false;
+      if (plan.newBytes !== null) {
+        await workspace.writeAtomic(plan.fileId, Readable.from([plan.newBytes]), expectedHash);
+        expectedHash = hashBytes(plan.newBytes).toString("hex");
+        setFileExtractedText(
+          db,
+          plan.fileId,
+          extractText(plan.realName, plan.newBytes) ?? strictText(plan.newBytes) ?? "",
+        );
+        applied.push({ plan, finalHash: expectedHash, renamed: false });
+        recorded = true;
+      }
+      if (plan.renameTo !== null) {
+        const parent = path.posix.dirname(before.relativePath);
+        const destination = parent === "." ? plan.renameTo : path.posix.join(parent, plan.renameTo);
+        await workspace.move(plan.fileId, destination, expectedHash);
+        if (recorded) applied[applied.length - 1]!.renamed = true;
+      }
+      if (!recorded) applied.push({ plan, finalHash: expectedHash, renamed: plan.renameTo !== null });
+    }
+  } catch (error) {
+    let rollbackFailed = false;
+    for (const { plan, finalHash, renamed } of [...applied].reverse()) {
+      try {
+        const before = current.get(plan.fileId)!;
+        if (renamed) await workspace.move(plan.fileId, before.relativePath, finalHash);
+        const versionId = versions.get(plan.fileId);
+        if (versionId !== undefined) {
+          const snapshot = await workspace.versionSnapshot(versionId);
+          await workspace.writeAtomic(plan.fileId, Readable.from([snapshot.bytes]), finalHash);
+          if (snapshot.text !== null) setFileExtractedText(db, plan.fileId, snapshot.text);
+        }
+      } catch {
+        rollbackFailed = true;
+      }
+    }
+    // Snapshots are useful evidence if rollback could not be completed. When
+    // rollback succeeded, remove the transient versions produced by a batch
+    // that ultimately changed nothing.
+    if (!rollbackFailed) {
+      for (const versionId of versions.values()) await workspace.deleteVersion(versionId).catch(() => undefined);
+    }
+    if (rollbackFailed) {
+      throw new EditError(
+        "The batch hit a conflict and Arcelle could not safely restore every earlier file. " +
+          "Review the changed files and use History to restore them.",
+        "error",
+      );
+    }
+    throw error;
+  }
+}
+
 // ----------------------------------------------------------------------- gate
 
 /** How the diff card ended. Nobody answering is NOT the same fact as a
@@ -533,7 +638,7 @@ export async function gatedWrite(
   cause: string,
   deps: GatedWriteDeps,
   effects: ToolEffects,
-  compute: (db: Database.Database) => PlannedWrite[]
+  compute: (db: Database.Database, workspace?: WorkspaceService) => PlannedWrite[] | Promise<PlannedWrite[]>
 ): Promise<GateOutcome> {
   // Phase 1 (sync): compute proposed writes, decide whether to gate.
   const room1 = deps.rooms.currentRoom();
@@ -542,7 +647,8 @@ export async function gatedWrite(
   }
   let plans: PlannedWrite[];
   try {
-    plans = compute(room1.db);
+    const computed = compute(room1.db, room1.workspace);
+    plans = computed instanceof Promise ? await computed : computed;
   } catch (e) {
     const err = e instanceof EditError ? e : new EditError(errMessage(e), "error");
     return { kind: "error", error: err };
@@ -555,7 +661,8 @@ export async function gatedWrite(
   if (!approvalNeeded(setting, effects) && !isLargeScaleEdit(tool, plans)) {
     // Gate off (or "turn" already granted), and not a mass replace: apply now.
     try {
-      commitPlans(room1.db, plans, cause);
+      if (room1.workspace === undefined) commitPlans(room1.db, plans, cause);
+      else await applyWorkspaceWithStaleness(room1.db, room1.workspace, plans, cause);
     } catch (e) {
       return { kind: "error", error: new EditError(errMessage(e), "error") };
     }
@@ -592,7 +699,8 @@ export async function gatedWrite(
     return { kind: "error", error: new EditError(NO_ROOM_OPEN, "error") };
   }
   try {
-    applyWithStaleness(room2.db, plans, cause);
+    if (room2.workspace === undefined) applyWithStaleness(room2.db, plans, cause);
+    else await applyWorkspaceWithStaleness(room2.db, room2.workspace, plans, cause);
   } catch (e) {
     const err = e instanceof EditError ? e : new EditError(errMessage(e), "error");
     return { kind: "error", error: err };

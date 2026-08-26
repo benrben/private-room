@@ -1650,6 +1650,10 @@ export async function execTool(
     }
     case "create_file": {
       const room = requireRoom(deps);
+      if (room.ok && deps.runtimeTool !== undefined) {
+        const liveCreate = await deps.runtimeTool(name, args, effects);
+        if (liveCreate !== null) return liveCreate;
+      }
       // The cancel FLAG is handed over, never a boolean snapshot of it: Rust
       // reads it inside `Artifact::commit`, between staging and committing,
       // and reading it out here instead would miss a Stop pressed while the
@@ -1665,10 +1669,18 @@ export async function execTool(
     }
     case "rename_file": {
       const room = requireRoom(deps);
+      if (room.ok && deps.runtimeTool !== undefined) {
+        const liveRename = await deps.runtimeTool(name, args, effects);
+        if (liveRename !== null) return liveRename;
+      }
       return room.ok ? execRenameFile(room.db, args, effects, deps.emit) : fail(room.error);
     }
     case "move_file": {
       const room = requireRoom(deps);
+      if (room.ok && deps.runtimeTool !== undefined) {
+        const liveMove = await deps.runtimeTool(name, args, effects);
+        if (liveMove !== null) return liveMove;
+      }
       return room.ok ? execMoveFile(room.db, args, effects, deps.emit) : fail(room.error);
     }
     case "set_in_library": {
@@ -1677,14 +1689,26 @@ export async function execTool(
     }
     case "organize_files": {
       const room = requireRoom(deps);
+      if (room.ok && deps.runtimeTool !== undefined) {
+        const liveOrganize = await deps.runtimeTool(name, args, effects);
+        if (liveOrganize !== null) return liveOrganize;
+      }
       return room.ok ? execOrganizeFiles(room.db, args, effects, deps.emit) : fail(room.error);
     }
     case "trash_files": {
       const room = requireRoom(deps);
+      if (room.ok && deps.runtimeTool !== undefined) {
+        const liveTrash = await deps.runtimeTool(name, args, effects);
+        if (liveTrash !== null) return liveTrash;
+      }
       return room.ok ? execTrashFiles(room.db, args, effects, deps.emit) : fail(room.error);
     }
     case "merge_files": {
       const room = requireRoom(deps);
+      if (room.ok && deps.runtimeTool !== undefined) {
+        const liveMerge = await deps.runtimeTool(name, args, effects);
+        if (liveMerge !== null) return liveMerge;
+      }
       return room.ok ? execMergeFiles(room.db, args, effects, deps.emit) : fail(room.error);
     }
 
