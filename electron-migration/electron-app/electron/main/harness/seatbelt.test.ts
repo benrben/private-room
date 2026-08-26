@@ -1,4 +1,5 @@
 import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -7,6 +8,7 @@ import {
   nativeWorkspaceSeatbeltProfile,
   verifyNativeHarnessExecutable,
   verifyNativeWorkspaceSandbox,
+  terminateNativeProcessTree,
 } from "./seatbelt.js";
 
 const roots: string[] = [];
@@ -85,5 +87,19 @@ describe("native workspace Seatbelt", () => {
       provider: "codex",
       writeEnabled: false,
     }, ["-c", "exit 0"])).toBe(true);
+  });
+
+  it.runIf(process.platform !== "win32")("terminates the native harness process group", async () => {
+    const child = spawn("/bin/sh", ["-c", "sleep 30 & wait"], {
+      detached: true,
+      stdio: "ignore",
+    });
+    await new Promise<void>((resolve, reject) => {
+      child.once("spawn", resolve);
+      child.once("error", reject);
+    });
+    expect(terminateNativeProcessTree(child)).toBe(true);
+    await new Promise<void>((resolve) => child.once("exit", () => resolve()));
+    expect(child.exitCode === null || child.signalCode === "SIGTERM").toBe(true);
   });
 });

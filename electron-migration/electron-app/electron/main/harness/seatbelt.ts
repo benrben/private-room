@@ -2,7 +2,12 @@ import { existsSync, lstatSync, realpathSync, readdirSync, rmSync, writeFileSync
 import { randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
-import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
+import {
+  spawn,
+  spawnSync,
+  type ChildProcess,
+  type ChildProcessWithoutNullStreams,
+} from "node:child_process";
 
 function quoteSeatbelt(value: string): string {
   return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
@@ -186,9 +191,31 @@ export function spawnWithNativeWorkspaceSandbox(
       cwd: spawnOptions.cwd,
       env: { ...spawnOptions.env, TMPDIR: runtime, CLAUDE_TMPDIR: runtime, CLAUDE_CODE_TMPDIR: runtime },
       signal: spawnOptions.signal,
+      // Give every native harness its own process group. Codex and Claude can
+      // create helper processes, so killing only sandbox-exec can otherwise
+      // leave a descendant alive after Stop, room lock, or app shutdown.
+      detached: true,
       stdio: ["pipe", "pipe", "pipe"],
     },
   );
+}
+
+/** Stop the complete native harness process tree, not only its launcher. */
+export function terminateNativeProcessTree(
+  child: Pick<ChildProcess, "pid" | "kill">,
+  signal: NodeJS.Signals = "SIGTERM",
+): boolean {
+  if (child.pid === undefined) return false;
+  if (process.platform !== "win32") {
+    try {
+      process.kill(-child.pid, signal);
+      return true;
+    } catch {
+      // The launcher may have exited before its process group. Fall through
+      // to the ordinary child handle as the final best-effort cleanup.
+    }
+  }
+  try { return child.kill(signal); } catch { return false; }
 }
 
 // Old `.arcelle`-only API stays fail-closed; callers must provide a run path.

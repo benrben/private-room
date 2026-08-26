@@ -1,8 +1,14 @@
 import { execFile } from "node:child_process";
+import { mkdtemp, readdir, rm } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { promisify } from "node:util";
 import readline from "node:readline";
 import { AsyncEventQueue } from "./eventQueue.js";
-import { spawnWithNativeWorkspaceSandbox } from "./seatbelt.js";
+import {
+  spawnWithNativeWorkspaceSandbox,
+  terminateNativeProcessTree,
+} from "./seatbelt.js";
 import type {
   ApprovalDecision,
   HarnessContext,
@@ -44,11 +50,22 @@ export class CodexAppServerRuntime implements HarnessRuntime {
   constructor(private readonly executable = process.env.ARCELLE_CODEX_PATH ?? "codex") {}
 
   async available(): Promise<boolean> {
+    const schemaRoot = await mkdtemp(path.join(os.tmpdir(), "arcelle-codex-schema-"));
     try {
       await execFileAsync(this.executable, ["app-server", "--help"], { timeout: 5_000 });
-      return true;
+      // app-server is versioned with the installed Codex binary. Generating
+      // its stable schema is both a compatibility probe and proof that Arcelle
+      // can bind to that exact installed protocol instead of a bundled guess.
+      await execFileAsync(
+        this.executable,
+        ["app-server", "generate-json-schema", "--out", schemaRoot],
+        { timeout: 10_000 },
+      );
+      return (await readdir(schemaRoot)).some((name) => name.endsWith(".json"));
     } catch {
       return false;
+    } finally {
+      await rm(schemaRoot, { recursive: true, force: true });
     }
   }
 
@@ -229,7 +246,7 @@ export class CodexAppServerRuntime implements HarnessRuntime {
       } catch (error) {
         terminal = true;
         events.push({ type: "run_failed", runId: context.runId, error: error instanceof Error ? error.message : String(error) });
-        child.kill("SIGTERM");
+        terminateNativeProcessTree(child);
       }
     })();
 
@@ -237,9 +254,9 @@ export class CodexAppServerRuntime implements HarnessRuntime {
       events,
       cancel: async () => {
         if (threadId !== null && turnId !== null) {
-          try { await request("turn/interrupt", { threadId, turnId }); } catch { child.kill("SIGTERM"); }
+          try { await request("turn/interrupt", { threadId, turnId }); } catch { terminateNativeProcessTree(child); }
         } else {
-          child.kill("SIGTERM");
+          terminateNativeProcessTree(child);
         }
       },
       approve: async (requestId, decision) => {

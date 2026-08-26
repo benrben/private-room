@@ -10,7 +10,10 @@ import {
   type SpawnedProcess,
 } from "@anthropic-ai/claude-agent-sdk";
 import { AsyncEventQueue } from "./eventQueue.js";
-import { spawnWithNativeWorkspaceSandbox } from "./seatbelt.js";
+import {
+  spawnWithNativeWorkspaceSandbox,
+  terminateNativeProcessTree,
+} from "./seatbelt.js";
 import type {
   ApprovalDecision,
   HarnessContext,
@@ -72,6 +75,7 @@ export class ClaudeAgentSdkRuntime implements HarnessRuntime {
     const events = new AsyncEventQueue<HarnessEvent>();
     const abortController = new AbortController();
     const pending = new Map<string, PendingApproval>();
+    const spawned = new Set<SpawnedProcess>();
 
     const canUseTool: CanUseTool = async (toolName, toolInput, options) => {
       const requestId = options.requestId || options.toolUseID;
@@ -169,8 +173,8 @@ export class ClaudeAgentSdkRuntime implements HarnessRuntime {
       return {};
     };
 
-    const spawnSandboxed = (options: SpawnOptions): SpawnedProcess =>
-      spawnWithNativeWorkspaceSandbox(
+    const spawnSandboxed = (options: SpawnOptions): SpawnedProcess => {
+      const child = spawnWithNativeWorkspaceSandbox(
         {
           workspacePath: context.workspacePath,
           runtimePath: context.runtimePath,
@@ -182,6 +186,10 @@ export class ClaudeAgentSdkRuntime implements HarnessRuntime {
         options.args,
         { cwd: options.cwd, env: options.env, signal: options.signal },
       );
+      spawned.add(child);
+      child.once("exit", () => spawned.delete(child));
+      return child;
+    };
 
     const sdkQuery = query({
       prompt: input.text,
@@ -279,6 +287,8 @@ export class ClaudeAgentSdkRuntime implements HarnessRuntime {
       cancel: async () => {
         abortController.abort();
         sdkQuery.close();
+        for (const child of spawned) terminateNativeProcessTree(child);
+        spawned.clear();
       },
       approve: async (requestId, decision) => {
         const approval = pending.get(requestId);
