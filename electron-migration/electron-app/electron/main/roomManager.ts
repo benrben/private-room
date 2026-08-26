@@ -191,7 +191,7 @@ import { getMeta, setMeta } from "./db-host/meta.js";
 import { migrate } from "./db-host/migrate.js";
 import { roomCounts } from "./db-host/messages.js";
 import { createRoom as dbCreateRoom, openRoom as dbOpenRoom } from "./db-host/open.js";
-import { recoverRecChunks } from "./db-host/recordings.js";
+import { recoverRecChunks, recoverRecChunksHybrid } from "./db-host/recordings.js";
 import { hasRecovery, recoverPassword, writeRecovery } from "./db-host/recovery.js";
 import { getSetting, setSetting } from "./db-host/settings.js";
 import { setBaseUrlOverride } from "./engineRouting.js";
@@ -1142,9 +1142,28 @@ export function openRoomImpl(
   // splice them onto the WAV so nothing recorded is lost.
   try {
     if (readOnly) throw new Error("READ_ONLY_SKIP_RECOVERY");
-    const recovered = recoverRecChunks(room.conn);
-    if (recovered > 0) {
-      console.error(`recovered ${recovered} interrupted recording(s)`);
+    if (room.workspace === undefined) {
+      const recovered = recoverRecChunks(room.conn);
+      if (recovered > 0) console.error(`recovered ${recovered} interrupted recording(s)`);
+    } else {
+      // Workspace recovery streams the normal WAV through the journaled
+      // WorkspaceService, so it cannot block this synchronous unlock command.
+      // The room identity check prevents a late failure from appearing in the
+      // next room after the user switches quickly.
+      void recoverRecChunksHybrid(room.conn, room.workspace).then((recovered) => {
+        if (recovered > 0 && state.room === room) {
+          console.error(`recovered ${recovered} interrupted recording(s)`);
+        }
+      }).catch((err: unknown) => {
+        if (state.room === room) {
+          reportRecRecoveryFailure(
+            state,
+            deps,
+            room.path,
+            err instanceof Error ? err.message : String(err),
+          );
+        }
+      });
     }
   } catch (err) {
     if (readOnly && err instanceof Error && err.message === "READ_ONLY_SKIP_RECOVERY") {
