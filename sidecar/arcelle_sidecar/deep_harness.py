@@ -41,6 +41,7 @@ from .messages import Message
 from .privacy import is_nonlocal_model
 
 MODEL_SEPARATOR = ":" * 2
+SAFE_WORKSPACE_FAILURE = "Workspace operation failed. Raw diagnostics were omitted to protect room data."
 
 
 def _text(content: Any) -> str:
@@ -221,7 +222,7 @@ class McpWorkspaceBridge:
     async def call(self, operation: str, arguments: dict[str, Any]) -> dict[str, Any]:
         result = await self.mcp.call_tool(f"workspace_{operation}", arguments)
         if result.is_error:
-            return {"error": result.text or "Workspace operation failed."}
+            return {"error": SAFE_WORKSPACE_FAILURE}
         try:
             payload = json.loads(result.text)
         except json.JSONDecodeError:
@@ -255,9 +256,12 @@ class ArcelleWorkspaceBackend(BackendProtocol):
         if self.cancel is not None and self.cancel.cancelled:
             return {"error": "This run was cancelled."}
         try:
-            return await self.bridge.call(operation, arguments)
-        except Exception as exc:  # noqa: BLE001 - backend errors are tool results
-            return {"error": str(exc)}
+            payload = await self.bridge.call(operation, arguments)
+            if payload.get("error"):
+                return {"error": SAFE_WORKSPACE_FAILURE}
+            return payload
+        except Exception:  # noqa: BLE001 - raw bridge errors can contain private data
+            return {"error": SAFE_WORKSPACE_FAILURE}
 
     async def _mutate(self, operation: str, arguments: dict[str, Any]) -> dict[str, Any]:
         key = f"{operation}:{json.dumps(arguments, sort_keys=True, separators=(',', ':'))}"

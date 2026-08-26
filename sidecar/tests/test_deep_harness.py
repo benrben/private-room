@@ -10,6 +10,7 @@ from arcelle_sidecar.config import McpConfig, ProviderConfig, Routing, RunReques
 from arcelle_sidecar.deep_harness import (
     ArcelleHarnessModelAdapter,
     ArcelleWorkspaceBackend,
+    SAFE_WORKSPACE_FAILURE,
     _subagent_initial_state,
     is_small_parameter_model,
     select_deep_harness,
@@ -81,6 +82,32 @@ async def test_workspace_backend_suppresses_duplicate_mutations_and_honours_canc
     cancel.cancelled = True
     assert (await backend.aread("/other.md")).error == "This run was cancelled."
     assert len(bridge.calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["raise", "error-result"])
+async def test_workspace_backend_never_forwards_raw_bridge_failures(mode: str) -> None:
+    secret = "Ben Reich Bearer secret-token /Users/benreich/private-room"
+
+    class FailingBridge:
+        async def call(self, operation: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            del operation, arguments
+            if mode == "raise":
+                raise RuntimeError(secret)
+            return {"error": secret}
+
+    backend = ArcelleWorkspaceBackend(FailingBridge(), write_enabled=True)
+    results = [
+        await backend.aread("/notes.md"),
+        await backend.awrite("/notes.md", "changed"),
+        await backend.als("/"),
+        await backend.agrep("secret", "/"),
+    ]
+    for result in results:
+        assert result.error == SAFE_WORKSPACE_FAILURE
+        assert "Ben Reich" not in result.error
+        assert "secret-token" not in result.error
+        assert "/Users/benreich" not in result.error
 
 
 @pytest.mark.asyncio
