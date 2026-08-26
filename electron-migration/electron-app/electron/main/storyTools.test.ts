@@ -27,6 +27,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import * as http from "node:http";
 import os from "node:os";
 import path from "node:path";
+import { Readable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type Database from "better-sqlite3-multiple-ciphers";
 import sharp from "sharp";
@@ -57,6 +58,7 @@ import {
   storyDeleteList,
   storyDocuments,
   storyPictures,
+  storyPicturesInRoom,
   storyPlanSplit,
   storyReadCastFile,
   storyRemoveCast,
@@ -73,6 +75,8 @@ import {
 } from "./storyTools.js";
 import type { CastMember } from "./db-host/story.js";
 import type { Commands } from "../shared/ipc-contract.js";
+import { createWorkspaceRoom } from "./workspace/roomLayout.js";
+import { WorkspaceService } from "./workspace/workspaceService.js";
 
 /** Every `story_*` channel the pre-migration frontend actually invokes, minus
  * the two that are registered next to them in `lib.rs` but live in
@@ -418,6 +422,28 @@ describe("storyDocuments / storyTextFromFile", () => {
 describe("storyPictures", () => {
   beforeEach(() => {
     resetThumbCacheForTests();
+  });
+
+  it("builds cast thumbnails from normal workspace image files", async () => {
+    tmpDir = mkdtempSync(path.join(os.tmpdir(), "story-workspace-"));
+    const root = path.join(tmpDir, "Room");
+    const { db } = createWorkspaceRoom(root, "correct horse battery staple", "Room");
+    openDb = db;
+    const workspace = new WorkspaceService(db, root);
+    const png = await sharp({
+      create: { width: 30, height: 20, channels: 3, background: { r: 1, g: 2, b: 3 } },
+    }).png().toBuffer();
+    const entry = await workspace.createFile("cast.png", Readable.from([png]), "upload");
+    db.prepare("UPDATE files SET mime_type = 'image/png' WHERE id = ?").run(entry.fileId);
+
+    const pictures = await storyPicturesInRoom({ db, path: root, workspace });
+
+    expect(pictures).toHaveLength(1);
+    expect(pictures[0]?.fileId).toBe(entry.fileId);
+    const row = db.prepare("SELECT original_bytes FROM files WHERE id = ?").get(entry.fileId) as {
+      original_bytes: Buffer | null;
+    };
+    expect(row.original_bytes).toBeNull();
   });
 
   it("thumbnails a big picture down into the 192px box, as a real JPEG", async () => {

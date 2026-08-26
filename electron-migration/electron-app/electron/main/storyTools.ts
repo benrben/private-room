@@ -104,6 +104,7 @@ import { allowsSeconds, limitsFor } from "./mediaLimits.js";
 import { sidecarJsonCancellable } from "./sidecarJsonCancellable.js";
 import { MAX_PARTS, partsFor, scriptChunks, splitScript } from "./shotsplitTools.js";
 import type { OpenRoom } from "./turnEngine.js";
+import { readRoomFile } from "./workspace/roomContent.js";
 // Every frontend-facing shape this file returns is NOT redeclared here. All six
 // already exist, camelCased and field-for-field with the Rust structs, in
 // `shared/apiTypes.ts` — and `shared/ipc-contract.ts` types each `story_*`
@@ -228,7 +229,10 @@ async function shrink(bytes: Buffer): Promise<string | null> {
  * by file id. A picture that will not decode is skipped, not fatal — one
  * corrupt file must not empty the whole picker.
  */
-export async function storyPictures(db: Database.Database): Promise<RoomPicture[]> {
+async function storyPicturesWithLoader(
+  db: Database.Database,
+  loadBytes: (fileId: string) => Promise<Buffer | null>,
+): Promise<RoomPicture[]> {
   const pictures = listFiles(db)
     .filter((f) => f.mimeType.startsWith("image/"))
     .slice(0, PICKER_LIMIT);
@@ -246,7 +250,7 @@ export async function storyPictures(db: Database.Database): Promise<RoomPicture[
     // the same "skip this one picture".
     let bytes: Buffer | null;
     try {
-      bytes = getFileBytes(db, meta.id);
+      bytes = await loadBytes(meta.id);
     } catch {
       continue;
     }
@@ -261,6 +265,18 @@ export async function storyPictures(db: Database.Database): Promise<RoomPicture[
     out.push({ fileId: meta.id, name: meta.name, thumbB64: thumb });
   }
   return out;
+}
+
+export async function storyPictures(db: Database.Database): Promise<RoomPicture[]> {
+  return storyPicturesWithLoader(db, async (fileId) => getFileBytes(db, fileId));
+}
+
+export async function storyPicturesInRoom(room: OpenRoom): Promise<RoomPicture[]> {
+  if (room.workspace === undefined) return storyPictures(room.db);
+  return storyPicturesWithLoader(
+    room.db,
+    async (fileId) => (await readRoomFile(room, fileId)).bytes,
+  );
 }
 
 // ------------------------------------------------------------------- cast
@@ -982,6 +998,12 @@ function openDb(room: RoomSource): Database.Database {
   return open.db;
 }
 
+function openRoom(room: RoomSource): OpenRoom {
+  const open = room.currentRoom();
+  if (open === null) throw new Error(NO_ROOM_OPEN);
+  return open;
+}
+
 /**
  * Register every Story-tab channel on `ipcMain`. NOT wired into any bootstrap
  * file (rule 4) — it exists, ready to be wired, once a preload/renderer batch
@@ -998,7 +1020,7 @@ export function registerStoryIpc(ipcMain: Pick<IpcMain, "handle">, room: RoomSou
   handle("story_board", (args: { listId?: string | null }) =>
     storyBoard(openDb(room), args.listId ?? null)
   );
-  handle("story_pictures", () => storyPictures(openDb(room)));
+  handle("story_pictures", () => storyPicturesInRoom(openRoom(room)));
 
   handle("story_add_cast", (args: { name: string; description: string; story: string }) =>
     storyAddCast(openDb(room), args.name, args.description, args.story)
