@@ -476,6 +476,25 @@ describe("RoomToolDispatcher.listTools", () => {
     expect(names).not.toContain("ui_snapshot");
     expect(names).toContain("list_room_files");
   });
+
+  it("routes standard file mutations to the normal workspace bridge", async () => {
+    const calls: Array<[string, Record<string, unknown>]> = [];
+    const dispatcher = new RoomToolDispatcher(baseOpts({
+      workspace: {
+        call: async (operation, args) => {
+          calls.push([operation, args]);
+          return { path: "/notes.md" };
+        },
+      },
+    }));
+
+    const result = await dispatcher.callTool(EXTERNAL_AGENT, "create_file", {
+      name: "notes.md",
+      content: "normal file",
+    });
+    expect(result.isError).not.toBe(true);
+    expect(calls).toEqual([["standard_create", { name: "notes.md", content: "normal file" }]]);
+  });
 });
 
 describe("RoomToolDispatcher.callTool — the advertised-tools-only gate", () => {

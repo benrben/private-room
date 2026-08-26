@@ -59,10 +59,103 @@ export function createWorkspaceMcpBridge(
     if (found === undefined) throw new Error("Workspace file not found.");
     return found;
   };
+  const fileLike = (value: unknown): FileRow => {
+    const query = virtualPath(value);
+    try { return file(query); } catch { /* fall through to unique fuzzy name */ }
+    const lower = query.toLocaleLowerCase("en-US");
+    const matches = rows().filter((row) => {
+      const candidate = row.relative_path.toLocaleLowerCase("en-US");
+      return path.posix.basename(candidate) === lower || candidate.includes(lower);
+    });
+    if (matches.length === 0) throw new Error("Workspace file not found.");
+    if (matches.length > 1) throw new Error("That name matches more than one workspace file. Use its full path.");
+    return matches[0]!;
+  };
 
   return {
     async call(operation, args) {
       try {
+        if (operation.startsWith("standard_") && !writeEnabled) {
+          return { error: "This workspace bridge is read-only." };
+        }
+
+        if (operation === "standard_create") {
+          const relative = virtualPath(args.name);
+          try {
+            file(relative);
+            return { error: "A workspace file already exists at that path." };
+          } catch (error) {
+            if (error instanceof Error && error.message !== "Workspace file not found.") throw error;
+          }
+          const content = String(args.content ?? "");
+          const created = await room().workspace!.createFile(
+            relative,
+            Readable.from([Buffer.from(content)]),
+            "agent",
+          );
+          setFileExtractedText(room().conn, created.fileId, content);
+          return { path: `/${relative}`, created: true };
+        }
+
+        if (operation === "standard_write" || operation === "standard_edit") {
+          const row = fileLike(args.name);
+          if (!isText(row)) return { error: "This workspace tool edits text files only." };
+          const current = (await readAll(room().workspace!.readStream(row.id))).toString("utf8");
+          let next: string;
+          let occurrences = 1;
+          if (operation === "standard_write") {
+            next = String(args.content ?? "");
+          } else {
+            const oldText = String(args.old_text ?? "");
+            const newText = String(args.new_text ?? "");
+            if (oldText === "" || oldText === newText) return { error: "The edit needs different old and new text." };
+            occurrences = current.split(oldText).length - 1;
+            if (occurrences === 0) return { error: "The old text was not found." };
+            if (occurrences > 1 && args.all !== true) return { error: "The old text is not unique." };
+            next = args.all === true ? current.split(oldText).join(newText) : current.replace(oldText, newText);
+          }
+          if (args.dry_run === true) return { path: `/${row.relative_path}`, occurrences, dry_run: true };
+          await room().workspace!.writeAtomic(
+            row.id,
+            Readable.from([Buffer.from(next)]),
+            row.content_sha256 ?? undefined,
+          );
+          setFileExtractedText(room().conn, row.id, next);
+          return { path: `/${row.relative_path}`, occurrences };
+        }
+
+        if (operation === "standard_rename" || operation === "standard_move") {
+          const row = fileLike(args.name);
+          const parent = path.posix.dirname(row.relative_path);
+          let destination: string;
+          if (operation === "standard_rename") {
+            let newName = path.posix.basename(String(args.new_name ?? "").trim());
+            if (newName === "") return { error: "The new file name is empty." };
+            if (path.extname(newName) === "" && path.extname(row.relative_path) !== "") {
+              newName += path.extname(row.relative_path);
+            }
+            destination = parent === "." ? newName : path.posix.join(parent, newName);
+          } else {
+            const folder = String(args.folder ?? "").trim().replace(/^\/+|\/+$/g, "");
+            destination = folder === "" ? path.posix.basename(row.relative_path) : path.posix.join(folder, path.posix.basename(row.relative_path));
+          }
+          await room().workspace!.move(row.id, destination, row.content_sha256 ?? undefined);
+          return { old_path: `/${row.relative_path}`, path: `/${destination}` };
+        }
+
+        if (operation === "standard_trash") {
+          const names = Array.isArray(args.names) ? args.names : [];
+          const targets = names.map(fileLike);
+          for (const row of targets) {
+            await room().workspace!.trash(row.id, row.content_sha256 ?? undefined);
+          }
+          return { trashed: targets.map((row) => `/${row.relative_path}`) };
+        }
+
+        if (operation === "standard_unsupported") {
+          return { error: "This multi-file or structured edit is not available for workspace rooms yet." };
+        }
+
         if (operation === "list") {
           const base = virtualPath(args.path, true);
           const prefix = base === "" ? "" : `${base}/`;

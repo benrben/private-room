@@ -909,6 +909,22 @@ function workspaceTools(scope: ToolScope, workspace: RoomToolDispatcherOptions["
     : [];
 }
 
+function standardWorkspaceOperation(name: string): string | null {
+  switch (name) {
+    case "create_file": return "standard_create";
+    case "write_file": return "standard_write";
+    case "edit_file": return "standard_edit";
+    case "rename_file": return "standard_rename";
+    case "move_file": return "standard_move";
+    case "trash_files": return "standard_trash";
+    case "edit_files":
+    case "set_cells":
+      return "standard_unsupported";
+    default:
+      return null;
+  }
+}
+
 /**
  * THE REAL {@link ToolDispatcher}. Ported from `room_mcp.rs`'s `tool_call`
  * (the transport-independent dispatch body — everything from "only an
@@ -981,8 +997,11 @@ export class RoomToolDispatcher implements ToolDispatcher {
       args = normalizeArguments(restored);
     }
 
-    if (name.startsWith("workspace_") && opts.workspace != null) {
-      const operation = name.slice("workspace_".length);
+    const workspaceOperation = name.startsWith("workspace_")
+      ? name.slice("workspace_".length)
+      : standardWorkspaceOperation(name);
+    if (workspaceOperation !== null && opts.workspace != null) {
+      const operation = workspaceOperation;
       const payload = await opts.workspace.call(operation, args);
       const isError = typeof payload.error === "string" && payload.error.length > 0;
       const text = JSON.stringify(payload);

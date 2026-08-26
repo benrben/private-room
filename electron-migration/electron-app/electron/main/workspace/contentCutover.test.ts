@@ -183,6 +183,29 @@ describe("workspace content cutover", () => {
     }
   });
 
+  it("maps standard Room MCP file mutations onto normal workspace files", async () => {
+    const { root, state, db } = await fixture();
+    const bridge = createWorkspaceMcpBridge(state, true);
+
+    try {
+      expect(await bridge.call("standard_create", { name: "Draft.md", content: "first" }))
+        .toMatchObject({ created: true, path: "/Draft.md" });
+      expect(await bridge.call("standard_edit", {
+        name: "draft",
+        old_text: "first",
+        new_text: "second",
+      })).toMatchObject({ path: "/Draft.md", occurrences: 1 });
+      expect(await bridge.call("standard_rename", { name: "Draft.md", new_name: "Final" }))
+        .toMatchObject({ path: "/Final.md" });
+      expect(await readFile(path.join(root, "Final.md"), "utf8")).toBe("second");
+      expect(await bridge.call("standard_trash", { names: ["Final"] }))
+        .toMatchObject({ trashed: ["/Final.md"] });
+      await expect(readFile(path.join(root, "Final.md"))).rejects.toThrow();
+    } finally {
+      db.close();
+    }
+  });
+
   it("applies renderer bulk trash and restore to normal workspace files", async () => {
     const { root, state, db, workspace } = await fixture();
     const { ipc, handlers } = ipcHandlers();
