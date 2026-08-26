@@ -87,28 +87,20 @@
   ],
   "knownIndirectBlobAssumptions": [
     {
-      "path": "electron-migration/electron-app/electron/main/browser/saved.ts",
-      "reason": "Browser page and selection capture still inserts Markdown and HTML through legacy blob primitives; its dependency contract has no WorkspaceService."
+      "path": "electron-migration/electron-app/electron/main/chatCmds.ts",
+      "reason": "Chat attachment ingestion still inserts uploaded image and document bytes through legacy blob primitives."
     },
     {
-      "path": "electron-migration/electron-app/electron/main/browserSurfaceIpc.ts",
-      "reason": "Finished browser downloads and readable web imports still insert bytes directly into the legacy database store."
+      "path": "electron-migration/electron-app/electron/main/chatCommandsKnowledge.ts",
+      "reason": "Knowledge command artifacts still call the synchronous legacy Artifact.commit path instead of commitToWorkspace."
     },
     {
-      "path": "electron-migration/electron-app/electron/main/chatCommandsGenerate.ts",
-      "reason": "Several command paths, including on-demand transcription caching and generated text output, still call legacy byte readers and writers without a workspace branch."
+      "path": "electron-migration/electron-app/electron/main/turnEngine.ts",
+      "reason": "The streamed-answer save path still publishes generated notes through the legacy database file store."
     },
     {
-      "path": "electron-migration/electron-app/electron/main/sketchCommands.ts",
-      "reason": "Drawing load, save, snapshot and export operations still use legacy blob primitives."
-    },
-    {
-      "path": "electron-migration/electron-app/electron/main/summarizeTools.ts",
-      "reason": "Room summary overwrite, creation and legacy-summary trash still use the legacy database file store."
-    },
-    {
-      "path": "electron-migration/electron-app/electron/main/creativeJobSurfaceIpc.ts",
-      "reason": "Creative image and video jobs still read references and publish generated media through legacy blob primitives."
+      "path": "electron-migration/electron-app/electron/main/storyTools.ts",
+      "reason": "Story and cast helpers still read generated image references through the legacy byte column."
     }
   ]
 }

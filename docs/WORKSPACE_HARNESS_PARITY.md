@@ -93,6 +93,8 @@ Direct access is not the only risk. A higher-level module can call an old blob h
 
 The live agent edit and organize paths are no longer on this list. Workspace `edit_file`, `edit_files`, `write_file`, `set_cells`, `save_link`, create, rename, move, merge and trash now use normal files, optimistic hashes, encrypted snapshots and atomic writes. Their synchronous blob functions remain only for legacy sealed-database rooms.
 
+Browser captures and imports, `#transcribe` and `#research`, drawings and drawing exports, room summaries, and creative image/video jobs also use the workspace source of truth now. Their legacy functions remain available only for sealed-database rooms.
+
 ## Acceptance fixture map
 
 The tests use real SQLCipher databases and real filesystem paths. They do not use a fake in-memory file service.
@@ -112,7 +114,7 @@ The parity matrix is complete. Product parity is not complete.
 
 Main blockers:
 
-1. Route the remaining browser capture/import, drawing, command transcription/generation, room-summary, and creative image/video paths through workspace storage. The exact source files are recorded in `config/original-bytes-inventory.json`.
+1. Route the remaining chat attachment, knowledge-command artifact, streamed-answer save, and story/cast image paths through workspace storage. The exact source files are recorded in `config/original-bytes-inventory.json`.
 2. Connect Deep Harness runs to the same normalized Electron event and approval lifecycle.
 3. Guarantee redacted mirrors for every cloud Deep Harness run.
 4. Finish the full Electron suite, synced-folder and security release tests.
