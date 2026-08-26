@@ -13,10 +13,8 @@ import {
   unfinishedJobs,
 } from "./db-host/jobs.js";
 import {
-  getFileBytes,
   getFileExtractedText,
   getFileMeta,
-  insertFile,
   listFilesForSummary,
   filesMissingSummary,
   markSectionOnly,
@@ -31,7 +29,15 @@ import {
 } from "./db-host/story.js";
 import { webAccessEnabled } from "./browser/webAccess.js";
 import { atCapacity, createJobQueueState, defaultRowStarters, QUEUE_FULL, runnerDepsFrom, submit, type JobQueueDeps, type RowStarter } from "./jobQueue.js";
-import { emitProgress, pinnedDb, runPlan, spawnJobRunner, spawnPodcastAudio, type Step } from "./jobs.js";
+import {
+  emitProgress,
+  pinnedDb,
+  runPlan,
+  spawnJobRunner,
+  spawnPodcastAudio,
+  type RoomHandle,
+  type Step,
+} from "./jobs.js";
 import { isSummaryFile, MAX_SUMMARY_FILES, summarizeOneFile, writeRoomSummary } from "./summarizeTools.js";
 import { flashcardsSpec } from "./studiosFlashcards.js";
 import { mindmapSpec } from "./studiosMindmap.js";
@@ -46,6 +52,7 @@ import { shotPrompt } from "./storyTools.js";
 import type { FilmPlan, ShotPreview, ShotRunStarted } from "../shared/apiTypes.js";
 import type { RoomManagerDeps, RoomManagerState } from "./roomManager.js";
 import type { EventSender } from "./turn.js";
+import { createRoomFile, readRoomFile } from "./workspace/roomContent.js";
 
 const MAX_VARIATIONS = 4;
 const MAX_SHOT_RUN = 80;
@@ -307,10 +314,23 @@ function deepSummaryStarter(state: RoomManagerState, emit: EventSender): RowStar
   };
 }
 
-function attachment(db: Database.Database, id: string): { b64: string; mime: string } {
-  const bytes = getFileBytes(db, id);
+export async function creativeAttachment(
+  room: RoomHandle,
+  id: string,
+): Promise<{ b64: string; mime: string }> {
+  const bytes = (await readRoomFile(room, id)).bytes;
   if (bytes === null) throw new Error("That reference file has no saved bytes.");
-  return { b64: bytes.toString("base64"), mime: getFileMeta(db, id).mimeType };
+  return { b64: bytes.toString("base64"), mime: getFileMeta(room.db, id).mimeType };
+}
+
+export async function storeCreativeOutput(
+  room: RoomHandle,
+  name: string,
+  mime: string,
+  bytes: Uint8Array,
+  text: string,
+) {
+  return createRoomFile(room, name, mime, bytes, text, "generated");
 }
 
 async function postMedia(path: string, body: Record<string, unknown>, model: string, cancel: CancelFlag, timeout?: number): Promise<Record<string, unknown>> {
@@ -365,11 +385,13 @@ async function runCreate(state: RoomManagerState, emit: EventSender, queue: JobQ
     let made: string[] = [];
     let failure: string | null = null;
     try {
-      const readDb = pinnedDb(runner.rooms, roomPath);
-      if (readDb === null) throw new Error("the room this job belongs to was closed");
-      const refs = plan.referenceFileIds.map((id) => attachment(readDb, id));
-      const frame = plan.frameFileId === null ? null : attachment(readDb, plan.frameFileId);
-      const tail = plan.lastFrameFileId === null ? null : attachment(readDb, plan.lastFrameFileId);
+      const readRoom = runner.rooms.current();
+      if (readRoom === null || readRoom.path !== roomPath) {
+        throw new Error("the room this job belongs to was closed");
+      }
+      const refs = await Promise.all(plan.referenceFileIds.map((id) => creativeAttachment(readRoom, id)));
+      const frame = plan.frameFileId === null ? null : await creativeAttachment(readRoom, plan.frameFileId);
+      const tail = plan.lastFrameFileId === null ? null : await creativeAttachment(readRoom, plan.lastFrameFileId);
       for (let index = 0; index < plan.variations && !cancel.load(); index += 1) {
         const done = Math.floor(index * 100 / plan.variations);
         emitProgress(runner.sink, jobId, plan.kind === "video" ? "Filming…" : "Painting…", done, 100);
@@ -407,12 +429,27 @@ async function runCreate(state: RoomManagerState, emit: EventSender, queue: JobQ
         const bytes = Buffer.from(b64, "base64");
         const mime = str(reply.mime, plan.kind === "video" ? "video/mp4" : "image/png");
         const ext = str(reply.ext, plan.kind === "video" ? "mp4" : "png");
-        const db = pinnedDb(runner.rooms, roomPath);
-        if (db === null) throw new Error("The room was closed before the creation could be saved.");
+        const writeRoom = runner.rooms.current();
+        if (writeRoom === null || writeRoom.path !== roomPath) {
+          throw new Error("The room was closed before the creation could be saved.");
+        }
         const narration = str(reply.text);
-        const meta = insertFile(db, artworkName(plan.prompt, index, plan.variations, ext), mime, bytes, narration === "" ? plan.prompt : `${plan.prompt}\n\n${narration}`, "generated");
-        markSectionOnly(db, meta.id, "create");
-        if (plan.shotId !== null && index === 0) setShotResult(db, plan.shotId, plan.kind === "image" ? meta.id : null, plan.kind === "video" ? meta.id : null);
+        const meta = await storeCreativeOutput(
+          writeRoom,
+          artworkName(plan.prompt, index, plan.variations, ext),
+          mime,
+          bytes,
+          narration === "" ? plan.prompt : `${plan.prompt}\n\n${narration}`,
+        );
+        markSectionOnly(writeRoom.db, meta.id, "create");
+        if (plan.shotId !== null && index === 0) {
+          setShotResult(
+            writeRoom.db,
+            plan.shotId,
+            plan.kind === "image" ? meta.id : null,
+            plan.kind === "video" ? meta.id : null,
+          );
+        }
         made.push(meta.id);
         emit("room-files-changed", undefined);
       }
