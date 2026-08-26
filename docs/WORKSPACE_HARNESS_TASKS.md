@@ -180,17 +180,17 @@ Legend:
 
 ## Phase K: cloud redacted mirror
 
-- [ ] Create a `0700` per-run mirror outside the room.
-- [ ] Preserve safe relative paths for text files.
-- [ ] Add redacted companions for PDFs, documents, sheets, audio and video.
-- [ ] Add image and unsupported-binary stubs.
-- [ ] Keep reverse placeholder maps only in trusted state.
-- [ ] Reject unknown or damaged placeholders.
-- [ ] Review duplicated protected placeholders.
-- [ ] Restore protected values locally.
-- [ ] Apply safe text writes atomically.
+- [x] Create a `0700` per-run mirror outside the room.
+- [x] Preserve safe relative paths for text files.
+- [x] Add redacted companions for PDFs, documents, sheets, audio and video.
+- [x] Add image and unsupported-binary stubs.
+- [x] Keep reverse placeholder maps only in trusted state.
+- [x] Reject unknown or damaged placeholders.
+- [x] Review duplicated protected placeholders.
+- [x] Restore protected values locally.
+- [x] Apply safe text writes atomically.
 - [ ] Route structured changes through Arcelle MCP tools.
-- [ ] Record cloud provenance.
+- [x] Record cloud provenance.
 - [ ] Delete mirrors after success, failure, cancellation and startup crash cleanup.
 - [ ] Add clear privacy-enabled and privacy-disabled UI text.
 
