@@ -14,8 +14,11 @@ const { _electron: electron } = requireFromElectron("playwright");
 const appPath = process.env.ARCELLE_INSTALLED_APP || "/Applications/Arcelle.app";
 const executablePath = path.join(appPath, "Contents", "MacOS", "Arcelle");
 const temp = await mkdtemp(path.join(os.tmpdir(), "arcelle-installed-workspace-review-"));
-const screenshots = process.env.ARCELLE_REVIEW_SCREENSHOTS
-  || path.join(os.tmpdir(), "arcelle-installed-workspace-screens");
+const screenshotParent = process.env.ARCELLE_REVIEW_SCREENSHOTS || os.tmpdir();
+await mkdir(screenshotParent, { recursive: true, mode: 0o700 });
+const screenshots = await mkdtemp(
+  path.join(screenshotParent, "arcelle-installed-workspace-screens-"),
+);
 const roomPath = path.join(temp, "Workspace Review");
 const extractedPath = path.join(temp, "Extracted Files");
 const sealedPath = path.join(temp, "workspace-review.arcelle");
@@ -23,9 +26,6 @@ const password = "workspace-review-password";
 const severeConsole = [];
 const pageErrors = [];
 let app;
-
-await rm(screenshots, { recursive: true, force: true });
-await mkdir(screenshots, { recursive: true, mode: 0o700 });
 
 function log(message) {
   process.stdout.write(`[installed-review] ${message}\n`);
@@ -46,6 +46,8 @@ async function shot(window, name) {
 }
 
 try {
+  await stat(executablePath);
+  log(`installed app ${executablePath}`);
   const env = {
     ...process.env,
     ARCELLE_E2E: "1",
@@ -55,6 +57,8 @@ try {
 
   app = await electron.launch({ executablePath, env, timeout: 30_000 });
   const window = await app.firstWindow({ timeout: 30_000 });
+  window.setDefaultTimeout(15_000);
+  window.setDefaultNavigationTimeout(15_000);
   window.on("console", (message) => {
     if (message.type() === "error") severeConsole.push(message.text());
   });
@@ -85,9 +89,17 @@ try {
   log(`reconciled files: ${JSON.stringify(reconciledFiles.map((file) => file.name))}`);
   assert.deepEqual(reconciledFiles.map((file) => file.name).sort(), ["data.csv", "notes.md"]);
 
-  await window.reload({ waitUntil: "domcontentloaded" });
+  log("reloading the installed renderer with the workspace still open");
+  await window.reload({ waitUntil: "domcontentloaded", timeout: 15_000 });
+  log("installed renderer reload completed");
   await window.locator(".workspace").waitFor({ state: "visible" });
-  await window.getByRole("button", { name: "Open Library" }).click();
+  log("reloaded workspace became visible");
+  // Dispatch directly so a macOS Keychain authorization sheet raised by a
+  // provider capability probe cannot make Playwright wait forever for the
+  // native modal's actionability lifecycle. The visible result is asserted
+  // immediately below.
+  await window.getByRole("button", { name: "Open Library" }).evaluate((button) => button.click());
+  log("opened the Library after reload");
   await shot(window, "02-workspace-library");
   await window.getByText("notes", { exact: true }).first().waitFor();
   await window.getByText("data", { exact: true }).first().waitFor();
