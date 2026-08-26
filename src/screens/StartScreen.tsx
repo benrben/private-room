@@ -115,7 +115,7 @@ export function StartScreen({
                        isn't there. App.tsx routes it. */
                     title={
                       room.missing
-                        ? "This room's file is not at that location any more — opens the file picker"
+                        ? "This room is not at that location any more — opens the room picker"
                         : undefined
                     }
                   >
@@ -134,7 +134,7 @@ export function StartScreen({
                     <span className="recent-meta">
                       {room.missing ? (
                         <span className="recent-when recent-missing">
-                          File not found — moved, deleted, or on a drive that
+                          Room not found — moved, deleted, or on a drive that
                           isn't connected
                         </span>
                       ) : (
@@ -145,18 +145,16 @@ export function StartScreen({
                             </span>
                           )}
                           {/* Marker states, each one paired with its word so
-                              the colour is never the signal on its own. Green
-                              is "verified" — every room file is encrypted at
-                              rest, which is the whole promise of the format.
-                              The second tape says where the file actually
-                              lives, and is absent whenever the path does not
-                              tell us — see roomPlace above. */}
+                              the colour is never the signal on its own. In a
+                              workspace, normal files are intentionally plain;
+                              chats, history and other private state are the
+                              encrypted part. */}
                           <span className="nb-tape nb-sem-done">
                             <span
                               className="nb-ico nb-ico-check"
                               aria-hidden="true"
                             />
-                            Encrypted
+                            Private state encrypted
                           </span>
                           {place && (
                             <span className={`nb-tape ${place.sem}`}>

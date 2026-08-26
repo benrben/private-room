@@ -29,6 +29,7 @@
 
 import type { IpcMain, IpcMainInvokeEvent } from "electron";
 import type { RoomInfo } from "../shared/apiTypes.js";
+import { convertLegacyRoomToWorkspace } from "./workspace/conversion.js";
 import {
   closeRoom,
   createRoom,
@@ -74,6 +75,15 @@ export function registerRoomManagerIpc(
     "open_room",
     (args: { path: string; password: string }): RoomInfo =>
       openRoom(state, deps, args.path, args.password)
+  );
+  handle(
+    "convert_legacy_room",
+    (args: { sourcePath: string; password: string; destinationPath: string }) => {
+      if (state.room !== null) {
+        throw new Error("Lock the open room before converting a legacy room.");
+      }
+      return convertLegacyRoomToWorkspace(args.sourcePath, args.password, args.destinationPath);
+    },
   );
   handle(
     "open_room_with_recovery",

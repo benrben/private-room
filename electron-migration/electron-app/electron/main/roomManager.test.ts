@@ -1579,6 +1579,7 @@ type Handler = (...args: unknown[]) => unknown;
  * dropped from the list fails here rather than shipping unnoticed. */
 const EXPECTED_CHANNELS = [
   "create_room",
+  "convert_legacy_room",
   "open_room",
   "open_room_with_recovery",
   "close_room",

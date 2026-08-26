@@ -473,6 +473,46 @@ export default function App() {
     }
   }
 
+  async function handleConvertLegacy(sourcePath: string) {
+    if (!password) {
+      setError("Enter the room password before converting it.");
+      return;
+    }
+    const sourceName = sourcePath.split(/[\\/]/).pop()?.replace(/\.(?:arcelle|roomai)$/i, "") || "Converted Room";
+    const destinationPath = await api.chooseSavePath({
+      title: "Choose the new normal-files workspace folder",
+      defaultPath: `${sourceName} Workspace`,
+    });
+    if (!destinationPath) return;
+    setBusy(true);
+    setError("");
+    const epoch = navEpochRef.current;
+    try {
+      const report = await api.convertLegacyRoom(sourcePath, password, destinationPath);
+      if (navEpochRef.current !== epoch) return;
+      if (report.renamed.length > 0 || report.skipped.length > 0) {
+        const details = [
+          `${report.convertedFiles} file${report.convertedFiles === 1 ? "" : "s"} converted.`,
+          report.renamed.length > 0
+            ? `${report.renamed.length} path${report.renamed.length === 1 ? " was" : "s were"} safely renamed.`
+            : "",
+          report.skipped.length > 0
+            ? `${report.skipped.length} legacy row${report.skipped.length === 1 ? " had" : "s had"} no current bytes and stayed in private state.`
+            : "",
+        ].filter(Boolean).join("\n");
+        await message(details, { title: "Conversion complete", kind: "info" });
+      }
+      const info = await api.openRoom(destinationPath, password);
+      if (navEpochRef.current !== epoch) return;
+      enterRoom(info);
+    } catch (e) {
+      console.error("legacy conversion failed:", e);
+      setError(unlockMessage(String(e)));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   // Unlock using a one-time recovery code instead of the password. Same
   // success handling as a normal open; any failure surfaces a calm message.
   async function handleRecoveryUnlock(path: string) {
@@ -645,6 +685,7 @@ export default function App() {
             onUnlock={() => handleUnlock(screen.path)}
             onRecoveryUnlock={() => handleRecoveryUnlock(screen.path)}
             onTouchId={() => handleTouchId(screen.path)}
+            onConvertLegacy={() => handleConvertLegacy(screen.path)}
             onEnterRecoveryMode={() => {
               setRecoveryMode(true);
               setPassword("");

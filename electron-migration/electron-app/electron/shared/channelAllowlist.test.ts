@@ -26,7 +26,7 @@ describe("channelAllowlist command names", () => {
     // `open_url`/`open_path`/`reveal_item_in_dir` (plugin-opener), and
     // `quit_guard_confirm` (plugin-process's `exit(0)`, which finished a held
     // quit), plus the 3 Electron updater/version host commands.
-    expect(ALL_COMMAND_NAMES.length).toBe(306);
+    expect(ALL_COMMAND_NAMES.length).toBe(307);
   });
 
   it("COMMAND_CHANNEL_SET agrees with ALL_COMMAND_NAMES", () => {

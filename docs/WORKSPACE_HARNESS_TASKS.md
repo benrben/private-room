@@ -48,7 +48,7 @@ Legend:
 - [x] Implement safe relative-path normalization.
 - [x] Block `.arcelle`, absolute paths, traversal and symlink segments.
 - [x] Implement atomic create, write, import, move, trash and restore.
-- [ ] Preserve original POSIX mode when replacing an existing file.
+- [x] Preserve original POSIX mode when replacing an existing file.
 - [ ] Implement the ten-unpinned-version retention job for object-backed versions.
 - [ ] Add storage reporting for normal files, database and private history.
 - [ ] Add safe read-only opening when another writer owns the lease.
@@ -63,7 +63,7 @@ Legend:
 - [x] Add the six index states.
 - [x] Run reconciliation after workspace unlock.
 - [ ] Add a user setting for polling on network and synced folders.
-- [ ] Add trusted-stat scan optimization before hashing unchanged large files.
+- [x] Add trusted-stat scan optimization before hashing unchanged large files.
 - [x] Add unique hash-only rename matching when filesystem identity changes.
 - [ ] Connect stale rows to extraction, chunks, FTS and embeddings.
 - [ ] Discard extraction results when the source hash changed.
@@ -92,13 +92,13 @@ Legend:
 
 ## Phase F: migration, sealed export and checkpoints
 
-- [ ] Implement resumable legacy-to-workspace conversion.
-- [ ] Export each current blob as a normal file.
-- [ ] Preserve stable IDs, provenance, chat, memory, workflows and versions.
-- [ ] Resolve invalid names and case collisions deterministically.
-- [ ] Validate count, size and SHA-256 before publishing.
-- [ ] Keep the legacy source file unchanged.
-- [ ] Produce a conversion report.
+- [x] Implement resumable legacy-to-workspace conversion.
+- [x] Export each current blob as a normal file.
+- [x] Preserve stable IDs, provenance, chat, memory, workflows and versions.
+- [x] Resolve invalid names and case collisions deterministically.
+- [x] Validate count, size and SHA-256 before publishing.
+- [x] Keep the legacy source file unchanged.
+- [x] Produce a conversion report.
 - [ ] Implement consistent sealed `.arcelle` creation.
 - [ ] Verify schema, password, file count, size and hashes before publish.
 - [ ] Import a sealed package into a new workspace.
@@ -171,7 +171,7 @@ Legend:
 - [x] Restore modified, deleted and moved files from encrypted objects.
 - [x] Move run-created files to Arcelle Trash on rollback.
 - [x] Refuse rollback overwrite after a later user edit.
-- [ ] Add “restore baseline as a copy” for conflicts.
+- [x] Add “restore baseline as a copy” for conflicts.
 - [ ] Show created, changed, moved and deleted files in the UI.
 - [ ] Add one-click rollback UI.
 - [ ] Reindex every changed file before marking the run complete.
@@ -198,8 +198,8 @@ Legend:
 
 - [ ] Run the complete Electron test suite.
 - [ ] Run the complete Python sidecar test suite.
-- [ ] Test legacy rooms without conversion.
-- [ ] Test interrupted conversion and resume.
+- [x] Test legacy rooms without conversion.
+- [x] Test interrupted conversion and resume.
 - [ ] Test power loss at every journal phase.
 - [ ] Test database corruption while normal files remain safe.
 - [ ] Test password change and recovery.
@@ -213,4 +213,4 @@ Legend:
 
 ## Current release gate
 
-The current branch is an implementation foundation, not general availability. Workspace room creation and the main text-file paths work. Legacy compatibility remains. Native and Deep harness drivers exist behind flags. Sealed packaging, conversion, cloud mirrors, complete byte-path migration, live orchestrator UI wiring and final security tests are still required.
+The current branch is an implementation foundation, not general availability. Workspace room creation, the main text-file paths, explicit resumable legacy conversion, and conflict-safe baseline copies work. Legacy compatibility remains. Native and Deep harness drivers exist behind flags. Sealed packaging, cloud mirrors, complete byte-path migration, live orchestrator UI wiring and final security tests are still required.

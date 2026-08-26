@@ -1,7 +1,7 @@
 import type Database from "better-sqlite3-multiple-ciphers";
 import { createHash, randomUUID } from "node:crypto";
 import { createReadStream, createWriteStream } from "node:fs";
-import { lstat, mkdir, open, rename, rm } from "node:fs/promises";
+import { chmod, lstat, mkdir, open, rename, rm } from "node:fs/promises";
 import path from "node:path";
 import { Transform, type Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -144,6 +144,7 @@ export class WorkspaceService {
     const relativePath = normalizeRelativePath(row.relative_path);
     const destination = resolveWorkspacePath(this.rootPath, relativePath);
     await assertNoSymlinkSegments(this.rootPath, relativePath);
+    const destinationStat = await lstat(destination);
     const oldHash = await this.verifyExpected(destination, expectedHash);
     const operationId = this.prepareOperation("write", fileId, relativePath, relativePath, oldHash, agentRunId);
     const tempPath = path.join(path.dirname(destination), `.${path.basename(destination)}.arcelle-${randomUUID()}.tmp`);
@@ -158,6 +159,7 @@ export class WorkspaceService {
     });
     try {
       await pipeline(content, observe, createWriteStream(tempPath, { flags: "wx", mode: 0o600 }));
+      await chmod(tempPath, destinationStat.mode & 0o7777);
       const handle = await open(tempPath, "r+");
       try { await handle.sync(); } finally { await handle.close(); }
       await rename(tempPath, destination);
@@ -271,6 +273,65 @@ export class WorkspaceService {
     }
   }
 
+  /** Restore a private immutable object as a new normal file without replacing anything. */
+  async createFileFromObject(
+    objectId: string,
+    destinationPath: string,
+    source = "rollback",
+  ): Promise<ContentEntry> {
+    const relativePath = normalizeRelativePath(destinationPath);
+    const destination = resolveWorkspacePath(this.rootPath, relativePath);
+    await assertNoSymlinkSegments(this.rootPath, relativePath, true);
+    await mkdir(path.dirname(destination), { recursive: true });
+    await assertNoSymlinkSegments(this.rootPath, relativePath, true);
+    await assertDestinationAbsent(destination);
+    const fileId = randomUUID();
+    const operationId = this.prepareOperation("restore_copy", fileId, null, relativePath, null, null);
+    try {
+      const restored = await this.objects.restoreTo(objectId, destination);
+      await syncDirectory(path.dirname(destination));
+      this.updateOperation(operationId, "filesystem_committed", restored.sha256);
+      const fileStat = await lstat(destination, { bigint: true });
+      const mime = mimeForName(relativePath);
+      this.db.transaction(() => {
+        this.db.prepare(
+          `INSERT INTO files(
+             id, name, mime_type, size_bytes, source, original_bytes, storage_kind,
+             relative_path, path_key, content_sha256, mtime_ns, fs_identity, index_state, last_seen_at
+           ) VALUES (?, ?, ?, ?, ?, NULL, 'workspace', ?, ?, ?, ?, ?, 'pending',
+             strftime('%Y-%m-%dT%H:%M:%SZ','now'))`,
+        ).run(
+          fileId,
+          path.basename(relativePath),
+          mime,
+          restored.sizeBytes,
+          source,
+          relativePath,
+          pathKey(relativePath),
+          restored.sha256,
+          Number(fileStat.mtimeNs),
+          `${fileStat.dev}:${fileStat.ino}:${fileStat.birthtimeNs}`,
+        );
+        this.updateOperation(operationId, "database_committed", restored.sha256);
+      })();
+      this.updateOperation(operationId, "completed", restored.sha256);
+      return {
+        fileId,
+        name: path.basename(relativePath),
+        relativePath,
+        mimeType: mime,
+        sizeBytes: restored.sizeBytes,
+        storageKind: "workspace",
+        sha256: restored.sha256,
+        indexState: "pending",
+      };
+    } catch (error) {
+      await rm(destination, { force: true });
+      this.updateOperation(operationId, "failed", undefined, error instanceof Error ? error.message : String(error));
+      throw error;
+    }
+  }
+
   async move(fileId: string, destinationPath: string, expectedHash?: string): Promise<void> {
     const row = this.fileRow(fileId);
     const oldRelative = normalizeRelativePath(row.relative_path);
@@ -376,11 +437,25 @@ export class WorkspaceService {
   }
 
   async reconcile(): Promise<{ added: number; changed: number; missing: number; renamed: number }> {
-    const manifest = await scanWorkspaceManifest(this.rootPath);
     const rows = this.db.prepare(
-      `SELECT id, name, relative_path, path_key, content_sha256, size_bytes, fs_identity
+      `SELECT id, name, relative_path, path_key, content_sha256, size_bytes, mtime_ns, fs_identity
        FROM files WHERE storage_kind = 'workspace' AND trashed_at IS NULL`,
-    ).all() as Array<WorkspaceFileRow & { path_key: string; fs_identity: string | null }>;
+    ).all() as Array<WorkspaceFileRow & {
+      path_key: string;
+      mtime_ns: number | null;
+      fs_identity: string | null;
+    }>;
+    const trustedEntries = new Map(
+      rows.flatMap((row) => row.content_sha256 !== null && row.mtime_ns !== null && row.fs_identity !== null
+        ? [[row.path_key, {
+          sizeBytes: row.size_bytes,
+          mtimeNs: row.mtime_ns,
+          sha256: row.content_sha256,
+          fsIdentity: row.fs_identity,
+        }] as const]
+        : []),
+    );
+    const manifest = await scanWorkspaceManifest(this.rootPath, { trustedEntries });
     const byKey = new Map(rows.map((row) => [row.path_key, row]));
     const unmatchedRows = new Map(rows.map((row) => [row.id, row]));
     const unmatchedEntries = new Map(manifest);

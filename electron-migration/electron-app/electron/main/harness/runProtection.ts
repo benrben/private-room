@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import path from "node:path";
@@ -159,5 +158,50 @@ export class RunProtection {
        WHERE run_id = ?`,
     ).run(result.conflicts.length === 0 ? "completed" : "conflicts", runId);
     return result;
+  }
+
+  /**
+   * Keep a later user edit and restore selected protected baselines beside it.
+   * The requested paths must belong to this run; callers cannot use this as a
+   * general object-store extraction API.
+   */
+  async restoreBaselineAsCopies(runId: string, requestedPaths: string[]): Promise<string[]> {
+    const wanted = new Set(requestedPaths);
+    if (wanted.size === 0) return [];
+    if (wanted.size > 100) throw new Error("Restore at most 100 baseline copies at one time.");
+    const rows = this.workspace.db.prepare(
+      `SELECT baseline_path, final_path, baseline_object_id
+       FROM agent_run_files WHERE run_id = ? AND baseline_object_id IS NOT NULL`,
+    ).all(runId) as Array<{
+      baseline_path: string | null;
+      final_path: string | null;
+      baseline_object_id: string;
+    }>;
+    const selected = rows.filter((row) =>
+      (row.baseline_path !== null && wanted.has(row.baseline_path))
+      || (row.final_path !== null && wanted.has(row.final_path))
+    );
+    if (selected.length !== wanted.size) {
+      throw new Error("One or more requested files do not belong to this rollback baseline.");
+    }
+    const restored: string[] = [];
+    for (const row of selected) {
+      if (row.baseline_path === null) continue;
+      const copyPath = this.availableBaselineCopyPath(row.baseline_path);
+      await this.workspace.createFileFromObject(row.baseline_object_id, copyPath, "rollback-copy");
+      restored.push(copyPath);
+    }
+    return restored;
+  }
+
+  private availableBaselineCopyPath(relativePath: string): string {
+    const extension = path.posix.extname(relativePath);
+    const stem = relativePath.slice(0, relativePath.length - extension.length);
+    for (let number = 1; number <= 10_000; number += 1) {
+      const suffix = number === 1 ? " (baseline)" : ` (baseline ${number})`;
+      const candidate = `${stem}${suffix}${extension}`;
+      if (!existsSync(resolveWorkspacePath(this.workspace.rootPath, candidate))) return candidate;
+    }
+    throw new Error("Could not find an available name for the baseline copy.");
   }
 }

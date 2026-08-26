@@ -87,6 +87,7 @@ const ALL_COMMANDS_TYPED: { [K in keyof Commands]: true } = {
   create_chat: true,
   create_folder: true,
   create_room: true,
+  convert_legacy_room: true,
   create_room_checkpoint: true,
   create_sketch: true,
   create_skill: true,

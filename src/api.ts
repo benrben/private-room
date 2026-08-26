@@ -164,6 +164,16 @@ export const api = {
     name?: string,
     format: "sealed-db" | "workspace-folder" = "workspace-folder",
   ) => invoke<RoomInfo>("create_room", { path, password, name: name ?? null, format }),
+  convertLegacyRoom: (sourcePath: string, password: string, destinationPath: string) =>
+    invoke<{
+      sourcePath: string;
+      destinationPath: string;
+      roomId: string;
+      convertedFiles: number;
+      renamed: Array<{ fileId: string; originalPath: string; convertedPath: string }>;
+      skipped: Array<{ fileId: string; name: string; reason: string }>;
+      resumed: boolean;
+    }>("convert_legacy_room", { sourcePath, password, destinationPath }),
   openRoom: (path: string, password: string) =>
     invoke<RoomInfo>("open_room", { path, password }),
   closeRoom: () => invoke<void>("close_room"),

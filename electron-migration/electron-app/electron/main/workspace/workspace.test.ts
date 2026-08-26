@@ -1,8 +1,9 @@
-import { mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
 import { afterEach, describe, expect, it } from "vitest";
+import { scanWorkspaceManifest } from "./manifest.js";
 import { acquireWorkspaceLease, createWorkspaceRoom, releaseWorkspaceLease } from "./roomLayout.js";
 import { assertNoSymlinkSegments, normalizeRelativePath } from "./pathSafety.js";
 import { ContentConflictError, WorkspaceService } from "./workspaceService.js";
@@ -102,6 +103,61 @@ describe("workspace room storage", () => {
         relative_path: string;
       };
       expect(row).toEqual({ id: imported.fileId, relative_path: "after.md" });
+    } finally {
+      db.close();
+    }
+  });
+
+  it("preserves POSIX permissions when atomically replacing a file", async () => {
+    const parent = await temporaryRoot();
+    const workspaceRoot = path.join(parent, "Mode Room");
+    const source = path.join(parent, "tool.sh");
+    await writeFile(source, "#!/bin/sh\necho first\n", "utf8");
+    const { db } = createWorkspaceRoom(workspaceRoot, "correct horse battery staple", "Mode Room");
+    const workspace = new WorkspaceService(db, workspaceRoot);
+    try {
+      const imported = await workspace.importFile(source, "tool.sh");
+      const destination = path.join(workspaceRoot, "tool.sh");
+      await chmod(destination, 0o750);
+      await workspace.writeAtomic(imported.fileId, Readable.from(["#!/bin/sh\necho second\n"]));
+      expect((await lstat(destination)).mode & 0o7777).toBe(0o750);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("reuses a trusted hash only while stat identity is unchanged", async () => {
+    const parent = await temporaryRoot();
+    const workspaceRoot = path.join(parent, "Scan Room");
+    const { db } = createWorkspaceRoom(workspaceRoot, "correct horse battery staple", "Scan Room");
+    try {
+      await writeFile(path.join(workspaceRoot, "notes.txt"), "one", "utf8");
+      const firstHashed: string[] = [];
+      const first = await scanWorkspaceManifest(workspaceRoot, {
+        onHash: (relativePath) => firstHashed.push(relativePath),
+      });
+      expect(firstHashed).toEqual(["notes.txt"]);
+      const entry = first.get("notes.txt")!;
+      const trusted = new Map([[entry.pathKey, {
+        sizeBytes: entry.sizeBytes,
+        mtimeNs: entry.mtimeNs,
+        sha256: entry.sha256,
+        fsIdentity: entry.fsIdentity,
+      }]]);
+      const unchangedHashed: string[] = [];
+      await scanWorkspaceManifest(workspaceRoot, {
+        trustedEntries: trusted,
+        onHash: (relativePath) => unchangedHashed.push(relativePath),
+      });
+      expect(unchangedHashed).toEqual([]);
+
+      await writeFile(path.join(workspaceRoot, "notes.txt"), "two-two", "utf8");
+      const changedHashed: string[] = [];
+      await scanWorkspaceManifest(workspaceRoot, {
+        trustedEntries: trusted,
+        onHash: (relativePath) => changedHashed.push(relativePath),
+      });
+      expect(changedHashed).toEqual(["notes.txt"]);
     } finally {
       db.close();
     }

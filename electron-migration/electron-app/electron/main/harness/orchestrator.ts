@@ -108,4 +108,10 @@ export class HarnessOrchestrator {
     if (this.protection === null) throw new Error("Rollback is unavailable for this room format.");
     return this.protection.rollback(runId);
   }
+
+  restoreBaselineAsCopies(runId: string, relativePaths: string[]): Promise<string[]> {
+    if (this.active.has(runId)) throw new Error("Stop the agent run before restoring its baseline.");
+    if (this.protection === null) throw new Error("Rollback is unavailable for this room format.");
+    return this.protection.restoreBaselineAsCopies(runId, relativePaths);
+  }
 }

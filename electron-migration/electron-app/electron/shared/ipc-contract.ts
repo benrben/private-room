@@ -114,6 +114,18 @@ export interface Commands {
     };
     result: RoomInfo;
   };
+  convert_legacy_room: {
+    args: { sourcePath: string; password: string; destinationPath: string };
+    result: {
+      sourcePath: string;
+      destinationPath: string;
+      roomId: string;
+      convertedFiles: number;
+      renamed: Array<{ fileId: string; originalPath: string; convertedPath: string }>;
+      skipped: Array<{ fileId: string; name: string; reason: string }>;
+      resumed: boolean;
+    };
+  };
   open_room: { args: { path: string; password: string }; result: RoomInfo };
   close_room: { args: Record<string, never>; result: void };
   touchid_has: { args: { path: string }; result: boolean };

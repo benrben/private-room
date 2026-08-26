@@ -16,6 +16,7 @@ type UnlockScreenProps = {
   onUnlock: () => void;
   onRecoveryUnlock: () => void;
   onTouchId: () => void;
+  onConvertLegacy: () => void;
   onEnterRecoveryMode: () => void;
   onExitRecoveryMode: () => void;
   onBack: () => void;
@@ -36,6 +37,7 @@ export function UnlockScreen({
   onUnlock,
   onRecoveryUnlock,
   onTouchId,
+  onConvertLegacy,
   onEnterRecoveryMode,
   onExitRecoveryMode,
   onBack,
@@ -119,6 +121,16 @@ export function UnlockScreen({
             >
               <RecoveryKeyIcon size={14} /> Forgot password? Use a recovery
               code
+            </button>
+          )}
+          {/\.(?:arcelle|roomai)$/i.test(path) && (
+            <button
+              type="button"
+              className="subtle recovery-forgot"
+              disabled={busy}
+              onClick={() => onConvertLegacy()}
+            >
+              Convert to normal files…
             </button>
           )}
         </form>
