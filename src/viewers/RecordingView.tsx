@@ -20,6 +20,7 @@ import {
   highlightQuote,
   needsPreflight,
   rateLabel,
+  recordingCanPlay,
   searchTranscript,
   seekLabel,
   seekMarks,
@@ -668,6 +669,7 @@ export default function RecordingView({
   // from — the <audio> element is the truth, these follow its events.
   const [tab, setTab] = useState<TabId>("transcript");
   const [playing, setPlaying] = useState(false);
+  const [playbackError, setPlaybackError] = useState("");
   const [playCs, setPlayCs] = useState(0);
   // Volume and speed used to belong to the native `<audio controls>`. They are
   // mirrors of the element, exactly like `playing`: the control asks the
@@ -970,10 +972,16 @@ export default function RecordingView({
   );
 
   // ---- playback (skips deleted spans) ------------------------------------
-  const src = mediaToken && !isLive ? `roommedia://localhost/${mediaToken}` : null;
+  const src = recordingCanPlay(mediaToken, isLive)
+    ? `roommedia://localhost/${mediaToken}`
+    : null;
   // The waveform drives the same element the transcript and the cut-skipping
   // do, so there is exactly one playhead.
   const [mediaEl, setMediaEl] = useState<HTMLAudioElement | null>(null);
+  useEffect(() => {
+    setPlaybackError("");
+    setPlaying(false);
+  }, [src]);
 
   /**
    * Jump the playhead out of, or over, a deleted span.
@@ -1139,7 +1147,13 @@ export default function RecordingView({
   function togglePlay() {
     const el = mediaRef.current;
     if (!el) return;
-    if (el.paused) void el.play().catch(() => {});
+    if (el.paused) {
+      setPlaybackError("");
+      void el.play().catch(() => {
+        setPlaying(false);
+        setPlaybackError("This recording could not be played. Its file is still safe.");
+      });
+    }
     else el.pause();
   }
 
@@ -1623,7 +1637,13 @@ export default function RecordingView({
    * lost its duration reads as `fresh`, so the drawer stays its one route to
    * the tool that rescues it. */
   const rebuildOnlyInDrawer = canRetranscribe && !hasAudio;
-  const canPlay = !!src && durationCs > 0;
+  // The real media file, not a derived duration stored in old recording
+  // metadata, decides whether playback is available. Converted legacy rooms
+  // can contain a valid recording whose old `durationCs` is missing or zero;
+  // refusing to mount the audio element made that perfectly good normal file
+  // impossible to play or measure. Once metadata loads below, it repairs the
+  // in-memory duration used by the clock and seek controls.
+  const canPlay = !!src;
   /** The re-transcribe figure the engine actually reported, written once so
    * the three places that show it cannot round it differently. */
   const retransPct = retrans
@@ -2077,6 +2097,11 @@ export default function RecordingView({
             <span className="rec-sys-banner-text">{micNote}</span>
           </div>
         )}
+        {playbackError && !isLive && (
+          <div className="rec-sys-banner" role="alert">
+            <span className="rec-sys-banner-text">{playbackError}</span>
+          </div>
+        )}
 
         {/* The conversation's shape, with each speaker's turns on their own
             lane under the wave. Diarization has run on this file since v0.14.0
@@ -2149,8 +2174,20 @@ export default function RecordingView({
                 armCutSkip();
               }}
               onPlay={() => {
+                setPlaybackError("");
                 setPlaying(true);
                 armCutSkip();
+              }}
+              onLoadedMetadata={(e) => {
+                const seconds = e.currentTarget.duration;
+                if (durationCs <= 0 && Number.isFinite(seconds) && seconds > 0) {
+                  setDurationCs(Math.round(seconds * 100));
+                }
+              }}
+              onCanPlay={() => setPlaybackError("")}
+              onError={() => {
+                setPlaying(false);
+                setPlaybackError("This recording could not be played. Its file is still safe.");
               }}
               onSeeked={armCutSkip}
               // The element's own report of what it is doing, which is what

@@ -107,6 +107,14 @@ test("a recording with no length has nothing to mark", () => {
   assert.deepEqual(R.seekMarks(0, [{ id: "h1", t0: 10, t1: 20 }], []), []);
 });
 
+test("a converted recording's real file remains playable when old duration metadata is zero", () => {
+  assert.equal(R.recordingCanPlay("workspace-media-token", false), true);
+  assert.equal(R.recordingCanPlay(null, false), false);
+  assert.equal(R.recordingCanPlay("workspace-media-token", true), false);
+  assert.match(VIEW, /const canPlay = !!src;/);
+  assert.doesNotMatch(VIEW, /const canPlay = !!src && durationCs > 0/);
+});
+
 test("a mark's place is a percentage of the whole recording, never past its ends", () => {
   const marks = R.seekMarks(
     10_000,

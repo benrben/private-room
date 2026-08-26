@@ -44,6 +44,13 @@ export function formatTimestamp(centiseconds: number): string {
  */
 export type CaptureStage = "recording" | "paused" | "saving" | "fresh" | "finished";
 
+/** Playback follows the presence of a real staged file. Historical metadata
+ * is useful for clocks and marks, but an absent/zero duration must not hide a
+ * valid recording after a legacy room is converted to normal files. */
+export function recordingCanPlay(mediaToken: string | null | undefined, isLive: boolean): boolean {
+  return !!mediaToken && !isLive;
+}
+
 export function captureStage(status: string, everRecorded: boolean): CaptureStage {
   if (status === "recording" || status === "paused" || status === "saving") return status;
   return everRecorded ? "finished" : "fresh";
