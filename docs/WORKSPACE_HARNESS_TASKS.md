@@ -134,12 +134,14 @@ Legend:
 - [x] Add initialize, thread and turn startup.
 - [x] Map Codex structured text, plan, tool, diff, usage and completion events.
 - [x] Map command and file-change approval requests.
-- [x] Add macOS `.arcelle` Seatbelt protection and self-test.
+- [x] Add strict macOS workspace Seatbelt protection and self-tests.
 - [ ] Load or generate the schema for the installed Codex version.
 - [ ] Add capability-version compatibility tests for several Codex releases.
 - [ ] Add the restricted `codex exec` fallback under the common contract.
 - [ ] Add the restricted Claude CLI fallback under the common contract.
-- [ ] Prove outside-workspace read isolation for native direct mode.
+- [x] Prove outside-workspace read/write isolation with room, private and sibling canaries.
+- [x] Refuse native direct mode when an exposed workspace symlink exists.
+- [x] Run the installed provider executable inside the sandbox before reporting it available.
 - [ ] Add mass-change pause at more than 20 paths.
 - [ ] Test cancellation and descendant-process cleanup with real CLIs.
 - [x] Disable native mode automatically when any isolation test fails.

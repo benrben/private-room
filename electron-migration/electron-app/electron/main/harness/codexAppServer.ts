@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import readline from "node:readline";
 import { AsyncEventQueue } from "./eventQueue.js";
-import { spawnWithPrivatePathSandbox, verifyPrivatePathSandbox } from "./seatbelt.js";
+import { spawnWithNativeWorkspaceSandbox } from "./seatbelt.js";
 import type {
   ApprovalDecision,
   HarnessContext,
@@ -53,13 +53,18 @@ export class CodexAppServerRuntime implements HarnessRuntime {
   }
 
   async startTurn(context: HarnessContext, input: HarnessInput): Promise<HarnessRun> {
-    if (!context.exposureVerified || !verifyPrivatePathSandbox(context.workspacePath)) {
+    if (!context.exposureVerified) {
       throw new Error("Codex native harness refused an unverified workspace exposure.");
     }
     const events = new AsyncEventQueue<HarnessEvent>();
-    const child = spawnWithPrivatePathSandbox(
-      context.workspacePath,
-      this.executable,
+    const child = spawnWithNativeWorkspaceSandbox(
+      {
+        workspacePath: context.workspacePath,
+        runtimePath: context.runtimePath,
+        executable: this.executable,
+        provider: "codex",
+        writeEnabled: context.writeEnabled,
+      },
       ["app-server", "--listen", "stdio://"],
       { cwd: context.workspacePath, env: { ...process.env, CODEX_INTERNAL_ORIGINATOR_OVERRIDE: "arcelle" } },
     );

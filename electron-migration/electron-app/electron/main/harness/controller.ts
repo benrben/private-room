@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { mkdir, rm } from "node:fs/promises";
 import path from "node:path";
 import type { EventSender } from "../turn.js";
 import { activePolicy, type PolicyState } from "../privacy.js";
@@ -13,6 +14,7 @@ import { CloudRedactedMirror } from "./cloudMirror.js";
 import { CodexAppServerRuntime } from "./codexAppServer.js";
 import { HarnessOrchestrator, type HarnessFinalStatus } from "./orchestrator.js";
 import { RunProtection, type RollbackResult } from "./runProtection.js";
+import { nativeWorkspaceSandboxSupported, verifyNativeHarnessExecutable } from "./seatbelt.js";
 import type {
   ApprovalDecision,
   HarnessEvent,
@@ -55,7 +57,12 @@ export interface HarnessControllerOptions {
    * Production deliberately supplies no verifier until that stronger sandbox
    * exists. The old `.arcelle`-only canary is not enough.
    */
-  verifyExposure?: (workspacePath: string) => Promise<boolean>;
+  verifyExposure?: (
+    workspacePath: string,
+    provider: "codex" | "claude",
+    runtimePath: string,
+    writeEnabled: boolean,
+  ) => Promise<boolean>;
   outsideWorkspaceIsolation?: boolean;
 }
 
@@ -64,11 +71,12 @@ export class HarnessController {
   private readonly runtimes: Record<"codex" | "claude", HarnessRuntime>;
   private readonly policy: () => PolicyState | null;
   private readonly flag: (name: WorkspaceHarnessFlag) => boolean;
-  private readonly verifyExposure: (workspacePath: string) => Promise<boolean>;
+  private readonly verifyExposure: NonNullable<HarnessControllerOptions["verifyExposure"]>;
   private isolationProven: boolean;
   private readonly mirrors = new Map<string, MirrorRun>();
   private readonly pendingMirrorApprovals = new Map<string, PendingMirrorApproval>();
   private readonly pumps = new Map<string, Promise<void>>();
+  private readonly runRoots = new Map<string, string>();
   private orchestrator: HarnessOrchestrator | null = null;
   private roomId: string | null = null;
 
@@ -84,8 +92,17 @@ export class HarnessController {
     };
     this.policy = options.policy ?? activePolicy;
     this.flag = options.flag ?? workspaceHarnessFlag;
-    this.verifyExposure = options.verifyExposure ?? (async () => false);
-    this.isolationProven = options.outsideWorkspaceIsolation === true;
+    this.verifyExposure = options.verifyExposure ?? (async (workspacePath, provider, runtimePath, writeEnabled) =>
+      verifyNativeHarnessExecutable({
+        workspacePath,
+        runtimePath,
+        provider,
+        writeEnabled,
+        executable: provider === "codex"
+          ? process.env.ARCELLE_CODEX_PATH ?? "codex"
+          : process.env.ARCELLE_CLAUDE_PATH ?? "claude",
+      }, provider === "codex" ? ["app-server", "--help"] : ["--version"]));
+    this.isolationProven = options.outsideWorkspaceIsolation ?? nativeWorkspaceSandboxSupported();
   }
 
   private runtimeRoot(): string {
@@ -114,14 +131,31 @@ export class HarnessController {
     const flags = workspaceHarnessCapabilities();
     for (const name of Object.keys(flags) as WorkspaceHarnessFlag[]) flags[name] = this.flag(name);
     const provider = async (name: "codex" | "claude", providerFlag: WorkspaceHarnessFlag) => {
-      const enabled = flags.unified_harness && flags[providerFlag] && this.isolationProven;
       const installed = flags[providerFlag] ? await this.runtimes[name].available() : false;
+      const room = this.state.room;
+      let sandboxReady = false;
+      if (
+        flags.unified_harness
+        && flags[providerFlag]
+        && this.isolationProven
+        && installed
+        && room?.workspace !== undefined
+        && room.descriptor?.kind === "workspace-folder"
+        && room.descriptor.rootPath !== null
+      ) {
+        const probePath = path.join(this.runtimeRoot(), room.descriptor.roomId, `capability-${randomUUID()}`);
+        await mkdir(probePath, { recursive: true, mode: 0o700 });
+        try { sandboxReady = await this.verifyExposure(room.descriptor.rootPath, name, probePath, false); }
+        finally { await rm(probePath, { recursive: true, force: true }); }
+      }
       let reason: string | null = null;
       if (!flags.unified_harness) reason = "The unified harness feature is disabled.";
       else if (!flags[providerFlag]) reason = `The ${name} native harness feature is disabled.`;
       else if (!this.isolationProven) reason = "Outside-workspace process isolation has not passed its security test.";
       else if (!installed) reason = `The ${name} agent runtime is not installed.`;
-      return { enabled: enabled && installed, installed, reason };
+      else if (room?.descriptor?.kind !== "workspace-folder") reason = "Open a workspace room to run the sandbox capability test.";
+      else if (!sandboxReady) reason = `The ${name} runtime failed its sandbox capability test.`;
+      return { enabled: sandboxReady, installed, reason };
     };
     return {
       flags,
@@ -153,6 +187,8 @@ export class HarnessController {
       throw new Error("Open a workspace room before starting this harness.");
     }
     const runId = randomUUID();
+    const runRuntimePath = path.join(this.runtimeRoot(), room.descriptor.roomId, runId);
+    this.runRoots.set(runId, runRuntimePath);
     let workspacePath = room.descriptor.rootPath;
     if (request.privacyMode === "cloud-redacted") {
       if (!this.flag("cloud_redacted_mirror")) throw new Error("Cloud Privacy workspace mirrors are disabled.");
@@ -168,10 +204,11 @@ export class HarnessController {
       const info = await mirror.create();
       workspacePath = info.workspacePath;
       this.mirrors.set(runId, { mirror, writeEnabled: request.writeEnabled });
+    } else {
+      await mkdir(runRuntimePath, { recursive: true, mode: 0o700 });
     }
-    if (!(await this.verifyExposure(workspacePath))) {
-      this.isolationProven = false;
-      await this.removeMirror(runId);
+    if (!(await this.verifyExposure(workspacePath, request.provider, runRuntimePath, request.writeEnabled))) {
+      await this.removeRunRuntime(runId);
       throw new Error("The native harness exposure failed its sandbox self-test.");
     }
 
@@ -182,6 +219,7 @@ export class HarnessController {
         runId,
         roomId: room.descriptor.roomId,
         workspacePath,
+        runtimePath: runRuntimePath,
         exposureVerified: true,
       });
       const pump = (async () => {
@@ -189,12 +227,13 @@ export class HarnessController {
           for await (const event of started.events) this.emit("harness-event", event);
         } finally {
           this.pumps.delete(runId);
+          await this.removeRunRuntime(runId);
         }
       })();
       this.pumps.set(runId, pump);
       return runId;
     } catch (error) {
-      await this.removeMirror(runId);
+      await this.removeRunRuntime(runId);
       throw error;
     }
   }
@@ -237,7 +276,7 @@ export class HarnessController {
       ]);
       if (timer !== undefined) clearTimeout(timer);
     }
-    await Promise.allSettled([...this.mirrors.keys()].map((id) => this.removeMirror(id)));
+    await Promise.allSettled([...this.runRoots.keys()].map((id) => this.removeRunRuntime(id)));
   }
 
   /** Forced synchronous teardown: signal providers and remove cloud exposure now. */
@@ -246,7 +285,7 @@ export class HarnessController {
       this.pendingMirrorApprovals.get(id)?.resolve(false);
       void this.orchestrator?.cancel(id).catch(() => undefined);
     }
-    for (const id of this.mirrors.keys()) void this.removeMirror(id).catch(() => undefined);
+    for (const id of this.runRoots.keys()) void this.removeRunRuntime(id).catch(() => undefined);
   }
 
   cleanupAbandoned(): Promise<number> {
@@ -294,5 +333,12 @@ export class HarnessController {
     const entry = this.mirrors.get(runId);
     this.mirrors.delete(runId);
     if (entry !== undefined) await entry.mirror.cleanup();
+  }
+
+  private async removeRunRuntime(runId: string): Promise<void> {
+    const runRoot = this.runRoots.get(runId);
+    this.runRoots.delete(runId);
+    if (this.mirrors.has(runId)) await this.removeMirror(runId);
+    else if (runRoot !== undefined) await rm(runRoot, { recursive: true, force: true });
   }
 }

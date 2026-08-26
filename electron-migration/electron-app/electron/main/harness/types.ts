@@ -12,6 +12,8 @@ export interface HarnessContext {
   roomId: string;
   /** A verified filesystem exposure. It can be the real room or a mirror. */
   workspacePath: string;
+  /** Private per-run temp/config root outside the real workspace. */
+  runtimePath: string;
   model: string;
   provider: string;
   privacyMode: PrivacyMode;

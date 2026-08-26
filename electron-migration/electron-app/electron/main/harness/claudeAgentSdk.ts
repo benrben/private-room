@@ -10,7 +10,7 @@ import {
   type SpawnedProcess,
 } from "@anthropic-ai/claude-agent-sdk";
 import { AsyncEventQueue } from "./eventQueue.js";
-import { spawnWithPrivatePathSandbox, verifyPrivatePathSandbox } from "./seatbelt.js";
+import { spawnWithNativeWorkspaceSandbox } from "./seatbelt.js";
 import type {
   ApprovalDecision,
   HarnessContext,
@@ -66,7 +66,7 @@ export class ClaudeAgentSdkRuntime implements HarnessRuntime {
   }
 
   async startTurn(context: HarnessContext, input: HarnessInput): Promise<HarnessRun> {
-    if (!context.exposureVerified || !verifyPrivatePathSandbox(context.workspacePath)) {
+    if (!context.exposureVerified) {
       throw new Error("Claude native harness refused an unverified workspace exposure.");
     }
     const events = new AsyncEventQueue<HarnessEvent>();
@@ -170,9 +170,15 @@ export class ClaudeAgentSdkRuntime implements HarnessRuntime {
     };
 
     const spawnSandboxed = (options: SpawnOptions): SpawnedProcess =>
-      spawnWithPrivatePathSandbox(
-        context.workspacePath,
-        options.command,
+      spawnWithNativeWorkspaceSandbox(
+        {
+          workspacePath: context.workspacePath,
+          runtimePath: context.runtimePath,
+          executable: options.command,
+          provider: "claude",
+          writeEnabled: context.writeEnabled,
+          env: options.env,
+        },
         options.args,
         { cwd: options.cwd, env: options.env, signal: options.signal },
       );

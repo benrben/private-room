@@ -289,11 +289,20 @@ mirror write-back, runs the full workspace reconciliation, records final file
 hashes, and only then sends the final `run_completed` event. Room lock cancels
 and drains harness runs while the encrypted database is still open.
 
-Native direct mode is fail-closed. The current `.arcelle` Seatbelt canary does
-not prove that a CLI process cannot read another path outside the room. Until a
-stronger outside-workspace isolation test passes, the controller reports native
-Codex and Claude as unavailable and refuses to start them. A feature flag alone
-cannot bypass this security gate.
+Native direct mode is fail-closed. The outer macOS Seatbelt denies file content
+and writes in writable data roots such as `/Users`, `/Volumes`, `/private` and
+`/Library`, then adds narrow access only for the selected workspace, one
+run-private directory, system runtime files and the provider executable. A more
+specific rule always blocks `.arcelle`. Read-only runs receive no workspace
+write rule.
+
+Every start creates canaries in the normal workspace, `.arcelle` and a sibling
+outside the runtime directory. The sandbox must read the normal canary, obey the
+requested write mode, and fail to read or write the other two. Arcelle also
+refuses an exposed workspace containing any symlink. Finally, the installed
+provider executable must start inside the same profile. Capability reporting is
+per provider: one failing provider does not weaken or disable another provider.
+A feature flag alone cannot bypass these gates.
 
 ### Shared agent manifest
 

@@ -59,6 +59,7 @@ describe("HarnessController", () => {
       const controller = new HarnessController(f.state, f.root, () => undefined, {
         runtimes: { codex: new EditingRuntime() },
         flag: () => true,
+        outsideWorkspaceIsolation: false,
       });
       const capabilities = await controller.capabilities();
       expect(capabilities.outsideWorkspaceIsolation).toBe(false);
@@ -114,6 +115,25 @@ describe("HarnessController", () => {
       const types = emitted.map(({ payload }) => (payload as { type: string }).type);
       expect(types).toEqual(["run_started", "file_changed", "run_completed"]);
       expect(await readdir(path.join(f.root, "Arcelle Runtime", f.created.descriptor.roomId))).toEqual([]);
+    } finally {
+      f.created.db.close();
+    }
+  });
+
+  it("reports provider capability from the real per-provider sandbox probe", async () => {
+    const f = await fixture();
+    try {
+      const runtime = new EditingRuntime();
+      const controller = new HarnessController(f.state, f.root, () => undefined, {
+        runtimes: { codex: runtime, claude: runtime },
+        flag: () => true,
+        outsideWorkspaceIsolation: true,
+        verifyExposure: async (_workspace, provider) => provider === "codex",
+      });
+      const capabilities = await controller.capabilities();
+      expect(capabilities.providers.codex).toMatchObject({ enabled: true, installed: true, reason: null });
+      expect(capabilities.providers.claude).toMatchObject({ enabled: false, installed: true });
+      expect(capabilities.providers.claude!.reason).toMatch(/sandbox capability test/i);
     } finally {
       f.created.db.close();
     }

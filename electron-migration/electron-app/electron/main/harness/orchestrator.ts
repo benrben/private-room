@@ -18,6 +18,7 @@ export interface StartHarnessTurn {
   provider: string;
   model: string;
   workspacePath: string;
+  runtimePath: string;
   privacyMode: PrivacyMode;
   writeEnabled: boolean;
   exposureVerified: boolean;
@@ -75,6 +76,7 @@ export class HarnessOrchestrator {
       provider: input.provider,
       model: input.model,
       workspacePath: input.workspacePath,
+      runtimePath: input.runtimePath,
       privacyMode: input.privacyMode,
       writeEnabled: input.writeEnabled,
       exposureVerified: input.exposureVerified,

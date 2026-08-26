@@ -36,6 +36,7 @@ describe("RunProtection conflict recovery", () => {
         provider: "codex",
         model: "test",
         workspacePath: workspaceRoot,
+        runtimePath: path.join(parent, "runtime"),
         privacyMode: "local",
         writeEnabled: true,
         exposureVerified: true,
