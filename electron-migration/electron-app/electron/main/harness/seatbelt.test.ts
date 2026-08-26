@@ -117,4 +117,19 @@ describe("native workspace Seatbelt", () => {
     }
     expect(grandchildAlive).toBe(false);
   });
+
+  it.runIf(process.platform !== "win32")("escalates to SIGKILL when a native process group ignores SIGTERM", async () => {
+    const child = spawn("/bin/sh", ["-c", "trap '' TERM; while :; do :; done"], {
+      detached: true,
+      stdio: "ignore",
+    });
+    await new Promise<void>((resolve, reject) => {
+      child.once("spawn", resolve);
+      child.once("error", reject);
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(terminateNativeProcessTree(child, "SIGTERM", 25)).toBe(true);
+    await new Promise<void>((resolve) => child.once("exit", () => resolve()));
+    expect(child.signalCode).toBe("SIGKILL");
+  });
 });

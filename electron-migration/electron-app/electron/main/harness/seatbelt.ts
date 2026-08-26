@@ -204,18 +204,31 @@ export function spawnWithNativeWorkspaceSandbox(
 export function terminateNativeProcessTree(
   child: Pick<ChildProcess, "pid" | "kill">,
   signal: NodeJS.Signals = "SIGTERM",
+  forceAfterMs = 2_000,
 ): boolean {
   if (child.pid === undefined) return false;
+  const pid = child.pid;
+  const scheduleForce = (terminated: boolean): boolean => {
+    if (!terminated || signal === "SIGKILL" || forceAfterMs < 0) return terminated;
+    const timer = setTimeout(() => {
+      if (process.platform !== "win32") {
+        try { process.kill(-pid, "SIGKILL"); return; } catch { /* group is already gone */ }
+      }
+      try { child.kill("SIGKILL"); } catch { /* process is already gone */ }
+    }, forceAfterMs);
+    timer.unref();
+    return true;
+  };
   if (process.platform !== "win32") {
     try {
-      process.kill(-child.pid, signal);
-      return true;
+      process.kill(-pid, signal);
+      return scheduleForce(true);
     } catch {
       // The launcher may have exited before its process group. Fall through
       // to the ordinary child handle as the final best-effort cleanup.
     }
   }
-  try { return child.kill(signal); } catch { return false; }
+  try { return scheduleForce(child.kill(signal)); } catch { return false; }
 }
 
 // Old `.arcelle`-only API stays fail-closed; callers must provide a run path.
