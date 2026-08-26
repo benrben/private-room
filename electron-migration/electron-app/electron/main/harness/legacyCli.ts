@@ -73,11 +73,14 @@ export class WorkspaceDispatcher implements ToolDispatcher {
       const task = typeof args.task === "string" ? args.task.trim() : "";
       if (agentId === "" || task === "") return result({ error: "arcelle_delegate requires agent_id and task." });
       try { return result(await this.delegate(agentId, task)); }
-      catch (error) { return result({ error: error instanceof Error ? error.message : String(error) }); }
+      catch { return result({ error: safeProviderFailure("provider", "tool") }); }
     }
     const operation = name.startsWith("workspace_") ? name.slice("workspace_".length) : "";
     if (this.base !== undefined) {
-      const call = () => this.base!.callTool(scope, name, args);
+      const call = async (): Promise<ToolCallResult> => {
+        try { return await this.base!.callTool(scope, name, args); }
+        catch { return result({ error: safeProviderFailure("provider", "tool") }); }
+      };
       return ["write", "edit", "delete"].includes(operation)
         ? this.writeGate.run(call)
         : call();
@@ -196,8 +199,8 @@ function mirrorBackend(root: string, writeEnabled: boolean): WorkspaceCalls {
         await writeFile(temporary, content, { mode: 0o600 });
         await rename(temporary, requested.absolute);
         return { path: `/${requested.relative}` };
-      } catch (error) {
-        return { error: error instanceof Error ? error.message : String(error) };
+      } catch {
+        return { error: safeProviderFailure("provider", "tool") };
       }
     },
   };

@@ -94,4 +94,20 @@ describe("DeepAgentRuntime", () => {
     expect(JSON.stringify(failure)).not.toContain("secret-token");
     expect(JSON.stringify(failure)).not.toContain("/room/private.txt");
   });
+
+  it("does not forward failed specialist report text as a tool error or result", async () => {
+    const secret = "Ben Reich Bearer secret-token /room/private.txt";
+    const runtime = new DeepAgentRuntime(state(), () => {}, undefined, vi.fn(async (req, opts) => {
+      opts.onEvent("ask-report", { runId: req.runId, chatId: "", v: { node: "files.read", ok: false, text: secret } });
+      return { kind: "done" as const, text: "", usage: null, plan: null };
+    }));
+    const started = await runtime.startTurn(context(), { text: "read notes" });
+    const events: HarnessEvent[] = [];
+    for await (const event of started.events) events.push(event);
+    const tool = events.find((event) => event.type === "tool_completed");
+    expect(tool).toMatchObject({ type: "tool_completed", tool: "files.read" });
+    expect(JSON.stringify(tool)).not.toContain("Ben Reich");
+    expect(JSON.stringify(tool)).not.toContain("secret-token");
+    expect(JSON.stringify(tool)).not.toContain("/room/private.txt");
+  });
 });

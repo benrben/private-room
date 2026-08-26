@@ -244,6 +244,29 @@ describe("RestrictedLegacyCliRuntime", () => {
     });
   });
 
+  it("contains raw errors from delegated and base MCP tools", async () => {
+    const secret = "Ben Reich Bearer secret-token /Users/benreich/private-room";
+    const base: ToolDispatcher = {
+      listTools: () => [{ name: "unsafe_tool", inputSchema: { type: "object" } }],
+      callTool: async () => { throw new Error(secret); },
+    };
+    const dispatcher = new WorkspaceDispatcher(
+      { call: async () => ({}) },
+      new AsyncWriteGate(),
+      async () => { throw new Error(secret); },
+      base,
+    );
+    const scope = { kind: "CloudEngine" as const };
+    const baseFailure = await dispatcher.callTool(scope, "unsafe_tool", {});
+    const delegateFailure = await dispatcher.callTool(scope, "arcelle_delegate", { agent_id: "chat.web", task: "work" });
+    for (const failure of [baseFailure, delegateFailure]) {
+      expect(failure.isError).toBe(true);
+      expect(JSON.stringify(failure)).not.toContain("Ben Reich");
+      expect(JSON.stringify(failure)).not.toContain("secret-token");
+      expect(JSON.stringify(failure)).not.toContain("/Users/benreich");
+    }
+  });
+
   it("inherits cancellation into an active delegated CLI child", async () => {
     const f = await fixture();
     let spawned = 0;

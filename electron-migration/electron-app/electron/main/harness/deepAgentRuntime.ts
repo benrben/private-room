@@ -101,12 +101,13 @@ export class DeepAgentRuntime implements HarnessRuntime {
         }
         case "ask-report": {
           const row = typeof value === "object" && value !== null ? value as Record<string, unknown> : {};
+          const failed = row.ok === false;
           output.push({
             type: "tool_completed",
             runId: context.runId,
             tool: typeof row.node === "string" ? row.node : "specialist",
-            result: typeof row.text === "string" ? row.text : value,
-            ...(row.ok === false ? { error: typeof row.text === "string" ? row.text : "Specialist failed." } : {}),
+            result: failed ? undefined : typeof row.text === "string" ? row.text : value,
+            ...(failed ? { error: safeProviderFailure(context.provider, "tool") } : {}),
           });
           break;
         }
