@@ -38,9 +38,10 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { Readable } from "node:stream";
 import { afterEach, describe, expect, it } from "vitest";
 import type Database from "better-sqlite3-multiple-ciphers";
 import { CancelFlag } from "./cancel.js";
@@ -79,6 +80,8 @@ import {
   type SketchDoc,
 } from "./chatCommandsGenerate.js";
 import { htmlDocument } from "./docsHtml.js";
+import { createWorkspaceRoom } from "./workspace/roomLayout.js";
+import { WorkspaceService } from "./workspace/workspaceService.js";
 
 // ============================================================================
 // fixtures
@@ -480,6 +483,37 @@ describe("cmdCompare", () => {
 });
 
 describe("cmdTranscribe", () => {
+  it("reads workspace audio from the normal file and caches only transcript text", async () => {
+    tmpDir = mkdtempSync(path.join(os.tmpdir(), "chat-command-workspace-"));
+    const root = path.join(tmpDir, "Room");
+    const { db } = createWorkspaceRoom(root, "correct horse battery staple", "Test Room");
+    openDb = db;
+    const workspace = new WorkspaceService(db, root);
+    const audio = Buffer.from([1, 2, 3, 4]);
+    const entry = await workspace.createFile("call.m4a", Readable.from([audio]), "upload");
+    db.prepare("UPDATE files SET mime_type = 'audio/mp4' WHERE id = ?").run(entry.fileId);
+    const rooms: RoomSource = { current: () => ({ db, path: root, workspace }) };
+    const ctx = makeCtx(db, {
+      rooms,
+      refs: [entry.fileId],
+      transcribeAudio: async (bytes) => {
+        expect(bytes).toEqual(audio);
+        return "Workspace words";
+      },
+    });
+
+    await cmdTranscribe(ctx);
+
+    expect(readFileSync(path.join(root, "call.m4a"))).toEqual(audio);
+    expect(getFileExtractedText(db, entry.fileId)).toBe(
+      "(transcribed from recording)\nWorkspace words",
+    );
+    const row = db.prepare("SELECT original_bytes FROM files WHERE id = ?").get(entry.fileId) as {
+      original_bytes: Buffer | null;
+    };
+    expect(row.original_bytes).toBeNull();
+  });
+
   it("requires an @-pinned recording", async () => {
     const ctx = makeCtx(freshRoom());
     await expect(cmdTranscribe(ctx)).rejects.toThrow("Add a recording with @");

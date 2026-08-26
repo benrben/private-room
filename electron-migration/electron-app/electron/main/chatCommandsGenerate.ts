@@ -118,12 +118,11 @@ import {
 } from "./chatCommandsKnowledge.js";
 import { htmlDocument, htmlEscape, htmlNoteName, refsContext, refsFiles } from "./docsHtml.js";
 import {
+  availableName,
   currentDate,
-  getFileBytes,
   getFileFull,
-  insertFile,
   listFileInventory,
-  updateFileContent,
+  setFileExtractedText,
 } from "./db-host/files.js";
 import { serializeDelim } from "./editMatchCells.js";
 import { extensionOf } from "./editMatchExtraction.js";
@@ -134,6 +133,7 @@ import { webAccessEnabled } from "./gatherContext.js";
 import { blockedNote, fetchReadable, joinNames, searchWeb } from "./web.js";
 import { linkFileName } from "./browser/saved.js";
 import type { RoomHandle, RoomSource } from "./jobs.js";
+import { createRoomFile, readRoomFile } from "./workspace/roomContent.js";
 import { SIDECAR_DOWN, sidecarErrorSentinel, type SidecarError } from "./sidecarJsonCancellable.js";
 import {
   authedHeaders,
@@ -1147,7 +1147,7 @@ export async function cmdTranscribe(ctx: CmdCtx): Promise<CommandResult> {
       throw new Error(`"${name}" isn't an audio or video file.`);
     }
     ctx.turn.step(ctx.send, `Transcribing ${name} (long recordings take a while)…`);
-    const bytes = getFileBytes(room.db, fileId);
+    const bytes = (await readRoomFile(room, fileId)).bytes;
     if (bytes === null) {
       throw new Error("This recording has no stored audio.");
     }
@@ -1161,10 +1161,7 @@ export async function cmdTranscribe(ctx: CmdCtx): Promise<CommandResult> {
     // Cache it so a re-run is instant and the one-liner filler picks it up.
     const fullText = `(transcribed from recording)\n${transcript}`;
     try {
-      const current = getFileBytes(room.db, fileId);
-      if (current !== null) {
-        updateFileContent(room.db, fileId, current, fullText);
-      }
+      setFileExtractedText(room.db, fileId, fullText);
     } catch {
       // best-effort, matching Rust's `let _ = db::update_file_content(...)`
     }
@@ -1544,12 +1541,20 @@ export async function cmdResearch(ctx: CmdCtx): Promise<CommandResult> {
       continue;
     }
     const title = fetched.title.trim() === "" ? hit.title : fetched.title;
-    const name = linkFileName(title, hit.url);
+    const name = availableName(room.db, linkFileName(title, hit.url));
     let metaName: string;
     try {
       const saved = currentDate(room.db);
       const content = `# ${title}\n\nSource: ${hit.url}\nSaved: ${saved}\n\n${fetched.text}`;
-      const meta = insertFile(room.db, name, "text/markdown", Buffer.from(content, "utf8"), content, "web");
+      const meta = await createRoomFile(
+        room,
+        name,
+        "text/markdown",
+        Buffer.from(content, "utf8"),
+        content,
+        "web",
+      );
+      room.db.prepare("UPDATE files SET origin_url = ? WHERE id = ?").run(hit.url, meta.id);
       metaName = meta.name;
     } catch {
       continue;
