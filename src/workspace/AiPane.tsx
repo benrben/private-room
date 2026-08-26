@@ -923,7 +923,18 @@ function HarnessRunner({ s, runs }: { s: WSState; runs: HarnessUiRun[] }) {
         <div className="harness-options">
           <label>
             Agent
-            <select value={provider} onChange={(event) => setProvider(event.target.value as HarnessProvider)}>
+            <select
+              value={provider}
+              onChange={(event) => {
+                const next = event.target.value as HarnessProvider;
+                setProvider(next);
+                if (next === "ollama-local" || next === "ollama-cloud" || next === "openrouter") {
+                  setModel(s.model ?? "");
+                } else {
+                  setModel(selectedModel ?? "default");
+                }
+              }}
+            >
               <option value="codex">Codex</option>
               <option value="claude">Claude</option>
               <option value="ollama-local">Ollama local</option>
