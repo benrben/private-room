@@ -9,7 +9,8 @@ import { createRoomManagerState } from "../roomManager.js";
 import { createWorkspaceRoom } from "../workspace/roomLayout.js";
 import { WorkspaceService } from "../workspace/workspaceService.js";
 import type { NativeWorkspaceSandbox } from "./seatbelt.js";
-import { AsyncWriteGate, RestrictedLegacyCliRuntime, RuntimeWithFallback } from "./legacyCli.js";
+import { AsyncWriteGate, RestrictedLegacyCliRuntime, RuntimeWithFallback, WorkspaceDispatcher } from "./legacyCli.js";
+import type { ToolDispatcher } from "../mcpBridge.js";
 import type { HarnessContext, HarnessRun, HarnessRuntime } from "./types.js";
 
 const roots: string[] = [];
@@ -97,6 +98,9 @@ describe("RestrictedLegacyCliRuntime", () => {
       expect(args).toContain("read-only");
       expect(args).toContain("shell_tool");
       expect(args.join(" ")).toContain("mcp_servers.room.url");
+      const bearerToken = sandbox!.env?.ARCELLE_ROOM_MCP_TOKEN;
+      expect(bearerToken).toMatch(/^[0-9a-f-]{36}$/i);
+      expect(args.join("\0")).not.toContain(bearerToken!);
       expect(events).toContainEqual({ type: "text_delta", runId: "run-1", text: "done" });
       expect(events.at(-1)).toEqual({ type: "run_completed", runId: "run-1", status: "completed" });
     } finally {
@@ -176,6 +180,28 @@ describe("RestrictedLegacyCliRuntime", () => {
     releaseFirst();
     await Promise.all([first, second]);
     expect(sequence).toEqual(["first-start", "parallel-read", "first-end", "second"]);
+  });
+
+  it("merges the full Arcelle MCP catalog into the restricted fallback", async () => {
+    const base: ToolDispatcher = {
+      listTools: () => [{ name: "special_arcelle_tool", inputSchema: { type: "object" } }],
+      callTool: async (_scope, name) => ({
+        isError: false,
+        content: [{ type: "text", text: `called ${name}` }],
+      }),
+    };
+    const dispatcher = new WorkspaceDispatcher(
+      { call: async () => ({ error: "generic backend should not be used" }) },
+      new AsyncWriteGate(),
+      undefined,
+      base,
+    );
+    const scope = { kind: "CloudEngine" as const };
+    expect(dispatcher.listTools(scope).map((tool) => tool.name)).toEqual(["special_arcelle_tool"]);
+    expect(await dispatcher.callTool(scope, "special_arcelle_tool", {})).toEqual({
+      isError: false,
+      content: [{ type: "text", text: "called special_arcelle_tool" }],
+    });
   });
 
   it("inherits cancellation into an active delegated CLI child", async () => {
