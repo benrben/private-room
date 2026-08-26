@@ -383,7 +383,13 @@ export function toRoomPinSource(state: RoomManagerState): RoomPinSource {
 export function toRoomSource(state: RoomManagerState): RoomSource {
   return {
     current: (): RoomHandle | null =>
-      state.room !== null ? { db: state.room.conn, path: state.room.path } : null,
+      state.room !== null
+        ? {
+            db: state.room.conn,
+            path: state.room.path,
+            ...(state.room.workspace === undefined ? {} : { workspace: state.room.workspace }),
+          }
+        : null,
   };
 }
 
