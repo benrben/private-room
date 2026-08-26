@@ -1,5 +1,5 @@
 import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -9,6 +9,7 @@ import {
   verifyNativeHarnessExecutable,
   verifyNativeWorkspaceSandbox,
   terminateNativeProcessTree,
+  spawnWithNativeWorkspaceSandbox,
 } from "./seatbelt.js";
 
 const roots: string[] = [];
@@ -132,4 +133,31 @@ describe("native workspace Seatbelt", () => {
     await new Promise<void>((resolve) => child.once("exit", () => resolve()));
     expect(child.signalCode).toBe("SIGKILL");
   });
+
+  it.each([
+    { provider: "codex" as const, executable: process.env.ARCELLE_CODEX_PATH ?? "codex", args: ["app-server", "--listen", "stdio://"] },
+    { provider: "claude" as const, executable: process.env.ARCELLE_CLAUDE_PATH ?? "claude", args: ["-p", "--output-format", "json"] },
+  ])("starts and cancels the installed $provider CLI inside the real sandbox", async ({ provider, executable, args }) => {
+    if (!nativeWorkspaceSandboxSupported()) return;
+    if (spawnSync(executable, ["--version"], { stdio: "ignore", timeout: 5_000 }).status !== 0) return;
+    const f = await fixture();
+    const child = spawnWithNativeWorkspaceSandbox({
+      workspacePath: f.workspacePath,
+      runtimePath: f.runtimePath,
+      executable,
+      provider,
+      writeEnabled: false,
+    }, args, { cwd: f.workspacePath, env: process.env });
+    await new Promise<void>((resolve, reject) => {
+      child.once("spawn", resolve);
+      child.once("error", reject);
+    });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(terminateNativeProcessTree(child, "SIGTERM", 250)).toBe(true);
+    await Promise.race([
+      new Promise<void>((resolve) => child.once("exit", () => resolve())),
+      new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error(`${provider} did not exit after cancellation.`)), 5_000)),
+    ]);
+    expect(child.exitCode !== null || child.signalCode !== null).toBe(true);
+  }, 15_000);
 });
