@@ -50,6 +50,8 @@ describe("DeepAgentRuntime", () => {
       harness: "deep",
       model: "qwen3:14b",
       runId: "run-1",
+      ollamaBaseUrl: "http://127.0.0.1:11434",
+      provider: null,
       mcp: { workspaceWrite: false, baselineRunId: "" },
     });
     expect((request as unknown as RunViaSidecarRequest).mcp.url).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/mcp$/);

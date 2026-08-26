@@ -42,6 +42,15 @@ function numeric(row: Record<string, unknown>, ...keys: string[]): number | unde
   return undefined;
 }
 
+function isLoopbackBaseUrl(value: string): boolean {
+  try {
+    const host = new URL(value).hostname.toLocaleLowerCase("en-US");
+    return host === "127.0.0.1" || host === "localhost" || host === "::1" || host === "[::1]";
+  } catch {
+    return false;
+  }
+}
+
 /** Built-in provider-neutral Deep Agents runtime over Arcelle's MCP bridge. */
 export class DeepAgentRuntime implements HarnessRuntime {
   readonly name = "arcelle-deep" as const;
@@ -143,13 +152,17 @@ export class DeepAgentRuntime implements HarnessRuntime {
           provider = providerRuntimeConfigWire(config);
         }
         const owner = new TurnId(context.runId, input.threadId ?? "");
+        const ollamaBaseUrl = resolvedBaseUrl();
+        if (context.provider === "ollama-local" && !isLoopbackBaseUrl(ollamaBaseUrl)) {
+          throw new Error("Local Ollama must use a loopback server on this Mac.");
+        }
         const outcome: SidecarOutcome = await this.runSidecar(
           {
             model: context.model,
             question: input.text,
             harness: "deep",
             messages: context.systemPrompt ? [{ role: "system", content: context.systemPrompt }] : [],
-            ollamaBaseUrl: resolvedBaseUrl(),
+            ollamaBaseUrl,
             mcp: {
               url: `http://127.0.0.1:${bridge.port}/mcp`,
               token: bridge.token,
