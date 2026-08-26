@@ -151,6 +151,9 @@ export class HarnessController {
     });
     orchestrator.register("codex", this.runtimes.codex);
     orchestrator.register("claude", this.runtimes.claude);
+    orchestrator.register("ollama-local", this.runtimes["ollama-local"]);
+    orchestrator.register("ollama-cloud", this.runtimes["ollama-cloud"]);
+    orchestrator.register("openrouter", this.runtimes.openrouter);
     this.orchestrator = orchestrator;
     this.roomId = room.descriptor.roomId;
     return orchestrator;

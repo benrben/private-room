@@ -68,6 +68,36 @@ async function fixture() {
 }
 
 describe("HarnessController", () => {
+  it("runs local Ollama through the unified lifecycle without native-process isolation", async () => {
+    const f = await fixture();
+    const events: Array<{ type?: string; status?: string }> = [];
+    try {
+      const controller = new HarnessController(f.state, f.root, (_event, payload) => {
+        events.push(payload as { type?: string; status?: string });
+      }, {
+        runtimes: { "ollama-local": new EditingRuntime() },
+        flag: () => true,
+        outsideWorkspaceIsolation: false,
+      });
+      const caps = await controller.capabilities();
+      expect(caps.providers["ollama-local"]).toMatchObject({ enabled: true, installed: true });
+      await controller.start({
+        provider: "ollama-local",
+        model: "qwen3:14b",
+        privacyMode: "local",
+        writeEnabled: true,
+        text: "edit",
+      });
+      for (let count = 0; count < 100 && !events.some((event) => event.type === "run_completed"); count += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(events.find((event) => event.type === "run_completed")?.status).toBe("completed");
+      expect(await readFile(path.join(f.roomPath, "notes.txt"), "utf8")).toContain("Reviewed");
+    } finally {
+      f.created.db.close();
+    }
+  });
+
   it("keeps production native mode disabled until outside-workspace isolation is proven", async () => {
     const f = await fixture();
     try {
