@@ -13,14 +13,17 @@
 
 import { randomUUID } from "node:crypto";
 import * as http from "node:http";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { Readable } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type Database from "better-sqlite3-multiple-ciphers";
 
 import { createRoom } from "./db-host/open.js";
 import { getFileMeta, insertFile, setFileAiSummary, trashFile } from "./db-host/files.js";
+import { createWorkspaceRoom } from "./workspace/roomLayout.js";
+import { WorkspaceService } from "./workspace/workspaceService.js";
 
 vi.mock("./sidecar.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./sidecar.js")>();
@@ -317,6 +320,35 @@ describe("combineSummary", () => {
 // ============================================================================
 
 describe("writeRoomSummary", () => {
+  it("creates and versions the summary as a normal workspace file", async () => {
+    const parent = mkdtempSync(path.join(os.tmpdir(), "summary-workspace-"));
+    tmpDirs.push(parent);
+    const root = path.join(parent, "Room");
+    const { db } = createWorkspaceRoom(root, "correct horse battery staple", "Workspace");
+    openDbs.push(db);
+    const workspace = new WorkspaceService(db, root);
+    const source = await workspace.createFile("notes.md", Readable.from(["facts"]), "upload");
+    db.prepare("UPDATE files SET mime_type = 'text/markdown' WHERE id = ?").run(source.fileId);
+    setFileAiSummary(db, source.fileId, "Useful facts.");
+    const rooms = new OneRoom({ db, path: root, name: "Workspace", workspace });
+
+    const first = await writeRoomSummary(rooms, "m", root, {
+      combineSummary: async () => ["First summary.", []],
+    });
+    const second = await writeRoomSummary(rooms, "m", root, {
+      combineSummary: async () => ["Second summary.", []],
+    });
+
+    expect(second.id).toBe(first.id);
+    expect(readFileSync(path.join(root, SUMMARY_FILE_NAME), "utf8")).toContain("Second summary.");
+    const row = db.prepare(
+      "SELECT storage_kind, original_bytes FROM files WHERE id = ?",
+    ).get(first.id) as { storage_kind: string; original_bytes: Buffer | null };
+    expect(row).toEqual({ storage_kind: "workspace", original_bytes: null });
+    expect((db.prepare("SELECT count(*) AS n FROM file_versions WHERE file_id = ?")
+      .get(first.id) as { n: number }).n).toBe(1);
+  });
+
   it("refuses an empty room", async () => {
     const { db, path, name } = freshRoomDb();
     const rooms = new OneRoom({ db, path, name });

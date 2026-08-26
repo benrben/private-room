@@ -126,6 +126,8 @@ import {
 } from "./db-host/files.js";
 import { listMemories } from "./db-host/memories.js";
 import { snapshotFileVersion } from "./db-host/versions.js";
+import { createRoomFile, writeRoomFile } from "./workspace/roomContent.js";
+import type { WorkspaceService } from "./workspace/workspaceService.js";
 import { resolvedBaseUrl } from "./engineRouting.js";
 import { htmlDocument, htmlEscape } from "./docsHtml.js";
 import { sidecarErrorSentinel, sidecarJsonCancellable } from "./sidecarJsonCancellable.js";
@@ -284,6 +286,7 @@ export interface SummaryRoom {
   db: Database.Database;
   path: string;
   name: string;
+  workspace?: WorkspaceService;
 }
 
 /** Minimal stand-in for `tauri::State<'_, AppState>`'s room access, scoped to
@@ -580,10 +583,13 @@ export async function writeRoomSummary(
   const bytes = Buffer.from(content, "utf8");
   let meta: FileMeta;
   if (existingId !== null) {
-    storeFileBytes(room1.db, existingId, bytes, content, "Summarized");
-    meta = getFileMeta(room1.db, existingId);
+    meta = room1.workspace === undefined
+      ? (storeFileBytes(room1.db, existingId, bytes, content, "Summarized"), getFileMeta(room1.db, existingId))
+      : await writeRoomFile(room1, existingId, bytes, content, "Summarized");
   } else {
-    meta = insertFile(room1.db, SUMMARY_FILE_NAME, "text/html", bytes, content, "generated");
+    meta = room1.workspace === undefined
+      ? insertFile(room1.db, SUMMARY_FILE_NAME, "text/html", bytes, content, "generated")
+      : await createRoomFile(room1, SUMMARY_FILE_NAME, "text/html", bytes, content, "generated");
   }
   // ADD-22: drop the legacy Markdown summary so only the HTML one remains.
   // Trashed, not destroyed, and labelled with the command that did it: this
@@ -592,7 +598,8 @@ export async function writeRoomSummary(
   if (legacyMdId !== null) {
     const actor: TrashActor = { kind: "app", what: "summarize_room" };
     try {
-      trashFile(room1.db, legacyMdId, actor);
+      if (room1.workspace === undefined) trashFile(room1.db, legacyMdId, actor);
+      else await room1.workspace.trash(legacyMdId);
     } catch {
       // Best-effort, mirrors Rust's `let _ = db::trash_file(...)`.
     }
