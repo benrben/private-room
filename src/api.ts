@@ -413,6 +413,7 @@ export const api = {
   listRecent: () => invoke<RecentRoom[]>("list_recent"),
   removeRecent: (path: string) => invoke<void>("remove_recent", { path }),
   clearRecent: () => invoke<void>("clear_recent"),
+  trashRoom: (path: string) => invoke<void>("trash_room", { path }),
   saveGeneratedFile: (name: string, content: string) =>
     invoke<FileMeta>("save_generated_file", { name, content }),
   // Write an HTML file to temp and open it in the real browser (interactive

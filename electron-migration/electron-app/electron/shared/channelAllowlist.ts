@@ -248,6 +248,7 @@ const ALL_COMMANDS_TYPED: { [K in keyof Commands]: true } = {
   regenerate_leash_token: true,
   remove_privacy_entity: true,
   remove_recent: true,
+  trash_room: true,
   rename_chat: true,
   rename_file: true,
   rename_folder: true,

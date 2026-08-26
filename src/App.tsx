@@ -260,6 +260,24 @@ export default function App() {
     loadRecent();
   }
 
+  async function trashRoom(room: RecentRoom) {
+    const ok = await askConfirm(
+      `Move “${room.name}” to the macOS Trash? This moves the complete room — its normal files and encrypted private state. You can recover it from Trash until Trash is emptied.`,
+      { title: "Move room to Trash", kind: "warning", okLabel: "Move to Trash" },
+    ).catch(() => false);
+    if (!ok) return;
+    try {
+      await api.trashRoom(room.path);
+      forgetSavedLayout(room.path);
+      await loadRecent();
+    } catch (e) {
+      await message(`The room couldn't be moved to Trash.\n\n${String(e)}`, {
+        title: "Move room to Trash",
+        kind: "error",
+      }).catch(() => {});
+    }
+  }
+
   // One click used to wipe every shortcut with no confirmation, no undo and
   // nothing said if it failed — and a room in a folder you don't remember then
   // has to be hunted down by hand.
@@ -678,6 +696,7 @@ export default function App() {
               else goTo({ kind: "unlock", path });
             }}
             onRemoveRecent={removeRecent}
+            onTrashRoom={(room) => void trashRoom(room)}
             onClearRecent={clearRecent}
           />
         )}

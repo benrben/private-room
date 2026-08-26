@@ -47,6 +47,7 @@ import {
   registerRecentIpc,
   removeRecent,
   renameRecent,
+  trashRoom,
   writePrivate,
   writeRecent,
 } from "./recentTools.js";
@@ -370,10 +371,42 @@ describe("clearRecent", () => {
   });
 });
 
+describe("trashRoom", () => {
+  it("moves only a valid workspace through the injected OS Trash and forgets it", async () => {
+    const dir = freshDir();
+    const room = path.join(dir, "Customer Project");
+    mkdirSync(path.join(room, ".arcelle"), { recursive: true });
+    writeFileSync(
+      path.join(room, ".arcelle", "room.json"),
+      JSON.stringify({ format: "arcelle-workspace", formatVersion: 2, roomId: "room-12345678" }),
+    );
+    writeRecent(dir, [mk(room)]);
+    const trashItem = vi.fn(async () => {});
+
+    await trashRoom(dir, room, { trashItem, currentRoomPath: () => null });
+
+    expect(trashItem).toHaveBeenCalledWith(path.resolve(room));
+    expect(readRecent(dir)).toEqual([]);
+  });
+
+  it("refuses arbitrary folders, symlinks, and the currently open room", async () => {
+    const dir = freshDir();
+    const arbitrary = path.join(dir, "ordinary-folder");
+    mkdirSync(arbitrary);
+    const trashItem = vi.fn(async () => {});
+
+    await expect(trashRoom(dir, arbitrary, { trashItem })).rejects.toThrow(/not an Arcelle workspace/i);
+    await expect(
+      trashRoom(dir, arbitrary, { trashItem, currentRoomPath: () => arbitrary }),
+    ).rejects.toThrow(/Close the room/i);
+    expect(trashItem).not.toHaveBeenCalled();
+  });
+});
+
 // ------------------------------------------------------------- registerRecentIpc
 
 describe("registerRecentIpc", () => {
-  it("wires list_recent/remove_recent/clear_recent to the right functions", async () => {
+  it("wires the recent-room and OS Trash commands to the right functions", async () => {
     const dir = freshDir();
     pushRecent(dir, "Room", "/r");
 
@@ -384,9 +417,14 @@ describe("registerRecentIpc", () => {
       }),
     };
 
-    registerRecentIpc(ipcMain, dir);
+    registerRecentIpc(ipcMain, dir, { trashItem: vi.fn(async () => {}) });
 
-    expect([...handlers.keys()].sort()).toEqual(["clear_recent", "list_recent", "remove_recent"]);
+    expect([...handlers.keys()].sort()).toEqual([
+      "clear_recent",
+      "list_recent",
+      "remove_recent",
+      "trash_room",
+    ]);
 
     const listed = await handlers.get("list_recent")!(null);
     expect(listed).toEqual([{ name: "Room", path: "/r", openedAt: expect.any(Number), missing: true }]);

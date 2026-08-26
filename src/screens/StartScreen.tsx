@@ -1,5 +1,5 @@
 import { RecentRoom } from "../api";
-import { CloseIcon, FolderIcon, PlusIcon } from "../icons";
+import { CloseIcon, FolderIcon, PlusIcon, TrashIcon } from "../icons";
 import { relativeTime } from "../rooms/helpers";
 
 /** What a room's own path lets us say truthfully about where it lives.
@@ -36,6 +36,7 @@ type StartScreenProps = {
   onDemo: () => void;
   onOpenRecent: (path: string) => void;
   onRemoveRecent: (path: string) => void;
+  onTrashRoom: (room: RecentRoom) => void;
   onClearRecent: () => void;
 };
 
@@ -46,6 +47,7 @@ export function StartScreen({
   onDemo,
   onOpenRecent,
   onRemoveRecent,
+  onTrashRoom,
   onClearRecent,
 }: StartScreenProps) {
   return (
@@ -167,12 +169,22 @@ export function StartScreen({
                   </button>
                   <button
                     className="recent-remove"
-                    title="Remove from list"
-                    aria-label="Remove from list"
+                    title="Forget this shortcut"
+                    aria-label="Forget this shortcut"
                     onClick={() => onRemoveRecent(room.path)}
                   >
                     <CloseIcon size={14} />
                   </button>
+                  {!room.missing && (
+                    <button
+                      className="recent-remove"
+                      title="Move room to Trash"
+                      aria-label={`Move ${room.name} to Trash`}
+                      onClick={() => onTrashRoom(room)}
+                    >
+                      <TrashIcon size={14} />
+                    </button>
+                  )}
                 </li>
               );
             })}

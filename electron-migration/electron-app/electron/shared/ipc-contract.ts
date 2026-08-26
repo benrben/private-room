@@ -267,6 +267,7 @@ export interface Commands {
   list_recent: { args: Record<string, never>; result: RecentRoom[] };
   remove_recent: { args: { path: string }; result: void };
   clear_recent: { args: Record<string, never>; result: void };
+  trash_room: { args: { path: string }; result: void };
   save_generated_file: {
     args: { name: string; content: string };
     result: FileMeta;

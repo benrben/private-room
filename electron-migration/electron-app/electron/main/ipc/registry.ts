@@ -788,7 +788,10 @@ export function registerAllIpc(opts: RegisterAllIpcOptions): RegisterAllIpcResul
   // ---- standalone channels with no room dependency ----
   registerDictIpc(recordingIpcMain);
   registerRolesIpc(recordingIpcMain);
-  registerRecentIpc(recordingIpcMain, userDataDir);
+  registerRecentIpc(recordingIpcMain, userDataDir, {
+    trashItem: (targetPath) => shell.shell.trashItem(targetPath),
+    currentRoomPath: () => state.room?.path ?? null,
+  });
   registerRuntimesIpc(recordingIpcMain, userDataDir, emit);
 
   // ---- OpenRoom-shaped RoomSource modules ----

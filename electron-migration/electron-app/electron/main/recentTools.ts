@@ -35,10 +35,11 @@
  */
 
 import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { stat } from "node:fs/promises";
+import { lstat, stat } from "node:fs/promises";
 import path from "node:path";
 import type { IpcMain, IpcMainInvokeEvent } from "electron";
 import type { RecentRoom } from "../shared/apiTypes.js";
+import { readWorkspaceMarker } from "./workspace/roomLayout.js";
 
 /** How many rooms the recents list remembers — recent.rs:61's inline `5`,
  * named here so {@link mergeRecent}'s cap and its test can both point at one
@@ -319,6 +320,57 @@ export function clearRecent(userDataDir: string): void {
   writeRecent(userDataDir, []);
 }
 
+export interface RecentTrashDeps {
+  trashItem: (targetPath: string) => Promise<void>;
+  currentRoomPath?: () => string | null;
+}
+
+/**
+ * Move one complete room to the operating-system Trash. This deliberately
+ * accepts only a valid workspace root or a legacy room-file extension: the
+ * renderer must never be able to turn this convenience command into a
+ * general-purpose delete primitive for an arbitrary path.
+ */
+export async function trashRoom(
+  userDataDir: string,
+  roomPath: string,
+  deps: RecentTrashDeps,
+): Promise<void> {
+  if (typeof roomPath !== "string" || roomPath.trim() === "" || !path.isAbsolute(roomPath)) {
+    throw new Error("A complete room path is required.");
+  }
+
+  const target = path.resolve(roomPath);
+  const openPath = deps.currentRoomPath?.();
+  if (openPath && path.resolve(openPath) === target) {
+    throw new Error("Close the room before moving it to Trash.");
+  }
+
+  let info;
+  try {
+    info = await lstat(target);
+  } catch {
+    throw new Error("The room is not at that location.");
+  }
+  if (info.isSymbolicLink()) {
+    throw new Error("A symbolic link cannot be moved as an Arcelle room.");
+  }
+  if (info.isDirectory()) {
+    // Reads and validates `.arcelle/room.json`; throws for an arbitrary folder.
+    readWorkspaceMarker(target);
+  } else if (info.isFile()) {
+    const extension = path.extname(target).toLocaleLowerCase("en-US");
+    if (extension !== ".arcelle" && extension !== ".roomai") {
+      throw new Error("Only an Arcelle workspace or legacy room file can be moved to Trash.");
+    }
+  } else {
+    throw new Error("Only an Arcelle workspace or legacy room file can be moved to Trash.");
+  }
+
+  await deps.trashItem(target);
+  removeRecent(userDataDir, roomPath);
+}
+
 /**
  * Registers `list_recent`/`remove_recent`/`clear_recent` on `ipcMain`, under
  * the exact channel names `src/api.ts:318-320`'s `invoke(...)` calls already
@@ -341,7 +393,11 @@ export function clearRecent(userDataDir: string): void {
  * migration's standing rule that `ipcMain.handle` never lands in a live
  * bootstrap file from a batch like this one.
  */
-export function registerRecentIpc(ipcMain: Pick<IpcMain, "handle">, userDataDir: string): void {
+export function registerRecentIpc(
+  ipcMain: Pick<IpcMain, "handle">,
+  userDataDir: string,
+  trashDeps?: RecentTrashDeps,
+): void {
   const handle = <A extends unknown[], R>(channel: string, fn: (...args: A) => R): void => {
     ipcMain.handle(channel, (_event: IpcMainInvokeEvent, ...args: A) => fn(...args));
   };
@@ -349,4 +405,8 @@ export function registerRecentIpc(ipcMain: Pick<IpcMain, "handle">, userDataDir:
   handle("list_recent", () => listRecent(userDataDir));
   handle("remove_recent", (args: { path: string }) => removeRecent(userDataDir, args.path));
   handle("clear_recent", () => clearRecent(userDataDir));
+  handle("trash_room", (args: { path: string }) => {
+    if (!trashDeps) throw new Error("Moving rooms to Trash is unavailable.");
+    return trashRoom(userDataDir, args.path, trashDeps);
+  });
 }

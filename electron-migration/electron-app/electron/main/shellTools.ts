@@ -78,7 +78,7 @@ export function isAllowedOpenUrl(url: string): boolean {
 
 export interface ShellDeps {
   /** Electron's real `shell`, narrowed to what this file calls. */
-  shell: Pick<Shell, "openExternal" | "openPath" | "showItemInFolder">;
+  shell: Pick<Shell, "openExternal" | "openPath" | "showItemInFolder" | "trashItem">;
   /** `/usr/bin/open -a <app> <target>` — see the module doc's `with` section.
    * Production wires {@link execFileOpenWithApp}. */
   openWithApp: (app: string, target: string) => Promise<void>;
