@@ -24,8 +24,16 @@
 
 import type Database from "better-sqlite3-multiple-ciphers";
 import { executeOne, queryOpt, queryRows, type Row } from "./util.js";
-import { getFileBytes, getFileExtractedText, inTransaction, updateFileContent } from "./files.js";
+import {
+  getFileBytes,
+  getFileExtractedText,
+  inTransaction,
+  setFileExtractedText,
+  updateFileContent,
+} from "./files.js";
 import { decodeWav, encodeWav } from "../recFormat.js";
+import { Readable } from "node:stream";
+import type { WorkspaceService } from "../workspace/workspaceService.js";
 
 // ADD-27: per-file recording metadata (segments with word timings, speakers,
 // cut list) as one JSON blob keyed by file id. The row's EXISTENCE is also the
@@ -144,6 +152,91 @@ export function finalizeRecAudio(
     updateFileContent(db, fileId, wav, text);
     clearRecChunks(db, fileId);
   });
+}
+
+/** Hybrid-room final save. Current audio is written to the normal workspace
+ * file; transcript/search metadata and crash checkpoints remain encrypted in
+ * SQLCipher. */
+export async function finalizeRecAudioHybrid(
+  db: Database.Database,
+  workspace: WorkspaceService,
+  fileId: string,
+  wav: Uint8Array,
+  text: string | null,
+): Promise<void> {
+  const row = db.prepare(
+    "SELECT storage_kind, content_sha256 FROM files WHERE id = ? AND trashed_at IS NULL",
+  ).get(fileId) as { storage_kind: string; content_sha256: string | null } | undefined;
+  if (row === undefined) throw new Error("That recording is no longer in the room.");
+  if (row.storage_kind !== "workspace") {
+    finalizeRecAudio(db, fileId, wav, text);
+    return;
+  }
+  await workspace.writeAtomic(
+    fileId,
+    Readable.from([Buffer.from(wav)]),
+    row.content_sha256 ?? undefined,
+  );
+  if (text !== null) setFileExtractedText(db, fileId, text);
+  clearRecChunks(db, fileId);
+}
+
+/** Recover live PCM checkpoints for a workspace recording without moving its
+ * current WAV back into `files.original_bytes`. */
+export async function recoverRecChunksHybrid(
+  db: Database.Database,
+  workspace: WorkspaceService,
+): Promise<number> {
+  const ids = queryRows(db, "SELECT DISTINCT file_id FROM rec_chunks", [], (r: Row) => r[0] as string);
+  let recovered = 0;
+  let failed = 0;
+  for (const id of ids) {
+    const row = db.prepare(
+      "SELECT storage_kind FROM files WHERE id = ? AND trashed_at IS NULL",
+    ).get(id) as { storage_kind: string } | undefined;
+    if (row === undefined) continue;
+    if (row.storage_kind !== "workspace") {
+      try {
+        recoverOne(db, id, getFileBytes(db, id));
+        recovered++;
+      } catch {
+        failed++;
+      }
+      continue;
+    }
+    try {
+      const stored = await workspace.readBuffer(id);
+      const base = stored.length > 0 ? decodeWav(stored) : new Float32Array(0);
+      const chunks = queryRows(
+        db,
+        "SELECT pcm FROM rec_chunks WHERE file_id = ? ORDER BY seq",
+        [id],
+        (r: Row) => r[0] as Buffer,
+      );
+      let total = base.length;
+      for (const pcm of chunks) total += Math.trunc(pcm.length / 2);
+      const samples = new Float32Array(total);
+      samples.set(base, 0);
+      let at = base.length;
+      for (const pcm of chunks) {
+        for (let i = 0; i < Math.trunc(pcm.length / 2); i++) {
+          samples[at++] = pcm.readInt16LE(i * 2) / 32768;
+        }
+      }
+      await finalizeRecAudioHybrid(db, workspace, id, encodeWav(samples), getFileExtractedText(db, id));
+      recovered++;
+    } catch {
+      failed++;
+    }
+  }
+  if (failed > 0) {
+    throw new Error(
+      `${failed} of ${ids.length} interrupted recording(s) could not be restored ` +
+        `(${recovered} were). Their audio is still stored in the room and the ` +
+        `rescue runs again the next time you unlock it.`,
+    );
+  }
+  return recovered;
 }
 
 /**

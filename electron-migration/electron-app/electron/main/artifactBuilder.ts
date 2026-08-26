@@ -39,11 +39,15 @@ import type { CancelFlag } from "./cancel.js";
 import {
   commitStaged,
   discardStaged,
+  provenanceToJson,
   stageArtifact,
   type Provenance,
 } from "./db-host/artifacts.js";
 import type { FileMeta } from "./db-host/files.js";
+import { availableName, getFileMeta, setFileExtractedText } from "./db-host/files.js";
 import { noteMime } from "./docsHtml.js";
+import { Readable } from "node:stream";
+import type { WorkspaceService } from "./workspace/workspaceService.js";
 
 /** `extraction::extension_of` — a bare local copy, matching `docsHtml.ts`'s
  * own (its module doc explains why: `extraction::extension_of` is external to
@@ -173,6 +177,65 @@ export class Artifact {
         // best-effort, mirrors the Rust `let _ = db::discard_staged(..)`
       }
       throw err;
+    }
+  }
+
+  /**
+   * Commit an accepted artifact into a hybrid room. Staging and cancellation
+   * remain private database state, but the accepted bytes become a normal
+   * workspace file. Regenerating the same generated artifact replaces it only
+   * after WorkspaceService has saved an encrypted history snapshot.
+   */
+  async commitToWorkspace(workspace: WorkspaceService): Promise<Written> {
+    const db = workspace.db;
+    const bytes = Buffer.from(this.content, "utf8");
+    const text = this.indexedText ?? this.content;
+    const staged = stageArtifact(db, this.name, this.mime, bytes, text, this.prov);
+    if (this.cancel !== null && this.cancel.load()) {
+      try { discardStaged(db, staged.id); } catch { /* startup sweep is the backstop */ }
+      throw new Error(`Stopped before "${staged.name}" was saved — nothing was written to the room.`);
+    }
+    try {
+      const provenance = provenanceToJson(this.prov);
+      const existing = db.prepare(
+        `SELECT id, storage_kind FROM files
+         WHERE source = 'generated' AND trashed_at IS NULL
+           AND (lower(artifact_key) = lower(?)
+                OR (artifact_key IS NULL AND lower(name) = lower(?)))
+         ORDER BY created_at DESC, rowid DESC LIMIT 1`,
+      ).get(staged.name, staged.name) as { id: string; storage_kind: string } | undefined;
+
+      let id: string;
+      let versioned: boolean;
+      if (existing !== undefined && existing.storage_kind === "workspace") {
+        const current = db.prepare("SELECT content_sha256 FROM files WHERE id = ?")
+          .get(existing.id) as { content_sha256: string | null };
+        await workspace.snapshotVersion(existing.id, "AI regenerated");
+        await workspace.writeAtomic(existing.id, Readable.from([bytes]), current.content_sha256 ?? undefined);
+        setFileExtractedText(db, existing.id, text);
+        id = existing.id;
+        versioned = true;
+      } else if (existing !== undefined) {
+        // Compatibility for an old blob row that still exists in a legacy
+        // room opened through this API.
+        const [meta, wasVersioned] = commitStaged(db, staged.id);
+        return { meta, versioned: wasVersioned };
+      } else {
+        const free = availableName(db, staged.name);
+        const entry = await workspace.createFile(free, Readable.from([bytes]), "generated");
+        setFileExtractedText(db, entry.fileId, text);
+        id = entry.fileId;
+        versioned = false;
+      }
+      db.transaction(() => {
+        db.prepare("UPDATE files SET mime_type = ?, provenance = ?, artifact_key = ? WHERE id = ?")
+          .run(this.mime, provenance, staged.name, id);
+        discardStaged(db, staged.id);
+      })();
+      return { meta: getFileMeta(db, id), versioned };
+    } catch (error) {
+      try { discardStaged(db, staged.id); } catch { /* startup sweep is the backstop */ }
+      throw error;
     }
   }
 }

@@ -106,12 +106,19 @@ import { execFile } from "node:child_process";
 import * as fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { Readable } from "node:stream";
 import { promisify } from "node:util";
 import type { IpcMain, IpcMainInvokeEvent } from "electron";
 import type Database from "better-sqlite3-multiple-ciphers";
 import { CancelFlag, guardCommit } from "./cancel.js";
 import type { RoomHandle, RoomSource } from "./jobs.js";
-import { insertFile, fileByExactName, type FileMeta } from "./db-host/files.js";
+import {
+  getFileMeta,
+  insertFile,
+  fileByExactName,
+  setFileExtractedText,
+  type FileMeta,
+} from "./db-host/files.js";
 import {
   eqIgnoreAsciiCase,
   getPodcast as dbGetPodcast,
@@ -449,7 +456,7 @@ export async function renderPodcastAudio(
   guardOrThrow(cancel, "the podcast recording");
   const room2 = pinnedRoom(rooms, roomPath);
   const name = nextTakeName(room2.db, title, ext);
-  const meta = insertFile(room2.db, name, mime, bytes, transcript, "generated");
+  const meta = await storePodcastAudioOutput(room2, name, mime, bytes, transcript);
   // Link it to the script, so the panel can say "recorded" and offer to play
   // it rather than offering to record it again.
   setPodcastAudio(room2.db, scriptFileId, meta.id);
@@ -462,6 +469,23 @@ export async function renderPodcastAudio(
     // Swallowed deliberately, matching Rust's `let _ = window.emit(...)`.
   }
   return meta;
+}
+
+/** Publish the finished episode through the room's active content backend. */
+export async function storePodcastAudioOutput(
+  room: RoomHandle,
+  name: string,
+  mime: string,
+  bytes: Uint8Array,
+  transcript: string,
+): Promise<FileMeta> {
+  if (room.workspace === undefined) {
+    return insertFile(room.db, name, mime, bytes, transcript, "generated");
+  }
+  const entry = await room.workspace.createFile(name, Readable.from([Buffer.from(bytes)]), "generated");
+  setFileExtractedText(room.db, entry.fileId, transcript);
+  room.db.prepare("UPDATE files SET mime_type = ? WHERE id = ?").run(mime, entry.fileId);
+  return getFileMeta(room.db, entry.fileId);
 }
 
 /** {@link guardCommit} as a throw — Rust's `crate::cancel::guard_commit(&cancel,

@@ -59,6 +59,7 @@
  */
 
 import type Database from "better-sqlite3-multiple-ciphers";
+import type { WorkspaceService } from "./workspace/workspaceService.js";
 import {
   forget,
   registerRun,
@@ -125,6 +126,7 @@ import {
 export interface OpenRoom {
   db: Database.Database;
   path: string;
+  workspace?: WorkspaceService;
 }
 
 /**

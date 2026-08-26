@@ -123,12 +123,14 @@ import { open as openFile, unlink } from "node:fs/promises";
 import * as os from "node:os";
 import path from "node:path";
 import type Database from "better-sqlite3-multiple-ciphers";
+import { Readable } from "node:stream";
 
 import { authToken, authedHeaders, busy, ensureUp } from "./sidecar.js";
 import {
   deleteFile,
   getFileBytes,
   getFileFull,
+  getFileMeta,
   getFileName,
   inTransaction,
   insertFile,
@@ -141,8 +143,10 @@ import { snapshotFileVersion } from "./db-host/versions.js";
 import {
   appendRecChunk,
   finalizeRecAudio,
+  finalizeRecAudioHybrid,
   getRecMeta,
   recoverRecChunks,
+  recoverRecChunksHybrid,
   setRecMeta,
 } from "./db-host/recordings.js";
 import {
@@ -531,11 +535,12 @@ export type PersistAck =
 const ROOM_CLOSED = "The room closed — recording stopped.";
 
 async function applyPersistWrite(
-  db: Database.Database,
+  room: OpenRoom,
   ctx: RecBridgeCtx,
   fileId: string,
   msg: PersistRequest
 ): Promise<void> {
+  const db = room.db;
   const readFrame = async (range: [number, number]): Promise<Buffer> => {
     const { spoolPath, spoolKey } = ctx.state;
     if (spoolPath === null || spoolKey === null) {
@@ -554,7 +559,11 @@ async function applyPersistWrite(
       }
       const wav = await readFrame(msg.spoolRange);
       // TWO statements, deliberately — `finalize_rec_audio(..).and_then(..)`.
-      finalizeRecAudio(db, fileId, wav, msg.text);
+      if (room.workspace === undefined) {
+        finalizeRecAudio(db, fileId, wav, msg.text);
+      } else {
+        await finalizeRecAudioHybrid(db, room.workspace, fileId, wav, msg.text);
+      }
       setRecMeta(db, fileId, msg.metaJson);
       return;
     }
@@ -602,7 +611,7 @@ export async function handlePersistRequest(ctx: RecBridgeCtx, msg: PersistReques
     return { reqId: msg.reqId, ok: false, reason: "closed", message: ROOM_CLOSED };
   }
   try {
-    await applyPersistWrite(room.db, ctx, liveFileId, msg);
+    await applyPersistWrite(room, ctx, liveFileId, msg);
     return { reqId: msg.reqId, ok: true };
   } catch (err) {
     // Disk full, a deleted row, a bad decrypt — the audio is NOT durable, and
@@ -889,16 +898,23 @@ export async function recStart(
     // every timestamp in the new transcript. Refusing is the only safe answer
     // when the rescue itself cannot run.
     try {
-      recoverRecChunks(db);
+      if (room.workspace === undefined) {
+        recoverRecChunks(db);
+      } else {
+        await recoverRecChunksHybrid(db, room.workspace);
+      }
     } catch (err) {
       throw new Error(
         `This recording can't be continued yet. ${err instanceof Error ? err.message : String(err)}`
       );
     }
-    const [existingName, , bytes] = getFileFull(db, fileId);
+    const [existingName, , storedBytes] = getFileFull(db, fileId);
     name = existingName;
     meta = parseRecMeta(getRecMeta(db, fileId));
     try {
+      const bytes = room.workspace === undefined
+        ? storedBytes
+        : await room.workspace.readBuffer(fileId);
       baseSamples = bytes !== null && bytes.length > 0 ? decodeWav(bytes) : new Float32Array(0);
     } catch (err) {
       throw new Error(
@@ -908,14 +924,14 @@ export async function recStart(
   } else {
     name = `Recording ${recordingStamp()}.wav`;
     meta = defaultRecMeta(); // maxSpeakers = 0 -> discovered
-    const file = insertFile(
-      db,
-      name,
-      "audio/wav",
-      encodeWav(new Float32Array(0)),
-      "(live recording)\n",
-      "recording"
-    );
+    const emptyWav = encodeWav(new Float32Array(0));
+    const file = room.workspace === undefined
+      ? insertFile(db, name, "audio/wav", emptyWav, "(live recording)\n", "recording")
+      : await room.workspace.createFile(name, Readable.from([emptyWav]), "recording").then((entry) => {
+          setFileExtractedText(db, entry.fileId, "(live recording)\n");
+          db.prepare("UPDATE files SET mime_type = 'audio/wav' WHERE id = ?").run(entry.fileId);
+          return getFileMeta(db, entry.fileId);
+        });
     fileId = file.id;
     freshFileId = file.id;
     setRecMeta(db, fileId, JSON.stringify(meta));

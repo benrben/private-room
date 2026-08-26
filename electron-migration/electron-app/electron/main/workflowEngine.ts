@@ -135,11 +135,13 @@
  */
 
 import type Database from "better-sqlite3-multiple-ciphers";
+import { Readable } from "node:stream";
 import { CancelFlag, stopped } from "./cancel.js";
 import { laneSlots, pinnedDb, type Lane, type RoomSource, type Step, type StepResult } from "./jobs.js";
 import { getJobArtifact, putJobArtifact } from "./db-host/jobs.js";
 import {
   currentDate,
+  availableName,
   getFileExtractedText,
   getFileMeta,
   inTransaction,
@@ -147,6 +149,7 @@ import {
   listFilesBrief,
   newSourceFileCount,
   setFileAiSummary,
+  setFileExtractedText,
   updateFileContent,
   type FileMeta,
 } from "./db-host/files.js";
@@ -1323,6 +1326,94 @@ export function saveFileNode(
   return { result: `Saved "${meta.name}" into the room.`, fileId: meta.id };
 }
 
+/** Workspace-room form of {@link saveFileNode}. Legacy rooms keep the exact
+ * synchronous database implementation above; hybrid rooms publish accepted
+ * workflow output as a normal file and retain only metadata/search/history in
+ * SQLCipher. */
+export async function saveFileNodeHybrid(
+  rooms: RoomSource,
+  roomPath: string,
+  nameTemplate: string,
+  format: string,
+  mode: string,
+  inputs: string,
+  existing: WfArtifact | null,
+  published: PublishedRef,
+  cause: string,
+  notifyFilesChanged?: () => void
+): Promise<{ result: string; fileId: string }> {
+  const pinned = rooms.current();
+  if (pinned === null || pinned.path !== roomPath) throw new Error(ROOM_GONE);
+  if (pinned.workspace === undefined) {
+    return saveFileNode(
+      rooms, roomPath, nameTemplate, format, mode, inputs, existing,
+      published, cause, notifyFilesChanged,
+    );
+  }
+
+  const db = pinned.db;
+  const workspace = pinned.workspace;
+  const nameRaw = cleanSaveName(interpolate(rooms, roomPath, nameTemplate, inputs));
+  const ext = format === "md" ? "md" : "html";
+  const name = nameRaw.toLowerCase().endsWith(`.${ext}`) ? nameRaw : `${nameRaw}.${ext}`;
+  const mime = ext === "md" ? "text/markdown" : "text/html";
+  const initialContent = ext === "md" ? inputs : htmlDocument(name, inputs);
+
+  const writeExisting = async (id: string, content: string): Promise<FileMeta> => {
+    const row = db.prepare(
+      "SELECT storage_kind, content_sha256 FROM files WHERE id = ? AND trashed_at IS NULL",
+    ).get(id) as { storage_kind: string; content_sha256: string | null } | undefined;
+    if (row === undefined || row.storage_kind !== "workspace") {
+      throw new Error("That workflow output is no longer a normal workspace file.");
+    }
+    await workspace.snapshotVersion(id, cause);
+    await workspace.writeAtomic(id, Readable.from([Buffer.from(content, "utf8")]), row.content_sha256 ?? undefined);
+    setFileExtractedText(db, id, content);
+    db.prepare("UPDATE files SET mime_type = ? WHERE id = ?").run(mime, id);
+    return getFileMeta(db, id);
+  };
+  const create = async (content: string): Promise<FileMeta> => {
+    const free = availableName(db, name);
+    const entry = await workspace.createFile(free, Readable.from([Buffer.from(content, "utf8")]), "generated");
+    setFileExtractedText(db, entry.fileId, content);
+    db.prepare("UPDATE files SET mime_type = ? WHERE id = ?").run(mime, entry.fileId);
+    return getFileMeta(db, entry.fileId);
+  };
+
+  let meta: FileMeta;
+  const prevFileId = existing?.file_id ?? null;
+  if (prevFileId !== null) {
+    const prev = db.prepare(
+      "SELECT storage_kind FROM files WHERE id = ? AND trashed_at IS NULL",
+    ).get(prevFileId) as { storage_kind: string } | undefined;
+    meta = prev?.storage_kind === "workspace"
+      ? await writeExisting(prevFileId, initialContent)
+      : await create(initialContent);
+  } else if (mode === "overwrite" || mode === "append") {
+    const found = db.prepare(
+      `SELECT id, storage_kind FROM files
+       WHERE name = ? AND source = 'generated' AND trashed_at IS NULL
+       ORDER BY created_at DESC LIMIT 1`,
+    ).get(name) as { id: string; storage_kind: string } | undefined;
+    if (found !== undefined && found.storage_kind === "workspace") {
+      const content = mode === "append"
+        ? (ext === "md"
+            ? `${getFileExtractedText(db, found.id) ?? ""}\n\n${inputs}`
+            : appendIntoHtml(getFileExtractedText(db, found.id) ?? "", name, inputs))
+        : initialContent;
+      meta = await writeExisting(found.id, content);
+    } else {
+      meta = await create(initialContent);
+    }
+  } else {
+    meta = await create(initialContent);
+  }
+
+  notifyFilesChanged?.();
+  published.value = meta;
+  return { result: `Saved "${meta.name}" into the room.`, fileId: meta.id };
+}
+
 // ============================================================================
 // execute_workflow_step / run_workflow_node (workflow.rs:1496-2107)
 // ============================================================================
@@ -1486,7 +1577,7 @@ export async function runWorkflowNode(
       if (stopped(cancel)) {
         throw new Error("STOPPED");
       }
-      const { result, fileId } = saveFileNode(
+      const { result, fileId } = await saveFileNodeHybrid(
         deps.rooms,
         roomPath,
         node.name_template,

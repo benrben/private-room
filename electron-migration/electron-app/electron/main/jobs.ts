@@ -93,6 +93,7 @@
  */
 
 import type Database from "better-sqlite3-multiple-ciphers";
+import type { WorkspaceService } from "./workspace/workspaceService.js";
 import type { CancelFlag } from "./cancel.js";
 import {
   type Job,
@@ -387,6 +388,8 @@ export function emitProgress(
 export interface RoomHandle {
   db: Database.Database;
   path: string;
+  /** Present for hybrid rooms whose current bytes are normal files. */
+  workspace?: WorkspaceService;
 }
 
 /**

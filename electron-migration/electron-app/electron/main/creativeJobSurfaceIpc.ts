@@ -105,7 +105,12 @@ function ensureQueue(state: RoomManagerState, deps: RoomManagerDeps, emit: Event
 }
 function roomSource(state: RoomManagerState) {
   return {
-    current: () => state.room === null ? null : { db: state.room.conn, path: state.room.path, name: state.room.name },
+    current: () => state.room === null ? null : {
+      db: state.room.conn,
+      path: state.room.path,
+      name: state.room.name,
+      ...(state.room.workspace === undefined ? {} : { workspace: state.room.workspace }),
+    },
     rollingBack: () => state.rollingBack,
   };
 }

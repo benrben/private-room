@@ -187,6 +187,7 @@ import { clampBytes } from "./textClamp.js";
 import { declaredFor } from "./capabilities.js";
 import { isExternalEngine, ROLLBACK_BUSY } from "./turnContext.js";
 import { isSummaryFile } from "./summarizeTools.js";
+import type { WorkspaceService } from "./workspace/workspaceService.js";
 
 // ============================================================================
 // room access — this file's own minimal slice of the (not-yet-ported)
@@ -200,6 +201,7 @@ export interface RoomHandle {
   db: Database.Database;
   path: string;
   name: string;
+  workspace?: WorkspaceService;
 }
 
 /** Mirrors `jobs.ts`'s own `RoomSource` (and is structurally compatible with
@@ -238,12 +240,14 @@ function emitSafely(emit: EmitFn | undefined, event: string, payload: unknown): 
  * fresh artifact, then tell the Files list to reload and the viewer to open
  * it.
  */
-function saveAndOpen(rooms: RoomSource, emit: EmitFn | undefined, art: Artifact): Written {
+async function saveAndOpen(rooms: RoomSource, emit: EmitFn | undefined, art: Artifact): Promise<Written> {
   const room = rooms.current();
   if (room === null) {
     throw new Error(NO_ROOM_OPEN);
   }
-  const written = art.commit(room.db);
+  const written = room.workspace === undefined
+    ? art.commit(room.db)
+    : await art.commitToWorkspace(room.workspace);
   emitSafely(emit, "room-files-changed", undefined);
   emitSafely(emit, "agent-open-file", { id: written.meta.id });
   return written;
@@ -1000,7 +1004,7 @@ export async function runStudioCore(
   if (hasRefs) {
     art = art.fromFiles(refs);
   }
-  const written = saveAndOpen(deps.rooms, deps.emit, art);
+  const written = await saveAndOpen(deps.rooms, deps.emit, art);
   const meta = written.meta;
 
   // Persist the artifact's STRUCTURE beside its page (the podcast's cast and
