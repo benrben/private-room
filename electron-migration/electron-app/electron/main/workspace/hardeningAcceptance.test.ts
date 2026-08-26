@@ -1,10 +1,18 @@
 import { randomUUID } from "node:crypto";
-import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { cp, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
 import { afterEach, describe, expect, it } from "vitest";
 import { recoverPassword, writeRecovery } from "../db-host/recovery.js";
+import {
+  createRoom,
+  createRoomManagerState,
+  openRoom,
+  registerWorkspaceCopy,
+  teardownOpenRoom,
+  type RoomManagerDeps,
+} from "../roomManager.js";
 import { changePassword } from "../safetyTools.js";
 import { createWorkspaceRoom, openWorkspaceRoom } from "./roomLayout.js";
 import { WorkspaceService } from "./workspaceService.js";
@@ -126,5 +134,33 @@ describe("workspace hardening acceptance", () => {
     } finally {
       f.created.db.close();
     }
+  });
+
+  it("opens a raw Finder copy read-only, then registers it with a new room identity", async () => {
+    const parent = await mkdtemp(path.join(os.tmpdir(), "arcelle-hardening-duplicate-"));
+    roots.push(parent);
+    const userDataDir = path.join(parent, "user-data");
+    const originalPath = path.join(parent, "Original");
+    const copyPath = path.join(parent, "Finder Copy");
+    const state = createRoomManagerState();
+    const deps: RoomManagerDeps = {
+      userDataDir,
+      spawnRoomServerIfEnabled: () => {},
+    };
+
+    createRoom(state, deps, originalPath, password, "Original", "workspace-folder");
+    const originalId = state.room!.descriptor!.roomId;
+    teardownOpenRoom(state, deps);
+    await cp(originalPath, copyPath, { recursive: true });
+
+    const duplicate = openRoom(state, deps, copyPath, password);
+    expect(duplicate).toMatchObject({ readOnly: true, duplicateRoomIdentity: true });
+    expect(state.room?.descriptor?.roomId).toBe(originalId);
+
+    const registered = registerWorkspaceCopy(state, deps);
+    expect(registered.readOnly).not.toBe(true);
+    expect(registered.duplicateRoomIdentity).not.toBe(true);
+    expect(state.room?.descriptor?.roomId).not.toBe(originalId);
+    teardownOpenRoom(state, deps);
   });
 });

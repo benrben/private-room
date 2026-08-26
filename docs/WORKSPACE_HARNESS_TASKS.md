@@ -84,8 +84,8 @@ Legend:
 - [x] Rename the outer workspace folder from the room rename command.
 - [ ] Add a full lock test that proves keys and decrypted caches are gone.
 - [ ] Add read-only UI when the lease belongs to another process.
-- [ ] Detect raw Finder copies with duplicate room IDs.
-- [ ] Register a duplicated workspace with a fresh room ID.
+- [x] Detect raw Finder copies with duplicate room IDs.
+- [x] Register a duplicated workspace with a fresh room ID.
 - [ ] Update Touch ID credentials after an outer-folder rename.
 - [ ] Move room deletion to recoverable operating-system Trash.
 - [ ] Update every UI sentence that still says all files are encrypted in one file.
@@ -118,7 +118,7 @@ Legend:
 - [x] Expose typed start, approval, cancellation, rollback and capability IPC.
 - [x] Emit one provider-neutral `harness-event` stream to the renderer.
 - [ ] Route the current agent UI through normalized events.
-- [ ] Generate all provider-specific specialists from the manifest.
+- [x] Generate all provider-specific specialists from the manifest.
 - [ ] Add `arcelle_delegate` child runs and normalized child events.
 - [ ] Serialize write specialists while allowing parallel read specialists.
 - [ ] Add per-provider capability results to Settings diagnostics.
@@ -135,10 +135,10 @@ Legend:
 - [x] Map Codex structured text, plan, tool, diff, usage and completion events.
 - [x] Map command and file-change approval requests.
 - [x] Add strict macOS workspace Seatbelt protection and self-tests.
-- [ ] Load or generate the schema for the installed Codex version.
+- [x] Load or generate the schema for the installed Codex version.
 - [ ] Add capability-version compatibility tests for several Codex releases.
-- [ ] Add the restricted `codex exec` fallback under the common contract.
-- [ ] Add the restricted Claude CLI fallback under the common contract.
+- [x] Add the restricted `codex exec` fallback under the common contract.
+- [x] Add the restricted Claude CLI fallback under the common contract.
 - [x] Prove outside-workspace read/write isolation with room, private and sibling canaries.
 - [x] Refuse native direct mode when an exposed workspace symlink exists.
 - [x] Run the installed provider executable inside the sandbox before reporting it available.
@@ -210,7 +210,7 @@ Legend:
 - [ ] Test large video, recording and generated artifacts.
 - [x] Test Unicode, case collisions, long paths and symlinks.
 - [ ] Test iCloud, Dropbox, network drives and offline placeholders.
-- [ ] Test two-process and duplicate-room conflicts.
+- [x] Test two-process and duplicate-room conflicts.
 - [ ] Complete traversal, shell escape, `.arcelle` and privacy security review.
 - [ ] Write upgrade, rollback, support and recovery documentation.
 - [ ] Enable general availability only after parity and security gates pass.
