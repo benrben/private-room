@@ -174,6 +174,35 @@ export const api = {
       skipped: Array<{ fileId: string; name: string; reason: string }>;
       resumed: boolean;
     }>("convert_legacy_room", { sourcePath, password, destinationPath }),
+  createSealedPackage: (
+    destinationPath: string,
+    exportPassword: string | null = null,
+    purpose = "backup",
+  ) => invoke<{
+    version: number;
+    purpose: string;
+    createdAt: string;
+    roomId: string;
+    fileCount: number;
+    objectCount: number;
+  }>("create_sealed_package", { destinationPath, exportPassword, purpose }),
+  inspectSealedPackage: (packagePath: string, password: string) => invoke<{
+    version: number;
+    purpose: string;
+    createdAt: string;
+    roomId: string;
+    fileCount: number;
+    objectCount: number;
+  }>("inspect_sealed_package", { packagePath, password }),
+  importSealedPackage: (
+    packagePath: string,
+    packagePassword: string,
+    destinationPath: string,
+    workspacePassword: string | null = null,
+  ) => invoke<{ destinationPath: string; roomId: string; fileCount: number; objectCount: number }>(
+    "import_sealed_package",
+    { packagePath, packagePassword, destinationPath, workspacePassword },
+  ),
   openRoom: (path: string, password: string) =>
     invoke<RoomInfo>("open_room", { path, password }),
   closeRoom: () => invoke<void>("close_room"),

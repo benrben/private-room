@@ -126,6 +126,37 @@ export interface Commands {
       resumed: boolean;
     };
   };
+  create_sealed_package: {
+    args: { destinationPath: string; exportPassword: string | null; purpose?: string };
+    result: {
+      version: number;
+      purpose: string;
+      createdAt: string;
+      roomId: string;
+      fileCount: number;
+      objectCount: number;
+    };
+  };
+  inspect_sealed_package: {
+    args: { packagePath: string; password: string };
+    result: {
+      version: number;
+      purpose: string;
+      createdAt: string;
+      roomId: string;
+      fileCount: number;
+      objectCount: number;
+    };
+  };
+  import_sealed_package: {
+    args: {
+      packagePath: string;
+      packagePassword: string;
+      destinationPath: string;
+      workspacePassword: string | null;
+    };
+    result: { destinationPath: string; roomId: string; fileCount: number; objectCount: number };
+  };
   open_room: { args: { path: string; password: string }; result: RoomInfo };
   close_room: { args: Record<string, never>; result: void };
   touchid_has: { args: { path: string }; result: boolean };

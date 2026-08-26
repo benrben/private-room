@@ -293,6 +293,20 @@ function buildPaletteActions(
     { id: "reset-layout", label: "Reset the layout", hint: "Restore the balanced default", run: () => layout?.resetLayout() },
     { id: "theme", label: "Switch theme", hint: "Dark ⇄ light", run: () => toggleTheme() },
     { id: "checkpoint", label: "Save a checkpoint", hint: "A room-wide recovery point", run: () => { api.createRoomCheckpoint("").then((m) => s.pushToast("success", `Saved checkpoint “${m.name}”.`)).catch((e) => s.pushToast("error", String(e))); } },
+    { id: "sealed-backup", label: "Create sealed backup…", hint: "One encrypted .arcelle file with documents and private history", run: () => { void (async () => {
+      const destination = await api.chooseSavePath({
+        title: "Save sealed Arcelle backup",
+        defaultPath: "Room Backup.arcelle",
+        filters: [{ name: "Arcelle sealed backup", extensions: ["arcelle"] }],
+      });
+      if (!destination) return;
+      try {
+        const info = await api.createSealedPackage(destination);
+        s.pushToast("success", `Sealed ${info.fileCount} file${info.fileCount === 1 ? "" : "s"} into the backup.`);
+      } catch (error) {
+        s.pushToast("error", String(error));
+      }
+    })(); } },
     { id: "export-all", label: "Export all files…", hint: "Plain copies outside the room", disabled: s.files.length === 0, run: () => a.exportAllFiles() },
     { id: "settings", label: "Room settings", hint: "Models, privacy, voice, connections (⌘,)", run: () => s.setShowSettings(true) },
     { id: "shortcuts", label: "Keyboard shortcuts", hint: "Every shortcut in one sheet (⌘/)", run: () => s.setShowShortcuts(true) },

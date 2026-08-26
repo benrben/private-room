@@ -17,6 +17,7 @@ type UnlockScreenProps = {
   onRecoveryUnlock: () => void;
   onTouchId: () => void;
   onConvertLegacy: () => void;
+  onImportSealed: () => void;
   onEnterRecoveryMode: () => void;
   onExitRecoveryMode: () => void;
   onBack: () => void;
@@ -38,6 +39,7 @@ export function UnlockScreen({
   onRecoveryUnlock,
   onTouchId,
   onConvertLegacy,
+  onImportSealed,
   onEnterRecoveryMode,
   onExitRecoveryMode,
   onBack,
@@ -124,14 +126,26 @@ export function UnlockScreen({
             </button>
           )}
           {/\.(?:arcelle|roomai)$/i.test(path) && (
-            <button
-              type="button"
-              className="subtle recovery-forgot"
-              disabled={busy}
-              onClick={() => onConvertLegacy()}
-            >
-              Convert to normal files…
-            </button>
+            <>
+              <button
+                type="button"
+                className="subtle recovery-forgot"
+                disabled={busy}
+                onClick={() => onConvertLegacy()}
+              >
+                Convert legacy room to normal files…
+              </button>
+              {path.toLocaleLowerCase().endsWith(".arcelle") && (
+                <button
+                  type="button"
+                  className="subtle recovery-forgot"
+                  disabled={busy}
+                  onClick={() => onImportSealed()}
+                >
+                  Import sealed backup as a workspace…
+                </button>
+              )}
+            </>
           )}
         </form>
       )}

@@ -99,9 +99,9 @@ Legend:
 - [x] Validate count, size and SHA-256 before publishing.
 - [x] Keep the legacy source file unchanged.
 - [x] Produce a conversion report.
-- [ ] Implement consistent sealed `.arcelle` creation.
-- [ ] Verify schema, password, file count, size and hashes before publish.
-- [ ] Import a sealed package into a new workspace.
+- [x] Implement consistent sealed `.arcelle` creation.
+- [x] Verify schema, password, file count, size and hashes before publish.
+- [x] Import a sealed package into a new workspace.
 - [ ] Rebuild `.roomck` checkpoints with the same packager.
 - [ ] Restore through a verified sibling workspace and recoverable backup.
 
@@ -213,4 +213,4 @@ Legend:
 
 ## Current release gate
 
-The current branch is an implementation foundation, not general availability. Workspace room creation, the main text-file paths, explicit resumable legacy conversion, and conflict-safe baseline copies work. Legacy compatibility remains. Native and Deep harness drivers exist behind flags. Sealed packaging, cloud mirrors, complete byte-path migration, live orchestrator UI wiring and final security tests are still required.
+The current branch is an implementation foundation, not general availability. Workspace room creation, the main text-file paths, explicit resumable legacy conversion, verified sealed export and import, and conflict-safe baseline copies work. Legacy compatibility remains. Native and Deep harness drivers exist behind flags. Workspace checkpoint restore, cloud mirrors, complete byte-path migration, live orchestrator UI wiring and final security tests are still required.

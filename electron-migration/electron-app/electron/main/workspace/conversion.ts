@@ -291,7 +291,16 @@ export async function convertLegacyRoomToWorkspace(
   if (source === destination) throw new Error("Choose a different destination folder for the workspace.");
   if (existsSync(destination)) throw new Error("A file or folder already exists at the destination.");
   const verified = openRoomReadonly(source, password);
-  verified.close();
+  try {
+    const sealed = verified.prepare(
+      "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sealed_package_meta'",
+    ).get();
+    if (sealed !== undefined) {
+      throw new Error("This is a sealed backup. Use sealed import instead of legacy conversion.");
+    }
+  } finally {
+    verified.close();
+  }
   const sourceHash = await sha256File(source);
   const tempRoot = conversionTempRoot(destination);
   const privateRoot = path.join(tempRoot, PRIVATE_DIR);

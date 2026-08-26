@@ -775,6 +775,12 @@ export function infoOf(room: Room, userDataDir: string): RoomInfo {
 function openRoomFile(roomPath: string, password: string): Database.Database {
   const conn = dbOpenRoom(roomPath, password);
   try {
+    const sealed = conn.prepare(
+      "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sealed_package_meta'",
+    ).get();
+    if (sealed !== undefined) {
+      throw new Error("This is a sealed backup. Import it as a new workspace instead of editing it directly.");
+    }
     migrate(conn);
   } catch (err) {
     closeQuietly(conn);

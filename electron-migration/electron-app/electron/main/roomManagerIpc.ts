@@ -31,6 +31,11 @@ import type { IpcMain, IpcMainInvokeEvent } from "electron";
 import type { RoomInfo } from "../shared/apiTypes.js";
 import { convertLegacyRoomToWorkspace } from "./workspace/conversion.js";
 import {
+  createSealedPackage,
+  importSealedPackage,
+  inspectSealedPackage,
+} from "./workspace/sealedPackage.js";
+import {
   closeRoom,
   createRoom,
   hasRecoveryKey,
@@ -83,6 +88,45 @@ export function registerRoomManagerIpc(
         throw new Error("Lock the open room before converting a legacy room.");
       }
       return convertLegacyRoomToWorkspace(args.sourcePath, args.password, args.destinationPath);
+    },
+  );
+  handle(
+    "create_sealed_package",
+    (args: { destinationPath: string; exportPassword: string | null; purpose?: string }) => {
+      const room = state.room;
+      if (room?.workspace === undefined || room.descriptor?.kind !== "workspace-folder") {
+        throw new Error("Sealed package creation is available for workspace rooms.");
+      }
+      return createSealedPackage(
+        room.workspace,
+        room.descriptor.roomId,
+        room.password,
+        args.destinationPath,
+        args.exportPassword ?? room.password,
+        args.purpose ?? "backup",
+      );
+    },
+  );
+  handle(
+    "inspect_sealed_package",
+    (args: { packagePath: string; password: string }) =>
+      inspectSealedPackage(args.packagePath, args.password),
+  );
+  handle(
+    "import_sealed_package",
+    (args: {
+      packagePath: string;
+      packagePassword: string;
+      destinationPath: string;
+      workspacePassword: string | null;
+    }) => {
+      if (state.room !== null) throw new Error("Lock the open room before importing a sealed package.");
+      return importSealedPackage(
+        args.packagePath,
+        args.packagePassword,
+        args.destinationPath,
+        args.workspacePassword ?? args.packagePassword,
+      );
     },
   );
   handle(

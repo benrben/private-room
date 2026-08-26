@@ -513,6 +513,39 @@ export default function App() {
     }
   }
 
+  async function handleImportSealed(packagePath: string) {
+    if (!password) {
+      setError("Enter the sealed backup password before importing it.");
+      return;
+    }
+    setBusy(true);
+    setError("");
+    const epoch = navEpochRef.current;
+    try {
+      const packageInfo = await api.inspectSealedPackage(packagePath, password);
+      const sourceName = packagePath.split(/[\\/]/).pop()?.replace(/\.arcelle$/i, "") || "Imported Room";
+      const destinationPath = await api.chooseSavePath({
+        title: "Choose the new workspace folder",
+        defaultPath: `${sourceName} Workspace`,
+      });
+      if (!destinationPath || navEpochRef.current !== epoch) return;
+      await api.importSealedPackage(packagePath, password, destinationPath);
+      if (navEpochRef.current !== epoch) return;
+      const info = await api.openRoom(destinationPath, password);
+      if (navEpochRef.current !== epoch) return;
+      await message(
+        `Imported ${packageInfo.fileCount} file${packageInfo.fileCount === 1 ? "" : "s"} and private history into a new workspace.`,
+        { title: "Sealed backup imported", kind: "info" },
+      ).catch(() => {});
+      enterRoom(info);
+    } catch (e) {
+      console.error("sealed import failed:", e);
+      setError(unlockMessage(String(e)));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   // Unlock using a one-time recovery code instead of the password. Same
   // success handling as a normal open; any failure surfaces a calm message.
   async function handleRecoveryUnlock(path: string) {
@@ -686,6 +719,7 @@ export default function App() {
             onRecoveryUnlock={() => handleRecoveryUnlock(screen.path)}
             onTouchId={() => handleTouchId(screen.path)}
             onConvertLegacy={() => handleConvertLegacy(screen.path)}
+            onImportSealed={() => handleImportSealed(screen.path)}
             onEnterRecoveryMode={() => {
               setRecoveryMode(true);
               setPassword("");

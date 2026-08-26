@@ -1580,6 +1580,9 @@ type Handler = (...args: unknown[]) => unknown;
 const EXPECTED_CHANNELS = [
   "create_room",
   "convert_legacy_room",
+  "create_sealed_package",
+  "inspect_sealed_package",
+  "import_sealed_package",
   "open_room",
   "open_room_with_recovery",
   "close_room",
