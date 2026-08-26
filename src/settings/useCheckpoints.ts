@@ -17,6 +17,7 @@ export function useCheckpoints() {
   const [storageUsage, setStorageUsage] = useState<RoomStorageUsage | null>(null);
   const [watcherStatus, setWatcherStatus] = useState<WorkspaceWatcherStatus | null>(null);
   const [rescanning, setRescanning] = useState(false);
+  const [changingPolling, setChangingPolling] = useState(false);
   const [ckName, setCkName] = useState("");
   const [creating, setCreating] = useState(false);
   const [ckError, setCkError] = useState("");
@@ -103,12 +104,27 @@ export function useCheckpoints() {
     }
   }
 
+  async function setWatcherPolling(enabled: boolean) {
+    setCkError("");
+    setChangingPolling(true);
+    try {
+      setWatcherStatus(await api.setWorkspaceWatcherPolling(enabled));
+      setCkNotice(enabled ? "Polling mode is on." : "Polling mode is off.");
+      window.setTimeout(() => setCkNotice(""), 3000);
+    } catch (e) {
+      setCkError(String(e));
+    } finally {
+      setChangingPolling(false);
+    }
+  }
+
   return {
     checkpoints,
     totalBytes,
     storageUsage,
     watcherStatus,
     rescanning,
+    changingPolling,
     ckName,
     setCkName,
     creating,
@@ -121,6 +137,7 @@ export function useCheckpoints() {
     deleteCheckpoint,
     rollback,
     rescanRoom,
+    setWatcherPolling,
     refresh,
   };
 }

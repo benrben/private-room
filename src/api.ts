@@ -136,6 +136,7 @@ export interface WorkspaceWatcherStatus {
   state: "starting" | "healthy" | "error";
   lastReconciledAt: string | null;
   lastError: string | null;
+  polling: boolean;
 }
 
 /** The wire shape of every `ask-*` event: the payload the listener wants, in
@@ -230,6 +231,8 @@ export const api = {
   workspaceWatcherStatus: () =>
     invoke<WorkspaceWatcherStatus | null>("workspace_watcher_status"),
   rescanWorkspaceRoom: () => invoke<WorkspaceWatcherStatus>("rescan_workspace_room"),
+  setWorkspaceWatcherPolling: (enabled: boolean) =>
+    invoke<WorkspaceWatcherStatus>("set_workspace_watcher_polling", { enabled }),
   /** Rename the open room. The name lives in the room's own encrypted `meta`
    *  table, not in the file path — renaming the `.roomai` in Finder changes
    *  nothing — so this command is the only way to change it. It writes both

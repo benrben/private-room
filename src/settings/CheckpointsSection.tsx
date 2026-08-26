@@ -10,6 +10,8 @@ interface Props {
   watcherStatus: WorkspaceWatcherStatus | null;
   rescanning: boolean;
   rescanRoom: () => void;
+  changingPolling: boolean;
+  setWatcherPolling: (enabled: boolean) => void;
   ckName: string;
   setCkName: (v: string) => void;
   creating: boolean;
@@ -50,6 +52,8 @@ export default function CheckpointsSection({
   watcherStatus,
   rescanning,
   rescanRoom,
+  changingPolling,
+  setWatcherPolling,
   ckName,
   setCkName,
   creating,
@@ -89,15 +93,29 @@ export default function CheckpointsSection({
               : `This legacy room uses ${formatSize(storageUsage.totalOnDiskBytes)} in one encrypted database file. Current files and history are included inside it.`}
           </p>
           {watcherStatus && (
-            <div className="settings-form">
-              <span className={watcherStatus.state === "error" ? "gate-error" : "settings-hint"}>
-                File watcher: {watcherStatus.state}
-                {watcherStatus.lastError ? ` — ${watcherStatus.lastError}` : ""}
-              </span>
-              <button className="subtle" disabled={rescanning} onClick={rescanRoom}>
-                {rescanning ? "Rescanning…" : "Rescan room"}
-              </button>
-            </div>
+            <>
+              <div className="settings-form">
+                <span className={watcherStatus.state === "error" ? "gate-error" : "settings-hint"}>
+                  File watcher: {watcherStatus.state}
+                  {watcherStatus.lastError ? ` — ${watcherStatus.lastError}` : ""}
+                </span>
+                <button className="subtle" disabled={rescanning} onClick={rescanRoom}>
+                  {rescanning ? "Rescanning…" : "Rescan room"}
+                </button>
+              </div>
+              <label className="settings-check">
+                <input
+                  type="checkbox"
+                  checked={watcherStatus.polling}
+                  disabled={changingPolling}
+                  onChange={(event) => setWatcherPolling(event.target.checked)}
+                />
+                <span>
+                  Use polling for synced or network folders
+                  <small>Uses more disk checks, but is safer when native file notifications are unreliable.</small>
+                </span>
+              </label>
+            </>
           )}
         </div>
       )}

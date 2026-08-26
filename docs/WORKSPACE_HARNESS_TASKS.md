@@ -62,7 +62,7 @@ Legend:
 - [x] Preserve file ID for a proven external rename.
 - [x] Add the six index states.
 - [x] Run reconciliation after workspace unlock.
-- [ ] Add a user setting for polling on network and synced folders.
+- [x] Add a user setting for polling on network and synced folders.
 - [x] Add trusted-stat scan optimization before hashing unchanged large files.
 - [x] Add unique hash-only rename matching when filesystem identity changes.
 - [ ] Connect stale rows to extraction, chunks, FTS and embeddings.

@@ -180,6 +180,7 @@ export interface Commands {
       state: "starting" | "healthy" | "error";
       lastReconciledAt: string | null;
       lastError: string | null;
+      polling: boolean;
     } | null;
   };
   rescan_workspace_room: {
@@ -188,6 +189,16 @@ export interface Commands {
       state: "starting" | "healthy" | "error";
       lastReconciledAt: string | null;
       lastError: string | null;
+      polling: boolean;
+    };
+  };
+  set_workspace_watcher_polling: {
+    args: { enabled: boolean };
+    result: {
+      state: "starting" | "healthy" | "error";
+      lastReconciledAt: string | null;
+      lastError: string | null;
+      polling: boolean;
     };
   };
   rename_room: { args: { name: string }; result: RoomInfo };

@@ -89,6 +89,7 @@ import {
   teardownOpenRoom,
   rescanWorkspaceRoom,
   workspaceWatcherStatus,
+  setWorkspaceWatcherPolling,
   type RoomManagerDeps,
   type RoomManagerState,
 } from "./roomManager.js";
@@ -193,6 +194,8 @@ describe("workspace-folder checkpoints", () => {
       const rescanned = await rescanWorkspaceRoom(state);
       expect(rescanned.state).toBe("healthy");
       expect(rescanned.lastReconciledAt).not.toBeNull();
+      const polling = await setWorkspaceWatcherPolling(state, true);
+      expect(polling).toMatchObject({ state: "starting", polling: true });
       const sourcePath = path.join(dir, "source.txt");
       writeFileSync(sourcePath, "checkpoint content", "utf8");
       const imported = await room.workspace!.importFile(sourcePath, "notes.txt");

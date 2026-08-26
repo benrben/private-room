@@ -290,6 +290,7 @@ const ALL_COMMANDS_TYPED: { [K in keyof Commands]: true } = {
   set_workflow_pinned: true,
   set_workflow_schedule: true,
   set_workflow_status: true,
+  set_workspace_watcher_polling: true,
   shape_text: true,
   skill_agent_ids: true,
   skill_import_conflict: true,

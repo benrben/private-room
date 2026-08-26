@@ -44,6 +44,7 @@ import {
   openRoomWithRecovery,
   renameRoom,
   rescanWorkspaceRoom,
+  setWorkspaceWatcherPolling,
   roomInfo,
   takePendingOpen,
   takeRecRecoveryError,
@@ -145,6 +146,10 @@ export function registerRoomManagerIpc(
   });
   handle("workspace_watcher_status", () => workspaceWatcherStatus(state));
   handle("rescan_workspace_room", () => rescanWorkspaceRoom(state));
+  handle(
+    "set_workspace_watcher_polling",
+    (args: { enabled: boolean }) => setWorkspaceWatcherPolling(state, args.enabled),
+  );
   handle("rename_room", (args: { name: string }): RoomInfo => renameRoom(state, deps, args.name));
   handle("write_recovery_key", (): Promise<string> => writeRecoveryKey(state));
   handle("has_recovery_key", (args: { path: string }): boolean => hasRecoveryKey(args.path));
