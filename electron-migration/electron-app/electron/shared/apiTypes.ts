@@ -9,6 +9,8 @@ export interface RoomInfo {
    * not yet approved on this Mac — the UI must ask before anything runs
    * (SEC-1). null when there's nothing to approve. */
   pendingMcp: McpApproval | null;
+  /** Another Arcelle process owns this workspace's writer lease. */
+  readOnly?: boolean;
 }
 
 /** An MCP config awaiting the user's approval before its servers start (SEC-1). */

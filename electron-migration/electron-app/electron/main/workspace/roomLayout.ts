@@ -13,7 +13,7 @@ import {
 import os from "node:os";
 import path from "node:path";
 import type Database from "better-sqlite3-multiple-ciphers";
-import { createRoom, openRoom } from "../db-host/open.js";
+import { createRoom, openRoom, openRoomReadonly } from "../db-host/open.js";
 import { migrate } from "../db-host/migrate.js";
 import { setMeta } from "../db-host/meta.js";
 import { PRIVATE_DIR } from "./pathSafety.js";
@@ -29,6 +29,18 @@ export const LOCK_FILE = "room.lock";
 export interface WorkspaceLease {
   token: string;
   lockPath: string;
+  renewal: ReturnType<typeof setInterval>;
+}
+
+export const REMOTE_LEASE_STALE_MS = 5 * 60_000;
+
+export class WorkspaceLeaseConflictError extends Error {
+  readonly code = "WORKSPACE_LEASE_CONFLICT";
+  constructor(readonly remote: boolean) {
+    super(remote
+      ? "This synced room appears to be open on another device. It was opened read-only."
+      : "This room is already open for writing in another Arcelle process. It was opened read-only.");
+  }
 }
 
 function privatePath(rootPath: string, child: string): string {
@@ -131,13 +143,16 @@ export function createWorkspaceRoom(
 export function openWorkspaceRoom(
   rootPath: string,
   password: string,
+  readOnly = false,
 ): { descriptor: RoomDescriptor & { kind: "workspace-folder"; rootPath: string }; db: Database.Database } {
   const descriptor = describeRoom(rootPath);
   if (descriptor.kind !== "workspace-folder" || descriptor.rootPath === null) {
     throw new Error("This path is not an Arcelle workspace folder.");
   }
-  const db = openRoom(descriptor.dbPath, password);
-  migrate(db);
+  const db = readOnly
+    ? openRoomReadonly(descriptor.dbPath, password)
+    : openRoom(descriptor.dbPath, password);
+  if (!readOnly) migrate(db);
   return { descriptor: descriptor as typeof descriptor & { kind: "workspace-folder"; rootPath: string }, db };
 }
 
@@ -155,21 +170,43 @@ export function acquireWorkspaceLease(rootPath: string): WorkspaceLease {
   readWorkspaceMarker(rootPath);
   const lockPath = privatePath(rootPath, LOCK_FILE);
   const token = randomUUID();
-  const record = { token, pid: process.pid, host: os.hostname(), createdAt: new Date().toISOString() };
+  const record = () => ({
+    token,
+    pid: process.pid,
+    host: os.hostname(),
+    createdAt: new Date().toISOString(),
+    renewedAt: new Date().toISOString(),
+  });
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
       const fd = openSync(lockPath, "wx", 0o600);
-      try { writeFileSync(fd, `${JSON.stringify(record)}\n`, "utf8"); } finally { closeSync(fd); }
-      return { token, lockPath };
+      try { writeFileSync(fd, `${JSON.stringify(record())}\n`, "utf8"); } finally { closeSync(fd); }
+      const lease = { token, lockPath } as WorkspaceLease;
+      lease.renewal = setInterval(() => {
+        try {
+          const existing = JSON.parse(readFileSync(lease.lockPath, "utf8")) as { token?: string };
+          if (existing.token === token) {
+            writeFileSync(lease.lockPath, `${JSON.stringify(record())}\n`, { encoding: "utf8", mode: 0o600 });
+          }
+        } catch {
+          // A missing lease is handled as a lost lease by the next open or
+          // write lifecycle. Renewal never recreates a lock it no longer owns.
+        }
+      }, Math.floor(REMOTE_LEASE_STALE_MS / 3));
+      lease.renewal.unref?.();
+      return lease;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      let existing: { pid?: number; host?: string } = {};
+      let existing: { pid?: number; host?: string; renewedAt?: string; createdAt?: string } = {};
       try { existing = JSON.parse(readFileSync(lockPath, "utf8")); } catch { /* stale/corrupt */ }
       if (existing.host === os.hostname() && processIsAlive(Number(existing.pid))) {
-        throw new Error("This room is already open for writing in another Arcelle process.");
+        throw new WorkspaceLeaseConflictError(false);
       }
       if (existing.host !== undefined && existing.host !== os.hostname()) {
-        throw new Error("This synced room appears to be open on another device. Open it read-only.");
+        const renewed = Date.parse(existing.renewedAt ?? existing.createdAt ?? "");
+        if (Number.isFinite(renewed) && Date.now() - renewed <= REMOTE_LEASE_STALE_MS) {
+          throw new WorkspaceLeaseConflictError(true);
+        }
       }
       rmSync(lockPath, { force: true });
     }
@@ -178,6 +215,7 @@ export function acquireWorkspaceLease(rootPath: string): WorkspaceLease {
 }
 
 export function releaseWorkspaceLease(lease: WorkspaceLease): void {
+  clearInterval(lease.renewal);
   try {
     const existing = JSON.parse(readFileSync(lease.lockPath, "utf8")) as { token?: string };
     if (existing.token === lease.token) rmSync(lease.lockPath, { force: true });

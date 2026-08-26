@@ -49,6 +49,11 @@ import { peekPendingOpen, setPendingOpen } from "./pendingOpen.js";
 import { readRecent } from "./recentTools.js";
 import { ROLLBACK_BUSY } from "./turnContext.js";
 import {
+  acquireWorkspaceLease,
+  createWorkspaceRoom,
+  releaseWorkspaceLease,
+} from "./workspace/roomLayout.js";
+import {
   applyOllamaOverride,
   closeRoom,
   createRoom,
@@ -457,6 +462,29 @@ describe("openRoom / openRoomImpl", () => {
     expect(openRoom(state, baseDeps(dir), roomPath, PASSWORD).name).toBe("Alpha");
     expect(state.room?.path).toBe(roomPath);
     state.room!.conn.close();
+  });
+
+  it("opens a workspace read-only when another process owns its writer lease", () => {
+    const dir = freshDir();
+    const workspacePath = path.join(dir, "Shared Workspace");
+    const created = createWorkspaceRoom(workspacePath, PASSWORD, "Shared Workspace");
+    created.db.close();
+    const writer = acquireWorkspaceLease(workspacePath);
+    const state = createRoomManagerState();
+    try {
+      const info = openRoom(state, baseDeps(dir), workspacePath, PASSWORD);
+      expect(info.readOnly).toBe(true);
+      expect(state.room?.readOnly).toBe(true);
+      expect(state.room?.workspaceWatcher).toBeUndefined();
+      expect(() => state.room!.conn.prepare(
+        "UPDATE meta SET value = 'changed' WHERE key = 'name'",
+      ).run()).toThrow();
+      expect(() => renameRoom(state, baseDeps(dir), "Renamed Elsewhere")).toThrow(/read-only/i);
+      expect(state.room?.path).toBe(workspacePath);
+      teardownOpenRoom(state, baseDeps(dir));
+    } finally {
+      releaseWorkspaceLease(writer);
+    }
   });
 
   it("falls back to the file's own name when the room has none in meta", () => {

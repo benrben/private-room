@@ -243,11 +243,13 @@ import {
   describeRoom,
   openWorkspaceRoom,
   releaseWorkspaceLease,
+  WorkspaceLeaseConflictError,
   type WorkspaceLease,
 } from "./workspace/roomLayout.js";
 import type { ContentStore, RoomDescriptor, RoomKind } from "./workspace/types.js";
 import { WorkspaceService } from "./workspace/workspaceService.js";
 import { WorkspaceWatcher } from "./workspace/watcher.js";
+import { WorkspaceIndexService } from "./workspace/indexing.js";
 
 // ============================================================================
 // Types
@@ -267,7 +269,10 @@ export interface Room {
   descriptor?: RoomDescriptor;
   contentStore?: ContentStore;
   workspace?: WorkspaceService;
+  workspaceIndexer?: WorkspaceIndexService;
   workspaceLease?: WorkspaceLease;
+  /** True when another Arcelle process/device owns the writer lease. */
+  readOnly?: boolean;
   workspaceWatcher?: WorkspaceWatcher;
   workspaceWatcherHealth?: WorkspaceWatcherHealth;
   workspaceRuntimeClosed?: boolean;
@@ -772,6 +777,7 @@ export function infoOf(room: Room, userDataDir: string): RoomInfo {
     messageCount,
     synced: isSyncedPath(room.path),
     pendingMcp: pendingMcpFor(room.conn, userDataDir),
+    ...(room.readOnly === true ? { readOnly: true } : {}),
   };
 }
 
@@ -822,6 +828,9 @@ function startWorkspaceRuntime(state: RoomManagerState, room: Room): void {
   const workspace = room.workspace;
   const rootPath = room.descriptor?.rootPath;
   if (workspace === undefined || rootPath === null || rootPath === undefined) return;
+  room.workspaceIndexer?.close();
+  room.workspaceIndexer = new WorkspaceIndexService(workspace);
+  const indexer = room.workspaceIndexer;
   const polling = getSetting(room.conn, "workspace_watcher_polling") === "true";
   room.workspaceWatcherHealth = {
     state: "starting",
@@ -834,6 +843,10 @@ function startWorkspaceRuntime(state: RoomManagerState, room: Room): void {
     if (state.room !== room) return;
     try {
       await workspace.reconcile();
+      if (state.room === room && room.workspaceRuntimeClosed !== true) {
+        void indexer.indexPending()
+          .catch((error) => console.error(`workspace indexing failed: ${error instanceof Error ? error.message : String(error)}`));
+      }
       room.workspaceWatcherHealth = {
         state: "healthy",
         lastReconciledAt: new Date().toISOString(),
@@ -875,7 +888,7 @@ function startWorkspaceRuntime(state: RoomManagerState, room: Room): void {
 
 export function workspaceWatcherStatus(state: RoomManagerState): WorkspaceWatcherHealth | null {
   const room = state.room;
-  if (room?.workspace === undefined) return null;
+  if (room?.workspace === undefined || room.readOnly === true) return null;
   return room.workspaceWatcherHealth ?? {
     state: "starting",
     lastReconciledAt: null,
@@ -887,6 +900,7 @@ export function workspaceWatcherStatus(state: RoomManagerState): WorkspaceWatche
 export async function rescanWorkspaceRoom(state: RoomManagerState): Promise<WorkspaceWatcherHealth> {
   const room = state.room;
   if (room?.workspace === undefined) throw new Error("A workspace room is not open.");
+  if (room.readOnly === true) throw new Error("This workspace is read-only because another Arcelle process owns the writer lease.");
   try {
     await room.workspace.reconcile();
     room.workspaceWatcherHealth = {
@@ -913,6 +927,7 @@ export async function setWorkspaceWatcherPolling(
 ): Promise<WorkspaceWatcherHealth> {
   const room = state.room;
   if (room?.workspace === undefined) throw new Error("A workspace room is not open.");
+  if (room.readOnly === true) throw new Error("This workspace is read-only because another Arcelle process owns the writer lease.");
   setSetting(room.conn, "workspace_watcher_polling", enabled ? "true" : "false");
   const oldWatcher = room.workspaceWatcher;
   room.workspaceWatcher = undefined;
@@ -1067,13 +1082,19 @@ export function openRoomImpl(
 ): RoomInfo {
   const descriptor = describeRoom(roomPath);
   let lease: WorkspaceLease | undefined;
+  let readOnly = false;
   let conn: Database.Database;
   if (descriptor.kind === "workspace-folder" && descriptor.rootPath !== null) {
-    lease = acquireWorkspaceLease(descriptor.rootPath);
     try {
-      conn = openWorkspaceRoom(descriptor.rootPath, password).db;
+      lease = acquireWorkspaceLease(descriptor.rootPath);
     } catch (error) {
-      releaseWorkspaceLease(lease);
+      if (!(error instanceof WorkspaceLeaseConflictError)) throw error;
+      readOnly = true;
+    }
+    try {
+      conn = openWorkspaceRoom(descriptor.rootPath, password, readOnly).db;
+    } catch (error) {
+      if (lease !== undefined) releaseWorkspaceLease(lease);
       throw error;
     }
   } else {
@@ -1093,7 +1114,7 @@ export function openRoomImpl(
     : getMeta(conn, "name") ?? roomNameFromPath(roomPath);
   // D10 (the Closet): re-apply this room's saved remote-Ollama URL on unlock.
   applyOllamaOverride(conn);
-  const room: Room = { conn, path: descriptor.path, name, password };
+  const room: Room = { conn, path: descriptor.path, name, password, readOnly };
   attachStorageRuntime(room, descriptor, lease);
 
   let info: RoomInfo;
@@ -1106,37 +1127,44 @@ export function openRoomImpl(
   }
   pushRecent(deps.userDataDir, room.name, room.path);
   state.room = room;
-  startWorkspaceRuntime(state, room);
-  quiesceStaleJobs(room.conn);
+  if (!readOnly) {
+    startWorkspaceRuntime(state, room);
+    quiesceStaleJobs(room.conn);
+  }
 
   // A live recording that died with the app left audio checkpoints behind —
   // splice them onto the WAV so nothing recorded is lost.
   try {
+    if (readOnly) throw new Error("READ_ONLY_SKIP_RECOVERY");
     const recovered = recoverRecChunks(room.conn);
     if (recovered > 0) {
       console.error(`recovered ${recovered} interrupted recording(s)`);
     }
   } catch (err) {
+    if (readOnly && err instanceof Error && err.message === "READ_ONLY_SKIP_RECOVERY") {
+      // Recovery writes belong to the lease owner.
+    } else {
     // Swallowing this meant the user simply found the end of a meeting
     // missing, with nothing said either way — on every unlock, forever.
-    reportRecRecoveryFailure(
-      state,
-      deps,
-      room.path,
-      err instanceof Error ? err.message : String(err)
-    );
+      reportRecRecoveryFailure(
+        state,
+        deps,
+        room.path,
+        err instanceof Error ? err.message : String(err)
+      );
+    }
   }
 
-  runCreateOpenSpawns(deps, room);
+  if (!readOnly) runCreateOpenSpawns(deps, room);
 
   // PRIV-1: resolve this room's privacy policy into the cache, and catch up on
   // any files imported while the door was off/absent.
-  if (deps.policy) {
+  if (!readOnly && deps.policy) {
     refreshPolicy(deps.policy);
   } else {
     logSkipped("refresh_policy", "no PolicyDeps supplied (privacy.ts's refreshPolicy is real)");
   }
-  if (deps.privacyScan) {
+  if (!readOnly && deps.privacyScan) {
     schedulePrivacyScan(deps.privacyScan);
   } else {
     logSkipped(
@@ -1186,6 +1214,9 @@ export async function openRoomWithRecovery(
  */
 export async function writeRecoveryKey(state: RoomManagerState): Promise<string> {
   const room = requireRoom(state);
+  if (room.readOnly === true) {
+    throw new Error("This workspace is read-only because another Arcelle process owns the writer lease.");
+  }
   try {
     return await writeRecovery(roomDatabasePath(room), room.password);
   } catch (err) {
@@ -1309,6 +1340,9 @@ export function renameRoom(
     throw new Error(`That name is too long — ${MAX_ROOM_NAME_CHARS} characters at most.`);
   }
   const room = requireRoom(state);
+  if (room.readOnly === true) {
+    throw new Error("This workspace is read-only because another Arcelle process owns the writer lease.");
+  }
   const oldPath = room.path;
   if (room.descriptor?.kind === "workspace-folder" && room.descriptor.rootPath !== null) {
     if (trimmed === "." || trimmed === ".." || trimmed.includes("/") || trimmed.includes("\\")) {
@@ -1319,6 +1353,7 @@ export function renameRoom(
       if (existsSync(newPath)) throw new Error("A file or folder already exists with that name.");
       room.workspaceRuntimeClosed = true;
       if (room.workspaceWatcher !== undefined) void room.workspaceWatcher.close().catch(() => undefined);
+      room.workspaceIndexer?.close();
       room.conn.pragma("wal_checkpoint(FULL)");
       renameSync(room.path, newPath);
       room.path = newPath;
@@ -1554,6 +1589,7 @@ export function teardownOpenRoom(state: RoomManagerState, deps: RoomManagerDeps)
   state.room = null;
   if (closing !== null) {
     closing.workspaceRuntimeClosed = true;
+    closing.workspaceIndexer?.close();
     if (closing.workspaceWatcher !== undefined) {
       void closing.workspaceWatcher.close().catch(() => undefined);
     }

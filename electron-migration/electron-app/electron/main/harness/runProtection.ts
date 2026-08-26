@@ -21,8 +21,18 @@ export interface RollbackResult {
   conflicts: string[];
 }
 
+export interface RunChangeSummary {
+  changedPaths: string[];
+  count: number;
+}
+
 export class RunProtection {
-  constructor(private readonly workspace: WorkspaceService, private readonly roomId: string) {}
+  private readonly writeRuns = new Set<string>();
+  constructor(
+    private readonly workspace: WorkspaceService,
+    private readonly roomId: string,
+    private readonly reindexChanged: () => Promise<unknown> = async () => undefined,
+  ) {}
 
   async createBaseline(context: HarnessContext): Promise<void> {
     await this.workspace.reconcile();
@@ -43,6 +53,7 @@ export class RunProtection {
         .run(context.runId);
       return;
     }
+    this.writeRuns.add(context.runId);
     const files = this.workspace.db.prepare(
       `SELECT id, relative_path, content_sha256 FROM files
        WHERE storage_kind = 'workspace' AND trashed_at IS NULL AND index_state != 'offline'
@@ -60,13 +71,36 @@ export class RunProtection {
       this.workspace.db.prepare("UPDATE agent_runs SET baseline_completed = 1, status = 'running' WHERE run_id = ?")
         .run(context.runId);
     } catch (error) {
+      this.writeRuns.delete(context.runId);
       this.workspace.db.prepare("UPDATE agent_runs SET status = 'failed' WHERE run_id = ?").run(context.runId);
       throw new Error(`The protected write baseline could not be completed: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
   async finish(runId: string, status: "completed" | "cancelled" | "failed"): Promise<void> {
+    if (!this.writeRuns.has(runId)) {
+      this.workspace.db.prepare(
+        `UPDATE agent_runs SET status = ?, completed_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+         WHERE run_id = ?`,
+      ).run(status, runId);
+      return;
+    }
+    await this.captureFinalState(runId);
+    this.writeRuns.delete(runId);
+    this.workspace.db.prepare(
+      `UPDATE agent_runs SET status = ?, completed_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+       WHERE run_id = ?`,
+    ).run(status, runId);
+  }
+
+  /** Reconcile and persist a reviewable, idempotent change set. */
+  async captureFinalState(runId: string): Promise<RunChangeSummary> {
+    if (!this.writeRuns.has(runId)) return { changedPaths: [], count: 0 };
     await this.workspace.reconcile();
+    // A terminal harness event is not final until changed normal files have a
+    // hash-matched extraction/search state. Failed extraction is recorded per
+    // file and does not damage or roll back the user's file.
+    await this.reindexChanged();
     const baseline = this.workspace.db.prepare(
       "SELECT file_id, baseline_path, baseline_hash FROM agent_run_files WHERE run_id = ?",
     ).all(runId) as Array<{ file_id: string; baseline_path: string | null; baseline_hash: string | null }>;
@@ -96,13 +130,18 @@ export class RunProtection {
       if (now.index_state === "offline" || baselineIds.has(now.id)) continue;
       this.workspace.db.prepare(
         `INSERT INTO agent_run_files(run_id, file_id, final_path, final_hash, change_type)
-         VALUES (?, ?, ?, ?, 'created')`,
+         VALUES (?, ?, ?, ?, 'created')
+         ON CONFLICT(run_id, file_id) DO UPDATE SET
+           final_path = excluded.final_path, final_hash = excluded.final_hash,
+           change_type = excluded.change_type`,
       ).run(runId, now.id, now.relative_path, now.content_sha256);
     }
-    this.workspace.db.prepare(
-      `UPDATE agent_runs SET status = ?, completed_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
-       WHERE run_id = ?`,
-    ).run(status, runId);
+    const changes = this.workspace.db.prepare(
+      `SELECT coalesce(final_path, baseline_path) AS path FROM agent_run_files
+       WHERE run_id = ? AND change_type IN ('created', 'modified', 'moved', 'deleted')
+       ORDER BY path`,
+    ).all(runId) as Array<{ path: string }>;
+    return { changedPaths: changes.map((row) => row.path), count: changes.length };
   }
 
   async rollback(runId: string): Promise<RollbackResult> {
@@ -153,6 +192,7 @@ export class RunProtection {
       result.restored.push(row.baseline_path);
     }
     await this.workspace.reconcile();
+    await this.reindexChanged();
     this.workspace.db.prepare(
       `UPDATE agent_runs SET rollback_status = ?, status = 'rolled_back'
        WHERE run_id = ?`,

@@ -5,7 +5,13 @@ import { Readable } from "node:stream";
 import { afterEach, describe, expect, it } from "vitest";
 import { listFileVersions, setVersionPinned } from "../db-host/fileVersionsList.js";
 import { scanWorkspaceManifest } from "./manifest.js";
-import { acquireWorkspaceLease, createWorkspaceRoom, releaseWorkspaceLease } from "./roomLayout.js";
+import {
+  acquireWorkspaceLease,
+  createWorkspaceRoom,
+  openWorkspaceRoom,
+  releaseWorkspaceLease,
+  REMOTE_LEASE_STALE_MS,
+} from "./roomLayout.js";
 import { assertNoSymlinkSegments, normalizeRelativePath } from "./pathSafety.js";
 import { ContentConflictError, WorkspaceService } from "./workspaceService.js";
 
@@ -215,6 +221,49 @@ describe("workspace room storage", () => {
       expect(() => acquireWorkspaceLease(workspaceRoot)).toThrow(/already open for writing/i);
     } finally {
       releaseWorkspaceLease(lease);
+      db.close();
+    }
+  });
+
+  it("supports a database-enforced read-only open while another writer owns the lease", async () => {
+    const parent = await temporaryRoot();
+    const workspaceRoot = path.join(parent, "Read Only Room");
+    const created = createWorkspaceRoom(workspaceRoot, "correct horse battery staple", "Read Only Room");
+    created.db.close();
+    const lease = acquireWorkspaceLease(workspaceRoot);
+    const readonly = openWorkspaceRoom(workspaceRoot, "correct horse battery staple", true).db;
+    try {
+      expect(readonly.prepare("SELECT value FROM meta WHERE key = 'name'").get()).toEqual({ value: "Read Only Room" });
+      expect(() => readonly.prepare("UPDATE meta SET value = 'changed' WHERE key = 'name'").run()).toThrow();
+    } finally {
+      readonly.close();
+      releaseWorkspaceLease(lease);
+    }
+  });
+
+  it("recovers an expired remote-device lease but preserves a fresh one", async () => {
+    const parent = await temporaryRoot();
+    const workspaceRoot = path.join(parent, "Synced Room");
+    const { db } = createWorkspaceRoom(workspaceRoot, "correct horse battery staple", "Synced Room");
+    const lockPath = path.join(workspaceRoot, ".arcelle", "room.lock");
+    try {
+      await writeFile(lockPath, JSON.stringify({
+        token: "remote",
+        pid: 123,
+        host: "another-device",
+        renewedAt: new Date().toISOString(),
+      }));
+      expect(() => acquireWorkspaceLease(workspaceRoot)).toThrow(/another device/i);
+
+      await writeFile(lockPath, JSON.stringify({
+        token: "expired",
+        pid: 123,
+        host: "another-device",
+        renewedAt: new Date(Date.now() - REMOTE_LEASE_STALE_MS - 1_000).toISOString(),
+      }));
+      const recovered = acquireWorkspaceLease(workspaceRoot);
+      releaseWorkspaceLease(recovered);
+    } finally {
       db.close();
     }
   });

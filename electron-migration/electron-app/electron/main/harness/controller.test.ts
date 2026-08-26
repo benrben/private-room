@@ -31,6 +31,21 @@ class EditingRuntime implements HarnessRuntime {
   }
 }
 
+class MassEditingRuntime implements HarnessRuntime {
+  readonly name = "legacy-cli" as const;
+  async available(): Promise<boolean> { return true; }
+  async startTurn(context: HarnessContext): Promise<HarnessRun> {
+    for (let index = 0; index < 21; index += 1) {
+      await writeFile(path.join(context.workspacePath, `bulk-${index}.txt`), `change ${index}`, "utf8");
+    }
+    async function* events() {
+      yield { type: "run_started", runId: context.runId, harness: "legacy-cli" } as const;
+      yield { type: "run_completed", runId: context.runId, status: "completed" } as const;
+    }
+    return { events: events(), cancel: async () => undefined, approve: async () => undefined };
+  }
+}
+
 async function fixture() {
   const root = await mkdtemp(path.join(os.tmpdir(), "arcelle-harness-controller-"));
   roots.push(root);
@@ -134,6 +149,40 @@ describe("HarnessController", () => {
       expect(capabilities.providers.codex).toMatchObject({ enabled: true, installed: true, reason: null });
       expect(capabilities.providers.claude).toMatchObject({ enabled: false, installed: true });
       expect(capabilities.providers.claude!.reason).toMatch(/sandbox capability test/i);
+    } finally {
+      f.created.db.close();
+    }
+  });
+
+  it("holds a run with more than twenty changed paths for approval and rolls it back when denied", async () => {
+    const f = await fixture();
+    const events: Array<{ type?: string; requestId?: string; status?: string }> = [];
+    try {
+      const controller = new HarnessController(f.state, f.root, (_event, payload) => {
+        events.push(payload as { type?: string; requestId?: string; status?: string });
+      }, {
+        runtimes: { codex: new MassEditingRuntime() },
+        flag: () => true,
+        outsideWorkspaceIsolation: true,
+        verifyExposure: async () => true,
+      });
+      const runId = await controller.start({
+        provider: "codex",
+        model: "test",
+        privacyMode: "cloud-direct",
+        writeEnabled: true,
+        text: "bulk edit",
+      });
+      for (let count = 0; count < 200 && !events.some((event) => event.requestId === `mass-change-${runId}`); count += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(events.some((event) => event.type === "run_completed")).toBe(false);
+      await controller.approve(runId, `mass-change-${runId}`, "deny");
+      for (let count = 0; count < 200 && !events.some((event) => event.type === "run_completed"); count += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(events.find((event) => event.type === "run_completed")?.status).toBe("cancelled");
+      expect((await readdir(f.roomPath)).filter((name) => name.startsWith("bulk-"))).toEqual([]);
     } finally {
       f.created.db.close();
     }

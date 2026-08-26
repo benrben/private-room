@@ -6,6 +6,7 @@ import path from "node:path";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { VERSIONS_KEPT } from "../db-host/versions.js";
+import { clearChunks } from "../db-host/files.js";
 import { ContentObjectStore } from "./contentObjects.js";
 import { scanWorkspaceManifest } from "./manifest.js";
 import {
@@ -23,6 +24,7 @@ interface WorkspaceFileRow {
   relative_path: string;
   content_sha256: string | null;
   size_bytes: number;
+  index_state?: string;
 }
 
 export interface WorkspaceVersionSnapshot {
@@ -293,8 +295,10 @@ export class WorkspaceService {
       this.updateOperation(operationId, "filesystem_committed", newHash);
       const fileStat = await lstat(destination, { bigint: true });
       this.db.transaction(() => {
+        clearChunks(this.db, fileId);
         this.db.prepare(
           `UPDATE files SET size_bytes = ?, content_sha256 = ?, mtime_ns = ?, fs_identity = ?,
+             extracted_text = NULL, ai_summary = NULL,
              index_state = 'stale', index_error = NULL,
              last_seen_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?`,
         ).run(
@@ -542,10 +546,12 @@ export class WorkspaceService {
       this.updateOperation(operationId, "filesystem_committed", restored.sha256);
       const fileStat = await lstat(destination, { bigint: true });
       this.db.transaction(() => {
+        clearChunks(this.db, fileId);
         this.db.prepare(
           `UPDATE files SET name = ?, relative_path = ?, path_key = ?, content_sha256 = ?,
              size_bytes = ?, mtime_ns = ?, fs_identity = ?, trashed_at = NULL,
-             trashed_by = NULL, trashed_by_id = NULL, index_state = 'stale',
+             trashed_by = NULL, trashed_by_id = NULL, extracted_text = NULL,
+             ai_summary = NULL, index_state = 'stale',
              last_seen_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?`,
         ).run(
           path.basename(relativePath), relativePath, pathKey(relativePath), restored.sha256,
@@ -563,7 +569,8 @@ export class WorkspaceService {
 
   async reconcile(): Promise<{ added: number; changed: number; missing: number; renamed: number }> {
     const rows = this.db.prepare(
-      `SELECT id, name, relative_path, path_key, content_sha256, size_bytes, mtime_ns, fs_identity
+      `SELECT id, name, relative_path, path_key, content_sha256, size_bytes, mtime_ns, fs_identity,
+              index_state
        FROM files WHERE storage_kind = 'workspace' AND trashed_at IS NULL`,
     ).all() as Array<WorkspaceFileRow & {
       path_key: string;
@@ -593,7 +600,7 @@ export class WorkspaceService {
       unmatchedRows.delete(row.id);
       unmatchedEntries.delete(key);
       if (row.content_sha256 !== entry.sha256 || row.size_bytes !== entry.sizeBytes) changed += 1;
-      this.updateManifestRow(row.id, entry, row.content_sha256 === entry.sha256 ? "ready" : "stale");
+      this.updateManifestRow(row.id, entry, this.reconciledIndexState(row, entry.sha256));
     }
 
     // An identity+hash pair is strong enough to call an external move. Hash
@@ -604,7 +611,7 @@ export class WorkspaceService {
       );
       if (candidates.length !== 1) continue;
       const entry = candidates[0]!;
-      this.updateManifestRow(id, entry, "ready");
+      this.updateManifestRow(id, entry, this.reconciledIndexState(row, entry.sha256));
       unmatchedRows.delete(id);
       unmatchedEntries.delete(entry.pathKey);
       renamed += 1;
@@ -622,7 +629,7 @@ export class WorkspaceService {
       );
       if (sourceMatches.length !== 1 || destinationMatches.length !== 1) continue;
       const entry = destinationMatches[0]!;
-      this.updateManifestRow(id, entry, "ready");
+      this.updateManifestRow(id, entry, this.reconciledIndexState(row, entry.sha256));
       unmatchedRows.delete(id);
       unmatchedEntries.delete(entry.pathKey);
       renamed += 1;
@@ -630,20 +637,33 @@ export class WorkspaceService {
 
     for (const entry of unmatchedEntries.values()) this.insertManifestEntry(entry);
     for (const row of unmatchedRows.values()) {
-      this.db.prepare("UPDATE files SET index_state = 'offline' WHERE id = ?").run(row.id);
+      this.db.transaction(() => {
+        clearChunks(this.db, row.id);
+        this.db.prepare("UPDATE files SET index_state = 'offline' WHERE id = ?").run(row.id);
+      })();
     }
     return { added: unmatchedEntries.size, changed, missing: unmatchedRows.size, renamed };
   }
 
-  private updateManifestRow(fileId: string, entry: ManifestEntry, state: "ready" | "stale"): void {
-    this.db.prepare(
-      `UPDATE files SET name = ?, relative_path = ?, path_key = ?, content_sha256 = ?,
-         size_bytes = ?, mtime_ns = ?, fs_identity = ?, index_state = ?, index_error = NULL,
-         last_seen_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?`,
-    ).run(
-      path.basename(entry.relativePath), entry.relativePath, entry.pathKey, entry.sha256,
-      entry.sizeBytes, entry.mtimeNs, entry.fsIdentity, state, fileId,
-    );
+  private reconciledIndexState(row: WorkspaceFileRow, sha256: string): string {
+    if (row.content_sha256 !== sha256 || row.index_state === "offline") return "stale";
+    return row.index_state ?? "stale";
+  }
+
+  private updateManifestRow(fileId: string, entry: ManifestEntry, state: string): void {
+    this.db.transaction(() => {
+      if (state === "stale") clearChunks(this.db, fileId);
+      this.db.prepare(
+        `UPDATE files SET name = ?, relative_path = ?, path_key = ?, content_sha256 = ?,
+           size_bytes = ?, mtime_ns = ?, fs_identity = ?, index_state = ?, index_error = NULL,
+           extracted_text = CASE WHEN ? = 'stale' THEN NULL ELSE extracted_text END,
+           ai_summary = CASE WHEN ? = 'stale' THEN NULL ELSE ai_summary END,
+           last_seen_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?`,
+      ).run(
+        path.basename(entry.relativePath), entry.relativePath, entry.pathKey, entry.sha256,
+        entry.sizeBytes, entry.mtimeNs, entry.fsIdentity, state, state, state, fileId,
+      );
+    })();
   }
 
   private insertManifestEntry(entry: ManifestEntry): string {
@@ -672,7 +692,10 @@ export class WorkspaceService {
            WHERE storage_kind = 'workspace' AND trashed_at IS NULL AND path_key = ?`,
         ).get(entry.pathKey) as { id: string } | undefined;
         if (existing !== undefined) {
-          this.updateManifestRow(existing.id, entry, "ready");
+          const row = this.db.prepare(
+            "SELECT content_sha256, index_state FROM files WHERE id = ?",
+          ).get(existing.id) as WorkspaceFileRow;
+          this.updateManifestRow(existing.id, entry, this.reconciledIndexState(row, entry.sha256));
           return existing.id;
         }
       }

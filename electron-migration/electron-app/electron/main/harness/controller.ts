@@ -75,6 +75,7 @@ export class HarnessController {
   private isolationProven: boolean;
   private readonly mirrors = new Map<string, MirrorRun>();
   private readonly pendingMirrorApprovals = new Map<string, PendingMirrorApproval>();
+  private readonly pendingSafetyApprovals = new Map<string, PendingMirrorApproval>();
   private readonly pumps = new Map<string, Promise<void>>();
   private readonly runRoots = new Map<string, string>();
   private orchestrator: HarnessOrchestrator | null = null;
@@ -116,9 +117,16 @@ export class HarnessController {
     }
     if (this.orchestrator !== null && this.roomId === room.descriptor.roomId) return this.orchestrator;
     if (this.pumps.size > 0) throw new Error("Wait for the active agent runs to stop before changing rooms.");
-    const protection = new RunProtection(room.workspace, room.descriptor.roomId);
+    const protection = new RunProtection(
+      room.workspace,
+      room.descriptor.roomId,
+      () => room.workspaceIndexer?.indexPending() ?? Promise.resolve(),
+    );
     const orchestrator = new HarnessOrchestrator(protection, {
-      beforeFinish: (runId, status, send) => this.finishMirror(runId, status, send),
+      beforeFinish: async (runId, status, send) => {
+        const mirrorStatus = await this.finishMirror(runId, status, send);
+        return this.reviewMassChanges(protection, runId, mirrorStatus, send);
+      },
     });
     orchestrator.register("codex", this.runtimes.codex);
     orchestrator.register("claude", this.runtimes.claude);
@@ -142,6 +150,7 @@ export class HarnessController {
         && room?.workspace !== undefined
         && room.descriptor?.kind === "workspace-folder"
         && room.descriptor.rootPath !== null
+        && room.readOnly !== true
       ) {
         const probePath = path.join(this.runtimeRoot(), room.descriptor.roomId, `capability-${randomUUID()}`);
         await mkdir(probePath, { recursive: true, mode: 0o700 });
@@ -154,6 +163,7 @@ export class HarnessController {
       else if (!this.isolationProven) reason = "Outside-workspace process isolation has not passed its security test.";
       else if (!installed) reason = `The ${name} agent runtime is not installed.`;
       else if (room?.descriptor?.kind !== "workspace-folder") reason = "Open a workspace room to run the sandbox capability test.";
+      else if (room.readOnly === true) reason = "This workspace is read-only because another Arcelle process owns the writer lease.";
       else if (!sandboxReady) reason = `The ${name} runtime failed its sandbox capability test.`;
       return { enabled: sandboxReady, installed, reason };
     };
@@ -185,6 +195,9 @@ export class HarnessController {
       || room.descriptor.rootPath === null
     ) {
       throw new Error("Open a workspace room before starting this harness.");
+    }
+    if (room.readOnly === true) {
+      throw new Error("This workspace is read-only because another Arcelle process owns the writer lease.");
     }
     const runId = randomUUID();
     const runRuntimePath = path.join(this.runtimeRoot(), room.descriptor.roomId, runId);
@@ -239,12 +252,19 @@ export class HarnessController {
   }
 
   approve(runId: string, requestId: string, decision: ApprovalDecision): Promise<void> {
+    if (requestId === `mass-change-${runId}`) {
+      const pending = this.pendingSafetyApprovals.get(runId);
+      if (pending === undefined) throw new Error("That mass-change approval is no longer pending.");
+      pending.resolve(decision === "allow-once" || decision === "allow-run");
+      return Promise.resolve();
+    }
     if (this.orchestrator === null) throw new Error("No harness run is active.");
     return this.orchestrator.approve(runId, requestId, decision);
   }
 
   async cancel(runId: string): Promise<void> {
     this.pendingMirrorApprovals.get(runId)?.resolve(false);
+    this.pendingSafetyApprovals.get(runId)?.resolve(false);
     await this.orchestrator?.cancel(runId);
   }
 
@@ -283,6 +303,7 @@ export class HarnessController {
   stopAllNoWait(): void {
     for (const id of this.orchestrator?.activeRunIds() ?? []) {
       this.pendingMirrorApprovals.get(id)?.resolve(false);
+      this.pendingSafetyApprovals.get(id)?.resolve(false);
       void this.orchestrator?.cancel(id).catch(() => undefined);
     }
     for (const id of this.runRoots.keys()) void this.removeRunRuntime(id).catch(() => undefined);
@@ -329,6 +350,31 @@ export class HarnessController {
     }
   }
 
+  private async reviewMassChanges(
+    protection: RunProtection,
+    runId: string,
+    status: HarnessFinalStatus,
+    send: (event: HarnessEvent) => void,
+  ): Promise<HarnessFinalStatus> {
+    if (status !== "completed") return status;
+    const summary = await protection.captureFinalState(runId);
+    if (summary.count <= 20) return status;
+    send({
+      type: "approval_requested",
+      runId,
+      requestId: `mass-change-${runId}`,
+      tool: "workspace_mass_change",
+      detail: `The agent changed ${summary.count} files. Approve to keep them, or deny to restore the protected baseline.`,
+    });
+    const approved = await new Promise<boolean>((resolve) => {
+      this.pendingSafetyApprovals.set(runId, { resolve });
+    });
+    this.pendingSafetyApprovals.delete(runId);
+    if (approved) return status;
+    await protection.rollback(runId);
+    return "cancelled";
+  }
+
   private async removeMirror(runId: string): Promise<void> {
     const entry = this.mirrors.get(runId);
     this.mirrors.delete(runId);
@@ -336,6 +382,7 @@ export class HarnessController {
   }
 
   private async removeRunRuntime(runId: string): Promise<void> {
+    this.pendingSafetyApprovals.delete(runId);
     const runRoot = this.runRoots.get(runId);
     this.runRoots.delete(runId);
     if (this.mirrors.has(runId)) await this.removeMirror(runId);
