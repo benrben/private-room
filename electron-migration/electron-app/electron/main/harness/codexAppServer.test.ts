@@ -1,12 +1,12 @@
 import { EventEmitter } from "node:events";
-import { chmod, cp, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, chmod, cp, mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
-import { CodexAppServerRuntime } from "./codexAppServer.js";
+import { CodexAppServerRuntime, prepareCodexRuntimeHome } from "./codexAppServer.js";
 import { inspectCodexSchemaDirectory } from "./codexSchema.js";
 import { nativeWorkspaceSandboxSupported } from "./seatbelt.js";
 
@@ -24,6 +24,26 @@ async function fakeCodex(body: string): Promise<string> {
   await writeFile(executable, `#!/bin/sh\nset -eu\n${body}\n`, "utf8");
   await chmod(executable, 0o700);
   return executable;
+}
+
+async function codexHomeFixture(): Promise<{
+  root: string;
+  sourceHome: string;
+  runtimePath: string;
+  workspacePath: string;
+}> {
+  const root = await mkdtemp(path.join(os.tmpdir(), "arcelle-codex-home-test-"));
+  roots.push(root);
+  const sourceHome = path.join(root, "source-home");
+  const runtimePath = path.join(root, "runtime");
+  const workspacePath = path.join(root, "workspace");
+  await mkdir(sourceHome, { recursive: true });
+  await mkdir(runtimePath, { recursive: true });
+  await mkdir(path.join(workspacePath, ".arcelle"), { recursive: true });
+  await writeFile(path.join(sourceHome, "auth.json"), "test-auth", { mode: 0o644 });
+  await writeFile(path.join(sourceHome, "config.toml"), "model = 'test'", { mode: 0o644 });
+  await writeFile(path.join(sourceHome, "history.jsonl"), "private history", { mode: 0o600 });
+  return { root, sourceHome, runtimePath, workspacePath };
 }
 
 function probeChild(
@@ -59,6 +79,19 @@ function probeChild(
 }
 
 describe("Codex app-server compatibility probe", () => {
+  it("creates a private runtime home with only auth and config", async () => {
+    const fixture = await codexHomeFixture();
+    const runtimeHome = await prepareCodexRuntimeHome(fixture.runtimePath, fixture.sourceHome);
+
+    expect(path.dirname(runtimeHome)).toBe(await realpath(fixture.runtimePath));
+    expect((await stat(runtimeHome)).mode & 0o777).toBe(0o700);
+    expect(await readFile(path.join(runtimeHome, "auth.json"), "utf8")).toBe("test-auth");
+    expect(await readFile(path.join(runtimeHome, "config.toml"), "utf8")).toBe("model = 'test'");
+    expect((await stat(path.join(runtimeHome, "auth.json"))).mode & 0o777).toBe(0o600);
+    expect((await stat(path.join(runtimeHome, "config.toml"))).mode & 0o777).toBe(0o600);
+    await expect(access(path.join(runtimeHome, "history.jsonl"))).rejects.toThrow();
+  });
+
   it("requires the installed Codex version to generate its stable schema", async () => {
     const executable = await fakeCodex(`
 if [ "$1" = "app-server" ] && [ "$2" = "--help" ]; then exit 0; fi
@@ -86,15 +119,18 @@ exit 2`);
   });
 
   it("requires a real initialized app-server, not a successful help command", async () => {
+    const fixture = await codexHomeFixture();
+    const expectedRuntimeHome = path.join(await realpath(fixture.runtimePath), "codex-home");
     const writes: string[] = [];
     const kills: NodeJS.Signals[] = [];
     const child = probeChild("initialize", writes, kills);
-    const spawn = ((_options: unknown, args: string[]) => {
+    const spawn = ((_options: unknown, args: string[], spawnOptions: { env?: NodeJS.ProcessEnv }) => {
       expect(args).toEqual(["app-server", "--listen", "stdio://"]);
+      expect(spawnOptions.env?.CODEX_HOME).toBe(expectedRuntimeHome);
       return child;
     }) as never;
-    const runtime = new CodexAppServerRuntime("codex", spawn, 100);
-    await expect(runtime.verifyExposure("/workspace/SECRET-room", "/runtime", false)).resolves.toBe(true);
+    const runtime = new CodexAppServerRuntime("codex", spawn, 100, fixture.sourceHome);
+    await expect(runtime.verifyExposure(fixture.workspacePath, fixture.runtimePath, false)).resolves.toBe(true);
     expect(writes).toHaveLength(1);
     expect(writes[0]).toContain('"method":"initialize"');
     expect(writes[0]).not.toContain("/workspace/SECRET-room");
@@ -103,19 +139,56 @@ exit 2`);
   });
 
   it.each(["exit", "hang"] as const)("fails closed when app-server %s before initialization", async (behavior) => {
+    const fixture = await codexHomeFixture();
     const writes: string[] = [];
     const kills: NodeJS.Signals[] = [];
     const runtime = new CodexAppServerRuntime(
       "codex",
       (() => probeChild(behavior, writes, kills)) as never,
       10,
+      fixture.sourceHome,
     );
-    await expect(runtime.verifyExposure("/workspace", "/runtime", false)).resolves.toBe(false);
+    await expect(runtime.verifyExposure(fixture.workspacePath, fixture.runtimePath, false)).resolves.toBe(false);
     if (behavior === "hang") expect(kills).toContain("SIGTERM");
   });
 
+  it("uses the isolated runtime home for the real turn process", async () => {
+    const fixture = await codexHomeFixture();
+    const expectedRuntimeHome = path.join(await realpath(fixture.runtimePath), "codex-home");
+    const writes: string[] = [];
+    const kills: NodeJS.Signals[] = [];
+    let spawnedHome: string | undefined;
+    const runtime = new CodexAppServerRuntime(
+      "codex",
+      ((_options: unknown, _args: string[], spawnOptions: { env?: NodeJS.ProcessEnv }) => {
+        spawnedHome = spawnOptions.env?.CODEX_HOME;
+        return probeChild("hang", writes, kills);
+      }) as never,
+      100,
+      fixture.sourceHome,
+    );
+
+    const run = await runtime.startTurn({
+      runId: "run-1",
+      roomId: "room-1",
+      provider: "codex",
+      model: "test-model",
+      workspacePath: fixture.workspacePath,
+      runtimePath: fixture.runtimePath,
+      privacyMode: "cloud-direct",
+      writeEnabled: false,
+      exposureVerified: true,
+    }, { text: "Read the workspace." });
+
+    expect(spawnedHome).toBe(expectedRuntimeHome);
+    expect(writes[0]).toContain('"method":"initialize"');
+    await run.cancel();
+    for await (const _event of run.events) { /* drain terminal cleanup */ }
+    expect(kills).toContain("SIGTERM");
+  });
+
   it.runIf(installedCodex && nativeWorkspaceSandboxSupported())(
-    "rejects the installed app-server when real sandbox initialization cannot complete",
+    "initializes the installed app-server with isolated mutable state",
     async () => {
       const root = await mkdtemp(path.join(os.tmpdir(), "arcelle-codex-live-probe-"));
       roots.push(root);
@@ -124,7 +197,7 @@ exit 2`);
       await mkdir(path.join(workspacePath, ".arcelle"), { recursive: true });
       await mkdir(runtimePath, { recursive: true });
       const runtime = new CodexAppServerRuntime();
-      await expect(runtime.verifyExposure(workspacePath, runtimePath, false)).resolves.toBe(false);
+      await expect(runtime.verifyExposure(workspacePath, runtimePath, false)).resolves.toBe(true);
     },
     15_000,
   );

@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, readdir, rm } from "node:fs/promises";
+import { chmod, copyFile, mkdir, mkdtemp, readdir, realpath, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -24,6 +24,56 @@ import type {
 
 const execFileAsync = promisify(execFile);
 type SandboxSpawn = typeof spawnWithNativeWorkspaceSandbox;
+
+const CODEX_RUNTIME_HOME = "codex-home";
+const CODEX_BOOTSTRAP_FILES = ["auth.json", "config.toml"] as const;
+
+function sourceCodexHome(): string {
+  return path.resolve(process.env.CODEX_HOME ?? path.join(os.homedir(), ".codex"));
+}
+
+/**
+ * Give Codex mutable state without granting it write access to the user's
+ * real `~/.codex`. Codex 0.144.5 opens SQLite state during app-server startup,
+ * before a turn exists, so a read-only real home cannot initialize.
+ *
+ * Only authentication and configuration cross into the private run tree.
+ * History, memories, queues and previous thread state remain outside the
+ * sandbox. The controller already removes the complete runtime tree after the
+ * probe/run, including this copy.
+ */
+export async function prepareCodexRuntimeHome(
+  runtimePath: string,
+  sourceHome = sourceCodexHome(),
+): Promise<string> {
+  const runtimeHome = path.resolve(runtimePath, CODEX_RUNTIME_HOME);
+  await mkdir(runtimeHome, { recursive: true, mode: 0o700 });
+  await chmod(runtimeHome, 0o700);
+  for (const name of CODEX_BOOTSTRAP_FILES) {
+    const source = path.resolve(sourceHome, name);
+    const destination = path.join(runtimeHome, name);
+    if (source === destination) continue;
+    try {
+      await copyFile(source, destination);
+      await chmod(destination, 0o600);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      // API-key and managed installations may not use one or both files.
+    }
+  }
+  // macOS temp locations commonly enter through /var but Seatbelt grants the
+  // canonical /private/var path. Passing the canonical home keeps the runtime
+  // environment and the generated profile aligned.
+  return realpath(runtimeHome);
+}
+
+function codexRunEnvironment(codexHome: string): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    CODEX_HOME: codexHome,
+    CODEX_INTERNAL_ORIGINATOR_OVERRIDE: "arcelle",
+  };
+}
 
 interface RpcMessage {
   id?: number | string;
@@ -73,6 +123,7 @@ export class CodexAppServerRuntime implements HarnessRuntime {
     private readonly executable = process.env.ARCELLE_CODEX_PATH ?? "codex",
     private readonly sandboxSpawn: SandboxSpawn = spawnWithNativeWorkspaceSandbox,
     private readonly startupProbeTimeoutMs = 5_000,
+    private readonly codexHomeSource = sourceCodexHome(),
   ) {}
 
   async available(): Promise<boolean> {
@@ -112,12 +163,13 @@ export class CodexAppServerRuntime implements HarnessRuntime {
     };
     let child;
     try {
+      const codexHome = await prepareCodexRuntimeHome(runtimePath, this.codexHomeSource);
       child = this.sandboxSpawn(
         options,
         ["app-server", "--listen", "stdio://"],
         {
           cwd: workspacePath,
-          env: { ...process.env, CODEX_INTERNAL_ORIGINATOR_OVERRIDE: "arcelle" },
+          env: codexRunEnvironment(codexHome),
         },
       );
     } catch {
@@ -195,7 +247,8 @@ export class CodexAppServerRuntime implements HarnessRuntime {
       throw new Error("Codex native harness refused an unverified workspace exposure.");
     }
     const events = new AsyncEventQueue<HarnessEvent>();
-    const child = spawnWithNativeWorkspaceSandbox(
+    const codexHome = await prepareCodexRuntimeHome(context.runtimePath, this.codexHomeSource);
+    const child = this.sandboxSpawn(
       {
         workspacePath: context.workspacePath,
         runtimePath: context.runtimePath,
@@ -204,7 +257,7 @@ export class CodexAppServerRuntime implements HarnessRuntime {
         writeEnabled: context.writeEnabled,
       },
       ["app-server", "--listen", "stdio://"],
-      { cwd: context.workspacePath, env: { ...process.env, CODEX_INTERNAL_ORIGINATOR_OVERRIDE: "arcelle" } },
+      { cwd: context.workspacePath, env: codexRunEnvironment(codexHome) },
     );
     const pendingRpc = new Map<number | string, {
       resolve(value: unknown): void;
