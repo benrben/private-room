@@ -2,7 +2,7 @@ import type { FileMeta } from "../api";
 
 /** WHERE AN OBJECT SHOWS UP — the section-only model, in one place.
  *
- * Every object here is a full room file: encrypted, versioned, searchable,
+ * Every object here is a full room file: normally readable on disk, versioned, searchable,
  * attachable, undeletable-by-accident. The only question this module answers is
  * which LISTS show it, and it is deliberately a question about visibility
  * rather than about storage, because there is exactly one copy of everything.

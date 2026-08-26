@@ -254,7 +254,8 @@ export default function App() {
   async function removeRecent(path: string) {
     await api.removeRecent(path);
     // The room's saved pane layout is the other thing this Mac remembers about
-    // it, outside the encrypted file. Forgetting the shortcut forgets that too.
+    // it, outside the room's encrypted private state. Forgetting the shortcut
+    // forgets that too.
     forgetSavedLayout(path);
     loadRecent();
   }
@@ -266,7 +267,7 @@ export default function App() {
     const ok = await askConfirm(
       `Forget all ${recent.length} recent room${recent.length === 1 ? "" : "s"}? ` +
         "This clears the shortcuts on this screen and the pane layouts saved for " +
-        "them — every room file stays exactly where it is, and you can open one " +
+        "them — every room folder or legacy room file stays exactly where it is, and you can open one " +
         "again with “Open Room…”.",
       { title: "Clear the recent list", kind: "warning", okLabel: "Clear list" },
     ).catch(() => false);
@@ -287,7 +288,7 @@ export default function App() {
 
   // Start the branded create flow immediately — the user names the room and
   // sets a password in-app; the native file panel is deferred to the final
-  // "Create & Enter", and only to choose where the one encrypted file lands.
+  // "Create & Enter", and only to choose where the workspace folder lands.
   function chooseCreate() {
     goTo({ kind: "create", path: "" });
   }

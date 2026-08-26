@@ -858,3 +858,13 @@
   background-size: 100% 1px;
   background-position: left top;
 }
+/* A lease conflict is room-wide, so the notice sits under the toolbar rather
+   than inside one editor or one agent card. */
+.workspace-readonly-banner {
+  padding: 8px 16px;
+  border-bottom: 1px solid color-mix(in srgb, var(--amber, #9a6a18) 42%, transparent);
+  background: color-mix(in srgb, var(--amber, #9a6a18) 10%, var(--paper, #fff));
+  color: var(--ink, #222);
+  font-size: 12px;
+  line-height: 1.4;
+}

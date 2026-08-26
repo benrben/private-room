@@ -42,8 +42,8 @@ export default class ErrorBoundary extends Component<
                 so "nothing was written" is a claim this class cannot make. */}
             <p>
               Arcelle hit an unexpected error while drawing the window. Your
-              room is an encrypted file on this Mac and is still there. Anything
-              already saved is saved; unsaved work in the editor is gone.
+              saved room data and encrypted private state are still on this Mac.
+              Anything already saved is saved; unsaved work in the editor is gone.
             </p>
             <pre className="crash-detail">{detail}</pre>
             <div className="crash-actions">

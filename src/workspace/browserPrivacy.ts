@@ -72,7 +72,7 @@ export interface PrivacyClaim {
 export const EPHEMERAL_VS_ROOM =
   "Page history, cookies and cache clear when the last private page closes. " +
   "The assistant's actions, the searches and page text the room kept, and the " +
-  "files you choose to save stay in this encrypted room — the Journal's Clear " +
+  "files you choose to save stay in the workspace, while the Journal stays in encrypted private room state — the Journal's Clear " +
   "erases that record.";
 
 /** The claim this browser must not let the user assume it is making.

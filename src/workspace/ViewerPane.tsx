@@ -1439,7 +1439,7 @@ export default function ViewerPane({
           <div className="viewer-empty-note">
             <LockIcon size={16} />
             <div>
-              <strong>This room is an encrypted file on this Mac.</strong>{" "}
+              <strong>Your room data is on this Mac; private Arcelle state is encrypted.</strong>{" "}
               {trust.tone === "good" && alsoSendsOut
                 ? "The AI runs on this Mac — but online search or a connected tool sends what it asks for off the device."
                 : trust.title}

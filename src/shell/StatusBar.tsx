@@ -105,8 +105,8 @@ export default function StatusBar({
       <div
         className="status-seal"
         role="img"
-        aria-label="This room is an encrypted file on this Mac"
-        title="This room is an encrypted file on this Mac"
+        aria-label="Room data on this Mac; private Arcelle state encrypted"
+        title="Room data on this Mac; private Arcelle state encrypted"
       >
         <ShieldIcon size={12} />
       </div>

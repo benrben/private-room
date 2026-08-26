@@ -751,6 +751,12 @@ export default function Workspace({ info, onLock, onRenamed }: Props) {
         approvals={pendingApprovals}
         running={runningJobs}
       />
+      {info.readOnly && (
+        <div className="workspace-readonly-banner" role="status">
+          <strong>Read-only room.</strong>{" "}
+          Another Arcelle process owns the writer lease. You can read the normal files here, but Arcelle will not save edits, run agents, index changes, or change private room data.
+        </div>
+      )}
 
       <StudioModal s={s} a={a} />
       {/* Every exit that unmounts the editor asks this before it happens. */}
