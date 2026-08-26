@@ -44,8 +44,8 @@ import type { OpenRoom } from "./turnEngine.js";
 import {
   recChapterAdd,
   recChapterSet,
-  recCorrectRange,
-  recDeleteRange,
+  recCorrectRangeHybrid,
+  recDeleteRangeHybrid,
   recExportCleanHybrid,
   recGet,
   recHighlightAdd,
@@ -123,10 +123,10 @@ export function registerRecIpc(
   handle("rec_set_live_stt", (args: { on: boolean }) => recSetLiveStt(ctx, args.on));
   handle("rec_get", (args: { id: string }) => recGet(openDb(room), args.id));
   handle("rec_delete_range", (args: { id: string; t0: number; t1: number }) =>
-    recDeleteRange(openDb(room), ctx, args.id, args.t0, args.t1)
+    recDeleteRangeHybrid(openDb(room), ctx, args.id, args.t0, args.t1)
   );
   handle("rec_correct_range", (args: { id: string; t0: number; t1: number; text: string }) =>
-    recCorrectRange(openDb(room), ctx, args.id, args.t0, args.t1, args.text)
+    recCorrectRangeHybrid(openDb(room), ctx, args.id, args.t0, args.t1, args.text)
   );
   handle("rec_set_speaker_name", (args: { id: string; speaker: string; name: string }) =>
     recSetSpeakerName(openDb(room), ctx, args.id, args.speaker, args.name)

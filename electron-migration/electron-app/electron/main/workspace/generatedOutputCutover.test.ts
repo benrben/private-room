@@ -4,7 +4,7 @@ import path from "node:path";
 import { Readable } from "node:stream";
 import { afterEach, describe, expect, it } from "vitest";
 import { Artifact } from "../artifactBuilder.js";
-import { createRecBridgeCtx, recDeleteRange, recExportCleanHybrid } from "../recBridge.js";
+import { createRecBridgeCtx, recDeleteRangeHybrid, recExportCleanHybrid } from "../recBridge.js";
 import {
   appendRecChunk,
   finalizeRecAudioHybrid,
@@ -155,7 +155,7 @@ describe("generated output workspace cutover", () => {
         }],
       }));
       const ctx = createRecBridgeCtx({ currentRoom: () => ({ db, path: root, workspace }) });
-      recDeleteRange(db, ctx, created.fileId, 0, 5);
+      await recDeleteRangeHybrid(db, ctx, created.fileId, 0, 5);
       expect((db.prepare("SELECT original_bytes FROM files WHERE id = ?")
         .get(created.fileId) as { original_bytes: Buffer | null }).original_bytes).toBeNull();
       const edited = await recExportCleanHybrid(db, ctx, created.fileId);

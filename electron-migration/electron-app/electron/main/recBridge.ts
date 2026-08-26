@@ -1488,13 +1488,16 @@ function storeTranscriptEdit(
   id: string,
   text: string,
   cause: string,
+  workspaceSnapshotAlready = false,
 ): void {
   const open = ctx.deps.currentRoom();
   if (open?.db === db && open.workspace !== undefined) {
     // snapshotVersion captures the outgoing transcript before its first await.
     // Audio bytes remain in the normal file; a failed history snapshot must
     // never move a copy back into original_bytes.
-    void open.workspace.snapshotVersion(id, cause).catch(() => undefined);
+    if (!workspaceSnapshotAlready) {
+      void open.workspace.snapshotVersion(id, cause).catch(() => undefined);
+    }
     setFileExtractedText(db, id, text);
     return;
   }
@@ -1525,7 +1528,8 @@ export function recDeleteRange(
   ctx: RecBridgeCtx,
   id: string,
   t0: number,
-  t1: number
+  t1: number,
+  workspaceSnapshotAlready = false,
 ): RecMeta {
   if (t1 <= t0) {
     throw new Error("Nothing selected.");
@@ -1547,9 +1551,22 @@ export function recDeleteRange(
     }
   }
   meta.cuts = addCut(meta.cuts, { t0, t1 });
-  storeTranscriptEdit(db, ctx, id, transcriptText(meta), "Edited transcript");
+  storeTranscriptEdit(db, ctx, id, transcriptText(meta), "Edited transcript", workspaceSnapshotAlready);
   setRecMeta(db, id, JSON.stringify(meta));
   return meta;
+}
+
+export async function recDeleteRangeHybrid(
+  db: Database.Database,
+  ctx: RecBridgeCtx,
+  id: string,
+  t0: number,
+  t1: number,
+): Promise<RecMeta> {
+  const open = ctx.deps.currentRoom();
+  if (open?.db !== db || open.workspace === undefined) return recDeleteRange(db, ctx, id, t0, t1);
+  await open.workspace.snapshotVersion(id, "Edited transcript");
+  return recDeleteRange(db, ctx, id, t0, t1, true);
 }
 
 /**
@@ -1609,7 +1626,8 @@ export function recCorrectRange(
   id: string,
   t0: number,
   t1: number,
-  rawText: string
+  rawText: string,
+  workspaceSnapshotAlready = false,
 ): RecMeta {
   if (t1 <= t0) {
     throw new Error("Nothing selected.");
@@ -1644,9 +1662,23 @@ export function recCorrectRange(
   if (n === 0) {
     throw new Error("Nothing to correct there.");
   }
-  storeTranscriptEdit(db, ctx, id, transcriptText(meta), "Corrected transcript");
+  storeTranscriptEdit(db, ctx, id, transcriptText(meta), "Corrected transcript", workspaceSnapshotAlready);
   setRecMeta(db, id, JSON.stringify(meta));
   return meta;
+}
+
+export async function recCorrectRangeHybrid(
+  db: Database.Database,
+  ctx: RecBridgeCtx,
+  id: string,
+  t0: number,
+  t1: number,
+  text: string,
+): Promise<RecMeta> {
+  const open = ctx.deps.currentRoom();
+  if (open?.db !== db || open.workspace === undefined) return recCorrectRange(db, ctx, id, t0, t1, text);
+  await open.workspace.snapshotVersion(id, "Corrected transcript");
+  return recCorrectRange(db, ctx, id, t0, t1, text, true);
 }
 
 /**
