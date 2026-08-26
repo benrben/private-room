@@ -174,6 +174,22 @@ export interface Commands {
       totalOnDiskBytes: number;
     };
   };
+  workspace_watcher_status: {
+    args: Record<string, never>;
+    result: {
+      state: "starting" | "healthy" | "error";
+      lastReconciledAt: string | null;
+      lastError: string | null;
+    } | null;
+  };
+  rescan_workspace_room: {
+    args: Record<string, never>;
+    result: {
+      state: "starting" | "healthy" | "error";
+      lastReconciledAt: string | null;
+      lastError: string | null;
+    };
+  };
   rename_room: { args: { name: string }; result: RoomInfo };
   take_pending_open: { args: Record<string, never>; result: string | null };
   take_rec_recovery_error: { args: Record<string, never>; result: string | null };

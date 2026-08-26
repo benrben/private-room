@@ -1,12 +1,15 @@
 import { useState } from "react";
 import { formatSize } from "../api";
-import type { CheckpointMeta, RoomStorageUsage } from "../api";
+import type { CheckpointMeta, RoomStorageUsage, WorkspaceWatcherStatus } from "../api";
 import { formatWhen } from "../workspace/composer";
 
 interface Props {
   checkpoints: CheckpointMeta[];
   totalBytes: number;
   storageUsage: RoomStorageUsage | null;
+  watcherStatus: WorkspaceWatcherStatus | null;
+  rescanning: boolean;
+  rescanRoom: () => void;
   ckName: string;
   setCkName: (v: string) => void;
   creating: boolean;
@@ -44,6 +47,9 @@ export default function CheckpointsSection({
   checkpoints,
   totalBytes,
   storageUsage,
+  watcherStatus,
+  rescanning,
+  rescanRoom,
   ckName,
   setCkName,
   creating,
@@ -82,6 +88,17 @@ export default function CheckpointsSection({
               ? `Total managed disk use is ${formatSize(storageUsage.totalOnDiskBytes)}. Current files are normal files; chats, indexes, metadata and history stay private.`
               : `This legacy room uses ${formatSize(storageUsage.totalOnDiskBytes)} in one encrypted database file. Current files and history are included inside it.`}
           </p>
+          {watcherStatus && (
+            <div className="settings-form">
+              <span className={watcherStatus.state === "error" ? "gate-error" : "settings-hint"}>
+                File watcher: {watcherStatus.state}
+                {watcherStatus.lastError ? ` — ${watcherStatus.lastError}` : ""}
+              </span>
+              <button className="subtle" disabled={rescanning} onClick={rescanRoom}>
+                {rescanning ? "Rescanning…" : "Rescan room"}
+              </button>
+            </div>
+          )}
         </div>
       )}
 

@@ -67,7 +67,7 @@ Legend:
 - [x] Add unique hash-only rename matching when filesystem identity changes.
 - [ ] Connect stale rows to extraction, chunks, FTS and embeddings.
 - [ ] Discard extraction results when the source hash changed.
-- [ ] Add watcher health and “Rescan room” UI.
+- [x] Add watcher health and “Rescan room” UI.
 - [ ] Reconcile after every native harness run and watcher error in the live orchestrator.
 
 ## Phase E: room lifecycle and UI

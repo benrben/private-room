@@ -1588,6 +1588,8 @@ const EXPECTED_CHANNELS = [
   "close_room",
   "room_info",
   "room_storage_usage",
+  "workspace_watcher_status",
+  "rescan_workspace_room",
   "rename_room",
   "write_recovery_key",
   "has_recovery_key",

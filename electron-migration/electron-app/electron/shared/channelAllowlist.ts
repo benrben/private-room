@@ -248,6 +248,7 @@ const ALL_COMMANDS_TYPED: { [K in keyof Commands]: true } = {
   resolve_agent_ui: true,
   resolve_edit_approval: true,
   resolve_mcp_call: true,
+  rescan_workspace_room: true,
   resolve_script_run: true,
   restore_file: true,
   restore_file_version: true,
@@ -353,6 +354,7 @@ const ALL_COMMANDS_TYPED: { [K in keyof Commands]: true } = {
   web_search_test: true,
   workflow_templates: true,
   write_recovery_key: true,
+  workspace_watcher_status: true,
 };
 
 /**

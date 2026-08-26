@@ -269,7 +269,14 @@ export interface Room {
   workspace?: WorkspaceService;
   workspaceLease?: WorkspaceLease;
   workspaceWatcher?: WorkspaceWatcher;
+  workspaceWatcherHealth?: WorkspaceWatcherHealth;
   workspaceRuntimeClosed?: boolean;
+}
+
+export interface WorkspaceWatcherHealth {
+  state: "starting" | "healthy" | "error";
+  lastReconciledAt: string | null;
+  lastError: string | null;
 }
 
 /** The user's answer to a per-call MCP approval prompt. Ported from
@@ -810,13 +817,37 @@ function startWorkspaceRuntime(state: RoomManagerState, room: Room): void {
   const workspace = room.workspace;
   const rootPath = room.descriptor?.rootPath;
   if (workspace === undefined || rootPath === null || rootPath === undefined) return;
+  room.workspaceWatcherHealth = { state: "starting", lastReconciledAt: null, lastError: null };
   workspace.recoverIncompleteOperations();
   const reconcileIfCurrent = async (): Promise<void> => {
     if (state.room !== room) return;
-    await workspace.reconcile();
+    try {
+      await workspace.reconcile();
+      room.workspaceWatcherHealth = {
+        state: "healthy",
+        lastReconciledAt: new Date().toISOString(),
+        lastError: null,
+      };
+    } catch (error) {
+      room.workspaceWatcherHealth = {
+        state: "error",
+        lastReconciledAt: room.workspaceWatcherHealth?.lastReconciledAt ?? null,
+        lastError: error instanceof Error ? error.message : String(error),
+      };
+      throw error;
+    }
   };
   const watcher = new WorkspaceWatcher(rootPath, {
-    onChange: () => { void reconcileIfCurrent().catch(() => undefined); },
+    onChange: (change) => {
+      if (change.kind === "error") {
+        room.workspaceWatcherHealth = {
+          state: "error",
+          lastReconciledAt: room.workspaceWatcherHealth?.lastReconciledAt ?? null,
+          lastError: change.error ?? "The workspace watcher reported an error.",
+        };
+      }
+      void reconcileIfCurrent().catch(() => undefined);
+    },
     reconcile: reconcileIfCurrent,
   });
   room.workspaceWatcher = watcher;
@@ -825,6 +856,33 @@ function startWorkspaceRuntime(state: RoomManagerState, room: Room): void {
     .catch((error) => {
       console.error(`workspace watcher could not start: ${error instanceof Error ? error.message : String(error)}`);
     });
+}
+
+export function workspaceWatcherStatus(state: RoomManagerState): WorkspaceWatcherHealth | null {
+  const room = state.room;
+  if (room?.workspace === undefined) return null;
+  return room.workspaceWatcherHealth ?? { state: "starting", lastReconciledAt: null, lastError: null };
+}
+
+export async function rescanWorkspaceRoom(state: RoomManagerState): Promise<WorkspaceWatcherHealth> {
+  const room = state.room;
+  if (room?.workspace === undefined) throw new Error("A workspace room is not open.");
+  try {
+    await room.workspace.reconcile();
+    room.workspaceWatcherHealth = {
+      state: "healthy",
+      lastReconciledAt: new Date().toISOString(),
+      lastError: null,
+    };
+  } catch (error) {
+    room.workspaceWatcherHealth = {
+      state: "error",
+      lastReconciledAt: room.workspaceWatcherHealth?.lastReconciledAt ?? null,
+      lastError: error instanceof Error ? error.message : String(error),
+    };
+    throw error;
+  }
+  return room.workspaceWatcherHealth;
 }
 
 /** The background spawns `create_room` AND `open_room_impl` both start at

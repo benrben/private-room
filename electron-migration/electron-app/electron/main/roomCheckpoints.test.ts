@@ -87,6 +87,8 @@ import {
   createRoomManagerState,
   spawnRoomServerIfEnabledNotImplemented,
   teardownOpenRoom,
+  rescanWorkspaceRoom,
+  workspaceWatcherStatus,
   type RoomManagerDeps,
   type RoomManagerState,
 } from "./roomManager.js";
@@ -187,6 +189,10 @@ describe("workspace-folder checkpoints", () => {
     createRoom(state, deps, roomPath, PASSWORD, "Workspace Room", "workspace-folder");
     try {
       const room = state.room!;
+      expect(workspaceWatcherStatus(state)?.state).toMatch(/starting|healthy/);
+      const rescanned = await rescanWorkspaceRoom(state);
+      expect(rescanned.state).toBe("healthy");
+      expect(rescanned.lastReconciledAt).not.toBeNull();
       const sourcePath = path.join(dir, "source.txt");
       writeFileSync(sourcePath, "checkpoint content", "utf8");
       const imported = await room.workspace!.importFile(sourcePath, "notes.txt");

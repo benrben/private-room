@@ -43,6 +43,7 @@ import {
   openRoom,
   openRoomWithRecovery,
   renameRoom,
+  rescanWorkspaceRoom,
   roomInfo,
   takePendingOpen,
   takeRecRecoveryError,
@@ -51,6 +52,7 @@ import {
   touchIdHas,
   touchIdOpen,
   writeRecoveryKey,
+  workspaceWatcherStatus,
   type RoomManagerDeps,
   type RoomManagerState,
 } from "./roomManager.js";
@@ -141,6 +143,8 @@ export function registerRoomManagerIpc(
     if (state.room === null) throw new Error("No room is open.");
     return roomStorageUsage(state.room);
   });
+  handle("workspace_watcher_status", () => workspaceWatcherStatus(state));
+  handle("rescan_workspace_room", () => rescanWorkspaceRoom(state));
   handle("rename_room", (args: { name: string }): RoomInfo => renameRoom(state, deps, args.name));
   handle("write_recovery_key", (): Promise<string> => writeRecoveryKey(state));
   handle("has_recovery_key", (args: { path: string }): boolean => hasRecoveryKey(args.path));

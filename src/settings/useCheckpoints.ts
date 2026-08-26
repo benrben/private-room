@@ -1,5 +1,10 @@
 import { useCallback, useEffect, useState } from "react";
-import { api, CheckpointMeta, type RoomStorageUsage } from "../api";
+import {
+  api,
+  CheckpointMeta,
+  type RoomStorageUsage,
+  type WorkspaceWatcherStatus,
+} from "../api";
 
 /** Idea 9: whole-room checkpoints — create named copies of the room, delete
  * them, and roll the room back to one. Mirrors the `usePrivacy` shape (the
@@ -10,6 +15,8 @@ export function useCheckpoints() {
   const [checkpoints, setCheckpoints] = useState<CheckpointMeta[]>([]);
   const [totalBytes, setTotalBytes] = useState(0);
   const [storageUsage, setStorageUsage] = useState<RoomStorageUsage | null>(null);
+  const [watcherStatus, setWatcherStatus] = useState<WorkspaceWatcherStatus | null>(null);
+  const [rescanning, setRescanning] = useState(false);
   const [ckName, setCkName] = useState("");
   const [creating, setCreating] = useState(false);
   const [ckError, setCkError] = useState("");
@@ -21,13 +28,15 @@ export function useCheckpoints() {
 
   const refresh = useCallback(async () => {
     try {
-      const [list, usage] = await Promise.all([
+      const [list, usage, watcher] = await Promise.all([
         api.listRoomCheckpoints(),
         api.roomStorageUsage(),
+        api.workspaceWatcherStatus(),
       ]);
       setCheckpoints(list.entries);
       setTotalBytes(list.totalBytes);
       setStorageUsage(usage);
+      setWatcherStatus(watcher);
     } catch {
       /* room may be locked/closed — leave the last list */
     }
@@ -78,10 +87,28 @@ export function useCheckpoints() {
     }
   }
 
+  async function rescanRoom() {
+    setCkError("");
+    setRescanning(true);
+    try {
+      setWatcherStatus(await api.rescanWorkspaceRoom());
+      setStorageUsage(await api.roomStorageUsage());
+      setCkNotice("Room files were rescanned.");
+      window.setTimeout(() => setCkNotice(""), 3000);
+    } catch (e) {
+      setCkError(String(e));
+      try { setWatcherStatus(await api.workspaceWatcherStatus()); } catch { /* room closed */ }
+    } finally {
+      setRescanning(false);
+    }
+  }
+
   return {
     checkpoints,
     totalBytes,
     storageUsage,
+    watcherStatus,
+    rescanning,
     ckName,
     setCkName,
     creating,
@@ -93,6 +120,7 @@ export function useCheckpoints() {
     createCheckpoint,
     deleteCheckpoint,
     rollback,
+    rescanRoom,
     refresh,
   };
 }
