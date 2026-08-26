@@ -4,6 +4,9 @@ import { api, type HarnessCapabilities } from "../api";
 const PROVIDER_LABELS: Record<string, string> = {
   codex: "Codex app-server",
   claude: "Claude Agent SDK",
+  "ollama-local": "Ollama local Deep Harness",
+  "ollama-cloud": "Ollama cloud Deep Harness",
+  openrouter: "OpenRouter Deep Harness",
 };
 
 /** Live capability report from the same sandbox probe that gates native mode. */
@@ -27,9 +30,9 @@ export default function HarnessDiagnosticsSection() {
     <section id="set-agent-harness">
       <h3>Workspace agent diagnostics</h3>
       <p className="settings-hint">
-        Codex and Claude can work as native file agents only after their runtime
-        and the macOS workspace sandbox pass a live test. A failed test keeps
-        direct mode off.
+        Codex and Claude require their native runtime and the macOS workspace
+        sandbox to pass a live test. Ollama and OpenRouter use Arcelle's
+        controlled Deep Harness backend and never receive database keys.
       </p>
       {report && (
         <>

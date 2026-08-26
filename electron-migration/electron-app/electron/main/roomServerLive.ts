@@ -210,13 +210,21 @@ export function roomServerDispatcherFactory(
   state: RoomManagerState,
   emit: EventSender,
   services?: LiveAppServices,
-): (webEnabled: boolean, scope: ToolScope, lanes: WebLanes) => ToolDispatcher {
+): (
+  webEnabled: boolean,
+  scope: ToolScope,
+  lanes: WebLanes,
+  runOptions?: {
+    workspace?: RoomToolDispatcherOptions["workspace"];
+    privacyBypass?: boolean;
+  },
+) => ToolDispatcher {
   const readLiveLanes = (): WebLanes =>
     openRoomWebLanes((): { db: Database.Database } | null =>
       state.room === null ? null : { db: state.room.conn }
     );
 
-  return (webEnabled, scope, lanes): ToolDispatcher => {
+  return (webEnabled, scope, lanes, runOptions = {}): ToolDispatcher => {
     const routes = services === undefined ? [] : liveMcpRoutes(state, services.mcp.manager);
     const base: RoomToolDispatcherOptions = {
       webEnabled,
@@ -225,13 +233,17 @@ export function roomServerDispatcherFactory(
       advisor: null,
       runCancel: null,
       sharedEffects: null,
-      privacyBypass: false,
+      privacyBypass: runOptions.privacyBypass ?? false,
       activePolicy: realActivePolicy,
       webThrottle: createWebThrottle(),
       execDeps: liveExecToolDeps(state, emit, services === undefined ? {} : { services }),
       // The persistent bridge is read-only. A write-enabled per-run bridge is
       // created only after HarnessOrchestrator completes rollback baselines.
-      workspace: state.room?.workspace === undefined ? null : createWorkspaceMcpBridge(state, false),
+      workspace: runOptions.workspace !== undefined
+        ? runOptions.workspace
+        : state.room?.workspace === undefined
+          ? null
+          : createWorkspaceMcpBridge(state, false),
     };
     return withCatalogTelemetry(
       new RoomToolDispatcher(liveLanesDispatcherOptions(base, readLiveLanes)),

@@ -1018,7 +1018,7 @@ export interface Commands {
   };
   harness_start: {
     args: {
-      provider: "codex" | "claude";
+      provider: "codex" | "claude" | "ollama-local" | "ollama-cloud" | "openrouter";
       model: string;
       privacyMode: PrivacyMode;
       writeEnabled: boolean;

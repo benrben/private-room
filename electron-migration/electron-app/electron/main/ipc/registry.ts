@@ -782,7 +782,7 @@ export function registerAllIpc(opts: RegisterAllIpcOptions): RegisterAllIpcResul
     deps,
     emit,
   );
-  registerHarnessSurfaceIpc(recordingIpcMain, state, deps, userDataDir, emit);
+  registerHarnessSurfaceIpc(recordingIpcMain, state, deps, userDataDir, emit, liveServices);
   deps.scheduleAutoIndex = createLiveAutoIndex(state, deps, emit);
 
   // ---- standalone channels with no room dependency ----

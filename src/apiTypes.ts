@@ -17,7 +17,12 @@ export interface RoomInfo {
 
 // ---- Unified provider-neutral agent harness -----------------------------
 
-export type HarnessProvider = "codex" | "claude";
+export type HarnessProvider =
+  | "codex"
+  | "claude"
+  | "ollama-local"
+  | "ollama-cloud"
+  | "openrouter";
 export type HarnessName =
   | "codex-app-server"
   | "claude-agent-sdk"

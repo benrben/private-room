@@ -4,6 +4,8 @@ import path from "node:path";
 import type { EventSender } from "../turn.js";
 import { activePolicy, type PolicyState } from "../privacy.js";
 import type { RoomManagerState } from "../roomManager.js";
+import type { LiveAppServices } from "../liveAppServices.js";
+import { runsOnThisMac } from "../capabilities.js";
 import {
   workspaceHarnessCapabilities,
   workspaceHarnessFlag,
@@ -13,6 +15,7 @@ import { ClaudeAgentSdkRuntime } from "./claudeAgentSdk.js";
 import { CloudRedactedMirror } from "./cloudMirror.js";
 import { CodexAppServerRuntime } from "./codexAppServer.js";
 import { RestrictedLegacyCliRuntime, RuntimeWithFallback } from "./legacyCli.js";
+import { DeepAgentRuntime } from "./deepAgentRuntime.js";
 import { HarnessOrchestrator, type HarnessFinalStatus } from "./orchestrator.js";
 import { RunProtection, type RollbackResult } from "./runProtection.js";
 import { nativeWorkspaceSandboxSupported, verifyNativeHarnessExecutable } from "./seatbelt.js";
@@ -23,8 +26,10 @@ import type {
   PrivacyMode,
 } from "./types.js";
 
+export type HarnessProvider = "codex" | "claude" | "ollama-local" | "ollama-cloud" | "openrouter";
+
 export interface HarnessStartRequest {
-  provider: "codex" | "claude";
+  provider: HarnessProvider;
   model: string;
   privacyMode: PrivacyMode;
   writeEnabled: boolean;
@@ -50,7 +55,8 @@ interface PendingMirrorApproval {
 }
 
 export interface HarnessControllerOptions {
-  runtimes?: Partial<Record<"codex" | "claude", HarnessRuntime>>;
+  runtimes?: Partial<Record<HarnessProvider, HarnessRuntime>>;
+  services?: LiveAppServices;
   policy?: () => PolicyState | null;
   flag?: (name: WorkspaceHarnessFlag) => boolean;
   /**
@@ -69,7 +75,7 @@ export interface HarnessControllerOptions {
 
 /** Trusted bridge between room state, provider runtimes and renderer events. */
 export class HarnessController {
-  private readonly runtimes: Record<"codex" | "claude", HarnessRuntime>;
+  private readonly runtimes: Record<HarnessProvider, HarnessRuntime>;
   private readonly policy: () => PolicyState | null;
   private readonly flag: (name: WorkspaceHarnessFlag) => boolean;
   private readonly verifyExposure: NonNullable<HarnessControllerOptions["verifyExposure"]>;
@@ -97,6 +103,9 @@ export class HarnessController {
         new ClaudeAgentSdkRuntime(),
         new RestrictedLegacyCliRuntime("claude", state),
       ),
+      "ollama-local": options.runtimes?.["ollama-local"] ?? new DeepAgentRuntime(state, emit, options.services),
+      "ollama-cloud": options.runtimes?.["ollama-cloud"] ?? new DeepAgentRuntime(state, emit, options.services),
+      openrouter: options.runtimes?.openrouter ?? new DeepAgentRuntime(state, emit, options.services),
     };
     this.policy = options.policy ?? activePolicy;
     this.flag = options.flag ?? workspaceHarnessFlag;
@@ -162,7 +171,6 @@ export class HarnessController {
         && room?.workspace !== undefined
         && room.descriptor?.kind === "workspace-folder"
         && room.descriptor.rootPath !== null
-        && room.readOnly !== true
       ) {
         const probePath = path.join(this.runtimeRoot(), room.descriptor.roomId, `capability-${randomUUID()}`);
         await mkdir(probePath, { recursive: true, mode: 0o700 });
@@ -175,9 +183,20 @@ export class HarnessController {
       else if (!this.isolationProven) reason = "Outside-workspace process isolation has not passed its security test.";
       else if (!installed) reason = `The ${name} agent runtime is not installed.`;
       else if (room?.descriptor?.kind !== "workspace-folder") reason = "Open a workspace room to run the sandbox capability test.";
-      else if (room.readOnly === true) reason = "This workspace is read-only because another Arcelle process owns the writer lease.";
       else if (!sandboxReady) reason = `The ${name} runtime failed its sandbox capability test.`;
       return { enabled: sandboxReady, installed, reason };
+    };
+    const deepProvider = async (name: "ollama-local" | "ollama-cloud" | "openrouter") => {
+      const installed = flags.deep_agent_harness ? await this.runtimes[name].available() : false;
+      const room = this.state.room;
+      let reason: string | null = null;
+      if (!flags.unified_harness) reason = "The unified harness feature is disabled.";
+      else if (!flags.deep_agent_harness) reason = "The Arcelle Deep Harness feature is disabled.";
+      else if (!installed) reason = "The built-in Deep Harness runtime is unavailable.";
+      else if (room?.descriptor?.kind !== "workspace-folder" || room.workspace === undefined) {
+        reason = "Open a workspace room to use the Deep Harness.";
+      }
+      return { enabled: reason === null, installed, reason };
     };
     return {
       flags,
@@ -186,19 +205,39 @@ export class HarnessController {
       providers: {
         codex: await provider("codex", "codex_app_server"),
         claude: await provider("claude", "claude_agent_sdk"),
+        "ollama-local": await deepProvider("ollama-local"),
+        "ollama-cloud": await deepProvider("ollama-cloud"),
+        openrouter: await deepProvider("openrouter"),
       },
     };
   }
 
   async start(request: HarnessStartRequest): Promise<string> {
     if (!this.flag("unified_harness")) throw new Error("The unified harness feature is disabled.");
-    const providerFlag = request.provider === "codex" ? "codex_app_server" : "claude_agent_sdk";
+    const native = request.provider === "codex" || request.provider === "claude";
+    const providerFlag = request.provider === "codex"
+      ? "codex_app_server"
+      : request.provider === "claude"
+        ? "claude_agent_sdk"
+        : "deep_agent_harness";
     if (!this.flag(providerFlag)) throw new Error(`The ${request.provider} native harness feature is disabled.`);
-    if (!this.isolationProven) {
+    if (native && !this.isolationProven) {
       throw new Error("Native harness mode is disabled because outside-workspace isolation is not proven.");
     }
-    if (request.privacyMode === "local") {
+    if (native && request.privacyMode === "local") {
       throw new Error("Codex and Claude are cloud providers. Choose cloud-direct or cloud-redacted privacy mode.");
+    }
+    if (request.provider === "ollama-local" && request.privacyMode !== "local") {
+      throw new Error("Local Ollama uses local privacy mode.");
+    }
+    if (request.provider === "ollama-local" && !runsOnThisMac(request.model)) {
+      throw new Error("Choose a model that runs on this Mac for the local Ollama harness.");
+    }
+    if ((request.provider === "ollama-cloud" || request.provider === "openrouter") && request.privacyMode === "local") {
+      throw new Error("This cloud provider requires cloud-direct or cloud-redacted privacy mode.");
+    }
+    if (request.provider === "ollama-cloud" && runsOnThisMac(request.model)) {
+      throw new Error("Choose an Ollama cloud model for the Ollama cloud harness.");
     }
     const room = this.state.room;
     if (
@@ -208,7 +247,7 @@ export class HarnessController {
     ) {
       throw new Error("Open a workspace room before starting this harness.");
     }
-    if (room.readOnly === true) {
+    if (room.readOnly === true && request.writeEnabled) {
       throw new Error("This workspace is read-only because another Arcelle process owns the writer lease.");
     }
     const runId = randomUUID();
@@ -232,7 +271,12 @@ export class HarnessController {
     } else {
       await mkdir(runRuntimePath, { recursive: true, mode: 0o700 });
     }
-    if (!(await this.verifyExposure(workspacePath, request.provider, runRuntimePath, request.writeEnabled))) {
+    if (native && !(await this.verifyExposure(
+      workspacePath,
+      request.provider as "codex" | "claude",
+      runRuntimePath,
+      request.writeEnabled,
+    ))) {
       await this.removeRunRuntime(runId);
       throw new Error("The native harness exposure failed its sandbox self-test.");
     }

@@ -832,7 +832,11 @@ function HarnessRunner({ s, runs }: { s: WSState; runs: HarnessUiRun[] }) {
       const result = await api.harnessStart({
         provider,
         model: model.trim() || "default",
-        privacyMode: s.privacyOn ? "cloud-redacted" : "cloud-direct",
+        privacyMode: provider === "ollama-local"
+          ? "local"
+          : s.privacyOn
+            ? "cloud-redacted"
+            : "cloud-direct",
         writeEnabled,
         text,
       });
@@ -909,7 +913,9 @@ function HarnessRunner({ s, runs }: { s: WSState; runs: HarnessUiRun[] }) {
     <section className="harness-runner" aria-label="Workspace agents">
       <div className="activity-group-title">Workspace agent</div>
       <p className="activity-copy harness-disclosure">
-        {s.privacyOn
+        {provider === "ollama-local"
+          ? "Local Ollama works through Arcelle's controlled file backend. It receives no database keys or unrestricted system paths."
+          : s.privacyOn
           ? "Cloud Privacy is on. The agent works in a temporary redacted copy; protected values and original binary files stay on this Mac."
           : "Cloud Privacy is off. The cloud agent can receive the real room files. Normal workspace files are readable files on disk; the private .arcelle folder stays blocked."}
       </p>
@@ -920,6 +926,9 @@ function HarnessRunner({ s, runs }: { s: WSState; runs: HarnessUiRun[] }) {
             <select value={provider} onChange={(event) => setProvider(event.target.value as HarnessProvider)}>
               <option value="codex">Codex</option>
               <option value="claude">Claude</option>
+              <option value="ollama-local">Ollama local</option>
+              <option value="ollama-cloud">Ollama cloud</option>
+              <option value="openrouter">OpenRouter</option>
             </select>
           </label>
           <label>
@@ -956,7 +965,14 @@ function HarnessRunner({ s, runs }: { s: WSState; runs: HarnessUiRun[] }) {
         return (
           <article className="activity-row harness-run" key={run.runId}>
             <div className="activity-row-head">
-              <span className="activity-row-title">{run.provider === "claude" ? "Claude" : run.provider === "codex" ? "Codex" : "Workspace agent"}</span>
+              <span className="activity-row-title">{
+                run.provider === "claude" ? "Claude"
+                  : run.provider === "codex" ? "Codex"
+                    : run.provider === "ollama-local" ? "Ollama local"
+                      : run.provider === "ollama-cloud" ? "Ollama cloud"
+                        : run.provider === "openrouter" ? "OpenRouter"
+                          : "Workspace agent"
+              }</span>
               <StateTape
                 word={run.status === "completed" ? "Done" : run.status === "failed" ? "Failed" : run.status === "cancelled" ? "Stopped" : run.status === "waiting" ? "Waiting" : "Running"}
                 mark={run.status === "completed" ? "nb-sem-done" : run.status === "failed" ? "nb-sem-urgent" : run.status === "running" ? "nb-sem-linked" : "nb-sem-pending"}

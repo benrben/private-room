@@ -1,6 +1,7 @@
 import type { IpcMain, IpcMainInvokeEvent } from "electron";
 import type { ApprovalDecision, PrivacyMode } from "../shared/harnessTypes.js";
-import { HarnessController, type HarnessStartRequest } from "./harness/controller.js";
+import { HarnessController, type HarnessProvider, type HarnessStartRequest } from "./harness/controller.js";
+import type { LiveAppServices } from "./liveAppServices.js";
 import type { RoomManagerDeps, RoomManagerState } from "./roomManager.js";
 import type { EventSender } from "./turn.js";
 
@@ -13,13 +14,16 @@ function stringValue(value: unknown, label: string, allowEmpty = false): string 
 
 function startRequest(args: unknown): HarnessStartRequest {
   const row = (typeof args === "object" && args !== null ? args : {}) as Record<string, unknown>;
-  if (row.provider !== "codex" && row.provider !== "claude") throw new Error("provider must be codex or claude.");
+  const providers: HarnessProvider[] = ["codex", "claude", "ollama-local", "ollama-cloud", "openrouter"];
+  if (!providers.includes(row.provider as HarnessProvider)) {
+    throw new Error("provider must be codex, claude, ollama-local, ollama-cloud, or openrouter.");
+  }
   if (row.privacyMode !== "local" && row.privacyMode !== "cloud-direct" && row.privacyMode !== "cloud-redacted") {
     throw new Error("privacyMode is invalid.");
   }
   if (typeof row.writeEnabled !== "boolean") throw new Error("writeEnabled must be a boolean.");
   return {
-    provider: row.provider,
+    provider: row.provider as HarnessProvider,
     model: stringValue(row.model, "model"),
     privacyMode: row.privacyMode satisfies PrivacyMode,
     writeEnabled: row.writeEnabled,
@@ -35,8 +39,9 @@ export function registerHarnessSurfaceIpc(
   deps: RoomManagerDeps,
   userDataDir: string,
   emit: EventSender,
+  services?: LiveAppServices,
 ): HarnessController {
-  const controller = new HarnessController(state, userDataDir, emit);
+  const controller = new HarnessController(state, userDataDir, emit, { services });
   const handle = (channel: string, fn: (args: unknown) => unknown): void => {
     ipcMain.handle(channel, (_event: IpcMainInvokeEvent, args: unknown) => fn(args));
   };
