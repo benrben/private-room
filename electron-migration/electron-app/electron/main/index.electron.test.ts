@@ -308,15 +308,12 @@ describe("real Electron boot (index.ts, compiled + launched for real)", () => {
     expect(marker).toBeDefined();
     expect(marker?.event).toBe("arcelle_main_ready");
     expect(marker?.completenessOk).toBe(true);
-    // 296 extracted from api.ts + the 7 this migration added for the surfaces
-    // Tauri answered with plugins (see `channelAllowlist.test.ts`).
-    expect(marker?.totalCommandCount).toBe(306);
-    // 167 real Commands keys wired by the registry's room-scoped modules, + 6
-    // for `dialogTools.ts`/`shellTools.ts`, + the 5 the registry registers
-    // itself (`run_command`, `set_unsaved_edits`, `quit_guard_rearm`,
-    // `quit_guard_confirm`, `menu_sync` — see its "THE HOST BRIDGE" doc), + the
-    // 2 documented non-Commands extras (restore_memory, dict-stop-timeout).
-    expect(marker?.registeredChannelCount).toBe(308);
+    // This count is pinned independently in `channelAllowlist.test.ts`, where
+    // the typed object literal proves it is exactly every `Commands` key.
+    expect(marker?.totalCommandCount).toBe(321);
+    // Every Commands key plus the two documented non-Commands compatibility
+    // channels (`restore_memory` and `dict-stop-timeout`).
+    expect(marker?.registeredChannelCount).toBe(323);
   });
 
   it("the documented stdout ready-marker line was actually printed by the real process", () => {
