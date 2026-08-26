@@ -122,6 +122,12 @@ import type {
   SketchDrawn,
   ViewMenuState,
   OrganizedChange,
+  HarnessApprovalDecision,
+  HarnessCapabilities,
+  HarnessEvent,
+  HarnessPrivacyMode,
+  HarnessProvider,
+  HarnessRollbackResult,
 } from "./apiTypes";
 
 export interface RoomStorageUsage {
@@ -233,6 +239,30 @@ export const api = {
   rescanWorkspaceRoom: () => invoke<WorkspaceWatcherStatus>("rescan_workspace_room"),
   setWorkspaceWatcherPolling: (enabled: boolean) =>
     invoke<WorkspaceWatcherStatus>("set_workspace_watcher_polling", { enabled }),
+  harnessCapabilities: () =>
+    invoke<HarnessCapabilities>("harness_capabilities", {}),
+  harnessStart: (request: {
+    provider: HarnessProvider;
+    model: string;
+    privacyMode: HarnessPrivacyMode;
+    writeEnabled: boolean;
+    text: string;
+    threadId?: string;
+    systemPrompt?: string;
+  }) => invoke<{ runId: string }>("harness_start", request),
+  harnessApprove: (
+    runId: string,
+    requestId: string,
+    decision: HarnessApprovalDecision,
+  ) => invoke<void>("harness_approve", { runId, requestId, decision }),
+  harnessCancel: (runId: string) =>
+    invoke<void>("harness_cancel", { runId }),
+  harnessCloudWriteback: (runId: string, approved: boolean) =>
+    invoke<void>("harness_cloud_writeback", { runId, approved }),
+  harnessRollback: (runId: string) =>
+    invoke<HarnessRollbackResult>("harness_rollback", { runId }),
+  harnessRestoreBaselineCopies: (runId: string, relativePaths: string[]) =>
+    invoke<string[]>("harness_restore_baseline_copies", { runId, relativePaths }),
   /** Rename the open room. The name lives in the room's own encrypted `meta`
    *  table, not in the file path — renaming the `.roomai` in Finder changes
    *  nothing — so this command is the only way to change it. It writes both
@@ -1510,6 +1540,8 @@ export const api = {
     cb: (req: AgentUiRequest) => void,
   ): Promise<UnlistenFn> =>
     listen<AgentUiRequest>("agent-ui-request", (e) => cb(e.payload)),
+  onHarnessEvent: (cb: (event: HarnessEvent) => void): Promise<UnlistenFn> =>
+    listen<HarnessEvent>("harness-event", (e) => cb(e.payload)),
   resolveAgentUi: (id: string, payload: unknown) =>
     invoke<void>("resolve_agent_ui", { id, payload }),
 

@@ -11,6 +11,7 @@ import { WSActions } from "./actions";
 import { ownerOf as ownsEvent } from "./runIdentity";
 import { applyRecState } from "./recSession";
 import { startRecordingTransport } from "./recordingTransport";
+import { applyHarnessEvent } from "./harnessUi";
 
 /** How many of the assistant's organization changes Activity keeps. A record of
  * this session, not an archive — the transcript is where every one of them is
@@ -429,6 +430,16 @@ export function useWorkspaceEffects(
       }));
       api.resolveAgentUi(req.id, payload).catch(() => {});
     });
+    const unlistenHarness = api.onHarnessEvent((event) => {
+      s.setHarnessRuns((runs) => applyHarnessEvent(runs, event));
+      if (event.type === "approval_requested") s.setAiTab("activity");
+      if (event.type === "file_changed") {
+        api.listFiles().then(s.setFiles).catch(() => {});
+      }
+      if (event.type === "run_failed") {
+        s.pushToast("error", `Agent run failed: ${event.error}`);
+      }
+    });
     a.refreshWebAccess();
     a.refreshAutolock();
     a.refreshPrivacy();
@@ -758,6 +769,7 @@ export function useWorkspaceEffects(
       unlistenMcpApprove.then((fn) => fn());
       unlistenEditApprove.then((fn) => fn());
       unlistenAgentUi.then((fn) => fn());
+      unlistenHarness.then((fn) => fn());
       unlistenRecState.then((fn) => fn());
       unlistenRecSave.then((fn) => fn());
       unlistenStt.then((fn) => fn());

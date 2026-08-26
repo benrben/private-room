@@ -6,7 +6,14 @@ import {
   type CSSProperties,
 } from "react";
 import { jobMeter } from "./jobProgress";
-import { RoomInfo } from "../api";
+import {
+  api,
+  RoomInfo,
+  splitExternalModel,
+  type HarnessApprovalDecision,
+  type HarnessCapabilities,
+  type HarnessProvider,
+} from "../api";
 import {
   ActivityIcon,
   ChatBubbleIcon,
@@ -43,6 +50,11 @@ import {
   pendingApprovalCount,
   runningJobCount,
 } from "../shell/activity";
+import {
+  registerHarnessRun,
+  resolveHarnessApproval,
+  type HarnessUiRun,
+} from "./harnessUi";
 
 /** Not a scope. The last option in the scope select opens the sources list
  * rather than changing what the turn reads — see the strip below for why it
@@ -499,6 +511,9 @@ function ActivityPanel({ s, a }: { s: WSState; a: WSActions }) {
   // jobs and are not grouped or counted as any. They have no duration, no
   // progress and no run to resume.
   const organized = s.organized.slice(0, HISTORY_LIMIT);
+  const harnessRuns = Object.values(s.harnessRuns ?? {}).sort((left, right) =>
+    right.startedAt.localeCompare(left.startedAt),
+  );
   // A recording is "being written out" while EITHER signal is up — the two
   // arrive a beat apart, and the counters use the same rule.
   const savingRec = s.recSave != null || s.recLive?.status === "saving";
@@ -508,6 +523,7 @@ function ActivityPanel({ s, a }: { s: WSState; a: WSActions }) {
     parked.length === 0 &&
     history.length === 0 &&
     organized.length === 0 &&
+    harnessRuns.length === 0 &&
     !s.importProgress &&
     // The privacy scanner has no job row, so nothing above can see it — and
     // "The room is idle" is a flat claim this pane would otherwise make while
@@ -522,6 +538,8 @@ function ActivityPanel({ s, a }: { s: WSState; a: WSActions }) {
         Background work, imports, saves, and consent requests stay in one
         predictable place.
       </p>
+
+      <HarnessRunner s={s} runs={harnessRuns} />
 
       {pendingApprovals > 0 && (
         <>
@@ -779,6 +797,207 @@ function ActivityPanel({ s, a }: { s: WSState; a: WSActions }) {
         </div>
       )}
     </div>
+  );
+}
+
+/** Native workspace-agent launcher and audit cards. The event listener lives
+ * at Workspace scope, so closing Activity does not lose a running agent. */
+function HarnessRunner({ s, runs }: { s: WSState; runs: HarnessUiRun[] }) {
+  const [capabilities, setCapabilities] = useState<HarnessCapabilities | null>(null);
+  const [capabilityError, setCapabilityError] = useState("");
+  const [provider, setProvider] = useState<HarnessProvider>("codex");
+  const [, selectedModel] = splitExternalModel(s.model ?? "");
+  const [model, setModel] = useState(selectedModel ?? "default");
+  const [prompt, setPrompt] = useState("");
+  const [writeEnabled, setWriteEnabled] = useState(false);
+  const [starting, setStarting] = useState(false);
+  const [rollbackBusy, setRollbackBusy] = useState<string | null>(null);
+  const [restoreConflicts, setRestoreConflicts] = useState<Record<string, string[]>>({});
+
+  const refreshCapabilities = () => {
+    setCapabilityError("");
+    void api.harnessCapabilities().then(setCapabilities).catch((error) => {
+      setCapabilities(null);
+      setCapabilityError(String(error));
+    });
+  };
+  useEffect(refreshCapabilities, []);
+
+  const available = capabilities?.providers[provider];
+  const start = async () => {
+    const text = prompt.trim();
+    if (!text || starting) return;
+    setStarting(true);
+    try {
+      const result = await api.harnessStart({
+        provider,
+        model: model.trim() || "default",
+        privacyMode: s.privacyOn ? "cloud-redacted" : "cloud-direct",
+        writeEnabled,
+        text,
+      });
+      s.setHarnessRuns((current) => registerHarnessRun(current, result.runId, provider));
+      setPrompt("");
+    } catch (error) {
+      s.pushToast("error", `Couldn't start the workspace agent: ${String(error)}`);
+      refreshCapabilities();
+    } finally {
+      setStarting(false);
+    }
+  };
+
+  const approve = async (
+    run: HarnessUiRun,
+    requestId: string,
+    decision: HarnessApprovalDecision,
+  ) => {
+    try {
+      if (requestId === `cloud-writeback-${run.runId}`) {
+        await api.harnessCloudWriteback(
+          run.runId,
+          decision === "allow-once" || decision === "allow-run",
+        );
+      } else {
+        await api.harnessApprove(run.runId, requestId, decision);
+      }
+      s.setHarnessRuns((current) =>
+        resolveHarnessApproval(current, run.runId, requestId),
+      );
+    } catch (error) {
+      s.pushToast("error", `Couldn't answer the agent request: ${String(error)}`);
+    }
+  };
+
+  const rollback = async (run: HarnessUiRun) => {
+    setRollbackBusy(run.runId);
+    try {
+      const result = await api.harnessRollback(run.runId);
+      setRestoreConflicts((all) => ({ ...all, [run.runId]: result.conflicts }));
+      const count = result.restored.length + result.removedCreated.length;
+      s.pushToast(
+        result.conflicts.length ? "info" : "success",
+        result.conflicts.length
+          ? `Restored ${count} changes. ${result.conflicts.length} newer file changes were kept.`
+          : `Restored ${count} agent file changes.`,
+      );
+      api.listFiles().then(s.setFiles).catch(() => {});
+    } catch (error) {
+      s.pushToast("error", `Couldn't roll back this run: ${String(error)}`);
+    } finally {
+      setRollbackBusy(null);
+    }
+  };
+
+  const restoreCopies = async (runId: string, paths: string[]) => {
+    setRollbackBusy(runId);
+    try {
+      const created = await api.harnessRestoreBaselineCopies(runId, paths);
+      setRestoreConflicts((all) => ({ ...all, [runId]: [] }));
+      s.pushToast(
+        "success",
+        `Restored ${created.length} baseline ${created.length === 1 ? "copy" : "copies"}.`,
+      );
+      api.listFiles().then(s.setFiles).catch(() => {});
+    } catch (error) {
+      s.pushToast("error", `Couldn't restore baseline copies: ${String(error)}`);
+    } finally {
+      setRollbackBusy(null);
+    }
+  };
+
+  return (
+    <section className="harness-runner" aria-label="Workspace agents">
+      <div className="activity-group-title">Workspace agent</div>
+      <p className="activity-copy harness-disclosure">
+        {s.privacyOn
+          ? "Cloud Privacy is on. The agent works in a temporary redacted copy; protected values and original binary files stay on this Mac."
+          : "Cloud Privacy is off. The cloud agent can receive the real room files. Normal workspace files are readable files on disk; the private .arcelle folder stays blocked."}
+      </p>
+      <div className="harness-compose">
+        <div className="harness-options">
+          <label>
+            Agent
+            <select value={provider} onChange={(event) => setProvider(event.target.value as HarnessProvider)}>
+              <option value="codex">Codex</option>
+              <option value="claude">Claude</option>
+            </select>
+          </label>
+          <label>
+            Model
+            <input value={model} onChange={(event) => setModel(event.target.value)} placeholder="default" />
+          </label>
+          <label className="settings-label harness-write-toggle">
+            <input type="checkbox" checked={writeEnabled} onChange={(event) => setWriteEnabled(event.target.checked)} />
+            Allow file changes
+          </label>
+        </div>
+        <textarea
+          value={prompt}
+          onChange={(event) => setPrompt(event.target.value)}
+          placeholder="Describe the work for the workspace agent…"
+          aria-label="Workspace agent task"
+          rows={3}
+        />
+        {capabilityError && <p className="gate-error" role="alert">{capabilityError}</p>}
+        {available && !available.enabled && (
+          <p className="activity-copy">Unavailable: {available.reason ?? "the runtime self-test did not pass."}</p>
+        )}
+        <div className="harness-actions">
+          <button className="primary" disabled={!prompt.trim() || starting || available?.enabled !== true} onClick={() => void start()}>
+            {starting ? "Starting…" : writeEnabled ? "Run with file access" : "Run read-only"}
+          </button>
+          <button className="subtle" onClick={refreshCapabilities}>Test agents again</button>
+        </div>
+      </div>
+
+      {runs.map((run) => {
+        const live = run.status === "starting" || run.status === "running" || run.status === "waiting";
+        const conflicts = restoreConflicts[run.runId] ?? [];
+        return (
+          <article className="activity-row harness-run" key={run.runId}>
+            <div className="activity-row-head">
+              <span className="activity-row-title">{run.provider === "claude" ? "Claude" : run.provider === "codex" ? "Codex" : "Workspace agent"}</span>
+              <StateTape
+                word={run.status === "completed" ? "Done" : run.status === "failed" ? "Failed" : run.status === "cancelled" ? "Stopped" : run.status === "waiting" ? "Waiting" : "Running"}
+                mark={run.status === "completed" ? "nb-sem-done" : run.status === "failed" ? "nb-sem-urgent" : run.status === "running" ? "nb-sem-linked" : "nb-sem-pending"}
+              />
+            </div>
+            {run.plan && <div className="activity-copy"><strong>Plan:</strong> {run.plan}</div>}
+            {run.currentTool && <div className="activity-copy">Using {run.currentTool}…</div>}
+            {run.text && <pre className="harness-output">{run.text}</pre>}
+            {run.error && <div className="gate-error" role="alert">{run.error}</div>}
+            {run.approvals.map((request) => (
+              <div className="harness-approval" data-agent-blocked="true" key={request.requestId}>
+                <strong>{request.tool} needs approval</strong>
+                <span>{request.detail}</span>
+                <div className="harness-actions">
+                  <button className="primary" onClick={() => void approve(run, request.requestId, "allow-once")}>Allow once</button>
+                  {request.tool !== "cloud_writeback" && <button className="subtle" onClick={() => void approve(run, request.requestId, "allow-run")}>Allow for run</button>}
+                  <button className="subtle danger" onClick={() => void approve(run, request.requestId, "deny")}>Deny</button>
+                </div>
+              </div>
+            ))}
+            {run.changes.length > 0 && (
+              <details className="harness-changes" open={run.status === "completed"}>
+                <summary>{run.changes.length} file {run.changes.length === 1 ? "change" : "changes"}</summary>
+                <ul>{run.changes.map((change) => <li key={change.relativePath}><code>{change.relativePath}</code> — {change.change}</li>)}</ul>
+              </details>
+            )}
+            {(run.inputTokens > 0 || run.outputTokens > 0) && <div className="activity-copy">{run.inputTokens.toLocaleString()} input · {run.outputTokens.toLocaleString()} output tokens{run.costUsd != null ? ` · $${run.costUsd.toFixed(4)}` : ""}</div>}
+            <div className="harness-actions">
+              {live && <button className="subtle danger" onClick={() => void api.harnessCancel(run.runId).catch((error) => s.pushToast("error", String(error)))}>Stop</button>}
+              {!live && run.changes.length > 0 && <button className="subtle" disabled={rollbackBusy === run.runId} onClick={() => void rollback(run)}>{rollbackBusy === run.runId ? "Restoring…" : "Roll back file changes"}</button>}
+            </div>
+            {conflicts.length > 0 && (
+              <div className="harness-conflicts" data-agent-blocked="true">
+                <p>These files changed again after the run, so Arcelle kept them: {conflicts.join(", ")}.</p>
+                <button className="subtle" disabled={rollbackBusy === run.runId} onClick={() => void restoreCopies(run.runId, conflicts)}>Restore baselines as copies</button>
+              </div>
+            )}
+          </article>
+        );
+      })}
+    </section>
   );
 }
 

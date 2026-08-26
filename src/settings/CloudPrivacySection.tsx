@@ -24,6 +24,7 @@ export default function CloudPrivacySection() {
   // about what the room is protecting, not a convenience.
   const [conceptsSaved, setConceptsSaved] = useState(false);
   const [conceptsErr, setConceptsErr] = useState<string | null>(null);
+  const [workspaceRoom, setWorkspaceRoom] = useState(false);
   const conceptsDirty = useRef(false);
   // Counts keystrokes so a save that lands AFTER the user has typed again
   // knows its text is no longer what the box holds, and leaves the flag up.
@@ -40,6 +41,7 @@ export default function CloudPrivacySection() {
   }, []);
 
   useEffect(() => {
+    api.roomStorageUsage().then((usage) => setWorkspaceRoom(usage.kind === "workspace")).catch(() => {});
     reload();
     let un: (() => void) | undefined;
     api.onPrivacyScan((p) => {
@@ -155,6 +157,14 @@ export default function CloudPrivacySection() {
         with neutral tags like “[Person A]” before anything leaves this Mac —
         and put back in the answer you read. Local models never need this.
       </p>
+      {workspaceRoom && (
+        <p className="set-note set-note--flag nb-sem-pending">
+          The room password encrypts Arcelle's private state: chats, memory,
+          search, agent history, and recovery versions. Current files in the
+          workspace folder are normal files and remain readable in Finder,
+          including while the room is locked.
+        </p>
+      )}
 
       <label className="settings-label">Hide private details from cloud AI</label>
       {/* `set-consequence` lifts the sentence beside the switch to --fs-lead:

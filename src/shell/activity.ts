@@ -8,12 +8,12 @@ import type { WSState } from "../workspace/state";
 
 export type ApprovalState = Pick<
   WSState,
-  "mcpApprovals" | "editApprovals" | "scriptApprovals" | "browseConsents"
+  "mcpApprovals" | "editApprovals" | "scriptApprovals" | "browseConsents" | "harnessRuns"
 >;
 
 export type WorkState = Pick<
   WSState,
-  "jobs" | "summaryStarting" | "recSave" | "recLive"
+  "jobs" | "summaryStarting" | "recSave" | "recLive" | "harnessRuns"
 >;
 
 /** Everything waiting on a yes/no from the user. */
@@ -22,7 +22,11 @@ export function pendingApprovalCount(s: ApprovalState): number {
     s.mcpApprovals.length +
     s.editApprovals.length +
     s.scriptApprovals.length +
-    s.browseConsents.length
+    s.browseConsents.length +
+    Object.values(s.harnessRuns ?? {}).reduce(
+      (total, run) => total + run.approvals.length,
+      0,
+    )
   );
 }
 
@@ -58,7 +62,10 @@ export function runningJobCount(s: WorkState): number {
   // reader derives from it.
   const jobs = groupActivity(s.jobs).active.length;
   const saving = s.recSave != null || s.recLive?.status === "saving";
-  return jobs + (summaryPending(s) ? 1 : 0) + (saving ? 1 : 0);
+  const harnesses = Object.values(s.harnessRuns ?? {}).filter(
+    (run) => run.status === "starting" || run.status === "running" || run.status === "waiting",
+  ).length;
+  return jobs + harnesses + (summaryPending(s) ? 1 : 0) + (saving ? 1 : 0);
 }
 
 /* ---------- Activity is two things, not one list (owner decision #12) ---------- */

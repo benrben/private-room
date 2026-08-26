@@ -19,6 +19,7 @@ import RoomServerSection from "./settings/RoomServerSection";
 import RoleSection from "./settings/RoleSection";
 import HelpersSection from "./settings/HelpersSection";
 import SupportMatrixSection from "./settings/SupportMatrixSection";
+import HarnessDiagnosticsSection from "./settings/HarnessDiagnosticsSection";
 import RecoverySection from "./settings/RecoverySection";
 import AboutSection from "./settings/AboutSection";
 import AppearanceSection from "./settings/AppearanceSection";
@@ -57,6 +58,7 @@ const SETTINGS_GROUPS: { key: string; label: string; sections: string[] }[] = [
       "set-role",
       "set-helpers",
       "set-support-matrix",
+      "set-agent-harness",
       "set-advisors",
     ],
   },
@@ -567,6 +569,7 @@ export default function Settings({
                 DownloadIcon={DownloadIcon}
               />
               <SupportMatrixSection />
+              <HarnessDiagnosticsSection />
               <AdvisorsSection
                 ai={ai}
                 advisorsOn={advisorsOn}

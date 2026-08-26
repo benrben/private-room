@@ -9,6 +9,55 @@ export interface RoomInfo {
    * not yet approved on this Mac — the UI must ask before anything runs
    * (SEC-1). null when there's nothing to approve. */
   pendingMcp: McpApproval | null;
+  /** Another Arcelle process owns this workspace's writer lease. */
+  readOnly?: boolean;
+}
+
+// ---- Unified provider-neutral agent harness -----------------------------
+
+export type HarnessProvider = "codex" | "claude";
+export type HarnessName =
+  | "codex-app-server"
+  | "claude-agent-sdk"
+  | "arcelle-deep"
+  | "legacy-cli";
+export type HarnessPrivacyMode = "local" | "cloud-direct" | "cloud-redacted";
+export type HarnessApprovalDecision =
+  | "allow-once"
+  | "allow-run"
+  | "deny"
+  | "cancel";
+
+/** Provider-neutral events emitted by the Electron harness controller. */
+export type HarnessEvent =
+  | { type: "run_started"; runId: string; harness: HarnessName }
+  | { type: "agent_started"; runId: string; agentId: string; label?: string }
+  | { type: "plan_updated"; runId: string; text: string }
+  | { type: "text_delta"; runId: string; text: string; agentId?: string }
+  | { type: "tool_requested"; runId: string; requestId: string; tool: string; input: unknown }
+  | { type: "approval_requested"; runId: string; requestId: string; tool: string; detail: string }
+  | { type: "tool_started"; runId: string; tool: string; toolId?: string }
+  | { type: "tool_completed"; runId: string; tool: string; toolId?: string; result?: unknown; error?: string }
+  | { type: "file_changed"; runId: string; relativePath: string; change: string }
+  | { type: "usage_updated"; runId: string; inputTokens?: number; outputTokens?: number; costUsd?: number }
+  | { type: "agent_completed"; runId: string; agentId: string }
+  | { type: "run_failed"; runId: string; error: string }
+  | { type: "run_completed"; runId: string; status: "completed" | "cancelled" };
+
+export interface HarnessCapabilities {
+  flags: Record<string, boolean>;
+  roomFormat: "workspace-folder" | "sealed-db" | null;
+  outsideWorkspaceIsolation: boolean;
+  providers: Record<
+    string,
+    { enabled: boolean; installed: boolean; reason: string | null }
+  >;
+}
+
+export interface HarnessRollbackResult {
+  restored: string[];
+  removedCreated: string[];
+  conflicts: string[];
 }
 
 /** An MCP config awaiting the user's approval before its servers start (SEC-1). */

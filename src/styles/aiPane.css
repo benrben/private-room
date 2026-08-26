@@ -572,6 +572,98 @@
   box-shadow: none;
 }
 
+/* Native workspace agents use the Activity journal's existing visual
+   language. The launcher is an outlined work area; run results remain normal
+   journal rows so they do not become a second, provider-specific UI. */
+.pane-ai .harness-runner > .activity-group-title:first-child {
+  margin-top: var(--sp-4);
+}
+.pane-ai .harness-disclosure {
+  padding: var(--sp-2);
+  border-left: 2px solid var(--sem-pending);
+  color: var(--text);
+}
+.pane-ai .harness-compose {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  margin-top: var(--sp-2);
+  padding: var(--sp-3);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+.pane-ai .harness-options,
+.pane-ai .harness-actions {
+  display: flex;
+  align-items: end;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+}
+.pane-ai .harness-options > label:not(.harness-write-toggle) {
+  display: flex;
+  flex: 1 1 110px;
+  min-width: 0;
+  flex-direction: column;
+  gap: 3px;
+  color: var(--muted);
+  font-size: var(--fs-micro);
+}
+.pane-ai .harness-options select,
+.pane-ai .harness-options input,
+.pane-ai .harness-compose textarea {
+  width: 100%;
+  min-width: 0;
+}
+.pane-ai .harness-write-toggle {
+  flex: 1 0 100%;
+  margin: 0;
+}
+.pane-ai .harness-run {
+  margin-top: var(--sp-2);
+}
+.pane-ai .harness-output {
+  max-height: 240px;
+  margin: var(--sp-2) 0 0;
+  padding: var(--sp-2);
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--text);
+  background: var(--hover);
+  border-radius: var(--radius-xs);
+  font: var(--fs-meta)/var(--lh-body) var(--mono);
+}
+.pane-ai .harness-approval,
+.pane-ai .harness-conflicts {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  margin-top: var(--sp-2);
+  padding: var(--sp-3);
+  border: 1px solid var(--sem-pending);
+  border-radius: var(--radius);
+}
+.pane-ai .harness-approval span,
+.pane-ai .harness-conflicts p {
+  margin: 0;
+  color: var(--text);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+}
+.pane-ai .harness-changes {
+  margin-top: var(--sp-2);
+  color: var(--text);
+  font-size: var(--fs-meta);
+}
+.pane-ai .harness-changes summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+.pane-ai .harness-changes ul {
+  margin: var(--sp-1) 0 0;
+  padding-left: var(--sp-5);
+}
+
 /* ----- nothing yet -----
    The one place on this tab the hand takes a whole paragraph: an empty state
    is a direction, and the direction is the notebook talking. */

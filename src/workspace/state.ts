@@ -48,6 +48,7 @@ import { AutocompleteState } from "./composer";
 import { type FileSort, loadFileSort, saveFileSort } from "./fileSort";
 import { OpenFile, Toast, WorkArea } from "./types";
 import { clearToastsAbout, stackToast, toastLifeMs } from "./toastStack";
+import type { HarnessUiRuns } from "./harnessUi";
 
 /** How many error messages the bug-report sheet may offer. Enough to cover the
  * run-up to a failure, few enough that the sheet stays readable — the user has
@@ -112,6 +113,9 @@ export function useWorkspaceState(_info: RoomInfo) {
   // have runs in flight at once with no way to cross-talk, and an answer the
   // user switched away from is still complete when they switch back.
   const [runs, setRuns] = useState<Runs>({});
+  // Native harness runs can continue while Activity is closed, so the room
+  // owns their audit records rather than the conditionally rendered panel.
+  const [harnessRuns, setHarnessRuns] = useState<HarnessUiRuns>({});
   // The conversation on screen, for the mount-once event listeners — they close
   // over the first render and cannot read `activeChatId` directly.
   const activeChatIdRef = useRef<string | null>(null);
@@ -683,6 +687,7 @@ export function useWorkspaceState(_info: RoomInfo) {
     activeAgent, agentSteps,
     agentReports,
     runs, beginRun, endRun, applyToRun, runIdOf,
+    harnessRuns, setHarnessRuns,
     undoByMsg, setUndoByMsg, editedRef,
     toasts, setToasts, dictState, setDictState, dictStateRef, dictOwner, setDictOwner,
     recorderRef, dictChunksRef, dictStreamRef, dictPartial, setDictPartial,
