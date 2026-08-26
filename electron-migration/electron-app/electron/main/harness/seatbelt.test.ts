@@ -135,7 +135,13 @@ describe("native workspace Seatbelt", () => {
   });
 
   it.each([
-    { provider: "codex" as const, executable: process.env.ARCELLE_CODEX_PATH ?? "codex", args: ["app-server", "--listen", "stdio://"] },
+    // `app-server` eagerly opens Codex's mutable global SQLite state and may
+    // correctly exit when this strict workspace sandbox denies that location
+    // (or another installed Codex process owns it). `exec-server` is Codex's
+    // long-running stdin service and exercises the same installed executable,
+    // Seatbelt wrapper, detached process group, and cancellation path without
+    // depending on unrelated provider-global state.
+    { provider: "codex" as const, executable: process.env.ARCELLE_CODEX_PATH ?? "codex", args: ["exec-server"] },
     { provider: "claude" as const, executable: process.env.ARCELLE_CLAUDE_PATH ?? "claude", args: ["-p", "--output-format", "json"] },
   ])("starts and cancels the installed $provider CLI inside the real sandbox", async ({ provider, executable, args }) => {
     if (!nativeWorkspaceSandboxSupported()) return;
@@ -152,10 +158,16 @@ describe("native workspace Seatbelt", () => {
       child.once("spawn", resolve);
       child.once("error", reject);
     });
+    // Subscribe before Stop. A small native process can acknowledge SIGTERM
+    // before the next JavaScript statement; attaching afterwards misses the
+    // one-shot exit event and turns successful cleanup into a timeout.
+    const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
     await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(child.exitCode).toBeNull();
+    expect(child.signalCode).toBeNull();
     expect(terminateNativeProcessTree(child, "SIGTERM", 250)).toBe(true);
     await Promise.race([
-      new Promise<void>((resolve) => child.once("exit", () => resolve())),
+      exited,
       new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error(`${provider} did not exit after cancellation.`)), 5_000)),
     ]);
     expect(child.exitCode !== null || child.signalCode !== null).toBe(true);
