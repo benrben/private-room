@@ -13,6 +13,7 @@ import {
 } from "../providers.js";
 import { runViaSidecar, type SidecarOutcome } from "../sidecar.js";
 import { AsyncEventQueue } from "./eventQueue.js";
+import { safeProviderFailure } from "./failureSafety.js";
 import { createDeepWorkspaceBridgeGrant } from "./deepWorkspaceBridge.js";
 import type {
   ApprovalDecision,
@@ -175,7 +176,7 @@ export class DeepAgentRuntime implements HarnessRuntime {
           { turn: owner, onEvent: sendOldEvent, signal: abort.signal },
         );
         if (outcome.kind === "failed") {
-          output.push({ type: "run_failed", runId: context.runId, error: outcome.error });
+          output.push({ type: "run_failed", runId: context.runId, error: safeProviderFailure(context.provider) });
         } else {
           output.push({
             type: "run_completed",
@@ -187,7 +188,7 @@ export class DeepAgentRuntime implements HarnessRuntime {
         output.push({
           type: "run_failed",
           runId: context.runId,
-          error: error instanceof Error ? error.message : String(error),
+          error: safeProviderFailure(context.provider, "startup"),
         });
       } finally {
         await bridge?.stopAndWait().catch(() => undefined);

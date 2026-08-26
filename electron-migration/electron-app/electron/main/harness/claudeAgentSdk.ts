@@ -11,6 +11,7 @@ import {
 } from "@anthropic-ai/claude-agent-sdk";
 import { AsyncEventQueue } from "./eventQueue.js";
 import { claudeAgentDefinitions } from "./agentManifest.js";
+import { safeProviderFailure } from "./failureSafety.js";
 import {
   spawnWithNativeWorkspaceSandbox,
   terminateNativeProcessTree,
@@ -313,7 +314,7 @@ export class ClaudeAgentSdkRuntime implements HarnessRuntime {
           }
         }
       } catch (error) {
-        events.push({ type: "run_failed", runId: context.runId, error: error instanceof Error ? error.message : String(error) });
+        events.push({ type: "run_failed", runId: context.runId, error: safeProviderFailure("claude") });
       } finally {
         for (const approval of pending.values()) approval.resolve("cancel");
         pending.clear();

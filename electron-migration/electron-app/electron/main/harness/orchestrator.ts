@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { AsyncEventQueue } from "./eventQueue.js";
+import { safeFinalizationFailure, safeProviderFailure } from "./failureSafety.js";
 import { RunProtection, type RollbackResult } from "./runProtection.js";
 import type {
   ApprovalDecision,
@@ -115,17 +116,22 @@ export class HarnessOrchestrator {
           if (lifecycleStatus !== undefined) final = lifecycleStatus;
         } catch (error) {
           final = "failed";
-          failure = `Run finalization failed: ${error instanceof Error ? error.message : String(error)}`;
+          failure = safeFinalizationFailure("write-back");
         }
         if (this.protection !== null) {
           try { await this.protection.finish(runId, final); }
           catch (error) {
             final = "failed";
-            failure = `Post-run reconciliation failed: ${error instanceof Error ? error.message : String(error)}`;
+            failure = safeFinalizationFailure("reconciliation");
           }
         }
         this.active.delete(runId);
-        if (final === "failed") output.push({ type: "run_failed", runId, error: failure });
+        if (final === "failed") {
+          const providerFailure = failure === "The agent harness ended without a completion event."
+            ? safeProviderFailure(input.provider)
+            : failure;
+          output.push({ type: "run_failed", runId, error: providerFailure });
+        }
         else output.push({ type: "run_completed", runId, status: final });
         output.end();
       }

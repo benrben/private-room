@@ -7,6 +7,7 @@ import readline from "node:readline";
 import { AsyncEventQueue } from "./eventQueue.js";
 import { codexAgentInstructions } from "./agentManifest.js";
 import { inspectCodexSchemaDirectory, type CodexSchemaCompatibility } from "./codexSchema.js";
+import { safeProviderFailure } from "./failureSafety.js";
 import {
   spawnWithNativeWorkspaceSandbox,
   terminateNativeProcessTree,
@@ -131,7 +132,6 @@ export class CodexAppServerRuntime implements HarnessRuntime {
     let threadId: string | null = null;
     let turnId: string | null = null;
     let terminal = false;
-    let stderr = "";
 
     const send = (message: RpcMessage): void => {
       if (child.stdin.destroyed) throw new Error("Codex app-server is closed.");
@@ -144,9 +144,9 @@ export class CodexAppServerRuntime implements HarnessRuntime {
     };
     const respond = (id: number | string, result: unknown): void => send({ id, result });
 
-    child.stderr.on("data", (chunk: Buffer) => {
-      stderr = `${stderr}${chunk.toString("utf8")}`.slice(-8_000);
-    });
+    // Drain stderr, but never retain it: provider diagnostics may echo room
+    // content, absolute paths, prompts, or credentials.
+    child.stderr.on("data", () => undefined);
 
     const lines = readline.createInterface({ input: child.stdout });
     lines.on("line", (line) => {
@@ -156,7 +156,7 @@ export class CodexAppServerRuntime implements HarnessRuntime {
         const pending = pendingRpc.get(message.id);
         if (pending === undefined) return;
         pendingRpc.delete(message.id);
-        if (message.error !== undefined) pending.reject(new Error(message.error.message ?? "Codex request failed."));
+        if (message.error !== undefined) pending.reject(new Error(safeProviderFailure("codex", "run")));
         else pending.resolve(message.result);
         return;
       }
@@ -212,7 +212,7 @@ export class CodexAppServerRuntime implements HarnessRuntime {
           runId: context.runId,
           tool: type,
           toolId: typeof item.id === "string" ? item.id : undefined,
-          error: item.status === "failed" ? nestedString(item, "error", "message") ?? "Tool failed." : undefined,
+          error: item.status === "failed" ? safeProviderFailure("codex", "tool") : undefined,
         });
         if (type === "collabToolCall" || type === "collabAgentToolCall") {
           const statuses = collabStatuses(item);
@@ -245,11 +245,11 @@ export class CodexAppServerRuntime implements HarnessRuntime {
         } else if (status === "interrupted") {
           events.push({ type: "run_completed", runId: context.runId, status: "cancelled" });
         } else {
-          events.push({ type: "run_failed", runId: context.runId, error: nestedString(turn, "error", "message") ?? "Codex turn failed." });
+          events.push({ type: "run_failed", runId: context.runId, error: safeProviderFailure("codex") });
         }
         child.stdin.end();
       } else if (message.method === "error") {
-        events.push({ type: "run_failed", runId: context.runId, error: nestedString(params, "error", "message") ?? "Codex app-server error." });
+        events.push({ type: "run_failed", runId: context.runId, error: safeProviderFailure("codex") });
       }
     });
 
@@ -260,7 +260,7 @@ export class CodexAppServerRuntime implements HarnessRuntime {
         events.push({
           type: "run_failed",
           runId: context.runId,
-          error: stderr.trim() || `Codex app-server exited with code ${String(code)}.`,
+          error: safeProviderFailure("codex", "run", code),
         });
       }
       events.end();
@@ -304,7 +304,7 @@ export class CodexAppServerRuntime implements HarnessRuntime {
         turnId = nestedString(turnResponse, "turn", "id");
       } catch (error) {
         terminal = true;
-        events.push({ type: "run_failed", runId: context.runId, error: error instanceof Error ? error.message : String(error) });
+        events.push({ type: "run_failed", runId: context.runId, error: safeProviderFailure("codex", "startup") });
         terminateNativeProcessTree(child);
       }
     })();

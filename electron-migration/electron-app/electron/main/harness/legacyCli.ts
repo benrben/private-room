@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { lstat, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { AsyncEventQueue } from "./eventQueue.js";
+import { safeProviderFailure } from "./failureSafety.js";
 import { codexAgentInstructions, loadAgentManifest, type SharedAgentDefinition } from "./agentManifest.js";
 import { parseClaudeJsonResult, parseCodexJsonStream } from "../externalAdvisor.js";
 import { McpBridge, type ToolCallResult, type ToolDispatcher, type ToolScope, type ToolSpec } from "../mcpBridge.js";
@@ -316,10 +317,11 @@ export class RestrictedLegacyCliRuntime implements HarnessRuntime {
       throw error;
     }
     const stdout: Buffer[] = [];
-    const stderr: Buffer[] = [];
     let terminal = false;
     child.stdout.on("data", (chunk: Buffer) => stdout.push(Buffer.from(chunk)));
-    child.stderr.on("data", (chunk: Buffer) => stderr.push(Buffer.from(chunk)));
+    // Drain but do not retain untrusted diagnostics. CLI stderr can include
+    // prompts, file content, paths, environment values, or bridge tokens.
+    child.stderr.on("data", () => undefined);
     child.once("exit", (code, signal) => {
       void (async () => {
         try {
@@ -328,7 +330,7 @@ export class RestrictedLegacyCliRuntime implements HarnessRuntime {
           if (signal !== null) {
             events.push({ type: "run_completed", runId: context.runId, status: "cancelled" });
           } else if (code !== 0) {
-            events.push({ type: "run_failed", runId: context.runId, error: Buffer.concat(stderr).toString("utf8").trim() || `${this.provider} fallback exited with code ${String(code)}.` });
+            events.push({ type: "run_failed", runId: context.runId, error: safeProviderFailure(this.provider, "run", code) });
           } else {
             const parsed = this.provider === "claude" ? parseClaudeJsonResult(Buffer.concat(stdout)) : parseCodexJsonStream(Buffer.concat(stdout));
             if (parsed.text !== "") events.push({ type: "text_delta", runId: context.runId, text: parsed.text });

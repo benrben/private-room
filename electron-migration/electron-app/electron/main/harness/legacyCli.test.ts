@@ -29,6 +29,19 @@ function fakeChild(stdoutText: string): ChildProcessWithoutNullStreams {
   return child as unknown as ChildProcessWithoutNullStreams;
 }
 
+function failedChild(stderrText: string, code = 1): ChildProcessWithoutNullStreams {
+  const stdin = new PassThrough();
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+  const child = Object.assign(new EventEmitter(), { stdin, stdout, stderr, pid: 12346, kill: () => true });
+  queueMicrotask(() => {
+    stdout.end();
+    stderr.end(stderrText);
+    child.emit("exit", code, null);
+  });
+  return child as unknown as ChildProcessWithoutNullStreams;
+}
+
 function controllableChild(onKill?: () => void): { child: ChildProcessWithoutNullStreams; stdout: PassThrough; stderr: PassThrough } {
   const stdin = new PassThrough();
   const stdout = new PassThrough();
@@ -103,6 +116,33 @@ describe("RestrictedLegacyCliRuntime", () => {
       expect(args.join("\0")).not.toContain(bearerToken!);
       expect(events).toContainEqual({ type: "text_delta", runId: "run-1", text: "done" });
       expect(events.at(-1)).toEqual({ type: "run_completed", runId: "run-1", status: "completed" });
+    } finally {
+      f.created.db.close();
+    }
+  });
+
+  it("never forwards raw CLI stderr into normalized failure events", async () => {
+    const f = await fixture();
+    const secret = "Ben Reich token=secret-token /Users/benreich/private-room";
+    try {
+      const runtime = new RestrictedLegacyCliRuntime("codex", f.state, {
+        executable: "/fake/codex",
+        available: () => true,
+        spawn: () => failedChild(secret, 7),
+      });
+      const run = await runtime.startTurn({
+        runId: "run-safe-error", roomId: f.created.descriptor.roomId, provider: "codex", model: "gpt-test",
+        workspacePath: f.roomPath, runtimePath: path.join(f.root, "runtime-error"), privacyMode: "cloud-direct",
+        writeEnabled: false, exposureVerified: true,
+      }, { text: "work" });
+      const events = [];
+      for await (const event of run.events) events.push(event);
+      const failure = events.find((event) => event.type === "run_failed");
+      expect(failure).toMatchObject({ type: "run_failed", runId: "run-safe-error" });
+      expect(JSON.stringify(failure)).not.toContain(secret);
+      expect(JSON.stringify(failure)).not.toContain("secret-token");
+      expect(JSON.stringify(failure)).not.toContain("/Users/benreich");
+      expect(JSON.stringify(failure)).toContain("exit 7");
     } finally {
       f.created.db.close();
     }

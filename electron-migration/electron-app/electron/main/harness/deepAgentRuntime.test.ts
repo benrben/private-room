@@ -74,4 +74,24 @@ describe("DeepAgentRuntime", () => {
     for await (const _event of started.events) { /* drain */ }
     expect(request).toMatchObject({ mcp: { workspaceWrite: true, baselineRunId: "run-1" } });
   });
+
+  it("does not forward raw sidecar failures into normalized events", async () => {
+    const secret = "Ben Reich Bearer secret-token /room/private.txt";
+    const runtime = new DeepAgentRuntime(state(), () => {}, undefined, vi.fn(async () => ({
+      kind: "failed" as const,
+      error: secret,
+      text: "",
+      toolRan: false,
+      usage: null,
+      plan: null,
+    })));
+    const started = await runtime.startTurn(context(), { text: "read notes" });
+    const events: HarnessEvent[] = [];
+    for await (const event of started.events) events.push(event);
+    const failure = events.find((event) => event.type === "run_failed");
+    expect(failure).toMatchObject({ type: "run_failed", runId: "run-1" });
+    expect(JSON.stringify(failure)).not.toContain("Ben Reich");
+    expect(JSON.stringify(failure)).not.toContain("secret-token");
+    expect(JSON.stringify(failure)).not.toContain("/room/private.txt");
+  });
 });
