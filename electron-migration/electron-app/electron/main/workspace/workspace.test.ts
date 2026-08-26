@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
 import { afterEach, describe, expect, it } from "vitest";
+import { listFileVersions, setVersionPinned } from "../db-host/fileVersionsList.js";
 import { scanWorkspaceManifest } from "./manifest.js";
 import { acquireWorkspaceLease, createWorkspaceRoom, releaseWorkspaceLease } from "./roomLayout.js";
 import { assertNoSymlinkSegments, normalizeRelativePath } from "./pathSafety.js";
@@ -103,6 +104,48 @@ describe("workspace room storage", () => {
         relative_path: string;
       };
       expect(row).toEqual({ id: imported.fileId, relative_path: "after.md" });
+    } finally {
+      db.close();
+    }
+  });
+
+  it("keeps ten unpinned encrypted versions, preserves pinned versions, and restores them", async () => {
+    const parent = await temporaryRoot();
+    const workspaceRoot = path.join(parent, "History Room");
+    const source = path.join(parent, "history-source.txt");
+    await writeFile(source, "version 0", "utf8");
+    const { db } = createWorkspaceRoom(workspaceRoot, "correct horse battery staple", "History Room");
+    const workspace = new WorkspaceService(db, workspaceRoot);
+    try {
+      const imported = await workspace.importFile(source, "history.txt");
+      const pinnedId = await workspace.snapshotVersion(imported.fileId, "pinned start");
+      setVersionPinned(db, pinnedId, true);
+      await workspace.writeAtomic(imported.fileId, Readable.from("version 1"));
+      for (let version = 1; version <= 11; version += 1) {
+        await workspace.snapshotVersion(imported.fileId, `save ${version}`);
+        await workspace.writeAtomic(imported.fileId, Readable.from(`version ${version + 1}`));
+      }
+
+      const versions = listFileVersions(db, imported.fileId);
+      expect(versions).toHaveLength(11);
+      expect(versions.filter((version) => version.pinned)).toHaveLength(1);
+      expect(versions.every((version) => version.bytes > 0)).toBe(true);
+      expect(db.prepare(
+        "SELECT count(*) AS n FROM file_versions WHERE length(bytes) = 0",
+      ).get()).toEqual({ n: 11 });
+      expect(db.prepare(
+        "SELECT count(*) AS n FROM content_object_refs WHERE owner_type = 'file_version'",
+      ).get()).toEqual({ n: 11 });
+
+      await workspace.restoreVersion(pinnedId);
+      expect(await readFile(path.join(workspaceRoot, "history.txt"), "utf8")).toBe("version 0");
+      expect(listFileVersions(db, imported.fileId)).toHaveLength(11);
+
+      await workspace.deleteVersion(pinnedId);
+      expect(listFileVersions(db, imported.fileId).some((version) => version.id === pinnedId)).toBe(false);
+      expect(db.prepare(
+        "SELECT count(*) AS n FROM content_object_refs WHERE owner_type = 'file_version' AND owner_id = ?",
+      ).get(pinnedId)).toEqual({ n: 0 });
     } finally {
       db.close();
     }

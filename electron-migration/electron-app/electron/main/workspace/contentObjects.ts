@@ -3,7 +3,7 @@ import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID }
 import { createReadStream, createWriteStream } from "node:fs";
 import { appendFile, mkdir, open, rename, rm, stat } from "node:fs/promises";
 import path from "node:path";
-import { Transform } from "node:stream";
+import { PassThrough, Transform, type Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { getMeta, setMeta } from "../db-host/meta.js";
 import type { ContentObjectRef } from "./types.js";
@@ -160,6 +160,61 @@ export class ContentObjectStore {
       await rm(tempPath, { force: true });
       throw error;
     }
+  }
+
+  /** Open a verified plaintext stream without exposing the object key or path. */
+  async readStream(objectId: string): Promise<{ stream: Readable; ref: ContentObjectRef }> {
+    const row = this.db
+      .prepare("SELECT id, sha256, size_bytes, nonce, relative_object_path FROM content_objects WHERE id = ?")
+      .get(objectId) as ObjectRow | undefined;
+    if (row === undefined) throw new Error("The saved content object no longer exists.");
+    const objectPath = path.join(this.privateRoot, ...row.relative_object_path.split("/"));
+    const objectStat = await stat(objectPath);
+    const headerBytes = MAGIC.length + NONCE_BYTES;
+    if (objectStat.size < headerBytes + TAG_BYTES) throw new Error("The saved content object is damaged.");
+    const source = await open(objectPath, "r");
+    const header = Buffer.alloc(headerBytes);
+    const tag = Buffer.alloc(TAG_BYTES);
+    try {
+      await source.read(header, 0, header.length, 0);
+      await source.read(tag, 0, tag.length, objectStat.size - TAG_BYTES);
+    } finally {
+      await source.close();
+    }
+    if (!header.subarray(0, MAGIC.length).equals(MAGIC)) throw new Error("The saved content object is damaged.");
+    const nonce = header.subarray(MAGIC.length);
+    if (!nonce.equals(row.nonce)) throw new Error("The saved content object nonce does not match its record.");
+
+    const decipher = createDecipheriv("aes-256-gcm", objectKey(this.db), nonce);
+    decipher.setAuthTag(tag);
+    const hash = createHash("sha256");
+    let sizeBytes = 0;
+    const verify = new Transform({
+      transform(chunk: Buffer, _encoding, callback) {
+        hash.update(chunk);
+        sizeBytes += chunk.length;
+        callback(null, chunk);
+      },
+      flush(callback) {
+        const valid = sizeBytes === row.size_bytes && hash.digest("hex") === row.sha256;
+        callback(valid ? undefined : new Error("The saved content object failed its integrity check."));
+      },
+    });
+    const output = new PassThrough();
+    void pipeline(
+      createReadStream(objectPath, { start: headerBytes, end: objectStat.size - TAG_BYTES - 1 }),
+      decipher,
+      verify,
+      output,
+    ).catch((error: unknown) => output.destroy(error instanceof Error ? error : new Error(String(error))));
+    return { stream: output, ref: rowRef(row) };
+  }
+
+  async readBuffer(objectId: string): Promise<Buffer> {
+    const opened = await this.readStream(objectId);
+    const chunks: Buffer[] = [];
+    for await (const chunk of opened.stream) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    return Buffer.concat(chunks);
   }
 
   addReference(ownerType: string, ownerId: string, objectId: string, role: string): void {

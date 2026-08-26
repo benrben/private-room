@@ -133,6 +133,7 @@ import { decodeTextBytes, extensionOf, isImage, isTextExtension } from "./editMa
 import { deleteEntry as keychainDeleteEntry, has as keychainHas, store as keychainStore } from "./keychain.js";
 import { mediaKind } from "./peaksTools.js";
 import { clampBytes } from "./textClamp.js";
+import type { WorkspaceService } from "./workspace/workspaceService.js";
 
 function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
@@ -344,6 +345,30 @@ export function versionContent(db: Database.Database, versionId: string): Versio
     fileName: name,
     versionText: contentText(name, mime, v.bytes, versionText),
     currentText: contentText(name, mime, currentBytes, currentExtracted),
+  };
+}
+
+async function workspaceVersionContent(
+  db: Database.Database,
+  workspace: WorkspaceService,
+  versionId: string,
+): Promise<VersionContent> {
+  const version = await workspace.versionSnapshot(versionId);
+  const file = db.prepare(
+    `SELECT name, mime_type, extracted_text FROM files
+     WHERE id = ? AND storage_kind = 'workspace' AND trashed_at IS NULL`,
+  ).get(version.fileId) as {
+    name: string;
+    mime_type: string | null;
+    extracted_text: string | null;
+  } | undefined;
+  if (file === undefined) throw new Error("That file is no longer in this room.");
+  const currentBytes = await workspace.readBuffer(version.fileId);
+  const versionText = version.text ?? rederiveVersionText(file.name, version.bytes);
+  return {
+    fileName: file.name,
+    versionText: contentText(file.name, file.mime_type ?? "", version.bytes, versionText),
+    currentText: contentText(file.name, file.mime_type ?? "", currentBytes, file.extracted_text),
   };
 }
 
@@ -768,6 +793,7 @@ export interface SafetyOpenRoom {
   conn: Database.Database;
   path: string;
   password: string;
+  workspace?: WorkspaceService;
 }
 
 export interface SafetyRoomSource {
@@ -828,17 +854,25 @@ export function registerSafetyIpc(
   handle("pin_file_version", (args: { versionId: string; pinned: boolean }) =>
     pinFileVersion(openRoomOrThrow(room).conn, args.versionId, args.pinned)
   );
-  handle("delete_file_version", (args: { versionId: string }) =>
-    deleteFileVersion(openRoomOrThrow(room).conn, args.versionId)
-  );
+  handle("delete_file_version", async (args: { versionId: string }) => {
+    const open = openRoomOrThrow(room);
+    if (open.workspace !== undefined) return open.workspace.deleteVersion(args.versionId);
+    deleteFileVersion(open.conn, args.versionId);
+  });
   handle("get_file_provenance", (args: { id: string }) =>
     getFileProvenance(openRoomOrThrow(room).conn, args.id)
   );
-  handle("get_file_version", (args: { versionId: string }) =>
-    versionContent(openRoomOrThrow(room).conn, args.versionId)
-  );
-  handle("restore_file_version", (args: { versionId: string }) => {
-    const fileId = restoreVersionInto(openRoomOrThrow(room).conn, args.versionId);
+  handle("get_file_version", async (args: { versionId: string }) => {
+    const open = openRoomOrThrow(room);
+    return open.workspace === undefined
+      ? versionContent(open.conn, args.versionId)
+      : workspaceVersionContent(open.conn, open.workspace, args.versionId);
+  });
+  handle("restore_file_version", async (args: { versionId: string }) => {
+    const open = openRoomOrThrow(room);
+    const fileId = open.workspace === undefined
+      ? restoreVersionInto(open.conn, args.versionId)
+      : await open.workspace.restoreVersion(args.versionId);
     emitSafely(deps.emit, "room-files-changed", undefined);
     emitSafely(deps.emit, "file-updated", fileId);
   });

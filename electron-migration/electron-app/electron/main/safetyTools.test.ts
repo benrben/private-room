@@ -11,6 +11,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { Readable } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type Database from "better-sqlite3-multiple-ciphers";
 import { createRoom, openRoom } from "./db-host/open.js";
@@ -50,6 +51,8 @@ import {
   versionContent,
   type SafetyRoomSource,
 } from "./safetyTools.js";
+import { createWorkspaceRoom } from "./workspace/roomLayout.js";
+import { WorkspaceService } from "./workspace/workspaceService.js";
 
 let tmpDir: string;
 let db: Database.Database;
@@ -740,6 +743,42 @@ describe("registerSafetyIpc", () => {
 
     expect(emitted).toContainEqual(["room-files-changed", undefined]);
     expect(emitted).toContainEqual(["file-updated", fid]);
+  });
+
+  it("reads, restores, and deletes object-backed workspace versions", async () => {
+    tmpDir = mkdtempSync(path.join(os.tmpdir(), "safety-workspace-"));
+    roomPath = path.join(tmpDir, "Workspace Room");
+    const created = createWorkspaceRoom(roomPath, "correct horse battery staple", "Workspace Room");
+    db = created.db;
+    const workspace = new WorkspaceService(db, roomPath);
+    const source = path.join(tmpDir, "source.txt");
+    writeFileSync(source, "old normal bytes", "utf8");
+    const file = await workspace.importFile(source, "notes.txt");
+    db.prepare("UPDATE files SET extracted_text = 'old normal bytes' WHERE id = ?").run(file.fileId);
+    const versionId = await workspace.snapshotVersion(file.fileId, "before edit");
+    await workspace.writeAtomic(file.fileId, Readable.from([Buffer.from("new normal bytes")]));
+    db.prepare("UPDATE files SET extracted_text = 'new normal bytes' WHERE id = ?").run(file.fileId);
+
+    const handle = vi.fn();
+    const sourceRoom: SafetyRoomSource = {
+      currentRoom: () => ({
+        conn: db,
+        path: roomPath,
+        password: "correct horse battery staple",
+        workspace,
+      }),
+    };
+    registerSafetyIpc({ handle }, sourceRoom);
+
+    await expect(listener(handle, "get_file_version")({}, { versionId })).resolves.toMatchObject({
+      fileName: "notes.txt",
+      versionText: "old normal bytes",
+      currentText: "new normal bytes",
+    });
+    await listener(handle, "restore_file_version")({}, { versionId });
+    expect(readFileSync(path.join(roomPath, "notes.txt"), "utf8")).toBe("old normal bytes");
+    await listener(handle, "delete_file_version")({}, { versionId });
+    expect(dbListFileVersions(db, file.fileId).some((version) => version.id === versionId)).toBe(false);
   });
 
   it("change_password calls onPasswordChanged after a successful rotation", async () => {

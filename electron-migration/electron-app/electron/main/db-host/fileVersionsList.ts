@@ -45,8 +45,12 @@ import { provenanceFromJson } from "./artifacts.js";
 export function listFileVersions(db: Database.Database, fileId: string): FileVersion[] {
   return queryRows(
     db,
-    `SELECT v.id, v.saved_at, v.cause, v.provenance, v.pinned, LENGTH(v.bytes)
+    `SELECT v.id, v.saved_at, v.cause, v.provenance, v.pinned,
+            COALESCE(o.size_bytes, LENGTH(v.bytes))
      FROM file_versions v JOIN files f ON f.id = v.file_id
+     LEFT JOIN content_object_refs r
+       ON r.owner_type = 'file_version' AND r.owner_id = v.id AND r.role = 'content'
+     LEFT JOIN content_objects o ON o.id = r.object_id
      WHERE v.file_id = ? AND f.trashed_at IS NULL
      ORDER BY v.saved_at DESC, v.rowid DESC`,
     [fileId],

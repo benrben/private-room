@@ -3,8 +3,9 @@ import { createHash, randomUUID } from "node:crypto";
 import { createReadStream, createWriteStream } from "node:fs";
 import { chmod, lstat, mkdir, open, rename, rm } from "node:fs/promises";
 import path from "node:path";
-import { Transform, type Readable } from "node:stream";
+import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
+import { VERSIONS_KEPT } from "../db-host/versions.js";
 import { ContentObjectStore } from "./contentObjects.js";
 import { scanWorkspaceManifest } from "./manifest.js";
 import {
@@ -22,6 +23,14 @@ interface WorkspaceFileRow {
   relative_path: string;
   content_sha256: string | null;
   size_bytes: number;
+}
+
+export interface WorkspaceVersionSnapshot {
+  fileId: string;
+  bytes: Buffer;
+  text: string | null;
+  recMeta: string | null;
+  provenance: string | null;
 }
 
 export class ContentConflictError extends Error {
@@ -132,6 +141,122 @@ export class WorkspaceService {
   readStream(fileId: string): Readable {
     const row = this.fileRow(fileId);
     return createReadStream(resolveWorkspacePath(this.rootPath, row.relative_path));
+  }
+
+  async readBuffer(fileId: string): Promise<Buffer> {
+    const chunks: Buffer[] = [];
+    for await (const chunk of this.readStream(fileId)) {
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    }
+    return Buffer.concat(chunks);
+  }
+
+  /** Save the current normal-file bytes as one History entry. */
+  async snapshotVersion(fileId: string, cause: string): Promise<string> {
+    const row = this.db.prepare(
+      `SELECT f.extracted_text, f.provenance, r.meta AS rec_meta
+       FROM files f LEFT JOIN recordings r ON r.file_id = f.id
+       WHERE f.id = ? AND f.storage_kind = 'workspace' AND f.trashed_at IS NULL`,
+    ).get(fileId) as {
+      extracted_text: string | null;
+      provenance: string | null;
+      rec_meta: string | null;
+    } | undefined;
+    if (row === undefined) throw new Error("That workspace file is not in this room.");
+    const file = this.fileRow(fileId);
+    const object = await this.objects.putFile(resolveWorkspacePath(this.rootPath, file.relative_path));
+    const versionId = randomUUID();
+    const pruned: string[] = [];
+    this.db.transaction(() => {
+      this.db.prepare(
+        `INSERT INTO file_versions(id, file_id, bytes, text, rec_meta, cause, provenance)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        versionId,
+        fileId,
+        Buffer.alloc(0),
+        row.extracted_text,
+        row.rec_meta,
+        cause,
+        row.provenance,
+      );
+      this.objects.addReference("file_version", versionId, object.id, "content");
+      const stale = this.db.prepare(
+        `SELECT id FROM file_versions
+         WHERE file_id = ? AND pinned = 0
+         ORDER BY saved_at DESC, rowid DESC LIMIT -1 OFFSET ${VERSIONS_KEPT}`,
+      ).all(fileId) as Array<{ id: string }>;
+      for (const version of stale) {
+        pruned.push(version.id);
+        this.db.prepare(
+          "DELETE FROM content_object_refs WHERE owner_type = 'file_version' AND owner_id = ?",
+        ).run(version.id);
+        this.db.prepare("DELETE FROM file_versions WHERE id = ?").run(version.id);
+      }
+    })();
+    if (pruned.length > 0) await this.objects.collectGarbage();
+    return versionId;
+  }
+
+  async versionSnapshot(versionId: string): Promise<WorkspaceVersionSnapshot> {
+    const row = this.db.prepare(
+      `SELECT v.file_id, v.bytes, v.text, v.rec_meta, v.provenance, r.object_id
+       FROM file_versions v
+       LEFT JOIN content_object_refs r
+         ON r.owner_type = 'file_version' AND r.owner_id = v.id AND r.role = 'content'
+       WHERE v.id = ?`,
+    ).get(versionId) as {
+      file_id: string;
+      bytes: Buffer;
+      text: string | null;
+      rec_meta: string | null;
+      provenance: string | null;
+      object_id: string | null;
+    } | undefined;
+    if (row === undefined) throw new Error("That version is no longer available.");
+    return {
+      fileId: row.file_id,
+      bytes: row.object_id === null ? row.bytes : await this.objects.readBuffer(row.object_id),
+      text: row.text,
+      recMeta: row.rec_meta,
+      provenance: row.provenance,
+    };
+  }
+
+  async restoreVersion(versionId: string): Promise<string> {
+    const version = await this.versionSnapshot(versionId);
+    const current = this.fileRow(version.fileId);
+    await this.snapshotVersion(version.fileId, "Restored");
+    const objectRow = this.db.prepare(
+      `SELECT object_id FROM content_object_refs
+       WHERE owner_type = 'file_version' AND owner_id = ? AND role = 'content'`,
+    ).get(versionId) as { object_id: string } | undefined;
+    const content = objectRow === undefined
+      ? Readable.from([version.bytes])
+      : (await this.objects.readStream(objectRow.object_id)).stream;
+    await this.writeAtomic(version.fileId, content, current.content_sha256 ?? undefined);
+    this.db.transaction(() => {
+      this.db.prepare(
+        "UPDATE files SET extracted_text = ?, provenance = ? WHERE id = ?",
+      ).run(version.text, version.provenance, version.fileId);
+      if (version.recMeta !== null) {
+        this.db.prepare("UPDATE recordings SET meta = ? WHERE file_id = ?")
+          .run(version.recMeta, version.fileId);
+      }
+    })();
+    return version.fileId;
+  }
+
+  async deleteVersion(versionId: string): Promise<void> {
+    const exists = this.db.prepare("SELECT 1 FROM file_versions WHERE id = ?").get(versionId);
+    if (exists === undefined) throw new Error("That version is no longer available.");
+    this.db.transaction(() => {
+      this.db.prepare(
+        "DELETE FROM content_object_refs WHERE owner_type = 'file_version' AND owner_id = ?",
+      ).run(versionId);
+      this.db.prepare("DELETE FROM file_versions WHERE id = ?").run(versionId);
+    })();
+    await this.objects.collectGarbage();
   }
 
   async writeAtomic(

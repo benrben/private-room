@@ -147,7 +147,7 @@ export function registerFileSurfaceIpc(
       const expected = db.prepare("SELECT content_sha256 FROM files WHERE id = ?").get(id) as {
         content_sha256: string | null;
       } | undefined;
-      return open.workspace.snapshot(id, "file", id, "version")
+      return open.workspace.snapshotVersion(id, "You saved")
         .then(() => open.workspace!.writeAtomic(
           id,
           Readable.from([Buffer.from(content, "utf8")]),
