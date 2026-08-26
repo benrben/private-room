@@ -359,6 +359,39 @@
   padding: 9px;
 }
 
+.sealed-export-options {
+  border: 0;
+  padding: 0;
+  margin: 0 0 var(--sp-3);
+  display: grid;
+  gap: var(--sp-2);
+}
+.sealed-export-options legend,
+.sealed-export-fields > label {
+  color: var(--text-strong);
+  font-weight: 650;
+  margin-bottom: var(--sp-2);
+}
+.sealed-export-options label {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+}
+.sealed-export-fields {
+  display: grid;
+  gap: var(--sp-2);
+  margin-bottom: var(--sp-3);
+}
+.sealed-export-fields > input {
+  width: 100%;
+}
+.sealed-export-fields > label:not(:first-child) {
+  margin-top: var(--sp-1);
+}
+.sealed-export-actions {
+  margin-top: var(--sp-3);
+}
+
 /* Wave 2 (Idea 6): the diff-preview approval card is wider and stacks one
    read-only Monaco diff per touched file. */
 .approve-card-wide {

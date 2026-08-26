@@ -26,10 +26,11 @@ const load = async (file) => {
   }).outputText;
   return import(`data:text/javascript,${encodeURIComponent(js)}`);
 };
-const { duplicateFileName } = await load("rooms/helpers.ts");
+const { duplicateDestinationSuggestion, duplicateFileName } = await load("rooms/helpers.ts");
 const {
   newPasswordProblem,
   revokedRecoveryWarning,
+  sealedExportPasswordProblem,
   strandedCheckpointWarning,
   touchIdLostWarning,
 } = await load("rooms/passwordChange.ts");
@@ -49,6 +50,43 @@ test("a duplicate is suggested under the room's own name, not 'Copy of room'", (
   assert.equal(duplicateFileName("   "), "Copy of room");
 });
 
+test("workspace duplicates are suggested as folders, not sealed .arcelle files", () => {
+  assert.deepEqual(duplicateDestinationSuggestion("Tax 2026", "workspace"), {
+    title: "Choose destination workspace folder",
+    defaultPath: "Copy of Tax 2026",
+  });
+  assert.deepEqual(duplicateDestinationSuggestion("Tax 2026", "legacy"), {
+    title: "Save duplicated Arcelle room",
+    defaultPath: "Copy of Tax 2026.arcelle",
+  });
+  const privacy = src("settings/usePrivacy.ts");
+  assert.match(privacy, /roomStorageUsage\(\)/, "the picker must ask for the actual storage format");
+  assert.match(privacy, /kind === "legacy" \? \{ filters: ROOM_FILTER \} : \{\}/,
+    "the .arcelle filter must only apply to legacy database copies");
+});
+
+test("sealed exports offer the current password or a validated alternate password", () => {
+  assert.equal(sealedExportPasswordProblem("different password", "different password", 8), null);
+  assert.equal(
+    sealedExportPasswordProblem("different password", "not the same", 8),
+    "The backup passwords do not match.",
+  );
+  assert.equal(
+    sealedExportPasswordProblem("short", "short", 8),
+    "Backup password must be at least 8 characters.",
+  );
+  const dialog = src("workspace/SealedExportDialog.tsx");
+  assert.match(dialog, /useState<PasswordMode>\("room"\)/,
+    "the safe default must reuse the current room password");
+  assert.match(dialog, /Use this room&apos;s password/);
+  assert.match(dialog, /Use a different password/);
+  assert.match(dialog, /alternate \? password : null/,
+    "the renderer must send null for the backend-held room password and only send an explicit alternate");
+  assert.match(dialog, /role="dialog"/);
+  assert.match(dialog, /aria-modal="true"/);
+  assert.match(dialog, /useFocusTrap/);
+});
+
 test("the start screen says when a recent room's file is gone", () => {
   // The backend has stat-ed every recents path for a while, but the TypeScript
   // type did not declare `missing` and no screen read it — so a moved or
@@ -60,7 +98,7 @@ test("the start screen says when a recent room's file is gone", () => {
   assert.match(start, /room\.missing/, "the start screen must read it");
   assert.match(
     start,
-    /File not found/,
+    /(?:File|Room) not found/,
     "and must say so in words, not just dim the row",
   );
 });

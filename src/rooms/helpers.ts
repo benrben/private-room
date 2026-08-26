@@ -17,6 +17,23 @@ export function duplicateFileName(roomName: string): string {
   return clean ? `Copy of ${clean}` : "Copy of room";
 }
 
+/** Save-panel wording for the two room storage formats.
+ *
+ * A workspace duplicate is a directory containing normal files. Giving that
+ * directory an `.arcelle` suffix makes it look like the single encrypted
+ * backup format and can make Finder treat it like a document. Legacy rooms
+ * still duplicate to one encrypted database file, so only they keep the
+ * extension. */
+export function duplicateDestinationSuggestion(
+  roomName: string,
+  kind: "legacy" | "workspace",
+): { title: string; defaultPath: string } {
+  const name = duplicateFileName(roomName);
+  return kind === "workspace"
+    ? { title: "Choose destination workspace folder", defaultPath: name }
+    : { title: "Save duplicated Arcelle room", defaultPath: `${name}.arcelle` };
+}
+
 export type Strength = { score: 0 | 1 | 2 | 3; label: string; level: "weak" | "okay" | "strong" };
 
 // Simple, library-free estimate: length plus the mix of character kinds

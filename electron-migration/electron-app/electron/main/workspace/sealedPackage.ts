@@ -5,7 +5,7 @@ import path from "node:path";
 import type Database from "better-sqlite3-multiple-ciphers";
 import { migrate } from "../db-host/migrate.js";
 import { getMeta, setMeta } from "../db-host/meta.js";
-import { openRoom, openRoomReadonly } from "../db-host/open.js";
+import { MIN_ROOM_PASSWORD_CHARS, openRoom, openRoomReadonly } from "../db-host/open.js";
 import { rekey, vacuum, vacuumInto } from "../db-host/rekey.js";
 import { scanWorkspaceManifest } from "./manifest.js";
 import {
@@ -357,6 +357,9 @@ export async function createSealedPackage(
   purpose = "backup",
   options: SealedCreateOptions = {},
 ): Promise<SealedPackageInfo> {
+  if ([...exportPassword].length < MIN_ROOM_PASSWORD_CHARS) {
+    throw new Error(`Backup password must be at least ${MIN_ROOM_PASSWORD_CHARS} characters.`);
+  }
   const progress = new WorkspaceOperationReporter(
     options.operation ?? "sealed-package-create",
     options.progress,

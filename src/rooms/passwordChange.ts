@@ -17,6 +17,21 @@ export function newPasswordProblem(
   return null;
 }
 
+/** Validate an alternate password chosen for a portable sealed backup.
+ * The room-password option never sends a secret to the renderer; this helper
+ * is only for the explicit alternate-password fields. */
+export function sealedExportPasswordProblem(
+  password: string,
+  repeat: string,
+  min: number,
+): string | null {
+  if (password !== repeat) return "The backup passwords do not match.";
+  if ([...password].length < min) {
+    return `Backup password must be at least ${min} characters.`;
+  }
+  return null;
+}
+
 /** `change_password` returns null both when the room never had a recovery
  * sidecar AND when re-wrapping the existing one failed, so the caller has to
  * know which it was: a key that existed and is now gone has been revoked, and

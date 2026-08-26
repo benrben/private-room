@@ -18,6 +18,27 @@ afterEach(async () => {
 });
 
 describe("sealed workspace packages", () => {
+  it("refuses a weak explicit backup password before creating an output file", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "arcelle-sealed-password-"));
+    roots.push(root);
+    const sourceRoot = path.join(root, "Source Room");
+    const roomPassword = "correct horse battery staple";
+    const created = createWorkspaceRoom(sourceRoot, roomPassword, "Source Room");
+    const sealedPath = path.join(root, "Weak Backup.arcelle");
+    try {
+      await expect(createSealedPackage(
+        new WorkspaceService(created.db, sourceRoot),
+        created.descriptor.roomId,
+        roomPassword,
+        sealedPath,
+        "short",
+      )).rejects.toThrow("Backup password must be at least 8 characters.");
+      await expect(readFile(sealedPath)).rejects.toThrow();
+    } finally {
+      created.db.close();
+    }
+  });
+
   it("exports, verifies and imports current files plus encrypted history", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "arcelle-sealed-"));
     roots.push(root);

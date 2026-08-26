@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { api, hasRecoveryKey } from "../api";
 import { MIN_PASSWORD, ROOM_FILTER } from "../rooms/constants";
-import { duplicateFileName } from "../rooms/helpers";
+import { duplicateDestinationSuggestion } from "../rooms/helpers";
 import {
   newPasswordProblem,
   revokedRecoveryWarning,
@@ -136,16 +136,23 @@ export function usePrivacy() {
     }
   }
 
-  // ADD-4: pick a destination file for the copy.
+  // ADD-4: pick a destination file or folder for the copy.
   async function chooseDupDest() {
-    // The save sheet used to suggest "Copy of room.arcelle" for every room,
-    // even though the app knows this room's name — so two rooms called the same
-    // thing ended up in files called the same generic thing.
-    const p = await api.chooseSavePath({
-      defaultPath: `${duplicateFileName(roomName)}.arcelle`,
-      filters: ROOM_FILTER,
-    });
-    if (p) setDupDest(p);
+    setDupError("");
+    try {
+      // Ask at click time instead of guessing from the path extension. A
+      // workspace can have any outer-folder name, including one inherited
+      // from an old buggy `.arcelle` suggestion.
+      const kind = (await api.roomStorageUsage()).kind;
+      const suggestion = duplicateDestinationSuggestion(roomName, kind);
+      const p = await api.chooseSavePath({
+        ...suggestion,
+        ...(kind === "legacy" ? { filters: ROOM_FILTER } : {}),
+      });
+      if (p) setDupDest(p);
+    } catch (e) {
+      setDupError(String(e));
+    }
   }
 
   async function duplicate() {

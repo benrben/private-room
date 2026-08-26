@@ -26,6 +26,7 @@ import { toggleTheme } from "../theme";
 import { SCRIPT_POWERS, SCRIPT_WORKSPACE_NOTE } from "./scriptTrust";
 import { newItemLabel, newItemOf } from "./destinations";
 import type { WorkArea } from "./types";
+import SealedExportDialog from "./SealedExportDialog";
 import {
   applyFindFilters,
   DEFAULT_FILTERS,
@@ -233,6 +234,7 @@ function buildPaletteActions(
   s: WSState,
   a: WSActions,
   layout: LayoutApi | undefined,
+  openSealedExport: () => void,
 ): PaletteAction[] {
   const leaveAreas = () => {
     s.setShowMap(false);
@@ -293,20 +295,7 @@ function buildPaletteActions(
     { id: "reset-layout", label: "Reset the layout", hint: "Restore the balanced default", run: () => layout?.resetLayout() },
     { id: "theme", label: "Switch theme", hint: "Dark ⇄ light", run: () => toggleTheme() },
     { id: "checkpoint", label: "Save a checkpoint", hint: "A room-wide recovery point", run: () => { api.createRoomCheckpoint("").then((m) => s.pushToast("success", `Saved checkpoint “${m.name}”.`)).catch((e) => s.pushToast("error", String(e))); } },
-    { id: "sealed-backup", label: "Create sealed backup…", hint: "One encrypted .arcelle file with documents and private history", run: () => { void (async () => {
-      const destination = await api.chooseSavePath({
-        title: "Save sealed Arcelle backup",
-        defaultPath: "Room Backup.arcelle",
-        filters: [{ name: "Arcelle sealed backup", extensions: ["arcelle"] }],
-      });
-      if (!destination) return;
-      try {
-        const info = await api.createSealedPackage(destination);
-        s.pushToast("success", `Sealed ${info.fileCount} file${info.fileCount === 1 ? "" : "s"} into the backup.`);
-      } catch (error) {
-        s.pushToast("error", String(error));
-      }
-    })(); } },
+    { id: "sealed-backup", label: "Create sealed backup…", hint: "One encrypted .arcelle file with documents and private history", run: openSealedExport },
     { id: "export-all", label: "Export all files…", hint: "Plain copies outside the room", disabled: s.files.length === 0, run: () => a.exportAllFiles() },
     { id: "settings", label: "Room settings", hint: "Models, privacy, voice, connections (⌘,)", run: () => s.setShowSettings(true) },
     { id: "shortcuts", label: "Keyboard shortcuts", hint: "Every shortcut in one sheet (⌘/)", run: () => s.setShowShortcuts(true) },
@@ -523,6 +512,7 @@ export default function Overlays({
   const pendingBrowse = s.browseConsents[0];
   const pendingEdit = s.editApprovals[0];
   const pendingScript = s.scriptApprovals[0];
+  const [showSealedExport, setShowSealedExport] = useState(false);
 
   // ---- ⌘K: the expanded results (P1-2) ----
   // The room used to have a second, full-page "Find" area for exactly this —
@@ -572,7 +562,7 @@ export default function Overlays({
   // Commands that match the query (all of them at rest — the palette's
   // resting state lists what the room can do instead of a blank panel).
   const q = s.searchQuery.trim().toLowerCase();
-  const actions = buildPaletteActions(s, a, layout).filter(
+  const actions = buildPaletteActions(s, a, layout, () => setShowSealedExport(true)).filter(
     (x) => !q || x.label.toLowerCase().includes(q) || x.hint.toLowerCase().includes(q),
   );
   const actOffset = flatShown.length;
@@ -634,6 +624,12 @@ export default function Overlays({
   return (
     <>
       <CaptureDock s={s} />
+      {showSealedExport && (
+        <SealedExportDialog
+          onClose={() => setShowSealedExport(false)}
+          pushToast={s.pushToast}
+        />
+      )}
       {s.showShortcuts && (
         <ShortcutsSheet
           area={s.area}
