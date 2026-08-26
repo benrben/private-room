@@ -11,10 +11,10 @@ import {
   addScriptApproval,
   ensureScriptWorkflow,
   interpreterLine,
-  listScripts,
+  listScriptsInRoom,
   readScriptApprovals,
   resolveScriptRun,
-  setScriptSchedule,
+  setScriptScheduleInRoom,
 } from "./scriptConsent.js";
 import {
   parseScriptManifest,
@@ -181,15 +181,30 @@ export function registerScriptSurfaceIpc(
     if (!state.room) throw new Error("No room is open.");
     return state.room;
   };
-  ipcMain.handle("list_scripts", () => listScripts(room().conn, userDataDir));
+  ipcMain.handle("list_scripts", () => {
+    const open = room();
+    return listScriptsInRoom(
+      {
+        db: open.conn,
+        path: open.path,
+        ...(open.workspace === undefined ? {} : { workspace: open.workspace }),
+      },
+      userDataDir,
+    );
+  });
   ipcMain.handle("resolve_script_run", (_event: IpcMainInvokeEvent, raw: unknown): void => {
     const args = object(raw);
     resolveScriptRun(state.scriptPending, String(args.id ?? ""), String(args.decision ?? "deny"));
   });
-  ipcMain.handle("set_script_schedule", (_event: IpcMainInvokeEvent, raw: unknown): void => {
+  ipcMain.handle("set_script_schedule", async (_event: IpcMainInvokeEvent, raw: unknown): Promise<void> => {
     const args = object(raw);
-    setScriptSchedule(
-      room().conn,
+    const open = room();
+    await setScriptScheduleInRoom(
+      {
+        db: open.conn,
+        path: open.path,
+        ...(open.workspace === undefined ? {} : { workspace: open.workspace }),
+      },
       userDataDir,
       String(args.fileId ?? ""),
       String(args.kind ?? ""),

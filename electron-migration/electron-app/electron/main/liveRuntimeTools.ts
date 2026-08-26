@@ -25,7 +25,7 @@ import { gatedWrite } from "./editGate.js";
 import { availableName, findFileLike, getFileMeta, insertFileFromUrl, setFileExtractedText } from "./db-host/files.js";
 import { Readable } from "node:stream";
 import { createJob, getJob, listJobs, setJobStatus } from "./db-host/jobs.js";
-import { agentListScripts, clampScriptOutput, scriptOutput } from "./scriptConsent.js";
+import { agentListScriptsInRoom, clampScriptOutput, scriptOutput } from "./scriptConsent.js";
 import { createScriptBytesApprovalRequester, runScriptFile } from "./scriptSurfaceIpc.js";
 import { agentRunSkillScript } from "./skillsCmds.js";
 import { createDownloadEngineDeps } from "./mediaDownloadSurfaceIpc.js";
@@ -344,7 +344,14 @@ export function createLiveRuntimeTool(options: LiveRuntimeToolOptions) {
             await fs.promises.rm(outcome.downloaded.path, { force: true }).catch(() => undefined);
           }
         }
-        case "list_scripts": return ok(agentListScripts(room.conn, userDataDir));
+        case "list_scripts": return ok(await agentListScriptsInRoom(
+          {
+            db: room.conn,
+            path: room.path,
+            ...(room.workspace === undefined ? {} : { workspace: room.workspace }),
+          },
+          userDataDir,
+        ));
         case "run_script": {
           const [fileId, realName] = findFileLike(room.conn, str(args.name));
           const jobId = await runScriptFile(state, roomDeps, userDataDir, emit, fileId);

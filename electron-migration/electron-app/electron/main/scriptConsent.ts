@@ -92,7 +92,8 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import type Database from "better-sqlite3-multiple-ciphers";
-import { getFileBytes, getFileBytesNamed, listFiles } from "./db-host/files.js";
+import { findFileLike, getFileBytes, getFileBytesNamed, listFiles } from "./db-host/files.js";
+import type { RoomHandle } from "./jobs.js";
 import { getJobArtifact } from "./db-host/jobs.js";
 import {
   createWorkflow,
@@ -115,8 +116,22 @@ import {
   type ResolvedScriptFile,
 } from "./scriptRun.js";
 import { clampBytes } from "./textClamp.js";
+import { readRoomFile } from "./workspace/roomContent.js";
 
 export { resolveScriptFile, scriptFingerprint, type ResolvedScriptFile };
+
+export async function resolveScriptFileInRoom(
+  room: RoomHandle,
+  file: string,
+): Promise<ResolvedScriptFile> {
+  if (room.workspace === undefined) return resolveScriptFile(room.db, file);
+  const exact = room.db.prepare(
+    "SELECT id FROM files WHERE id = ? AND trashed_at IS NULL",
+  ).get(file) as { id: string } | undefined;
+  const id = exact?.id ?? findFileLike(room.db, file)[0];
+  const content = await readRoomFile(room, id);
+  return { id, name: content.name, bytes: content.bytes ?? Buffer.alloc(0) };
+}
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
@@ -358,6 +373,29 @@ export function stampScriptConsents(
   return out;
 }
 
+export async function stampScriptConsentsInRoom(
+  room: RoomHandle,
+  definition: unknown,
+  approved: ReadonlySet<string>,
+): Promise<Map<string, string>> {
+  if (room.workspace === undefined) return stampScriptConsents(room.db, definition, approved);
+  const out = new Map<string, string>();
+  const nodes = isPlainObject(definition) && Array.isArray(definition["nodes"])
+    ? definition["nodes"]
+    : [];
+  for (const node of nodes) {
+    if (!isPlainObject(node) || node["kind"] !== "script_run" || typeof node["file"] !== "string") continue;
+    try {
+      const resolved = await resolveScriptFileInRoom(room, node["file"]);
+      const sha = scriptFingerprint(resolved.bytes);
+      if (approved.has(sha)) out.set(resolved.id, sha);
+    } catch {
+      // The executor reports missing or unreadable scripts.
+    }
+  }
+  return out;
+}
+
 // ============================================================================
 // Scripts-page command: scheduling. Ported from `set_script_schedule`.
 // ============================================================================
@@ -401,6 +439,34 @@ export function setScriptSchedule(
     throw new Error("That schedule is invalid — check the time or interval.");
   }
   upsertSchedule(db, wfId, kind, param, enabled, catchUp, next);
+}
+
+export async function setScriptScheduleInRoom(
+  room: RoomHandle,
+  userDataDir: string,
+  fileId: string,
+  kind: string,
+  param: string,
+  enabled: boolean,
+): Promise<void> {
+  if (room.workspace === undefined) {
+    setScriptSchedule(room.db, userDataDir, fileId, kind, param, enabled);
+    return;
+  }
+  const resolved = await resolveScriptFileInRoom(room, fileId);
+  const sha = scriptFingerprint(resolved.bytes);
+  if (kind !== "" && !readScriptApprovals(userDataDir).includes(sha)) {
+    throw new Error("Approve this script (run it once and choose “Always allow”) before scheduling it.");
+  }
+  const wfId = ensureScriptWorkflow(room.db, fileId, resolved.name);
+  if (kind === "") {
+    upsertSchedule(room.db, wfId, "", "", true, true, null);
+    return;
+  }
+  const catchUp = kind === "daily" || kind === "weekly";
+  const next = enabled ? nextRunFromNow(kind, param) : null;
+  if (enabled && next === null) throw new Error("That schedule is invalid — check the time or interval.");
+  upsertSchedule(room.db, wfId, kind, param, enabled, catchUp, next);
 }
 
 // ============================================================================
@@ -615,13 +681,77 @@ export function listScripts(db: Database.Database, userDataDir: string): ScriptI
   return out;
 }
 
+export async function listScriptsInRoom(
+  room: RoomHandle,
+  userDataDir: string,
+): Promise<ScriptInfo[]> {
+  if (room.workspace === undefined) return listScripts(room.db, userDataDir);
+  const approved = new Set(readScriptApprovals(userDataDir));
+  const workflows = listWorkflows(room.db);
+  const out: ScriptInfo[] = [];
+  for (const file of listFiles(room.db)) {
+    const lang = scriptLangOf(file.name);
+    if (lang === null) continue;
+    const resolved = await resolveScriptFileInRoom(room, file.id);
+    const text = resolved.bytes.toString("utf8");
+    const manifest = parseScriptManifest(file.name, text);
+    const isApproved = approved.has(scriptFingerprint(resolved.bytes));
+    const workflow = workflows.find((candidate) => wfIsForScript(candidate, file.id));
+    const runs = workflow ? listWorkflowRuns(room.db, workflow.id) : [];
+    let consecutiveFailures = 0;
+    let lastError: string | null = null;
+    for (const run of runs) {
+      if (run.status !== "error") break;
+      const error = run.error ?? "";
+      if (lastError === null) {
+        lastError = error;
+        consecutiveFailures = 1;
+      } else if (lastError === error) {
+        consecutiveFailures += 1;
+      } else break;
+    }
+    out.push({
+      fileId: file.id,
+      name: file.name,
+      lang,
+      deps: manifest.deps,
+      inputs: readableRoomFiles(room.db, manifest.inputs, text),
+      outputs: manifest.outputs,
+      shortcut: manifest.shortcut,
+      approved: isApproved,
+      changedSinceApproval: !isApproved && workflow !== undefined,
+      workflowId: workflow?.id ?? null,
+      schedule: workflow ? getSchedule(room.db, workflow.id) : null,
+      lastRun: runs[0] ?? null,
+      consecutiveFailures,
+      lastError,
+    });
+  }
+  return out;
+}
+
 export function getScriptManifest(db: Database.Database, fileId: string) {
   const [name, bytes] = getFileBytesNamed(db, fileId);
   return parseScriptManifest(name, (bytes ?? Buffer.alloc(0)).toString("utf8"));
 }
 
+export async function getScriptManifestInRoom(room: RoomHandle, fileId: string) {
+  if (room.workspace === undefined) return getScriptManifest(room.db, fileId);
+  const resolved = await resolveScriptFileInRoom(room, fileId);
+  return parseScriptManifest(resolved.name, resolved.bytes.toString("utf8"));
+}
+
 export function agentListScripts(db: Database.Database, userDataDir: string): string {
   const rows = listScripts(db, userDataDir);
+  if (rows.length === 0) return "This room has no .py or .js scripts yet.";
+  return rows.map((script) => {
+    const deps = script.deps.length === 0 ? "" : `, needs ${script.deps.join(" ")}`;
+    return `- ${script.name} (${script.lang}${deps}) — ${script.approved ? "approved to run" : "needs the user's approval on first run"}`;
+  }).join("\n");
+}
+
+export async function agentListScriptsInRoom(room: RoomHandle, userDataDir: string): Promise<string> {
+  const rows = await listScriptsInRoom(room, userDataDir);
   if (rows.length === 0) return "This room has no .py or .js scripts yet.";
   return rows.map((script) => {
     const deps = script.deps.length === 0 ? "" : `, needs ${script.deps.join(" ")}`;

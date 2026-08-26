@@ -180,7 +180,7 @@ import {
   type RowStarter,
   type RowStartResult,
 } from "./jobQueue.js";
-import { interpreterLine, readScriptApprovals, stampScriptConsents } from "./scriptConsent.js";
+import { interpreterLine, readScriptApprovals, stampScriptConsentsInRoom } from "./scriptConsent.js";
 import {
   parseScriptManifest,
   resolveInterpreter,
@@ -931,7 +931,7 @@ export async function startWorkflowRun(
   for (const c of extraConsents) {
     approved.add(c);
   }
-  const scriptConsents = stampScriptConsents(room0.db, def, approved);
+  const scriptConsents = await stampScriptConsentsInRoom(room0, def, approved);
 
   const models = await (deps.listModels ?? listModelsReal)().catch(() => []);
   const compiled = compileWorkflow(def, roomModel, models);
