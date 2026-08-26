@@ -87,7 +87,9 @@
 
 import type { IpcMain, IpcMainInvokeEvent } from "electron";
 import type Database from "better-sqlite3-multiple-ciphers";
+import { CancelFlag } from "./cancel.js";
 import { getFileFull } from "./db-host/files.js";
+import { sidecarJsonCancellable } from "./sidecarJsonCancellable.js";
 import type { OpenRoom } from "./turnEngine.js";
 import type { QuickLookPreview } from "../shared/apiTypes.js";
 
@@ -134,6 +136,20 @@ export const QUICKLOOK_RENDER_NOT_IMPLEMENTED =
  * fabricated "nothing to draw". */
 export const previewRenderNotImplemented: PreviewRenderFn = () =>
   Promise.reject(new Error(QUICKLOOK_RENDER_NOT_IMPLEMENTED));
+
+/** Production Quick Look renderer hosted by the Python sidecar. */
+export const renderQuickLook: PreviewRenderFn = async (name, bytes) => {
+  const outcome = await sidecarJsonCancellable("/quicklook", {
+    name,
+    data_b64: bytes.toString("base64"),
+  }, new CancelFlag(), 30_000);
+  if (outcome.kind === "stopped") throw new Error("The preview was stopped.");
+  if (outcome.kind === "error") throw new Error(outcome.error.error);
+  const raw = outcome.value as { png_b64?: unknown } | null;
+  if (raw?.png_b64 === null || raw?.png_b64 === undefined) return null;
+  if (typeof raw.png_b64 !== "string") throw new Error("The preview renderer returned unreadable data.");
+  return Buffer.from(raw.png_b64, "base64");
+};
 
 /**
  * Port of `commands::quicklook_preview`. Takes the room's ALREADY-UNWRAPPED

@@ -7,9 +7,9 @@ as React components in `src/icons.tsx`; the favicon is `public/logo.svg`.
 
 | Source | Generates | How |
 |---|---|---|
-| `appicon.svg` | `src-tauri/icons/*` (icns, ico, PNGs) | render to 1024px PNG, then `npx tauri icon <png>` |
-| `docicon.svg` | `src-tauri/icons/document.icns` (.roomai Finder icon) | render sizes 16–1024 into an `.iconset`, then `iconutil -c icns` |
-| `dmg-bg.svg` | `src-tauri/dmg-background.tiff` | render at 660×400 and 1320×800, then `tiffutil -cathidpicheck a.png b.png -out …` |
+| `appicon.svg` | `electron-migration/electron-app/assets/icons/icon.icns` | render sizes 16–1024 into an `.iconset`, then `iconutil -c icns` |
+| `docicon.svg` | `electron-migration/electron-app/assets/icons/document.icns` (Finder document icon) | render sizes 16–1024 into an `.iconset`, then `iconutil -c icns` |
+| `dmg-bg.svg` | Release DMG background artwork | render at 660×400 and 1320×800, then `tiffutil -cathidpicheck a.png b.png -out …` |
 | `banner.svg` | `docs/banner.png` (README banner) | render at 2560×1280 |
 
 > `docicon.svg` is currently a byte-for-byte copy of `appicon.svg`, so
@@ -54,6 +54,7 @@ Render SVG → PNG with headless Chrome (no extra tooling needed):
   "file:///path/to/wrapper.html"   # html: <img src="appicon.svg" style="width:1024px;height:1024px"> with zero body margin
 ```
 
-The `.roomai` document icon is attached via `src-tauri/Info.plist`
-(`CFBundleTypeIconFile` → `document.icns`, bundled through the
-`bundle.resources` map in `tauri.conf.json`).
+The `.arcelle`/`.roomai` document icon is attached by
+`electron-migration/electron-app/electron-builder.config.mjs`
+(`CFBundleTypeIconFile` → `document.icns`) and bundled through
+electron-builder's `extraResources` configuration.

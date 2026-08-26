@@ -437,6 +437,8 @@
    case, not uppercase — Room Home's state tapes are set the same way, and the
    pair are the same idiom saying the same kind of thing. */
 .toast-mark {
+  grid-column: 1;
+  grid-row: 1;
   flex: none;
   margin-top: 1px;
   white-space: nowrap;
@@ -452,6 +454,9 @@
    would otherwise keep its own 2px padding and leave this under the 24px
    minimum target. */
 .toast .toast-action {
+  grid-column: 2;
+  grid-row: 2;
+  justify-self: start;
   display: inline-flex;
   align-items: center;
   gap: 5px;

@@ -154,6 +154,7 @@
     { id: "f-review", name: "review-sample.docx", mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document", sizeBytes: 188_000, source: "upload", hasText: true, createdAt: iso(1300), folderId: "fo-research", partiallyIndexed: false, originDestination: "library", libraryVisibility: "linked", aiSummary: "A sample review document used to exercise the Word-doc viewer and editor." },
     { id: "f-apollo", name: "Apollo missions.csv", mimeType: "text/csv", sizeBytes: 8210, source: "upload", hasText: true, createdAt: iso(2100), folderId: "fo-research", partiallyIndexed: false, originDestination: "library", libraryVisibility: "linked", aiSummary: null },
     { id: "f-meeting", name: "Product review.m4a", mimeType: "audio/mp4", sizeBytes: 22_000_000, source: "recording", hasText: true, createdAt: iso(60), folderId: null, partiallyIndexed: false, originDestination: "library", libraryVisibility: "linked", aiSummary: "A recorded product review meeting with a full speaker transcript." },
+    { id: "f-standup", name: "Monday standup.m4a", mimeType: "audio/mp4", sizeBytes: 18_000_000, source: "recording", hasText: true, createdAt: iso(80), folderId: null, partiallyIndexed: false, originDestination: "library", libraryVisibility: "linked", aiSummary: "A standup the room has already read, including a recognised returning voice." },
     { id: "f-script", name: "prepare_release.py", mimeType: "text/x-python", sizeBytes: 1180, source: "upload", hasText: true, createdAt: iso(400), folderId: null, partiallyIndexed: false, originDestination: "library", libraryVisibility: "linked", aiSummary: null },
     // The video viewer's own surface (technical strip, Set start/Set end, Trim,
     // Save frame) had NO fixture at all, so nothing in this harness could reach
@@ -275,6 +276,7 @@
     "f-apollo": { kind: "csv", name: "Apollo missions.csv", mime: "text/csv", editable: true, text: "mission,year,crew\nApollo 7,1968,3\nApollo 8,1968,3\nApollo 11,1969,3\nApollo 13,1970,3\nApollo 17,1972,3", dataB64: null },
     "f-script": { kind: "code", name: "prepare_release.py", mime: "text/x-python", editable: true, text: "# /// script\n# room-inputs: Research/*.md\n# room-outputs: Reports/release-brief.md\n# room-timeout: 120\n# ///\n\nfrom pathlib import Path\nnotes = list(Path('Research').glob('*.md'))\nprint(len(notes))", dataB64: null },
     "f-meeting": { kind: "recording", name: "Product review.m4a", mime: "audio/mp4", editable: false, text: "[00:12] We should keep the document in the center.\n[00:41] And the AI needs to say which sources it used.", dataB64: null, mediaToken: null },
+    "f-standup": { kind: "recording", name: "Monday standup.m4a", mime: "audio/mp4", editable: false, text: "[00:02] Search is ready for review.\n[00:05] I will ship it Thursday.\n[00:08] Keep the release note short.", dataB64: null, mediaToken: null },
     // `mediaMeta: null` ON PURPOSE: this is the room that predates the column,
     // so opening it is what makes the viewer ask for `probe_video_meta`. That
     // on-open probe is the ONLY way an already-imported video ever fills in.
@@ -564,6 +566,34 @@
       ],
     },
   };
+  const standupSegments = [
+    recSeg("ms1", "Speaker 1", 0, "Search is ready for review"),
+    recSeg("ms2", "Speaker 2", 300, "I will ship it Thursday"),
+    recSeg("ms3", "Speaker 1", 600, "Keep the release note short"),
+  ];
+  const standupMeta = {
+    name: "Monday standup.m4a",
+    meta: {
+      durationCs: 900,
+      cuts: [],
+      maxSpeakers: 0,
+      segments: standupSegments,
+      speakerNames: { "Speaker 2": "Dana" },
+      recognized: ["Dana"],
+      chapters: [{ id: "mc1", t0: 0, title: "Release status", by: "room" }],
+      highlights: [{ id: "mh1", t0: 250, t1: 520, by: "room" }],
+      notes: [
+        { id: "mn1", t0: 100, kind: "decision", text: "Decided to ship search on Thursday", by: "room" },
+        { id: "mn2", t0: 300, kind: "action", text: "Prepare the release", who: "Dana", by: "room" },
+        { id: "mn3", t0: 700, kind: "point", text: "Keep the launch note concise", by: "you" },
+      ],
+      readOf: {
+        turns: standupSegments.length,
+        chars: standupSegments.reduce((n, segment) => n + new TextEncoder().encode(segment.text).length, 0),
+      },
+    },
+  };
+  const recMetas = { "f-meeting": recMeta, "f-standup": standupMeta };
 
   /* event name -> Map(key -> wrapped(payload)). ONE registry for BOTH
    * bridges: Tauri's `plugin:event|listen`/`|unlisten` and the Electron
@@ -1787,26 +1817,72 @@
     rec_live_status: () => null,
     // A finished, transcribed meeting: two voices, one of them speaking twice
     // — enough to prove that naming a speaker renames EVERY line they said.
-    rec_get: (a2) => ({ name: recMeta.name, meta: recMeta.meta }),
+    rec_get: (a2) => {
+      const recording = recMetas[a2?.id] ?? recMeta;
+      return { name: recording.name, meta: recording.meta };
+    },
+    rec_read_start: (a2) => {
+      const recording = recMetas[a2?.id] ?? recMeta;
+      const mine = (recording.meta.notes ?? []).filter((note) => note.by === "you");
+      recording.meta = {
+        ...recording.meta,
+        notes: [
+          { id: "reread-decision", t0: 100, kind: "decision", text: "Ship search on Thursday", by: "room" },
+          ...mine,
+        ],
+        readOf: {
+          turns: recording.meta.segments.length,
+          chars: recording.meta.segments.reduce((n, segment) => n + new TextEncoder().encode(segment.text).length, 0),
+        },
+      };
+      setTimeout(() => window.__qaEmit?.("rec-read-done", { fileId: a2?.id }), 20);
+      return "qa-rec-read";
+    },
+    rec_highlight_add: (a2) => {
+      const recording = recMetas[a2?.id] ?? recMeta;
+      recording.meta = { ...recording.meta, highlights: [...(recording.meta.highlights ?? []), { id: `qh-${Date.now()}`, t0: a2?.t0 ?? 0, t1: a2?.t1 ?? 0, by: "you" }] };
+      return recording.meta;
+    },
+    rec_chapter_add: (a2) => {
+      const recording = recMetas[a2?.id] ?? recMeta;
+      recording.meta = { ...recording.meta, chapters: [...(recording.meta.chapters ?? []), { id: `qc-${Date.now()}`, t0: a2?.t0 ?? 0, title: a2?.title ?? "", by: "you" }] };
+      return recording.meta;
+    },
+    rec_note_add: (a2) => {
+      const recording = recMetas[a2?.id] ?? recMeta;
+      recording.meta = { ...recording.meta, notes: [...(recording.meta.notes ?? []), { id: `qn-${Date.now()}`, t0: a2?.t0 ?? 0, kind: a2?.kind ?? "point", text: a2?.text ?? "", who: a2?.who, by: "you" }] };
+      return recording.meta;
+    },
+    rec_item_delete: (a2) => {
+      const recording = recMetas[a2?.id] ?? recMeta;
+      const field = a2?.kind === "note" ? "notes" : a2?.kind === "chapter" ? "chapters" : "highlights";
+      recording.meta = { ...recording.meta, [field]: (recording.meta[field] ?? []).filter((item) => item.id !== a2?.itemId) };
+      return recording.meta;
+    },
     // GH #5. Mirrors the Rust command: an overlay keyed by the machine label,
     // empty name clears it, and the segments are never rewritten.
     rec_set_speaker_name: (a2) => {
       const { speaker, name } = a2 ?? {};
+      const recording = recMetas[a2?.id] ?? recMeta;
       // The two refusals the real command has and this stand-in used to skip,
       // so a UI that sent either was "passing" under QA.
       if (!String(speaker ?? "").trim()) throw new Error("No speaker selected.");
-      if (recMeta.meta.segments.length === 0) {
+      if (recording.meta.segments.length === 0) {
         throw new Error("That recording has no transcript yet.");
       }
-      if (!recMeta.meta.segments.some((s) => s.speaker === speaker)) {
+      if (!recording.meta.segments.some((s) => s.speaker === speaker)) {
         throw new Error(`Nobody in this recording is labelled "${speaker}".`);
       }
       const clean = String(name ?? "").trim().slice(0, 60);
-      const names = { ...(recMeta.meta.speakerNames ?? {}) };
+      const names = { ...(recording.meta.speakerNames ?? {}) };
       if (!clean || clean === speaker) delete names[speaker];
       else names[speaker] = clean;
-      recMeta.meta = { ...recMeta.meta, speakerNames: names };
-      return recMeta.meta;
+      recording.meta = {
+        ...recording.meta,
+        speakerNames: names,
+        recognized: (recording.meta.recognized ?? []).filter((recognized) => recognized !== clean),
+      };
+      return recording.meta;
     },
     // Typed links, in the REAL GraphEdge shape (a/b/weight/kind/directed/shared)
     // — this used to mock a {from,to,why} shape the app has never sent, so the
@@ -1821,6 +1897,7 @@
     }),
     studio_prompts: () => ({ flashcards: "Make flashcards", mindmap: "Make a mind map", podcast: "Write a podcast script" }),
     ai_action_prompts: () => [],
+    generate_ui_text: () => null,
     warm_model: () => null,
     create_chat: () => ({ id: "c" + Math.random().toString(36).slice(2), title: "New chat", createdAt: new Date().toISOString() }),
     touchid_has: () => false,
@@ -1864,6 +1941,11 @@
       { name: "Dana", seconds: 412, takes: 6, corrections: 0, updatedAt: iso(2880) },
       { name: "Yonatan", seconds: 96, takes: 2, corrections: 1, updatedAt: iso(10080) },
     ],
+    voice_forget: (a2) =>
+      [
+        { name: "Dana", seconds: 412, takes: 6, corrections: 0, updatedAt: iso(2880) },
+        { name: "Yonatan", seconds: 96, takes: 2, corrections: 1, updatedAt: iso(10080) },
+      ].filter((voice) => voice.name !== a2?.name),
     list_neural_voices: () => [
       { id: "en-US-AndrewMultilingualNeural", gender: "Male", locale: "en-US" },
       { id: "en-US-AvaMultilingualNeural", gender: "Female", locale: "en-US" },
@@ -1888,20 +1970,13 @@
       new Uint8Array(buf).forEach((b) => { bin += String.fromCharCode(b); });
       return btoa(bin);
     },
-    // Streaming dictation (start → push → stop) is the ONLY dictation path the
-    // app has; the old send-the-whole-clip `transcribe_audio` is still a Rust
-    // command but no screen calls it, so faking it here only implied a route
-    // that is gone. Without these three the composer mic throws, and the error
-    // toast then sits on top of the button the next click needs.
-    dict_start: () => null,
-    dict_push_audio: () => null,
-    dict_cancel: () => null,
-    // First stop yields a follow-up (drives one hands-free auto-send loop),
-    // later stops yield silence so the QA run terminates.
-    dict_stop: () => {
-      window.__qaDictStops = (window.__qaDictStops || 0) + 1;
-      return window.__qaDictStops === 1 ? "and a follow-up question" : "";
-    },
+    // Electron provisions the authenticated sidecar socket; audio and Stop no
+    // longer cross IPC. The QA WebSocket below owns the rest of this fixture.
+    dict_start: () => ({
+      url: "ws://qa.arcelle.invalid/dict/session",
+      stopBaseMs: 100,
+      stopPerAudioSecondMs: 10,
+    }),
     recommended_models: () => ({ vision: "qwen2.5vl:3b", embed: "nomic-embed-text" }),
     get_ollama_url: () => "",
     // Token-budget bar QA: a context-compaction marker, appended so the next
@@ -2314,6 +2389,26 @@
       registerListener(channel, key, (payload) => callback(payload));
       return () => dropListener(channel, key);
     },
+    dialog: {
+      open: async () => null,
+      save: async (options) => options?.defaultPath ?? null,
+      message: async () => null,
+      ask: async () => true,
+      confirm: async () => true,
+    },
+    shell: {
+      openUrl: async (url) => {
+        (window.__qaOpenedUrls = window.__qaOpenedUrls || []).push(url);
+      },
+      openPath: async (path) => {
+        (window.__qaOpenedUrls = window.__qaOpenedUrls || []).push(path);
+      },
+      revealItemInDir: async (paths) => {
+        const values = Array.isArray(paths) ? paths : [paths];
+        (window.__qaRevealedPaths = window.__qaRevealedPaths || []).push(...values);
+      },
+    },
+    files: { paths: () => [] },
   };
 
   /** Patch whichever bridge is already there, provide whichever is not.
@@ -2357,6 +2452,46 @@
   });
   installBridge("__TAURI_INTERNALS__", tauriBridge);
   installBridge("arcelle", arcelleBridge);
+
+  // Direct dictation deliberately bypasses both bridges. Keep its renderer
+  // protocol real in QA (open, binary frames, JSON Stop/final) while replacing
+  // only the sidecar endpoint that cannot exist in the browser harness.
+  class QaWebSocket extends EventTarget {
+    static CONNECTING = 0;
+    static OPEN = 1;
+    static CLOSING = 2;
+    static CLOSED = 3;
+    constructor(url) {
+      super();
+      this.url = String(url);
+      this.readyState = QaWebSocket.CONNECTING;
+      this.binaryType = "blob";
+      queueMicrotask(() => {
+        this.readyState = QaWebSocket.OPEN;
+        this.dispatchEvent(new Event("open"));
+      });
+    }
+    send(data) {
+      if (typeof data !== "string") return;
+      let message;
+      try { message = JSON.parse(data); } catch { return; }
+      if (message?.type === "stop") {
+        window.__qaDictStops = (window.__qaDictStops || 0) + 1;
+        const text = window.__qaDictStops === 1 ? "and a follow-up question" : "";
+        queueMicrotask(() => this.dispatchEvent(new MessageEvent("message", {
+          data: JSON.stringify({ type: "final", ok: true, text }),
+        })));
+      } else if (message?.type === "cancel") {
+        this.close();
+      }
+    }
+    close(code = 1000, reason = "") {
+      if (this.readyState === QaWebSocket.CLOSED) return;
+      this.readyState = QaWebSocket.CLOSED;
+      queueMicrotask(() => this.dispatchEvent(new CloseEvent("close", { code, reason })));
+    }
+  }
+  window.WebSocket = QaWebSocket;
 
   // Hands-free QA: a synthetic mic (oscillator → MediaStream) so dictation
   // runs headless without fake-device launch flags.

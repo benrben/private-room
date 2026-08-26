@@ -200,12 +200,15 @@ test("a chained traceback has no advice, so the card offers none", () => {
 });
 
 test("the guidance openers are the words the runner actually writes", () => {
-  const rust = readFileSync(join(here, "../../src-tauri/src/commands/jobs/script_run.rs"), "utf8");
+  const host = readFileSync(
+    join(here, "../../electron-migration/electron-app/electron/main/scriptRun.ts"),
+    "utf8",
+  );
   assert.ok(GUIDANCE_OPENERS.length >= 2, "the openers list did not load");
   for (const opener of GUIDANCE_OPENERS) {
     assert.ok(
-      rust.includes(opener),
-      `ScriptRow no longer recognises the runner's guidance: script_run.rs writes nothing starting "${opener}"`,
+      host.includes(opener),
+      `ScriptRow no longer recognises the runner's guidance: scriptRun.ts writes nothing starting "${opener}"`,
     );
   }
 });

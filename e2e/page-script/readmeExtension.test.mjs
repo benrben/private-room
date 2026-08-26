@@ -22,13 +22,12 @@ const read = (rel) => readFileSync(join(root, rel), "utf8");
 
 const README = read("README.md");
 const CONSTANTS = read("src/rooms/constants.ts");
-const TAURI_CONF = JSON.parse(read("src-tauri/tauri.conf.json"));
+const BUILDER = read("electron-migration/electron-app/electron-builder.config.mjs");
 
 test("the app really does save new rooms as .arcelle", () => {
   // The premise of the test below — asserted, not assumed.
   assert.match(CONSTANTS, /extensions:\s*\["arcelle",\s*"roomai"\]/);
-  const exts = JSON.stringify(TAURI_CONF).match(/"ext":\s*\[[^\]]*\]/)?.[0] ?? "";
-  assert.ok(exts.includes("arcelle"), exts);
+  assert.match(BUILDER, /CFBundleTypeExtensions: \["arcelle", "roomai"\]/);
 });
 
 test("the README names the extension a new room actually gets", () => {

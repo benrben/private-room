@@ -19,3 +19,16 @@ dist_boot_b/
 # Scratch compile output for electron/renderer/tsconfig.json — the renderer
 # subproject's own DOM-lib typecheck target, never hand-edited, never shipped.
 dist_renderer/
+
+# Electron packaging compile output and proof artifacts. Source and configs
+# live beside these directories; their generated JS, fixture bundles and DMGs
+# must never be staged by `git add -A`.
+dist_pkg_a/
+dist_pkg_b/
+dist_package/
+pkgout_a/
+release/
+release_b/
+release_b_proof*/
+build_b/
+resources_b/

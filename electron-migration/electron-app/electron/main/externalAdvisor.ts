@@ -147,9 +147,9 @@ export const CODEX_ARCELLE_FLAGS =
   "--sandbox read-only -c 'approval_policy=\"never\"' --disable shell_tool " +
   "--disable unified_exec -c 'web_search=\"disabled\"'";
 
-/** The two engines this module executes directly. `openrouter` is external
+/** The CLI engines this module executes directly. `openrouter` is external
  * too, but runs through the provider-aware Python sidecar. */
-export type CliEngine = "claude-cli" | "codex-cli";
+export type CliEngine = "claude-cli" | "codex-cli" | "antigravity-cli";
 
 export interface BuildCommandLineOptions {
   /** Already through {@link checkCliSlug} — this function interpolates, it
@@ -181,9 +181,10 @@ export interface BuildCommandLineOptions {
  */
 export function buildCommandLine(engine: CliEngine, opts: BuildCommandLineOptions): string {
   const modelFlag = opts.submodel !== null ? ` --model '${opts.submodel}'` : "";
-  // Claude takes `--effort <level>`; Codex takes `-c model_reasoning_effort=<level>`.
+  // Claude takes `--effort <level>`; Codex takes a config override.
+  // Antigravity's live catalog already exposes effort as model variants.
   const effortFlag =
-    opts.effort === null
+    opts.effort === null || engine === "antigravity-cli"
       ? ""
       : engine === "claude-cli"
         ? ` --effort '${opts.effort}'`
@@ -197,6 +198,9 @@ export function buildCommandLine(engine: CliEngine, opts: BuildCommandLineOption
       );
     }
     return `claude -p --output-format json${modelFlag}${effortFlag}`;
+  }
+  if (engine === "antigravity-cli") {
+    return `agy --sandbox --mode plan --input-format stream-json --output-format stream-json --print-timeout 5m${modelFlag}`;
   }
   return `codex exec --json${CODEX_ARCELLE_FLAGS}${opts.codexMcpFlags ?? ""}${modelFlag}${effortFlag} -`;
 }
@@ -320,6 +324,35 @@ export function parseCodexJsonStream(stdout: Buffer | string): { text: string; u
   if (!parsedAny) {
     text = raw.trim();
   }
+  return { text, usage: { inputTokens, outputTokens } };
+}
+
+/** Antigravity CLI's `--output-format stream-json` JSONL stream. The terminal
+ * result carries the final response and aggregate token stats. */
+export function parseAntigravityJsonStream(stdout: Buffer | string): { text: string; usage: ExternalUsage } {
+  const raw = typeof stdout === "string" ? stdout : stdout.toString("utf8");
+  let text = "";
+  let inputTokens: number | null = null;
+  let outputTokens: number | null = null;
+  let parsedAny = false;
+  for (const line of raw.split("\n")) {
+    if (!line.trim()) continue;
+    let event: unknown;
+    try { event = JSON.parse(line); } catch { continue; }
+    parsedAny = true;
+    const obj = asRecord(event);
+    if (obj?.event === "step_update") {
+      const update = asRecord(obj.step_update);
+      if (update?.step_type === "agent_response" && typeof update.text_delta === "string") text += update.text_delta;
+    } else if (obj?.event === "result") {
+      const result = asRecord(obj.result);
+      if (typeof result?.response === "string") text = result.response;
+      const usage = asRecord(result?.usage);
+      inputTokens = u64Field(usage, "input_tokens");
+      outputTokens = u64Field(usage, "output_tokens");
+    }
+  }
+  if (!parsedAny) text = raw.trim();
   return { text, usage: { inputTokens, outputTokens } };
 }
 
@@ -635,7 +668,7 @@ export interface ExternalRunResult {
 }
 
 /**
- * Run one prompt through a cloud CLI (Claude Code / Codex) — the real port of
+ * Run one prompt through a cloud CLI (Claude Code / Codex / Antigravity) — the real port of
  * `run_external` (external.rs lines 643-892). The content leaves the machine
  * via the user's own account.
  *
@@ -752,7 +785,7 @@ export async function runExternalCli(
     const submodel = checkCliSlug(submodelRaw, "model");
     const effort = checkCliSlug(effortRaw, "reasoning effort");
 
-    if (engine !== "claude-cli" && engine !== "codex-cli") {
+    if (engine !== "claude-cli" && engine !== "codex-cli" && engine !== "antigravity-cli") {
       throw new Error("Unknown engine");
     }
     const cmdline = buildCommandLine(engine, { submodel, effort, mcpConfigPath, codexMcpFlags });
@@ -771,7 +804,9 @@ export async function runExternalCli(
       args: [...shell.args, cmdline],
       cwd: workDir,
       env,
-      stdinText: prompt,
+      stdinText: engine === "antigravity-cli"
+        ? `${JSON.stringify({ event: "user", message: { role: "user", content: prompt } })}\n`
+        : prompt,
       engineName: engine,
       cancel: options.cancel,
     });
@@ -783,8 +818,11 @@ export async function runExternalCli(
       throw new Error(`${engine} failed: ${snippet}`);
     }
 
-    const parsed =
-      engine === "claude-cli" ? parseClaudeJsonResult(run.result.stdout) : parseCodexJsonStream(run.result.stdout);
+    const parsed = engine === "claude-cli"
+      ? parseClaudeJsonResult(run.result.stdout)
+      : engine === "antigravity-cli"
+        ? parseAntigravityJsonStream(run.result.stdout)
+        : parseCodexJsonStream(run.result.stdout);
 
     // PRIV-1: put the real values back into the reply — the cloud only ever
     // saw the placeholders; the user reads a normal answer. Usage numbers

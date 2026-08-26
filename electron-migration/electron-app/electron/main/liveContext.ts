@@ -72,13 +72,11 @@
  * `ExecToolDeps.cancel` into the advisor's `RunExternalOptions`, and falls back
  * to the flagless default only when there genuinely is no run flag to bind.
  *
- * DELIBERATELY LEFT ON ITS EXISTING DEFAULT — an honest gap, not an oversight:
- *   - `CmdCtx.transcribeAudio` — on-device Whisper has no Electron port anywhere
- *     in this tree (`sttTools.ts` covers model download/management only, never
- *     live decoding). Left unset, so `#transcribe`'s on-demand branch keeps
- *     refusing through `transcribeAudioNotImplemented`; its cached-transcript
- *     branch is unaffected. Faking it is the one thing this port has repeatedly
- *     refused to do.
+ * HOST-SUPPLIED ENGINE CONTEXT:
+ *   - `CmdCtx.transcribeAudio` is installed when the bootstrap supplies its
+ *     user-data and resources paths. Production does so and routes decoding to
+ *     the bundled Whisper sidecar; callers that construct this helper without
+ *     host paths retain the explicit unavailable seam used by isolated tests.
  *   - `ExecToolDeps.downloadJob`/`.workflowRun`/`.runStudioDeps` — each needs an
  *     APP-WIDE job queue / cancel-tree bundle that nothing in this room- and
  *     turn-scoped assembler's remit constructs. A queue owned by this module
@@ -118,6 +116,8 @@ import { toRoomPinSource, toRoomSource, type RoomManagerState } from "./roomMana
 import { layoutGraphReal } from "./sketchLayoutAdapter.js";
 import type { EventSender, TurnId } from "./turn.js";
 import type { OpenRoom, TurnRoomSource } from "./turnEngine.js";
+import { applyLiveAppServices, type LiveAppServices } from "./liveAppServices.js";
+import { transcribeMediaBytes } from "./speechSttSurfaceIpc.js";
 
 // ============================================================================
 // The room view — one RoomManagerState, through roomManager.ts's own adapters
@@ -159,14 +159,18 @@ export function liveTurnRoomSource(state: RoomManagerState): TurnRoomSource {
  * `CmdCtx` is assembled … belongs to whichever host-bootstrap batch assembles
  * one").
  *
- * `transcribeAudio` is deliberately ABSENT — see the module doc.
+ * `transcribeAudio` is included when the production host paths are supplied.
  */
-export function liveCmdCtxDeps(): CmdCtxDeps {
+export function liveCmdCtxDeps(stt?: { userDataDir: string; resourcesPath: string | null }): CmdCtxDeps {
   return {
     generate: generateReal,
     chatStructured: chatStructuredReal,
     generateStream: generateStreamReal,
     layoutGraph: layoutGraphReal,
+    ...(stt === undefined ? {} : {
+      transcribeAudio: (bytes, ext, kind) =>
+        transcribeMediaBytes(stt.userDataDir, stt.resourcesPath, bytes, ext, kind),
+    }),
   };
 }
 
@@ -212,14 +216,18 @@ function registeredCancelFor(state: RoomManagerState, runId: string): CancelFlag
  * `listModels` is left unset so `runCommand` resolves `engineRouting.ts`'s real
  * one — the live app's behavior — rather than this module deciding for it.
  */
-export function liveRunCommandDeps(state: RoomManagerState, send: EventSender): RunCommandDeps {
+export function liveRunCommandDeps(
+  state: RoomManagerState,
+  send: EventSender,
+  stt?: { userDataDir: string; resourcesPath: string | null },
+): RunCommandDeps {
   return {
     room: liveTurnRoomSource(state),
     cancelState: state.cancel,
     send,
     emit: send,
     checkpointState: state,
-    ...liveCmdCtxDeps(),
+    ...liveCmdCtxDeps(stt),
   };
 }
 
@@ -257,7 +265,8 @@ export interface LiveCmdCtxOptions {
 export function assembleCmdCtx(
   state: RoomManagerState,
   send: EventSender,
-  opts: LiveCmdCtxOptions
+  opts: LiveCmdCtxOptions,
+  stt?: { userDataDir: string; resourcesPath: string | null },
 ): CmdCtx {
   return new CmdCtx({
     model: opts.model,
@@ -270,7 +279,7 @@ export function assembleCmdCtx(
     room: liveTurnRoomSource(state),
     send,
     emit: send,
-    ...liveCmdCtxDeps(),
+    ...liveCmdCtxDeps(stt),
   });
 }
 
@@ -302,6 +311,7 @@ export interface LiveExecToolDepsOptions {
    * module doc) unless this supplies its own `cancel`.
    */
   advisorOptions?: RunExternalOptions;
+  services?: LiveAppServices;
 }
 
 /**
@@ -356,7 +366,8 @@ export function liveExecToolDeps(
       ? undefined
       : { ...(cancel !== null ? { cancel } : {}), ...opts.advisorOptions };
 
-  return withRealAdvisorCli(withRealPrivacyGates(base), advisorOptions);
+  const core = withRealAdvisorCli(withRealPrivacyGates(base), advisorOptions);
+  return opts.services === undefined ? core : applyLiveAppServices(core, state, send, opts.services);
 }
 
 // ============================================================================
@@ -391,10 +402,14 @@ export interface LiveContext {
  * `CancelState` as `state.cancel`, reused rather than reinvented) plus an
  * `EventSender` standing in for the `Window`.
  */
-export function assembleLiveContext(state: RoomManagerState, send: EventSender): LiveContext {
+export function assembleLiveContext(
+  state: RoomManagerState,
+  send: EventSender,
+  stt?: { userDataDir: string; resourcesPath: string | null },
+): LiveContext {
   return {
-    runCommandDeps: liveRunCommandDeps(state, send),
-    cmdCtx: (opts) => assembleCmdCtx(state, send, opts),
+    runCommandDeps: liveRunCommandDeps(state, send, stt),
+    cmdCtx: (opts) => assembleCmdCtx(state, send, opts, stt),
     execToolDeps: (opts) => liveExecToolDeps(state, send, opts),
   };
 }

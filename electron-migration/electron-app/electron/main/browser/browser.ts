@@ -163,6 +163,7 @@ export class Browser {
    */
   private guardDestination(url: string): URL {
     let parsed: URL;
+    if (url === START_BLANK) return new URL(START_BLANK);
     try {
       parsed = new URL(url);
     } catch {
@@ -531,6 +532,14 @@ export class Browser {
    *  that is genuinely not answering. */
   async eval(js: string): Promise<unknown> {
     return evalJson(this.evalHost(), this.requireActive(), js);
+  }
+
+  /** Capture the active page as PNG bytes for the browse_look tool. */
+  async captureActivePage(): Promise<Buffer> {
+    const page = this.pages.get(this.requireActive());
+    if (!page) throw new Error("The browser isn't open.");
+    const image = await page.contents.capturePage();
+    return image.toPNG();
   }
 }
 

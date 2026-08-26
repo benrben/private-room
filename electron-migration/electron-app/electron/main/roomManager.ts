@@ -183,6 +183,7 @@
 
 import type Database from "better-sqlite3-multiple-ciphers";
 import { existsSync } from "node:fs";
+import { renameSync } from "node:fs";
 import path from "node:path";
 import type { McpApproval, RoomInfo } from "../shared/apiTypes.js";
 import { cancelAll, createCancelState, type CancelState } from "./cancel.js";
@@ -233,7 +234,20 @@ import { pushRecent, readRecent, renameRecent, writeRecent } from "./recentTools
 import type { RoomPinSource } from "./roomPin.js";
 import type { PendingScriptResolver } from "./scriptConsent.js";
 import type { EventSender } from "./turn.js";
+import type { AgentRunFn } from "./workflowEngine.js";
 import { ROLLBACK_BUSY } from "./turnContext.js";
+import { contentStoreFor } from "./workspace/contentStore.js";
+import {
+  acquireWorkspaceLease,
+  createWorkspaceRoom,
+  describeRoom,
+  openWorkspaceRoom,
+  releaseWorkspaceLease,
+  type WorkspaceLease,
+} from "./workspace/roomLayout.js";
+import type { ContentStore, RoomDescriptor, RoomKind } from "./workspace/types.js";
+import { WorkspaceService } from "./workspace/workspaceService.js";
+import { WorkspaceWatcher } from "./workspace/watcher.js";
 
 // ============================================================================
 // Types
@@ -248,6 +262,14 @@ export interface Room {
   path: string;
   name: string;
   password: string;
+  /** Present on rooms opened by the hybrid-storage runtime. Optional so old
+   * tests and extension seams that construct Room remain source-compatible. */
+  descriptor?: RoomDescriptor;
+  contentStore?: ContentStore;
+  workspace?: WorkspaceService;
+  workspaceLease?: WorkspaceLease;
+  workspaceWatcher?: WorkspaceWatcher;
+  workspaceRuntimeClosed?: boolean;
 }
 
 /** The user's answer to a per-call MCP approval prompt. Ported from
@@ -375,6 +397,10 @@ export interface RoomManagerDeps {
   scheduler?: { deps: SchedulerDeps; state: SchedulerState };
   policy?: PolicyDeps;
   privacyScan?: PrivacyScanDeps;
+  /** One headless, cancellable agent turn for an `agent_run` workflow node. */
+  workflowAgentRun?: AgentRunFn;
+  /** Debounced background description/read scheduling after an ingest. */
+  scheduleAutoIndex?: (roomPath: string) => void;
 
   // ---- bucket 2: genuinely unported Rust subsystems ----
   /** `refresh_mcp` — reconnect the room's saved connector config. */
@@ -757,6 +783,44 @@ function openRoomFile(roomPath: string, password: string): Database.Database {
   return conn;
 }
 
+function roomDatabasePath(room: Room): string {
+  return room.descriptor?.dbPath ?? room.path;
+}
+
+function attachStorageRuntime(
+  room: Room,
+  descriptor: RoomDescriptor,
+  lease?: WorkspaceLease,
+): void {
+  room.descriptor = descriptor;
+  room.contentStore = contentStoreFor(room.conn, descriptor.rootPath);
+  room.workspaceLease = lease;
+  if (descriptor.kind === "workspace-folder" && descriptor.rootPath !== null) {
+    room.workspace = new WorkspaceService(room.conn, descriptor.rootPath);
+  }
+}
+
+function startWorkspaceRuntime(state: RoomManagerState, room: Room): void {
+  const workspace = room.workspace;
+  const rootPath = room.descriptor?.rootPath;
+  if (workspace === undefined || rootPath === null || rootPath === undefined) return;
+  workspace.recoverIncompleteOperations();
+  const reconcileIfCurrent = async (): Promise<void> => {
+    if (state.room !== room) return;
+    await workspace.reconcile();
+  };
+  const watcher = new WorkspaceWatcher(rootPath, {
+    onChange: () => { void reconcileIfCurrent().catch(() => undefined); },
+    reconcile: reconcileIfCurrent,
+  });
+  room.workspaceWatcher = watcher;
+  void reconcileIfCurrent()
+    .then(() => room.workspaceRuntimeClosed === true ? undefined : watcher.start())
+    .catch((error) => {
+      console.error(`workspace watcher could not start: ${error instanceof Error ? error.message : String(error)}`);
+    });
+}
+
 /** The background spawns `create_room` AND `open_room_impl` both start at
  * their tail, in Rust's own order — everything up to, but not including,
  * `open_room_impl`'s privacy refresh, which `create_room` does not do. */
@@ -824,7 +888,8 @@ export function createRoom(
   deps: RoomManagerDeps,
   roomPath: string,
   password: string,
-  name?: string | null
+  name?: string | null,
+  format: RoomKind = "sealed-db",
 ): RoomInfo {
   // Wave 3 (Idea 9): don't create/switch rooms while a rollback is swapping.
   if (state.rollingBack) {
@@ -837,7 +902,23 @@ export function createRoom(
   const resolvedName =
     trimmed !== undefined && trimmed !== "" ? trimmed : roomNameFromPath(roomPath);
 
-  const conn = dbCreateRoom(roomPath, password, resolvedName);
+  let conn: Database.Database;
+  let descriptor: RoomDescriptor;
+  let lease: WorkspaceLease | undefined;
+  if (format === "workspace-folder") {
+    const created = createWorkspaceRoom(roomPath, password, resolvedName);
+    conn = created.db;
+    descriptor = created.descriptor;
+    try {
+      lease = acquireWorkspaceLease(created.descriptor.rootPath);
+    } catch (error) {
+      closeQuietly(conn);
+      throw error;
+    }
+  } else {
+    conn = dbCreateRoom(roomPath, password, resolvedName);
+    descriptor = describeRoom(roomPath);
+  }
 
   if (state.room !== null) {
     teardownOpenRoom(state, deps);
@@ -846,7 +927,8 @@ export function createRoom(
   // D10 (the Closet): a fresh room has no remote-Ollama URL, which clears any
   // override the previous room set.
   applyOllamaOverride(conn);
-  const room: Room = { conn, path: roomPath, name: resolvedName, password };
+  const room: Room = { conn, path: descriptor.path, name: resolvedName, password };
+  attachStorageRuntime(room, descriptor, lease);
 
   let info: RoomInfo;
   try {
@@ -855,10 +937,12 @@ export function createRoom(
     // Rust's `let info = info_of(..)?;` drops `room` — and its connection —
     // on the way out, leaving `state.room` untouched.
     closeQuietly(conn);
+    if (lease !== undefined) releaseWorkspaceLease(lease);
     throw err;
   }
   pushRecent(deps.userDataDir, room.name, room.path);
   state.room = room;
+  startWorkspaceRuntime(state, room);
   // ADD-30: a job left 'running' belongs to a process that's gone — mark it
   // 'paused' so the UI offers Resume rather than a phantom active job.
   quiesceStaleJobs(room.conn);
@@ -880,7 +964,20 @@ export function openRoomImpl(
   roomPath: string,
   password: string
 ): RoomInfo {
-  const conn = openRoomFile(roomPath, password);
+  const descriptor = describeRoom(roomPath);
+  let lease: WorkspaceLease | undefined;
+  let conn: Database.Database;
+  if (descriptor.kind === "workspace-folder" && descriptor.rootPath !== null) {
+    lease = acquireWorkspaceLease(descriptor.rootPath);
+    try {
+      conn = openWorkspaceRoom(descriptor.rootPath, password).db;
+    } catch (error) {
+      releaseWorkspaceLease(lease);
+      throw error;
+    }
+  } else {
+    conn = openRoomFile(descriptor.dbPath, password);
+  }
 
   // Opening a room while another is open (a Finder double-click on a second
   // .roomai) must fully tear the old one down first. Runs only AFTER the
@@ -890,20 +987,25 @@ export function openRoomImpl(
     teardownOpenRoom(state, deps);
   }
 
-  const name = getMeta(conn, "name") ?? roomNameFromPath(roomPath);
+  const name = descriptor.kind === "workspace-folder"
+    ? roomNameFromPath(descriptor.path)
+    : getMeta(conn, "name") ?? roomNameFromPath(roomPath);
   // D10 (the Closet): re-apply this room's saved remote-Ollama URL on unlock.
   applyOllamaOverride(conn);
-  const room: Room = { conn, path: roomPath, name, password };
+  const room: Room = { conn, path: descriptor.path, name, password };
+  attachStorageRuntime(room, descriptor, lease);
 
   let info: RoomInfo;
   try {
     info = infoOf(room, deps.userDataDir);
   } catch (err) {
     closeQuietly(conn);
+    if (lease !== undefined) releaseWorkspaceLease(lease);
     throw err;
   }
   pushRecent(deps.userDataDir, room.name, room.path);
   state.room = room;
+  startWorkspaceRuntime(state, room);
   quiesceStaleJobs(room.conn);
 
   // A live recording that died with the app left audio checkpoints behind —
@@ -970,7 +1072,7 @@ export async function openRoomWithRecovery(
   roomPath: string,
   code: string
 ): Promise<RoomInfo> {
-  const password = await recoverPassword(roomPath, code);
+  const password = await recoverPassword(describeRoom(roomPath).dbPath, code);
   return openRoom(state, deps, roomPath, password);
 }
 
@@ -984,7 +1086,7 @@ export async function openRoomWithRecovery(
 export async function writeRecoveryKey(state: RoomManagerState): Promise<string> {
   const room = requireRoom(state);
   try {
-    return await writeRecovery(room.path, room.password);
+    return await writeRecovery(roomDatabasePath(room), room.password);
   } catch (err) {
     throw humanizeStorageError(err, room.path);
   }
@@ -993,7 +1095,11 @@ export async function writeRecoveryKey(state: RoomManagerState): Promise<string>
 /** True when the room at `roomPath` has a recovery sidecar — the gate shows
  * "Unlock with recovery code" only then. Ported from `has_recovery_key`. */
 export function hasRecoveryKey(roomPath: string): boolean {
-  return hasRecovery(roomPath);
+  try {
+    return hasRecovery(describeRoom(roomPath).dbPath);
+  } catch {
+    return false;
+  }
 }
 
 // ============================================================================
@@ -1102,6 +1208,29 @@ export function renameRoom(
     throw new Error(`That name is too long — ${MAX_ROOM_NAME_CHARS} characters at most.`);
   }
   const room = requireRoom(state);
+  const oldPath = room.path;
+  if (room.descriptor?.kind === "workspace-folder" && room.descriptor.rootPath !== null) {
+    if (trimmed === "." || trimmed === ".." || trimmed.includes("/") || trimmed.includes("\\")) {
+      throw new Error("A workspace name cannot contain path separators.");
+    }
+    const newPath = path.join(path.dirname(room.path), trimmed);
+    if (newPath !== room.path) {
+      if (existsSync(newPath)) throw new Error("A file or folder already exists with that name.");
+      room.workspaceRuntimeClosed = true;
+      if (room.workspaceWatcher !== undefined) void room.workspaceWatcher.close().catch(() => undefined);
+      room.conn.pragma("wal_checkpoint(FULL)");
+      renameSync(room.path, newPath);
+      room.path = newPath;
+      room.descriptor = describeRoom(newPath);
+      room.workspace = new WorkspaceService(room.conn, newPath);
+      room.contentStore = contentStoreFor(room.conn, newPath);
+      if (room.workspaceLease !== undefined) {
+        room.workspaceLease.lockPath = path.join(newPath, ".arcelle", "room.lock");
+      }
+      room.workspaceRuntimeClosed = false;
+      startWorkspaceRuntime(state, room);
+    }
+  }
   setMeta(room.conn, "name", trimmed);
   room.name = trimmed;
   const info = infoOf(room, deps.userDataDir);
@@ -1109,7 +1238,7 @@ export function renameRoom(
   try {
     writeRecent(
       deps.userDataDir,
-      renameRecent(readRecent(deps.userDataDir), info.path, info.name)
+      renameRecent(readRecent(deps.userDataDir), oldPath, info.name, info.path)
     );
   } catch {
     // Best-effort, matching Rust's `let _ = write_recent(...)`: the recents
@@ -1317,7 +1446,14 @@ export function teardownOpenRoom(state: RoomManagerState, deps: RoomManagerDeps)
   const closing = state.room;
   state.room = null;
   if (closing !== null) {
+    closing.workspaceRuntimeClosed = true;
+    if (closing.workspaceWatcher !== undefined) {
+      void closing.workspaceWatcher.close().catch(() => undefined);
+    }
     closeQuietly(closing.conn);
+    if (closing.workspaceLease !== undefined) {
+      releaseWorkspaceLease(closing.workspaceLease);
+    }
   }
 
   // PRIV-1: the cached privacy policy holds the room's protected strings — it

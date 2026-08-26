@@ -790,16 +790,20 @@ export interface RecStart {
   fileId: string;
   name: string;
   meta: RecMeta;
+  /** Authenticated renderer-owned `WS /rec/session` URL. */
+  sessionUrl: string;
 }
 
 export interface RecLive {
   fileId: string;
   status: string;
-  durationCs: number;
+  /** Fresh authenticated URL used to reattach after a renderer reload. */
+  sessionUrl?: string;
+  durationCs?: number;
   /** Durable per-source health [status, message] — lets a viewer that
    *  mounted after a fast failure still show the banner. */
-  mic: [string, string];
-  sys: [string, string];
+  mic?: [string, string];
+  sys?: [string, string];
 }
 
 export interface RecFile {
@@ -829,7 +833,7 @@ export interface AiStatus {
   installed: boolean;
   models: string[];
   defaultModel: string;
-  /** Cloud CLIs detected on this Mac ("claude-cli", "codex-cli"). */
+  /** Cloud CLIs detected on this Mac (Claude Code, Codex, Antigravity CLI). */
   external: string[];
   /** True when this room's Ollama is ANOTHER computer (Settings → the Closet).
    * The model name cannot carry that fact, so every "does content leave this
@@ -840,6 +844,7 @@ export interface AiStatus {
 export const ENGINE_LABELS: Record<string, string> = {
   "claude-cli": "Claude Code",
   "codex-cli": "Codex",
+  "antigravity-cli": "Antigravity CLI",
   openrouter: "OpenRouter",
 };
 
@@ -1136,7 +1141,7 @@ export function splitExternalModel(
 ): [string, string | null, string | null] {
   const parts = model.split("::");
   const engine = parts[0];
-  if (engine !== "claude-cli" && engine !== "codex-cli" && engine !== "openrouter") {
+  if (engine !== "claude-cli" && engine !== "codex-cli" && engine !== "antigravity-cli" && engine !== "openrouter") {
     return [model, null, null];
   }
   return [engine, parts[1] ?? null, parts[2] ?? null];
@@ -1257,6 +1262,14 @@ export interface SttStatus {
   installed: boolean;
   downloading: boolean;
   sizeMb: number;
+}
+
+/** Renderer-owned streaming dictation session. Electron provisions the
+ * authenticated sidecar URL; PCM and transcript events never cross IPC. */
+export interface DictSessionInfo {
+  url: string;
+  stopBaseMs: number;
+  stopPerAudioSecondMs: number;
 }
 
 /** Idea 3: one voice from the Edge service's LIVE catalog (the app bundles

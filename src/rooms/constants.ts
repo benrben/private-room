@@ -11,9 +11,9 @@ export type Screen =
   | { kind: "unlock"; path: string }
   | { kind: "workspace"; info: RoomInfo };
 
-// New vaults save as `.arcelle`; legacy `.roomai` stays openable.
+// Legacy sealed files remain openable beside the new workspace-folder format.
 export const ROOM_FILTER = [
-  { name: "Arcelle Workspace", extensions: ["arcelle", "roomai"] },
+  { name: "Arcelle Legacy Room", extensions: ["arcelle", "roomai"] },
 ];
 
 export const MIN_PASSWORD = 8;

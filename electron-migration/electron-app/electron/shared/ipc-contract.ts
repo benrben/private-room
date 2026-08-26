@@ -80,6 +80,7 @@ import type {
   Specialist,
   ImageBox,
   SttStatus,
+  DictSessionInfo,
   NeuralVoiceInfo,
   AiActionDef,
   RecStart,
@@ -104,7 +105,15 @@ import type {
 
 export interface Commands {
   // ---- chunk 1 --------------------------------------------------------
-  create_room: { args: { path: string; password: string; name: string | null }; result: RoomInfo };
+  create_room: {
+    args: {
+      path: string;
+      password: string;
+      name: string | null;
+      format?: "sealed-db" | "workspace-folder";
+    };
+    result: RoomInfo;
+  };
   open_room: { args: { path: string; password: string }; result: RoomInfo };
   close_room: { args: Record<string, never>; result: void };
   touchid_has: { args: { path: string }; result: boolean };
@@ -660,7 +669,7 @@ export interface Commands {
     args: { text: string; translate: boolean; mode: string };
     result: string;
   };
-  dict_start: { args: Record<string, never>; result: void };
+  dict_start: { args: Record<string, never>; result: DictSessionInfo };
   dict_push_audio: { args: { rate: number; dataB64: string }; result: void };
   dict_stop: { args: Record<string, never>; result: string };
   dict_cancel: { args: Record<string, never>; result: void };
@@ -840,6 +849,8 @@ export interface Commands {
       defaultPath?: string;
       multiple?: boolean;
       directory?: boolean;
+      /** macOS room picker: allow either a workspace folder or a legacy room file. */
+      room?: boolean;
       /** macOS-only in the real plugin too, and enabled by default there — so
        * only an explicit `false` turns it off. */
       canCreateDirectories?: boolean;
@@ -900,6 +911,17 @@ export interface Commands {
    * discard" left the app running until they pressed ⌘Q a second time.
    * See `quitDoor.ts`'s `confirmQuit` and `main/index.ts`'s host bridge. */
   quit_guard_confirm: { args: Record<string, never>; result: void };
+
+  // ---- Electron host/update surface -----------------------------------
+  /** The installed app version, supplied by Electron's `app.getVersion()`. */
+  app_version: { args: Record<string, never>; result: string };
+  /** Check the Tauri-compatible signed update feed without downloading. */
+  updater_check: {
+    args: Record<string, never>;
+    result: { version: string; notes?: string } | null;
+  };
+  /** Download, verify, install and relaunch the update found by the feed. */
+  updater_install: { args: Record<string, never>; result: void };
 }
 
 // merged: 291 commands total (chunk 1: 37, chunk 2: 36, chunk 3: 36,

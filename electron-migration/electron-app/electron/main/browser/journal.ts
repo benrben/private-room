@@ -47,17 +47,26 @@ export function insertBrowseJournal(
       `SELECT id, kind, url, detail, session, created_at AS at FROM browse_journal WHERE id = ?`,
     )
     .get(info.lastInsertRowid) as BrowseJournalRow;
-  // `id` is AUTOINCREMENT, so it only ever climbs: everything at or below
-  // (newest − cap) is older than the cap's worth of lines we keep. Ignored on
-  // failure exactly as Rust ignores it — a trim that will not run must not cost
-  // the caller the line it just wrote.
-  try {
-    db.prepare(
-      `DELETE FROM browse_journal
-       WHERE id <= (SELECT MAX(id) FROM browse_journal) - ?`,
-    ).run(JOURNAL_CAP);
-  } catch {
-    // best-effort — see above
+  // `id` is AUTOINCREMENT, so no retention work can possibly be needed before
+  // the first `JOURNAL_CAP + 1` insert. Skipping those 5,000 no-op DELETEs is
+  // important for encrypted rooms: it keeps a large import from turning into
+  // thousands of needless encrypted writes. Once the id crosses the cap, use
+  // row order rather than `max(id) - cap`; ids can contain gaps after a clear,
+  // and an arithmetic cutoff could otherwise discard too many surviving rows.
+  // Ignored on failure exactly as Rust ignores it — a trim that will not run
+  // must not cost the caller the line it just wrote.
+  if (Number(info.lastInsertRowid) > JOURNAL_CAP) {
+    try {
+      db.prepare(
+        `DELETE FROM browse_journal
+         WHERE id < COALESCE(
+           (SELECT id FROM browse_journal ORDER BY id DESC LIMIT 1 OFFSET ?),
+           -1
+         )`,
+      ).run(JOURNAL_CAP - 1);
+    } catch {
+      // best-effort — see above
+    }
   }
   return row;
 }

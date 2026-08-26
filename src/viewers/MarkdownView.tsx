@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { openUrl } from "@tauri-apps/plugin-opener";
+import { openUrl } from "../platform";
 import { applyQuoteHighlight, clearQuoteHighlight } from "./highlight";
 import Mermaid from "./Mermaid";
 import { loadRichPlugins, RichPlugins, richPluginsIfLoaded } from "./markdownRich";

@@ -160,19 +160,17 @@ test("Escape in the private-topics box does not close Settings", () => {
 /* ------------------------------------------------- connector runtime download */
 
 test("the runtime download is wired end to end, not just written", () => {
-  const commands = read("src-tauri/src/commands.rs");
-  assert.ok(/^mod runtimes;$/m.test(commands), "runtimes.rs is out of the build again");
-  const lib = read("src-tauri/src/lib.rs");
+  const host = read("electron-migration/electron-app/electron/main/runtimesCmds.ts");
   for (const cmd of ["mcp_runtime_for_command", "mcp_provision_runtime"]) {
-    assert.ok(lib.includes(`commands::${cmd}`), `${cmd} is not in the invoke handler`);
+    assert.ok(host.includes(`handle("${cmd}"`), `${cmd} is not in the IPC handler`);
   }
   assert.ok(
-    /refresh_path_prefix/.test(lib),
+    /refreshPathPrefix/.test(host),
     "nothing publishes the downloaded-runtime PATH at startup",
   );
   // Without this the download lands in a folder no connector ever looks in.
   assert.ok(
-    /cached_path_prefix\(\)/.test(read("src-tauri/src/mcp.rs")),
+    /cachedPathPrefix/.test(read("electron-migration/electron-app/electron/main/mcpClient.ts")),
     "the connector launcher does not put the downloaded runtimes on PATH",
   );
   const mkt = read("src/settings/McpMarketplace.tsx");

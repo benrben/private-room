@@ -1,4 +1,4 @@
-"""The skill-owner id list must mean the same thing in both languages.
+"""The skill-owner id list must mean the same thing in both processes.
 
 `save_skill(agent=…)` scopes a procedure to ONE sub-agent. Rust owns the enum
 the model picks from and the validation that rejects anything else
@@ -23,63 +23,59 @@ import pytest
 
 from arcelle_sidecar.agents import REGISTRY
 
-AGENT_RS = Path(__file__).resolve().parents[2] / "src-tauri" / "src" / "commands" / "agent.rs"
+TOOL_SPECS_TS = (
+    Path(__file__).resolve().parents[2]
+    / "electron-migration" / "electron-app" / "electron" / "main" / "toolSpecs.ts"
+)
 
 
-def _rust_skill_agent_ids() -> list[str]:
-    """Parse `SKILL_AGENT_IDS` out of the Rust source."""
-    src = AGENT_RS.read_text(encoding="utf-8")
+def _host_skill_agent_ids() -> list[str]:
+    """Parse `SKILL_AGENT_IDS` out of the Electron host source."""
+    src = TOOL_SPECS_TS.read_text(encoding="utf-8")
     m = re.search(
-        r"pub\(crate\) const SKILL_AGENT_IDS: &\[&str\] = &\[(.*?)\];", src, re.S
+        r"export const SKILL_AGENT_IDS:[^=]+?= \[(.*?)\];", src, re.S
     )
-    assert m, "SKILL_AGENT_IDS not found in agent.rs — was it renamed?"
+    assert m, "SKILL_AGENT_IDS not found in toolSpecs.ts — was it renamed?"
     return re.findall(r'"([^"]+)"', m.group(1))
 
 
 @pytest.fixture(scope="module")
-def rust_ids() -> list[str]:
-    if not AGENT_RS.exists():  # pragma: no cover - sidecar built standalone
-        pytest.skip("Rust source not present in this checkout")
-    return _rust_skill_agent_ids()
+def host_ids() -> list[str]:
+    return _host_skill_agent_ids()
 
 
-def test_rust_lists_exactly_the_python_worker_ids(rust_ids: list[str]) -> None:
+def test_host_lists_exactly_the_python_worker_ids(host_ids: list[str]) -> None:
     workers = [spec.id for spec in REGISTRY if not spec.main]
-    assert set(rust_ids) == set(workers), (
+    assert set(host_ids) == set(workers), (
         "SKILL_AGENT_IDS drifted from the registry: "
-        f"rust-only={sorted(set(rust_ids) - set(workers))} "
-        f"python-only={sorted(set(workers) - set(rust_ids))}"
+        f"host-only={sorted(set(host_ids) - set(workers))} "
+        f"python-only={sorted(set(workers) - set(host_ids))}"
     )
 
 
-def test_the_main_agent_is_not_offered_as_a_skill_owner(rust_ids: list[str]) -> None:
+def test_the_main_agent_is_not_offered_as_a_skill_owner(host_ids: list[str]) -> None:
     """`chat.answer` delegates and runs no room tools — it can own no procedure,
     and `list_skills` is not even in its catalog."""
     main_ids = [spec.id for spec in REGISTRY if spec.main]
     for main_id in main_ids:
-        assert main_id not in rust_ids, f"{main_id} is the hub, not a skill owner"
+        assert main_id not in host_ids, f"{main_id} is the hub, not a skill owner"
 
 
-def test_the_ids_are_unique_and_non_empty(rust_ids: list[str]) -> None:
-    assert rust_ids, "the enum must not be empty — that would reject every value"
-    assert len(rust_ids) == len(set(rust_ids)), f"duplicate ids: {rust_ids}"
-    assert all(i.strip() == i and i for i in rust_ids)
+def test_the_ids_are_unique_and_non_empty(host_ids: list[str]) -> None:
+    assert host_ids, "the enum must not be empty — that would reject every value"
+    assert len(host_ids) == len(set(host_ids)), f"duplicate ids: {host_ids}"
+    assert all(i.strip() == i and i for i in host_ids)
 
 
-def test_the_tool_description_documents_every_id_it_offers(rust_ids: list[str]) -> None:
+def test_the_tool_description_documents_every_id_it_offers(host_ids: list[str]) -> None:
     """The enum and its prose must not drift apart either — the description
     explains what each id MEANS, and an undocumented value is one a model
     cannot choose sensibly."""
-    src = AGENT_RS.read_text(encoding="utf-8")
-    # The whole save_skill spec: from its name to the start of the NEXT tool
-    # spec. The ids are explained in the `agent` parameter's description, which
-    # sits well after the tool-level one.
-    m = re.search(
-        r'"name": "save_skill".*?(?=\{"type": "function")', src, re.S
-    )
+    src = TOOL_SPECS_TS.read_text(encoding="utf-8")
+    m = re.search(r'name: "save_skill".*?(?=\n\s*\{\n\s*type: "function")', src, re.S)
     assert m, "save_skill spec not found"
     spec_text = m.group(0)
-    for agent_id in rust_ids:
+    for agent_id in host_ids:
         assert agent_id in spec_text, (
             f"{agent_id} is in the enum but never explained in save_skill's description"
         )

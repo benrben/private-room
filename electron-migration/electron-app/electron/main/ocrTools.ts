@@ -57,24 +57,16 @@
  * own reasoning about that risk is checkable independent of whichever
  * process ends up doing the rasterizing.
  *
- * THE ONE GENUINE GAP — Vision-framework recognition itself. `ocr.py`
- * ALREADY HAS A REAL, WORKING PORT of `recognize`/`ocr_pdf`/`ocr_image_bytes`
+ * PRODUCTION WIRING — Vision-framework recognition itself. `ocr.py`
+ * has the real implementation of `recognize`/`ocr_pdf`/`ocr_image_bytes`
  * (PyObjC `Vision.VNRecognizeTextRequest`, PDF pages rasterized via
  * `pymupdf` rather than hand-rolled `CGPDFDocument`/`CGContext` calls — its
  * own doc explains why pymupdf stands in for the two CoreGraphics calls
- * objc2 has no direct binding for) — but `sidecar/arcelle_sidecar/server.py`
- * wires NO HTTP route to it (grepped the whole file, case-insensitively, for
- * "ocr"/"quicklook"/"probe": zero route matches, and `media.ocr` /
- * `media.quicklook` are imported nowhere in it), so nothing in this Electron
- * process can reach it yet. Exactly `previewTools.ts`'s own `/quicklook`
- * situation (the same commit added `quicklook.py` alongside `ocr.py`, also
- * unwired) — same shape, same seam: {@link recognize} takes an injectable
- * {@link OcrRecognizeFn}, defaulting to {@link ocrRecognizeNotImplemented},
- * which REJECTS with a clearly labelled reason rather than resolving `null`
- * — resolving `null` would misrepresent "nobody has wired this up yet" as
- * "Vision tried this file and found nothing," the same distinction
- * `previewTools.ts`'s own doc draws between "never attempted" and "the OS
- * drew nothing."
+ * objc2 has no direct binding for). The sidecar exposes it through `/ocr`, and
+ * {@link recognizeViaSidecar} is the production client used by the automatic
+ * file-import OCR path. {@link recognize} retains an injectable recognizer and
+ * a labelled rejecting default for isolated callers and tests; production
+ * always supplies the live sidecar recognizer.
  *
  * DEVIATION FROM RUST'S OWN STATED CONTRACT, spelled out because `ocr.rs`'s
  * own doc comment says close to the opposite: "Best-effort by design: any
@@ -110,7 +102,10 @@
  * Image" action, but only if that exact shortcut already exists on the
  * user's Mac — an unshippable, undocumented, silently-fragile dependency,
  * not a real port.
- */
+*/
+
+import { CancelFlag } from "./cancel.js";
+import { sidecarJsonCancellable } from "./sidecarJsonCancellable.js";
 
 // ---------------------------------------------------------------- constants
 
@@ -140,6 +135,10 @@ export const MAX_PAGE_PIXELS = 40_000_000;
  * attacker-supplied: OCR runs on any text-less PDF that arrives by import or
  * by download. */
 export const MAX_PAGE_EDGE = 20_000;
+
+/** Prefix stored ahead of recognized text so viewers can distinguish OCR from
+ * authored/extracted text. Kept in sync with `src/viewers/util.ts`. */
+export const OCR_TEXT_PREFIX = "(text recognized from scan)";
 
 /** Scripts worth offering the recognizer, in priority order. Only English
  * and Hebrew used to be requested, so a scan in Russian, Chinese, Japanese
@@ -267,7 +266,7 @@ export function unreadNotes(totalPages: number, pages: number, unrendered: numbe
  * standing in for the whole Vision (+ PDF rasterization) pipeline as ONE
  * call — matching `previewTools.ts`'s `PreviewRenderFn` and how a real
  * future wiring will actually reach this: one HTTP round trip to the
- * sidecar's eventual `/ocr` endpoint, which internally does exactly what
+ * sidecar's live `/ocr` endpoint, which internally does exactly what
  * `ocr.py`'s own `recognize` does (dispatch on extension, rasterize+OCR a
  * PDF page by page OR OCR a single image, in Python). See this module's doc
  * for why the caps/bookkeeping live here as their own real functions rather
@@ -280,12 +279,8 @@ export type OcrRecognizeFn = (mime: string, ext: string, bytes: Buffer) => Promi
  * Exported so a caller or a test can recognize it without hand-copying the
  * string. */
 export const OCR_NOT_IMPLEMENTED =
-  "NOT_IMPLEMENTED: ocr.rs's on-device Vision-framework recognition (VNRecognizeTextRequest, " +
-  "accurate level, auto language detection; PDFs rasterized page-by-page via pymupdf) has a " +
-  "REAL, working Python/PyObjC port already at sidecar/arcelle_sidecar/media/ocr.py — but " +
-  "sidecar/arcelle_sidecar/server.py wires no HTTP route to it yet, so nothing in this " +
-  "Electron process can reach it. The page-size caps and unread-page bookkeeping around it " +
-  "(pageRasterSize/unreadNotes/isOcrCandidate, all in this file) are real.";
+  "NOT_IMPLEMENTED: no OCR recognizer was supplied to this isolated call. Production uses " +
+  "recognizeViaSidecar and the sidecar's live /ocr Vision endpoint.";
 
 /** {@link recognize}'s `ocr` parameter falls back to when no real
  * implementation is supplied — a clearly-labelled failure, never a
@@ -314,4 +309,22 @@ export async function recognize(
 ): Promise<string | null> {
   const text = await ocr(mime, ext, bytes);
   return text !== null && text.trim() !== "" ? text : null;
+}
+
+/** Production Vision recognizer, hosted by the Python sidecar. */
+export async function recognizeViaSidecar(
+  mime: string,
+  ext: string,
+  bytes: Buffer,
+): Promise<string | null> {
+  const outcome = await sidecarJsonCancellable(
+    "/ocr",
+    { mime, ext, data_b64: bytes.toString("base64") },
+    new CancelFlag(),
+    30 * 60 * 1000,
+  );
+  if (outcome.kind === "stopped") throw new Error("Stopped.");
+  if (outcome.kind === "error") throw new Error(outcome.error.error);
+  const value = outcome.value as { text?: unknown } | null;
+  return typeof value?.text === "string" ? value.text : null;
 }

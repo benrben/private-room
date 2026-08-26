@@ -22,13 +22,13 @@ from ollama import ResponseError
 from arcelle_sidecar import ai_actions, llm
 from arcelle_sidecar.server import create_app
 
-#: The app-side twin of the action table. It owns the menu (title, description,
+#: The Electron host-side twin of the action table. It owns the menu (title, description,
 #: order) and posts `action` + the resolved `instructions`; this module owns the
 #: system prompts. `default_prompt` is the one field written out in BOTH, so the
 #: last test in this file is what stops the two from drifting.
-_RUST = (
+_HOST = (
     Path(__file__).resolve().parents[2]
-    / "src-tauri" / "src" / "commands" / "moonshot" / "ai_actions.rs"
+    / "electron-migration" / "electron-app" / "electron" / "main" / "moonshotAiActions.ts"
 )
 
 
@@ -94,7 +94,7 @@ def test_catalog_is_the_fourteen_actions_in_menu_order() -> None:
         assert a.system.strip()
 
 
-def test_catalog_matches_the_rust_menu_table() -> None:
+def test_catalog_matches_the_electron_host_menu_table() -> None:
     """Adding an action means editing BOTH tables; nothing compared them before.
 
     The frontend menu is built from the Rust table and every run is dispatched by
@@ -104,21 +104,19 @@ def test_catalog_matches_the_rust_menu_table() -> None:
     silent edit on one side changes what actually runs while this file still
     documents the old wording.
     """
-    if not _RUST.exists():  # pragma: no cover - only outside the repo checkout
-        pytest.skip("the Rust host is not part of this checkout")
-    src = _RUST.read_text()
-    table = re.search(r"pub\(crate\) const AI_ACTIONS: &\[AiActionSpec\] = &\[(.*?)\n\];", src, re.S)
+    src = _HOST.read_text()
+    table = re.search(r"const AI_ACTIONS:[^=]+?= \[(.*?)\n\];", src, re.S)
     assert table, "the AI_ACTIONS table moved — update this parity check"
-    entries = re.findall(r"AiActionSpec \{(.*?)\n    \},", table.group(1), re.S)
+    entries = re.findall(r"\{\n(.*?\n  )\},", table.group(1), re.S)
     assert len(entries) == len(ai_actions.AI_ACTIONS)
     for body, spec in zip(entries, ai_actions.AI_ACTIONS, strict=True):
         text = dict(re.findall(r'(\w+): "(.*?)",', body))
         flags = dict(re.findall(r"(\w+): (true|false),", body))
         assert text["id"] == spec.id
         assert text["scope"] == spec.scope
-        assert text["default_prompt"] == spec.default_prompt
-        assert (flags["needs_question"] == "true") is spec.needs_question
-        assert (flags["needs_language"] == "true") is spec.needs_language
+        assert text["defaultPrompt"] == spec.default_prompt
+        assert (flags["needsQuestion"] == "true") is spec.needs_question
+        assert (flags["needsLanguage"] == "true") is spec.needs_language
 
 
 # --- /ai_action -------------------------------------------------------------

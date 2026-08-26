@@ -1,8 +1,9 @@
 """On-device speech-to-text: the whole-file transcription path.
 
-Port of `src-tauri/src/stt.rs` — module doc + `MODEL_FILE`/`MODEL_URL`/
-`MODEL_SIZE_MB` (lines 1-30), and the warm-context cache, `unload_ctx`,
+Port of `src-tauri/src/stt.rs` — the warm-context cache, `unload_ctx`,
 `unload_model`, `transcribe` (lines 173-309).
+
+Model download constants and lifecycle live in the sibling `models.py`.
 
 Deliberately NOT ported here: `transcribe_segments`, the live-recording
 word-timestamp path (a later batch's job) — nor `decode_to_pcm`/
@@ -107,9 +108,6 @@ from arcelle_sidecar.stt.hallucination import (
     is_junk_segment,
     is_stock_hallucination,
 )
-from arcelle_sidecar.stt.models import MODEL_FILE, MODEL_SIZE_MB, MODEL_URL
-
-
 def format_stamp(cs: int) -> str:
     """The "[m:ss]" (or "[h:mm:ss]" past an hour) transcript stamp.
 

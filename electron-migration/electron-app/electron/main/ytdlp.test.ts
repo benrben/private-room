@@ -431,6 +431,15 @@ describe("findFfmpeg", () => {
     ]);
   });
 
+  it("GH #29: finds Apple Silicon Homebrew ffmpeg even when the GUI PATH omits Homebrew", () => {
+    expect(
+      findFfmpeg({
+        isFile: (p) => p === "/opt/homebrew/bin/ffmpeg",
+        pathEnv: "/usr/bin:/bin:/usr/sbin:/sbin",
+      })
+    ).toBe("/opt/homebrew/bin/ffmpeg");
+  });
+
   it("falls back to PATH when none of the explicit paths has one", () => {
     expect(
       findFfmpeg({ isFile: (p) => p === "/somewhere/ffmpeg", pathEnv: "/nope:/somewhere" })

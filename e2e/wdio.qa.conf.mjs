@@ -1,10 +1,7 @@
 // WebdriverIO config for the REGRESSION suite (e2e/qa-specs/*.e2e.mjs).
 //
-// Why this exists next to wdio.conf.mjs: that suite drives the packaged Tauri
-// binary through `tauri-driver`, which has no macOS support (WKWebView has no
-// WebDriver) — so on the machine this app is developed on, it cannot run at
-// all. This config drives the SAME React app in Chrome instead, against
-// dist/qa.html, where qa/qa-mock.js stands in for the Rust backend.
+// This config drives the production React app in Chrome against dist/qa.html,
+// where qa/qa-mock.js stands in for the Electron IPC backend.
 //
 //   npm run build  ──▶ dist/index.html
 //   qa/make-qa.mjs ──▶ dist/qa.html  (= index.html + the IPC mock, injected first)
@@ -12,10 +9,9 @@
 //
 // What that buys and what it doesn't: the real components, real state, real
 // event wiring, real CSS and real layout maths are all under test, so UI
-// regressions are caught on every platform. The Rust commands are not — those
-// are covered by `cargo test` (and, on Linux/Windows CI, by wdio.conf.mjs).
-// Where a fix spans both, the Rust half has its own unit test; see
-// recording::tests::speaker_names_* for GH #5.
+// regressions are caught on every platform. Main-process commands are covered
+// by the Electron Vitest suite. Where a fix spans both, each half has its own
+// focused test.
 
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";

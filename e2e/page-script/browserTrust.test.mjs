@@ -538,11 +538,11 @@ test("the summary's idea of a healthy blocker matches what Rust writes", () => {
   // sentence. That is a string match across the FFI boundary: reword the Rust
   // literal and every successful attach starts being counted as a protection
   // warning, silently, in the one place a user goes to check.
-  const RUST = read("src-tauri/src/browser.rs");
+  const HOST = read("electron-migration/electron-app/electron/main/browser/browser.ts");
   const SUCCESS = "Content blocking active";
   assert.ok(
-    RUST.includes(`"${SUCCESS}.`) || RUST.includes(`${SUCCESS}.`),
-    `browser.rs no longer journals "${SUCCESS}." — browserJournal.summarise still keys off it`,
+    HOST.includes(`"${SUCCESS}.`) || HOST.includes(`${SUCCESS}.`),
+    `browser.ts no longer journals "${SUCCESS}." — browserJournal.summarise still keys off it`,
   );
   const [ok] = journal.groupSessions(
     [row(1, "blocker", `${SUCCESS}.`, "s1")],

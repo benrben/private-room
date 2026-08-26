@@ -66,7 +66,6 @@ import {
   clipChars,
   collectFolderFiles,
   composeSkill,
-  COMPOSE_SKILL_NOT_IMPLEMENTED,
   createSkillCmd,
   deleteSkillCmd,
   deleteSkillResourceCmd,
@@ -487,14 +486,29 @@ describe("composeSkill", () => {
     db.close();
   });
 
-  it("validates and loads sources for real, then honestly refuses the model call", async () => {
+  it("generates, validates, and saves a disabled draft with bundled sources", async () => {
     const db = freshRoom();
-    await expect(composeSkill(db, "Build something", null)).rejects.toThrow(COMPOSE_SKILL_NOT_IMPLEMENTED);
-    await expect(composeSkill(db, "Build something", [])).rejects.toThrow(/generate_text_any_engine/);
-    // The real source-file failure still surfaces ahead of the stub, proving
-    // the work before the missing seam actually runs.
+    const source = insertFile(db, "evidence.txt", "text/plain", Buffer.from("facts"), "facts", "import");
+    const id = await composeSkill(db, "Build something", [source.id], {
+      listModels: async () => ["local"],
+      generate: async () => JSON.stringify({
+        name: "built-skill",
+        description: "Builds something when requested.",
+        instructions: "Use the bundled evidence.",
+        resources: [{ path: "references/guide.md", content: "Guide" }],
+      }),
+    });
+    const skill = findSkillDb(db, id)!;
+    expect(skill.enabled).toBe(false);
+    expect(listSkillResourcesDb(db, id).map((resource) => resource.path)).toEqual([
+      "references/guide.md",
+      "references/source-files/evidence-txt.md",
+    ]);
     const blank = insertFile(db, "scan.pdf", "application/pdf", Buffer.from("x"), null, "import");
-    await expect(composeSkill(db, "Build something", [blank.id])).rejects.toThrow(/no readable text yet/);
+    await expect(composeSkill(db, "Build something else", [blank.id], {
+      listModels: async () => ["local"],
+      generate: async () => "{}",
+    })).rejects.toThrow(/no readable text yet/);
     db.close();
   });
 });
@@ -1170,12 +1184,21 @@ describe("registerSkillsIpc", () => {
     expect(emit).not.toHaveBeenCalled();
   });
 
-  it("compose_skill is wired but still honestly NOT_IMPLEMENTED", async () => {
+  it("compose_skill is wired to the supplied production generator seam", async () => {
     const db = freshRoom();
     const room: RoomSource = { currentRoom: () => ({ db, path: "irrelevant" }) };
     const { ipcMain, call } = fakeIpcMain();
-    registerSkillsIpc(ipcMain, room);
-    await expect(call("compose_skill", { description: "x" })).rejects.toThrow(COMPOSE_SKILL_NOT_IMPLEMENTED);
+    registerSkillsIpc(ipcMain, room, undefined, {
+      listModels: async () => ["local"],
+      generate: async () => JSON.stringify({
+        name: "ipc-skill",
+        description: "Created by IPC.",
+        instructions: "Do the work.",
+        resources: [],
+      }),
+    });
+    const id = await call("compose_skill", { description: "x" });
+    expect(findSkillDb(db, id as string)?.name).toBe("ipc-skill");
     db.close();
   });
 });

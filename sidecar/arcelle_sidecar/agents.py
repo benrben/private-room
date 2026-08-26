@@ -1149,7 +1149,8 @@ AGENT_TOOL_DOMAINS: tuple[tuple[str, tuple[str, ...], str], ...] = (
             "creator.draw",
         ),
         "Ask the File agent to work with this room's content: list, search, "
-        "read, open, summarize, create or edit files and notes, run this "
+        "read, open, summarize, create, edit, rename, move, organize or delete "
+        "files and notes, run this "
         "room's .py/.js scripts, transcribe its audio and video on-device, "
         "WATCH a video and report what is on screen at any moment, "
         "turn its material into flashcards, a mind map or a podcast script, "

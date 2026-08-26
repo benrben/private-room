@@ -557,7 +557,7 @@ const EXTENSION_MIME: ReadonlyMap<string, string> = new Map([
   ["pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation"],
 ]);
 
-function guessDownloadMime(fileName: string): string {
+export function guessDownloadMime(fileName: string): string {
   const dot = fileName.lastIndexOf(".");
   if (dot <= 0 || dot === fileName.length - 1) {
     return "application/octet-stream";

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type React from "react";
-import { listen } from "@tauri-apps/api/event";
+import { listen } from "../platform";
 import { api, ModelCaps, SttStatus, recommendedModels, ensureEmbedModel } from "../api";
 import type { AiStatus } from "../api";
 import { PullProgress, RecommendedModels } from "./types";

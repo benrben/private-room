@@ -28,23 +28,15 @@ import { transformSync } from "esbuild";
 const root = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const SRC = readFileSync(join(root, "src/workspace/liveRec.ts"), "utf8");
 
-/** The one import the module has, replaced by the stub the test installs. */
-const withStubbedApi = SRC.replace(
-  /^import \{ api \} from "\.\.\/api";$/m,
-  "const api = globalThis.__recApi;",
-);
-if (withStubbedApi === SRC) throw new Error("the api import moved — this harness is stale");
-
 let loaded = 0;
 async function load(world) {
-  globalThis.__recApi = world.api;
   globalThis.window = {
     setTimeout: (fn, ms) => world.timers.push({ fn, ms }),
     clearTimeout: (id) => world.cleared.push(id),
   };
   globalThis.AudioContext = world.AudioContext;
   globalThis.AudioWorkletNode = world.AudioWorkletNode;
-  const js = transformSync(withStubbedApi, {
+  const js = transformSync(SRC, {
     loader: "ts",
     format: "esm",
     target: "es2022",
@@ -63,10 +55,6 @@ function makeWorld() {
     pushes: [],
     timers: [],
     cleared: [],
-    /** Held so a batch can be left in flight while the next one is offered. */
-    resolvers: [],
-    /** …and so one can be made to FAIL, which is the case the lane swallows. */
-    rejectors: [],
     addModule: null,
   };
   let releaseAddModule;
@@ -74,16 +62,6 @@ function makeWorld() {
     releaseAddModule = r;
   });
   world.releaseAddModule = () => releaseAddModule();
-
-  world.api = {
-    recPushAudio: (rate, b64) => {
-      world.pushes.push({ rate, b64 });
-      return new Promise((resolve, reject) => {
-        world.resolvers.push(resolve);
-        world.rejectors.push(reject);
-      });
-    },
-  };
 
   world.AudioWorkletNode = class {
     constructor(ctx) {
@@ -143,6 +121,7 @@ const settle = async () => {
 test("a second Resume cannot leave a microphone tap with nobody holding it", async () => {
   const world = makeWorld();
   const M = await load(world);
+  M.setRecordingAudioSink((rate, frame) => world.pushes.push({ rate, frame }));
   const first = makeStream("first");
   const second = makeStream("second");
 
@@ -164,9 +143,10 @@ test("a second Resume cannot leave a microphone tap with nobody holding it", asy
   assert.ok(world.contexts[0].closed);
 });
 
-test("audio batches reach the engine in the order they were captured", async () => {
+test("audio batches reach the direct socket as raw ordered float frames", async () => {
   const world = makeWorld();
   const M = await load(world);
+  M.setRecordingAudioSink((rate, frame) => world.pushes.push({ rate, frame }));
   const mic = makeStream("mic");
   const attached = M.attachMicTap(mic);
   world.releaseAddModule();
@@ -178,23 +158,15 @@ test("audio batches reach the engine in the order they were captured", async () 
   await settle();
   assert.equal(world.pushes.length, 1, "the first batch goes out at once");
 
-  // The engine appends each batch where it ARRIVES, so the second must not be
-  // invoked until the first has landed.
+  assert.ok(world.pushes[0].frame instanceof Float32Array);
+  assert.equal(world.pushes[0].frame.length, 48000 / 4);
+
+  // WebSocket.send queues synchronously, so consecutive capture batches are
+  // handed over in capture order with no async IPC race.
   tap.port.onmessage({ data: quarterSecond() });
   await settle();
-  assert.equal(world.pushes.length, 1, "the second batch waits for the first");
-
-  world.resolvers[0]();
-  await settle();
-  assert.equal(world.pushes.length, 2, "…and follows it once it has landed");
-
-  // A batch the engine REJECTS must not stall the lane behind it: the chain is
-  // what orders the audio, so a link that never settles would end the
-  // recording's capture in silence.
-  world.rejectors[1](new Error("the engine refused this batch"));
+  assert.equal(world.pushes.length, 2);
   tap.port.onmessage({ data: quarterSecond() });
   await settle();
-  assert.equal(world.pushes.length, 3, "the batch after a failed one still goes out");
-  world.resolvers[2]();
-  await settle();
+  assert.equal(world.pushes.length, 3);
 });

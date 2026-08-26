@@ -185,12 +185,14 @@ describe("splitExternalModel / isCliEngine / isExternalEngine", () => {
     expect(splitExternalModel("codex-cli")).toEqual(["codex-cli", undefined, undefined]);
     expect(splitExternalModel("codex-cli::gpt-5.6-sol")).toEqual(["codex-cli", "gpt-5.6-sol", undefined]);
     expect(splitExternalModel("codex-cli::gpt-5.6-sol::high")).toEqual(["codex-cli", "gpt-5.6-sol", "high"]);
+    expect(splitExternalModel("antigravity-cli::gemini-3.7-flash-high")).toEqual(["antigravity-cli", "gemini-3.7-flash-high", undefined]);
     expect(splitExternalModel("qwen3.5:4b")).toEqual(["qwen3.5:4b", undefined, undefined]);
   });
 
-  it("only the two CLI-backed engines are CLI engines", () => {
+  it("only CLI-backed engines are CLI engines", () => {
     expect(isCliEngine("claude-cli")).toBe(true);
     expect(isCliEngine("codex-cli::gpt-5.6-sol")).toBe(true);
+    expect(isCliEngine("antigravity-cli::gemini-3.7-flash-high")).toBe(true);
     expect(isCliEngine("openrouter::vendor/model")).toBe(false);
     expect(isCliEngine("qwen3.5:4b")).toBe(false);
   });
@@ -198,6 +200,7 @@ describe("splitExternalModel / isCliEngine / isExternalEngine", () => {
   it("all three non-local engines are external", () => {
     expect(isExternalEngine("claude-cli")).toBe(true);
     expect(isExternalEngine("codex-cli")).toBe(true);
+    expect(isExternalEngine("antigravity-cli")).toBe(true);
     expect(isExternalEngine("openrouter::vendor/model")).toBe(true);
     expect(isExternalEngine("qwen3.5:4b")).toBe(false);
   });

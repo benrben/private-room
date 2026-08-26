@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { confirm as askConfirm } from "@tauri-apps/plugin-dialog";
+import { confirm as askConfirm } from "../platform";
 import { RecoveryKeyIcon } from "./RecoveryKeyIcon";
 import { CircleCheckIcon } from "../icons";
 import { useFocusTrap } from "../settings/useFocusTrap";

@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Electron app entitlements. Union of what Electron's own hardened
+       runtime needs and what src-tauri/Entitlements.plist already granted the
+       Tauri build. This is `mac.entitlements` (the APP's own entitlements,
+       read by codesign's outer/final pass) — NOT
+       sidecar/sidecar-entitlements.plist, which stays a separate file signed
+       into only the sidecar executable by scripts/afterSign.mjs. Giving the
+       app process the sidecar's grants (disable-library-validation,
+       allow-unsigned-executable-memory, allow-dyld-environment-variables)
+       would be free-riding privilege the app itself does not need.
+
+       GOTCHA, found empirically running this file through a real codesign:
+       `plutil -lint` accepts a bare double hyphen inside an XML comment
+       body, but the kernel-level AMFI entitlements deserializer codesign
+       actually hands this file to (AMFIUnserializeXML) does not — it is
+       strict XML, which forbids two adjacent hyphen characters anywhere in
+       a comment except at the delimiters. A prose comment written with a
+       double hyphen (a common dash habit) parses fine under plutil and then
+       fails signing with an opaque "syntax error near line N". Every
+       comment in this file uses an em dash instead, deliberately, for
+       exactly that reason (this paragraph included, on its second pass). -->
+
+  <!-- Mandatory for V8/JIT under the hardened runtime. Electron aborts on
+       launch without it (Electron docs, "Signing and notarizing macOS
+       builds"); electron-builder's own default entitlements template
+       (app-builder-lib/templates/entitlements.mac.plist) carries the same
+       key, this just makes it explicit alongside the app-specific grants
+       below rather than splitting the truth across two files. -->
+  <key>com.apple.security.cs.allow-jit</key>
+  <true/>
+
+  <!-- src-tauri/Entitlements.plist, verbatim intent: dictation/voice notes/
+       meeting recording read the mic through the renderer's getUserMedia.
+       hardenedRuntime BLOCKS mic access without this entitlement even with
+       NSMicrophoneUsageDescription present and the user's Privacy toggle on. -->
+  <key>com.apple.security.device.audio-input</key>
+  <true/>
+
+  <!-- Required if (and only if) mac.identity resolves to "-" (ad-hoc). Ad-hoc
+       signing plus hardenedRuntime:true (electron-builder's default) means
+       library validation rejects Electron's own pre-signed frameworks, which
+       carry a DIFFERENT (Electron's) Team ID than the ad-hoc "no team" the
+       app itself signs under — electron-builder's own MacTargetHelper warns
+       about exactly this combination. It ALSO covers foreign-Team-ID dylibs
+       under the sidecar tree if this process ever dlopen's one in-process
+       (it does not today, but the grant is what makes that safe if it ever
+       does). A real Developer ID identity does not need this: the whole
+       tree is signed under one real Team ID, so library validation never
+       trips. Harmless to carry unconditionally either way — it only
+       RELAXES a check, so shipping it on the Developer-ID path is not a
+       security regression, just unnecessary. Kept here rather than made
+       conditional on identity so this file's shape is signature-stable
+       (macsign.sh's guard reads `codesign -dv` output, not this file, so
+       there's no correctness reason to vary it). -->
+  <key>com.apple.security.cs.disable-library-validation</key>
+  <true/>
+
+  <!-- electron-builder's own default entitlements template
+       (app-builder-lib/templates/entitlements.mac.plist) grants this to the
+       app; the Tauri build never granted it to Arcelle.app itself (only to
+       the sidecar, via sidecar-entitlements.plist). Kept here deliberately,
+       matching electron-builder's own baseline rather than trimming it —
+       V8's JIT allocator can want RWX pages under some configurations, and
+       Electron's upstream template treats it as part of the same "let V8
+       run" grant as allow-jit above. Revisit only if a build is observed to
+       work without it. -->
+  <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+  <true/>
+</dict>
+</plist>

@@ -83,7 +83,7 @@ export default function AdvisorsSection({
               </>
             ) : (
               <p className="settings-hint">
-                No cloud AI CLIs (Claude Code, Codex) were detected on this Mac.
+                No cloud AI CLIs (Claude Code, Codex, Antigravity) were detected on this Mac.
                 Install one and reopen Settings to enable advisors.
               </p>
             )}

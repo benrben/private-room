@@ -1,11 +1,9 @@
-import { api } from "../api";
-
 /** ADD-27: the microphone half of a live recording.
  *
  * Capture stays in the WebView (same permission path as dictation, and the
  * browser's echo cancellation keeps meeting audio played through the
- * speakers from re-entering the mic lane); raw PCM flows to the Rust engine
- * in ~250 ms base64 batches via rec_push_audio. Module-level singleton on
+ * speakers from re-entering the mic lane); raw PCM flows to the renderer-owned
+ * sidecar WebSocket in ~250 ms batches. Module-level singleton on
  * purpose — the recording must keep running while the user looks at other
  * files, so its lifetime can't belong to any component. */
 
@@ -22,7 +20,19 @@ let attaching = false;
 let firstFrameTimer: number | null = null;
 let muted = false;
 let liveStt = true;
-let voiceProcessing = true;
+// Coexistence first: macOS voice-processing mode can reconfigure the shared
+// input device underneath Teams, Slack, Zoom, or Meet. It is opt-in so starting
+// an Arcelle recording never makes the call app lose or attenuate the user.
+let voiceProcessing = false;
+let recordingAudioSink: ((rate: number, frame: Float32Array) => void) | null = null;
+
+/** Bind the current renderer-owned `/rec/session` socket to the microphone
+ * tap. Kept across pause/resume; cleared only when the recording ends. */
+export function setRecordingAudioSink(
+  sink: ((rate: number, frame: Float32Array) => void) | null,
+): void {
+  recordingAudioSink = sink;
+}
 
 /** Same-origin asset, never a blob: URL — the app's CSP allows `script-src
  * 'self'` only, and an AudioWorklet module is fetched as a script. */
@@ -72,11 +82,11 @@ export function micMuted(): boolean {
  * dropping. Whisper does its own normalization, so we lose nothing by leaving
  * the hardware level exactly where the user set it.
  *
- * `echoCancellation` IS load-bearing and stays on by default: it stops meeting
+ * `echoCancellation` is useful when explicitly enabled: it stops meeting
  * audio played through the speakers from re-entering the mic lane and being
- * attributed to "You" (see recording_cmds::rec_start). Users on headphones have
- * no acoustic echo to cancel, and turning the whole voice-processing path off
- * is what fully releases the device — hence the setting.
+ * attributed to "You" (see recording_cmds::rec_start). It defaults off because
+ * letting the meeting app keep its normal microphone session is the safer
+ * starting point; users recording on speakers can opt into cleanup.
  *
  * Read SYNCHRONOUSLY (module state, not an await): `acquireMic` has to be the
  * first thing awaited in the click handler or WebKit revokes the capture
@@ -130,8 +140,8 @@ function makeSink(
     const b64 = floatsToBase64(pending, pendingLen);
     pending = [];
     pendingLen = 0;
-    // Chained, not fired: `rec_push_audio` is an async command, so each
-    // invocation is its own task and the engine appends a batch where it
+    // Chained, not fired: dictation pushes are async, so each invocation is
+    // its own task and the engine appends a batch where it
     // ARRIVES. Two batches in flight at once means a starved task can write
     // its 250 ms after the audio that followed it — the mixed WAV and the
     // phrase boundaries both scrambled at that point, silently.
@@ -141,6 +151,35 @@ function makeSink(
   };
   return {
     push: (frame) => {
+      pending.push(frame);
+      pendingLen += frame.length;
+      if (pendingLen >= batch) send();
+    },
+    flush: send,
+  };
+}
+
+function makeFrameSink(
+  rate: number,
+  push: (rate: number, frame: Float32Array) => void,
+): { push: (frame: Float32Array) => void; flush: () => void } {
+  let pending: Float32Array[] = [];
+  let pendingLen = 0;
+  const batch = Math.max(1, Math.round(rate / 4));
+  const send = (): void => {
+    if (pendingLen === 0) return;
+    const all = new Float32Array(pendingLen);
+    let at = 0;
+    for (const chunk of pending) {
+      all.set(chunk, at);
+      at += chunk.length;
+    }
+    pending = [];
+    pendingLen = 0;
+    push(rate, all);
+  };
+  return {
+    push(frame) {
       pending.push(frame);
       pendingLen += frame.length;
       if (pendingLen >= batch) send();
@@ -252,7 +291,8 @@ async function buildMicTap(mic: MediaStream): Promise<void> {
   ctx = new AudioContext();
   if (ctx.state === "suspended") await ctx.resume().catch(() => {});
   const source = ctx.createMediaStreamSource(mic);
-  const rawSink = makeSink(ctx.sampleRate, (r, b64) => api.recPushAudio(r, b64));
+  if (!recordingAudioSink) throw new Error("The recording audio session is not connected.");
+  const rawSink = makeFrameSink(ctx.sampleRate, recordingAudioSink);
   let gotFrame = false;
   const sink = (frame: Float32Array) => {
     gotFrame = true;
@@ -270,7 +310,7 @@ async function buildMicTap(mic: MediaStream): Promise<void> {
     // sink after the flush sends the final partial batch.
     stop();
     source.disconnect();
-    void rawSink.flush();
+    rawSink.flush();
   };
   // First-frame acknowledgement: a worklet that loaded but never produces a
   // quantum (seen with throttled WebViews) would otherwise record silence
@@ -301,12 +341,13 @@ function rebuildOnFallback(): void {
   clearFirstFrameProbe();
   teardown();
   const source = ctx.createMediaStreamSource(stream);
-  const sink = makeSink(ctx.sampleRate, (r, b64) => api.recPushAudio(r, b64));
+  if (!recordingAudioSink) return;
+  const sink = makeFrameSink(ctx.sampleRate, recordingAudioSink);
   const stop = scriptProcessorTap(ctx, source, (f) => sink.push(f));
   teardown = () => {
     stop();
     source.disconnect();
-    void sink.flush();
+    sink.flush();
   };
 }
 

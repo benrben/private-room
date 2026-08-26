@@ -22,6 +22,10 @@ async function shoot(name) {
 
 async function openCreate() {
   await openApp();
+  const more = await $('[data-testid="more-tools"]');
+  if ((await more.isExisting()) && (await more.getAttribute("aria-expanded")) !== "true") {
+    await more.click();
+  }
   await (await $('.rail-button[data-area="create"]')).click();
   const crumb = await $(".editor-breadcrumb .crumb-title");
   await browser.waitUntil(async () => (await crumb.getText()) === "Create", {

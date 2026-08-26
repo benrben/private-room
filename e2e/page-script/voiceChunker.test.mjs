@@ -248,11 +248,11 @@ test("the offline branch still matches the words the Rust actually sends", () =>
   // message composed in another language, in another file. Reword the Rust and
   // the user is quietly pointed at a network problem instead of the one-click
   // setting that caused it — with nothing failing to say so.
-  const rust = read("src-tauri/src/commands/speech_cmds.rs");
+  const host = read("electron-migration/electron-app/electron/main/studiosPodcastAudio.ts");
   const needle = VOICE_SOURCE.match(/reason\.includes\("([^"]+)"\)/);
   assert.ok(needle, "expected voice.ts to branch on a substring of the host's refusal");
-  const offline = rust.match(/SPEECH_OFFLINE_MESSAGE: &str =\s*([\s\S]*?);/);
-  assert.ok(offline, "expected SPEECH_OFFLINE_MESSAGE in speech_cmds.rs");
+  const offline = host.match(/SPEECH_OFFLINE_MESSAGE\s*=\s*([\s\S]*?);/);
+  assert.ok(offline, "expected SPEECH_OFFLINE_MESSAGE in studiosPodcastAudio.ts");
   assert.ok(
     offline[1].includes(needle[1]),
     `voice.ts matches on "${needle[1]}", which SPEECH_OFFLINE_MESSAGE no longer contains — ` +

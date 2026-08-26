@@ -18,10 +18,13 @@ and a log line is a copy of them that outlives the run (SPEC §6).
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import hmac
 import logging
 import os
+import tempfile
+from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable, TypeVar
 from urllib.parse import parse_qsl
 
@@ -50,6 +53,7 @@ from . import privacy as privacy_mod
 from . import privacy_scan as privacy_scan_mod
 from . import summarize as summarize_feature
 from . import tts as tts_mod
+from .docs.dispatch import extract_text as extract_document_text
 from .chat import ChatModel, OllamaChatModel
 from .config import (
     CLOUD_WORKER_PARALLEL,
@@ -65,6 +69,7 @@ from .config import (
     KnowledgeExtractRequest,
     LabelRequest,
     ModelsRequest,
+    OcrRequest,
     PrivacyScanRequest,
     PullRequest,
     RunRequest,
@@ -75,9 +80,11 @@ from .config import (
     VideoJobRequest,
     VideoStartRequest,
     VisionLocateRequest,
+    QuickLookRequest,
     WarmRequest,
     WebSearchRequest,
 )
+from .media.ocr import recognize as ocr_recognize
 from .agents import agent_roster, reachable_agent_ids, specialist_roster
 from .external_llm import ExternalChatModel, is_external_model
 from .graph import CancelToken, Deps, Emit, stream_events
@@ -86,6 +93,9 @@ from .messages import compact_json
 from .provider_api import OpenAICompatibleChatModel
 from .rec.session_ws import register_rec_routes
 from .stt.dictation import register_dict_routes
+from .stt import engine as stt_engine
+from .media.decode import MediaKind as SttMediaKind, decode_to_pcm
+from .media.quicklook import preview_png as quicklook_preview_png
 
 log = logging.getLogger("arcelle_sidecar")
 
@@ -891,6 +901,70 @@ def create_app(
                 {"code": "TTS_UNAVAILABLE", "error": str(exc)}, status_code=502
             )
 
+    @app.post("/stt/transcribe_file")
+    async def stt_transcribe_file(request: Request) -> Any:
+        """Transcribe one host-staged media file with the on-device model.
+
+        The authenticated Electron host stages decrypted bytes beneath the
+        OS temp directory and removes them after this call. Refusing every
+        other input path prevents this local endpoint becoming a generic file
+        reader even if its process token were accidentally disclosed.
+        """
+        body = await request.json()
+        staged = Path(str(body.get("path", ""))).resolve()
+        temp_root = Path(tempfile.gettempdir()).resolve()
+        if staged.parent.parent != temp_root or not staged.parent.name.startswith("arcelle-stt-"):
+            return JSONResponse(
+                {"code": "STT_BAD_REQUEST", "error": "the staged audio path was refused"},
+                status_code=400,
+            )
+        model_path = Path(str(body.get("model_path", ""))).resolve()
+        if not staged.is_file() or not model_path.is_file():
+            return JSONResponse(
+                {"code": "STT_BAD_REQUEST", "error": "the audio file or speech model is missing"},
+                status_code=400,
+            )
+        kind = SttMediaKind.VIDEO if body.get("kind") == "video" else SttMediaKind.AUDIO
+        try:
+            pcm = await asyncio.to_thread(decode_to_pcm, staged, kind)
+            text = await asyncio.to_thread(stt_engine.transcribe, str(model_path), pcm, True)
+            return {"text": text}
+        except (OSError, RuntimeError, ValueError) as exc:
+            return JSONResponse(
+                {"code": "STT_FAILED", "error": str(exc)}, status_code=502
+            )
+
+    @app.post("/docs/extract")
+    async def docs_extract(request: Request) -> Any:
+        """Extract text from one host-staged room document.
+
+        Only the Electron host's private temporary directories are accepted;
+        the endpoint cannot be used as a general local-file reader.
+        """
+        body = await request.json()
+        staged = Path(str(body.get("path", ""))).resolve()
+        temp_root = Path(tempfile.gettempdir()).resolve()
+        if staged.parent.parent != temp_root or not staged.parent.name.startswith("arcelle-docs-"):
+            return JSONResponse(
+                {"code": "DOCS_BAD_REQUEST", "error": "the staged document path was refused"},
+                status_code=400,
+            )
+        if not staged.is_file():
+            return JSONResponse(
+                {"code": "DOCS_BAD_REQUEST", "error": "the staged document is missing"},
+                status_code=400,
+            )
+        try:
+            data = await asyncio.to_thread(staged.read_bytes)
+            text = await asyncio.to_thread(
+                extract_document_text, str(body.get("name", staged.name)), data
+            )
+            return {"text": text}
+        except (OSError, RuntimeError, ValueError) as exc:
+            return JSONResponse(
+                {"code": "DOCS_EXTRACT_FAILED", "error": str(exc)}, status_code=422
+            )
+
 
     @app.post("/label")
     async def label(req: LabelRequest, request: Request) -> Any:
@@ -948,6 +1022,29 @@ def create_app(
         except llm.LlmError as exc:
             return exc.response()
         return {"boxes": boxes}
+
+    @app.post("/quicklook")
+    async def quicklook(req: QuickLookRequest, request: Request) -> Any:
+        """Render host-supplied bytes through macOS Quick Look off the loop."""
+        try:
+            data = base64.b64decode(req.data_b64, validate=True)
+        except (ValueError, TypeError):
+            return JSONResponse({"code": "QUICKLOOK_BAD_REQUEST", "error": "invalid base64"}, status_code=400)
+        png = await until_hangup(request, asyncio.to_thread(quicklook_preview_png, req.name, data))
+        return {"png_b64": None if png is None else base64.b64encode(png).decode("ascii")}
+
+    @app.post("/ocr")
+    async def ocr(req: OcrRequest, request: Request) -> Any:
+        """Recognize text with macOS Vision without blocking the event loop."""
+        try:
+            data = base64.b64decode(req.data_b64, validate=True)
+        except (ValueError, TypeError):
+            return JSONResponse({"code": "OCR_BAD_REQUEST", "error": "invalid base64"}, status_code=400)
+        text = await until_hangup(
+            request,
+            asyncio.to_thread(ocr_recognize, req.mime, req.ext, data),
+        )
+        return {"text": text}
 
     @app.post("/knowledge_extract")
     async def knowledge_extract(req: KnowledgeExtractRequest, request: Request) -> Any:

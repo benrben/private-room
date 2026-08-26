@@ -1,8 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { getCurrentWindow } from "@tauri-apps/api/window";
 // Aliased: this component already owns a `confirm` (the create screen's
 // second password field), and the local name would shadow the import.
-import { confirm as askConfirm, message } from "@tauri-apps/plugin-dialog";
+import { confirm as askConfirm, message, setWindowTitle } from "./platform";
 import {
   api,
   RoomInfo,
@@ -297,6 +296,7 @@ export default function App() {
     const path = await api.chooseOpenPath({
       title: "Open an Arcelle Room",
       multiple: false,
+      room: true,
       filters: ROOM_FILTER,
     });
     if (typeof path === "string") goTo({ kind: "unlock", path });
@@ -354,12 +354,11 @@ export default function App() {
     // gate), this create flow is stale — it must not create/enter a room
     // behind the new gate.
     const epoch = navEpochRef.current;
-    // Defer to the native panel only now, to pick where the file is saved.
+    // Defer to the native panel only now, to pick the new workspace folder.
     const suggested = (roomName.trim() || "My Room").replace(/[/\\:]/g, "-");
     const path = await api.chooseSavePath({
-      title: "Choose where to save this room",
-      defaultPath: `${suggested}.arcelle`,
-      filters: ROOM_FILTER,
+      title: "Choose where to create this workspace folder",
+      defaultPath: suggested,
     });
     if (!path) return; // cancelled the location picker; stay in the branded flow
     if (navEpochRef.current !== epoch) return; // gate moved on — create nothing
@@ -368,7 +367,12 @@ export default function App() {
       // The typed name is the room's name, not just a filename suggestion —
       // saving "Journal" as "stuff.arcelle" used to leave the room called
       // "stuff" everywhere. Blank still falls back to the file's name.
-      const info = await api.createRoom(path, password, roomName.trim() || undefined);
+      const info = await api.createRoom(
+        path,
+        password,
+        roomName.trim() || undefined,
+        "workspace-folder",
+      );
       if (navEpochRef.current !== epoch) return; // stale: don't seed or enter
       // The room is now open. Seed the chosen template and role through
       // ordinary APIs before entering. Everything created here is normal,
@@ -524,7 +528,7 @@ export default function App() {
     if (prefersReducedMotion()) {
       await api.closeRoom();
       // Drop the room name from the title bar once locked (CHG-9).
-      getCurrentWindow().setTitle("Arcelle").catch(() => {});
+      setWindowTitle("Arcelle").catch(() => {});
       // Another navigation (e.g. a .roomai opened mid-close showed its gate)
       // wins over the default return to the start screen.
       if (navEpochRef.current === epoch) goTo({ kind: "start" });
@@ -551,7 +555,7 @@ export default function App() {
     }
     window.clearTimeout(slowTimer);
     // Drop the room name from the title bar once locked (CHG-9).
-    getCurrentWindow().setTitle("Arcelle").catch(() => {});
+    setWindowTitle("Arcelle").catch(() => {});
     window.setTimeout(() => {
       setLocking(false);
       setLockSlow(false);

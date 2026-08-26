@@ -50,14 +50,11 @@ export function StartScreen({
 }: StartScreenProps) {
   return (
     <>
-      {/* "…that never leaves this computer" was a claim about a file path,
-          made before any path is known — and `roomPlace` below deliberately
-          refuses to make it, saying nothing about a room in ~/Dropbox rather
-          than affirming it is local. The sentence now claims only what is
-          true of every room: one file, encrypted, on your Mac. */}
+      {/* Current documents are ordinary files. Private Arcelle state is the
+          encrypted part and stays inside the reserved folder. */}
       <p className="gate-sub">
-        Your files, links, chats and AI — sealed inside one encrypted
-        file on your Mac.
+        Your documents stay as normal files. Chats, memory, search and history
+        stay encrypted.
       </p>
       <ul className="gate-assurances">
         {/* The check is a drawn glyph rather than a "✓" character: it is
@@ -76,7 +73,7 @@ export function StartScreen({
         </li>
         <li>
           <span className="nb-ico nb-ico-check" aria-hidden="true" />
-          One file, fully encrypted
+          Normal files, encrypted private state
         </li>
       </ul>
       <div className="gate-actions">

@@ -92,10 +92,12 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import type Database from "better-sqlite3-multiple-ciphers";
-import { getFileBytesNamed } from "./db-host/files.js";
+import { getFileBytes, getFileBytesNamed, listFiles } from "./db-host/files.js";
 import { getJobArtifact } from "./db-host/jobs.js";
 import {
   createWorkflow,
+  getSchedule,
+  listWorkflowRuns,
   listWorkflows,
   setWorkflowStatus,
   upsertSchedule,
@@ -104,7 +106,14 @@ import {
   type WorkflowRun,
 } from "./db-host/workflows.js";
 import { nextRunFromNow } from "./jobScheduler.js";
-import { resolveScriptFile, scriptFingerprint, type ResolvedScriptFile } from "./scriptRun.js";
+import {
+  parseScriptManifest,
+  referencedRoomFiles,
+  resolveScriptFile,
+  scriptFingerprint,
+  scriptLangOf,
+  type ResolvedScriptFile,
+} from "./scriptRun.js";
 import { clampBytes } from "./textClamp.js";
 
 export { resolveScriptFile, scriptFingerprint, type ResolvedScriptFile };
@@ -550,33 +559,74 @@ export interface ScriptInfo {
   lastError: string | null;
 }
 
-export const LIST_SCRIPTS_NOT_IMPLEMENTED =
-  "NOT_IMPLEMENTED: list_scripts (every .py/.js room file as a script row) needs " +
-  "script_lang_of/parse_script_manifest for deps/inputs/outputs/shortcut and " +
-  "referenced_room_files for the auto-materialized inputs column, all from " +
-  "commands/jobs/script_run.rs, which has no Electron port yet. The approval " +
-  "check, the auto-workflow join (wfIsForScript) and the consecutive-failure " +
-  "walk this command also needs are ready in scriptConsent.ts.";
-
-export function listScripts(_db: Database.Database, _userDataDir: string): ScriptInfo[] {
-  throw new Error(LIST_SCRIPTS_NOT_IMPLEMENTED);
+function readableRoomFiles(db: Database.Database, declared: readonly string[], text: string): string[] {
+  const names = listFiles(db).map((file) => file.name);
+  const out = [...declared];
+  for (const name of referencedRoomFiles(text, names, 20)) {
+    if (!out.some((existing) => existing.toLowerCase() === name.toLowerCase())) out.push(name);
+  }
+  return out;
 }
 
-export const GET_SCRIPT_MANIFEST_NOT_IMPLEMENTED =
-  "NOT_IMPLEMENTED: get_script_manifest needs parse_script_manifest/ScriptManifest " +
-  "from commands/jobs/script_run.rs, which has no Electron port yet.";
-
-export function getScriptManifest(_db: Database.Database, _fileId: string): never {
-  throw new Error(GET_SCRIPT_MANIFEST_NOT_IMPLEMENTED);
+export function listScripts(db: Database.Database, userDataDir: string): ScriptInfo[] {
+  const approved = new Set(readScriptApprovals(userDataDir));
+  const workflows = listWorkflows(db);
+  const out: ScriptInfo[] = [];
+  for (const file of listFiles(db)) {
+    const lang = scriptLangOf(file.name);
+    if (lang === null) continue;
+    const bytes = getFileBytes(db, file.id) ?? Buffer.alloc(0);
+    const text = bytes.toString("utf8");
+    const manifest = parseScriptManifest(file.name, text);
+    const isApproved = approved.has(scriptFingerprint(bytes));
+    const workflow = workflows.find((candidate) => wfIsForScript(candidate, file.id));
+    const runs = workflow ? listWorkflowRuns(db, workflow.id) : [];
+    let consecutiveFailures = 0;
+    let lastError: string | null = null;
+    for (const run of runs) {
+      if (run.status !== "error") break;
+      const error = run.error ?? "";
+      if (lastError === null) {
+        lastError = error;
+        consecutiveFailures = 1;
+      } else if (lastError === error) {
+        consecutiveFailures += 1;
+      } else {
+        break;
+      }
+    }
+    out.push({
+      fileId: file.id,
+      name: file.name,
+      lang,
+      deps: manifest.deps,
+      inputs: readableRoomFiles(db, manifest.inputs, text),
+      outputs: manifest.outputs,
+      shortcut: manifest.shortcut,
+      approved: isApproved,
+      changedSinceApproval: !isApproved && workflow !== undefined,
+      workflowId: workflow?.id ?? null,
+      schedule: workflow ? getSchedule(db, workflow.id) : null,
+      lastRun: runs[0] ?? null,
+      consecutiveFailures,
+      lastError,
+    });
+  }
+  return out;
 }
 
-export const AGENT_LIST_SCRIPTS_NOT_IMPLEMENTED =
-  "NOT_IMPLEMENTED: agent_list_scripts (the agent's one-line-per-script inventory) " +
-  "needs parse_script_manifest from commands/jobs/script_run.rs — the same blocker " +
-  "as list_scripts — which has no Electron port yet.";
+export function getScriptManifest(db: Database.Database, fileId: string) {
+  const [name, bytes] = getFileBytesNamed(db, fileId);
+  return parseScriptManifest(name, (bytes ?? Buffer.alloc(0)).toString("utf8"));
+}
 
-export function agentListScripts(_db: Database.Database, _userDataDir: string): string {
-  throw new Error(AGENT_LIST_SCRIPTS_NOT_IMPLEMENTED);
+export function agentListScripts(db: Database.Database, userDataDir: string): string {
+  const rows = listScripts(db, userDataDir);
+  if (rows.length === 0) return "This room has no .py or .js scripts yet.";
+  return rows.map((script) => {
+    const deps = script.deps.length === 0 ? "" : `, needs ${script.deps.join(" ")}`;
+    return `- ${script.name} (${script.lang}${deps}) — ${script.approved ? "approved to run" : "needs the user's approval on first run"}`;
+  }).join("\n");
 }
 
 export const RUN_SCRIPT_NOT_IMPLEMENTED =

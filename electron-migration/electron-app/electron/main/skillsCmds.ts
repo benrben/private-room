@@ -145,6 +145,11 @@ import { DELETE_DECLINED } from "./mcpConfig.js";
 import { SKILL_AGENT_IDS } from "./toolSpecs.js";
 import { clampBytes } from "./textClamp.js";
 import type { OpenRoom } from "./turnEngine.js";
+import { listModels } from "./engineRouting.js";
+import { modelSetting } from "./gatherContext.js";
+import { recoverJson } from "./ollamaGenerate.js";
+import { defaultResolvedModel } from "./workflowModel.js";
+import { generateTextAnyEngine, withRealOllamaGenerate } from "./workflowCompose.js";
 
 export { SKILL_GONE };
 
@@ -1245,19 +1250,85 @@ export const COMPOSE_SKILL_NOT_IMPLEMENTED =
  * migration has no rollback-state container yet, so that guard has no seam to
  * hang on — and it is moot while the call below cannot succeed at all.
  */
+export interface ComposeSkillDeps {
+  generate?: (model: string, prompt: string) => Promise<string>;
+  listModels?: () => Promise<string[]>;
+  isRollingBack?: () => boolean;
+  emit?: EmitFn;
+}
+
 export async function composeSkill(
   db: Database.Database,
   description: string,
-  fileIds?: readonly string[] | null
+  fileIds?: readonly string[] | null,
+  deps: ComposeSkillDeps = {}
 ): Promise<string> {
   const request = description.trim();
   if (request === "") {
     throw new Error("Describe the skill you want.");
   }
+  if (deps.isRollingBack?.() === true) {
+    throw new Error("A room restore is in progress. Try again when it finishes.");
+  }
   const sources = loadSkillSources(db, fileIds ?? []);
-  // Built for real, so a caller can inspect exactly what WOULD have been sent.
-  void skillComposePrompt(request, sources);
-  throw new Error(COMPOSE_SKILL_NOT_IMPLEMENTED);
+  const models = await (deps.listModels ?? listModels)();
+  const model = modelSetting(db) ?? defaultResolvedModel(null, models);
+  const generate = deps.generate ?? ((picked: string, prompt: string) =>
+    generateTextAnyEngine(picked, prompt, withRealOllamaGenerate({})));
+  const raw = await generate(model, skillComposePrompt(request, sources));
+  let value: unknown;
+  try {
+    value = JSON.parse(recoverJson(raw));
+  } catch (error) {
+    throw new Error(`The model did not return a valid skill: ${errMessage(error)}`);
+  }
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("The model did not return a skill object.");
+  }
+  const record = value as Record<string, unknown>;
+  if (typeof record.name !== "string" || typeof record.description !== "string" ||
+      typeof record.instructions !== "string") {
+    throw new Error("The composed skill is missing name, description, or instructions.");
+  }
+  const instructions = instructionsWithSourceLinks(record.instructions, sources);
+  const name = validateSkillFields(record.name, record.description, instructions);
+  const rawResources = record.resources === undefined ? [] : record.resources;
+  if (!Array.isArray(rawResources)) throw new Error("The composed skill's resources must be an array.");
+  if (rawResources.length + sources.length > MAX_RESOURCES) {
+    throw new Error(`A skill may contain at most ${MAX_RESOURCES} resources.`);
+  }
+  const resources: Array<{ path: string; content: Buffer }> = [];
+  for (const item of rawResources) {
+    if (typeof item !== "object" || item === null || Array.isArray(item)) {
+      throw new Error("Each composed skill resource needs a path and text content.");
+    }
+    const resource = item as Record<string, unknown>;
+    if (typeof resource.path !== "string" || typeof resource.content !== "string") {
+      throw new Error("Each composed skill resource needs a path and text content.");
+    }
+    const resourcePath = normalizeSkillPath(resource.path);
+    const content = Buffer.from(resource.content, "utf8");
+    if (content.length > MAX_RESOURCE_BYTES) throw new Error(`${resourcePath} is too large.`);
+    resources.push({ path: resourcePath, content });
+  }
+  const sourceResources = sources.map((source) => ({ path: source.path, content: Buffer.from(source.content, "utf8") }));
+  checkResourcePaths([...resources, ...sourceResources].map((resource) => resource.path));
+  const totalBytes = [...resources, ...sourceResources].reduce((sum, resource) => sum + resource.content.length, 0);
+  if (totalBytes > MAX_IMPORT_BYTES) throw new Error("The composed skill's resources are too large.");
+
+  const existing = findSkillDb(db, name);
+  if (existing !== null) throw new Error(`A skill named "${name}" already exists.`);
+  const id = createSkillDb(db, name, record.description.trim(), instructions, false, "agent", "");
+  try {
+    for (const resource of [...resources, ...sourceResources]) {
+      upsertSkillResourceDb(db, id, resource.path, skillResourceKind(resource.path), resource.content);
+    }
+  } catch (error) {
+    bestEffortDeleteSkill(db, id);
+    throw error;
+  }
+  emitSafely(deps.emit, "skills-changed", undefined);
+  return id;
 }
 
 // ============================================================================
@@ -1581,7 +1652,8 @@ function openDb(room: RoomSource): Database.Database {
 export function registerSkillsIpc(
   ipcMain: Pick<IpcMain, "handle">,
   room: RoomSource,
-  emit?: EmitFn
+  emit?: EmitFn,
+  composeDeps: Omit<ComposeSkillDeps, "emit"> = {}
 ): void {
   const handle = <A extends unknown[], R>(channel: string, fn: (...args: A) => R): void => {
     ipcMain.handle(channel, (_event: IpcMainInvokeEvent, ...args: A) => fn(...args));
@@ -1628,6 +1700,6 @@ export function registerSkillsIpc(
     exportSkillFolderCmd(openDb(room), args.id, args.destination)
   );
   handle("compose_skill", (args: { description: string; fileIds?: string[] | null }) =>
-    composeSkill(openDb(room), args.description, args.fileIds)
+    composeSkill(openDb(room), args.description, args.fileIds, { ...composeDeps, emit })
   );
 }

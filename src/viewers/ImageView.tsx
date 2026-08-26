@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { listen } from "@tauri-apps/api/event";
+import { listen } from "../platform";
 import { api, ImageBox, recommendedModels } from "../api";
 import { BOX_COLORS, ocrBody } from "./util";
 import { fileUrl } from "./useFileBytes";

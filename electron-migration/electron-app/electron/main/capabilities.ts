@@ -286,6 +286,20 @@ export const CODEX_CLI: EngineDecl = {
   tier: primaryCliScope(),
 };
 
+/** Antigravity CLI as the room's engine. Arcelle uses its headless JSON stream and
+ * the same scoped text tool protocol as Codex, so transport capabilities match
+ * the other CLI-backed engines. */
+export const ANTIGRAVITY_CLI: EngineDecl = {
+  id: "antigravity-cli",
+  label: "Antigravity CLI",
+  local: false,
+  streaming: "no",
+  imageChannel: false,
+  toolCalling: "yes",
+  structuredOutput: "no",
+  tier: primaryCliScope(),
+};
+
 /** An API provider (OpenRouter today). A real HTTP chat API: it streams, it
  * takes images, and tools/vision/structured output are per-model facts the live
  * catalog already carries — the same catalog the model picker fetches. */
@@ -302,7 +316,7 @@ export const OPENROUTER: EngineDecl = {
 
 /** Every engine the app can be pointed at, in the order the matrix shows them.
  * Ported verbatim from `DECLARED`. */
-export const DECLARED: readonly EngineDecl[] = [OLLAMA, OLLAMA_CLOUD, CLAUDE_CLI, CODEX_CLI, OPENROUTER];
+export const DECLARED: readonly EngineDecl[] = [OLLAMA, OLLAMA_CLOUD, CLAUDE_CLI, CODEX_CLI, ANTIGRAVITY_CLI, OPENROUTER];
 
 // -------------------------------------------------------- engine resolution
 
@@ -327,6 +341,9 @@ export function engineIdOf(model: string): string {
   }
   if (engine === "codex-cli") {
     return CODEX_CLI.id;
+  }
+  if (engine === "antigravity-cli") {
+    return ANTIGRAVITY_CLI.id;
   }
   if (engine === "openrouter") {
     return OPENROUTER.id;

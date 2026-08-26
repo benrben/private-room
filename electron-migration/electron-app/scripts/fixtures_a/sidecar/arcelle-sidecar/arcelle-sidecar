@@ -1,0 +1,8 @@
+#!/bin/sh
+# Fixture stand-in for the real PyInstaller onedir sidecar executable. It
+# exists only so electron-builder.config.mjs's --dir proof build has
+# something to copy into the doubled Contents/Resources/sidecar/arcelle-sidecar/
+# onedir layout sidecar.ts:534-541 resolves at runtime. Never bundled by a
+# real package build (see ARCELLE_SIDECAR_STAGE_DIR in electron-builder.config.mjs).
+echo "arcelle-sidecar fixture stub -- not the real sidecar" >&2
+exit 0

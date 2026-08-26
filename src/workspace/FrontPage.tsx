@@ -366,7 +366,7 @@ export default function FrontPage({
 }) {
   const [suggestionsOpen, setSuggestionsOpen] = useState(false);
   const goArea = (
-    area: "recordings" | "memory" | "skills" | "connectors" | "sketch" | "create",
+    area: "files" | "recordings" | "memory" | "skills" | "connectors" | "sketch" | "create",
   ) => {
     s.setShowMap(false);
     s.setShowWorkflows(false);
@@ -379,6 +379,7 @@ export default function FrontPage({
    * this list has silently fallen two and three destinations behind twice. */
   const openArea: Record<NavArea, (() => void) | null> = {
     home: null,
+    files: () => goArea("files"),
     recordings: () => goArea("recordings"),
     browser: () => a.revealBrowser(),
     sketch: () => goArea("sketch"),

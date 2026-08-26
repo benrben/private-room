@@ -85,6 +85,7 @@ dependencies = [
     # of the Mozilla Readability algorithm. Imported as `readability`.
     "readability-lxml>=0.8.4.1",
     "cryptography>=50.0.0",
+    "deepagents>=0.7.8,<0.8",
 ]
 
 [project.optional-dependencies]

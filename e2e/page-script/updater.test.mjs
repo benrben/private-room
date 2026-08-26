@@ -2,9 +2,8 @@
  *
  * Runs under `npm run test:page` (node --test) against the REAL
  * `src/updater.ts`, type-stripped in memory. Unlike theme.ts this module does
- * import the Tauri plugins, so each specifier is rewritten to a tiny stub
- * module that forwards to `globalThis.__tauri` — the test controls `check`,
- * `confirm`, `relaunch` and `message` without the app being built or running.
+ * import the platform bridge, so that specifier is rewritten to a tiny stub
+ * module that forwards to `globalThis.__platform` without running Electron.
  *
  * What these pin: a skip is remembered ONLY for a real "no". `prSkippedUpdate`
  * is per exact version and nothing in the app clears it, so a dialog that
@@ -24,21 +23,13 @@ let JS = ts.transpileModule(SOURCE, {
   compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
 }).outputText;
 
-// Each Tauri package becomes a data-URL module of forwarders, so the test can
-// swap the backend per case without touching the source under test.
-for (const [spec, names] of Object.entries({
-  "@tauri-apps/plugin-updater": ["check"],
-  "@tauri-apps/plugin-process": ["relaunch"],
-  "@tauri-apps/plugin-dialog": ["confirm", "message"],
-})) {
-  const body = names
-    .map((n) => `export const ${n} = (...a) => globalThis.__tauri.${n}(...a);`)
-    .join("\n");
-  JS = JS.replace(
-    `"${spec}"`,
-    JSON.stringify(`data:text/javascript,${encodeURIComponent(body)}`),
-  );
-}
+const platformBody = ["checkForUpdate", "confirm", "installUpdate", "message"]
+  .map((n) => `export const ${n} = (...a) => globalThis.__platform.${n}(...a);`)
+  .join("\n");
+JS = JS.replace(
+  '"./platform"',
+  JSON.stringify(`data:text/javascript,${encodeURIComponent(platformBody)}`),
+);
 const updater = await import(`data:text/javascript,${encodeURIComponent(JS)}`);
 
 const SKIP_KEY = "prSkippedUpdate";
@@ -48,30 +39,24 @@ const SKIP_KEY = "prSkippedUpdate";
  * "no DOM to draw on" path. */
 function harness({ version = "9.9.9", confirm, check } = {}) {
   const store = new Map();
-  const log = { confirms: 0, installs: 0, relaunches: 0, messages: 0 };
+  const log = { confirms: 0, installs: 0, messages: 0 };
   globalThis.localStorage = {
     getItem: (k) => (store.has(k) ? store.get(k) : null),
     setItem: (k, v) => store.set(k, String(v)),
     removeItem: (k) => store.delete(k),
   };
-  globalThis.__tauri = {
-    check:
+  globalThis.__platform = {
+    checkForUpdate:
       check ??
       (async () => ({
         version,
-        downloadAndInstall: async (on) => {
-          log.installs++;
-          on({ event: "Started", data: { contentLength: 10 } });
-          on({ event: "Progress", data: { chunkLength: 10 } });
-          on({ event: "Finished" });
-        },
       })),
+    installUpdate: async () => {
+      log.installs++;
+    },
     confirm: async (...args) => {
       log.confirms++;
       return confirm(...args);
-    },
-    relaunch: async () => {
-      log.relaunches++;
     },
     message: async () => {
       log.messages++;
@@ -117,16 +102,15 @@ test("a real no is remembered, and only for that exact version", async () => {
   assert.equal(h.log.confirms, 1);
 
   // The NEXT release still asks.
-  globalThis.__tauri.check = async () => ({ version: "9.9.10" });
+  globalThis.__platform.checkForUpdate = async () => ({ version: "9.9.10" });
   await updater.checkForUpdatesQuietly();
   assert.equal(h.log.confirms, 2);
 });
 
-test("yes installs and relaunches", async () => {
+test("yes hands installation and relaunch to the Electron host", async () => {
   const h = harness({ confirm: async () => true });
   await updater.checkForUpdatesQuietly();
   assert.equal(h.log.installs, 1);
-  assert.equal(h.log.relaunches, 1);
   assert.equal(h.store.has(SKIP_KEY), false);
 });
 

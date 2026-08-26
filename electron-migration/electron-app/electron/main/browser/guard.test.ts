@@ -97,6 +97,27 @@ describe("resolve_rejects_private_literal_hosts", () => {
     expect(resolved.address).toBe("8.8.8.8");
     expect(resolved.port).toBe(443);
   });
+
+  it("prefers IPv4 on a dual-stack host after checking every answer", async () => {
+    const dualStack = async () => [
+      { address: "2001:4860:4860::8888", family: 6 },
+      { address: "8.8.8.8", family: 4 },
+    ];
+    await expect(resolvePublicAddr("dual.example", 443, dualStack)).resolves.toEqual({
+      address: "8.8.8.8",
+      port: 443,
+    });
+  });
+
+  it("still rejects the whole DNS answer when any address is private", async () => {
+    const rebound = async () => [
+      { address: "8.8.8.8", family: 4 },
+      { address: "127.0.0.1", family: 4 },
+    ];
+    await expect(resolvePublicAddr("rebound.example", 443, rebound)).rejects.toThrow(
+      /private network/i,
+    );
+  });
 });
 
 // Additional direct coverage of `isPublicIp`, exported per this port's

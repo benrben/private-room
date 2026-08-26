@@ -95,7 +95,7 @@ _DOWNLOADED_MODEL = (
     / "ggml-large-v3-turbo-q5_0.bin"
 )
 _BUNDLED_MODEL = Path(__file__).resolve().parents[2] / (
-    "src-tauri/resources/models/ggml-large-v3-turbo-q5_0.bin"
+    "electron-migration/electron-app/assets/models/ggml-large-v3-turbo-q5_0.bin"
 )
 MODEL_PATH = str(_DOWNLOADED_MODEL if _DOWNLOADED_MODEL.exists() else _BUNDLED_MODEL)
 

@@ -108,12 +108,13 @@
  * ============================================================================
  * RETIRED — confirmed against the sidecar, not inferred
  * ============================================================================
- * {@link dictStart}/{@link dictPushAudio}/{@link dictStop}/{@link dictCancel}.
- * `stt/dictation.py`'s module doc §1 states in as many words that all four Rust
- * commands (plus the `dict_worker` thread) "collapse into the socket's own
- * lifecycle" of `WS /dict/session`, which `register_dict_routes` mounts in
+ * {@link dictPushAudio}/{@link dictStop}/{@link dictCancel}. `dictStart` is now
+ * the narrow trusted bootstrap that resolves the model and authenticated URL;
+ * it never proxies audio. `stt/dictation.py`'s module doc §1 states that the
+ * Rust audio/control commands (plus `dict_worker`) collapse into the socket's
+ * own lifecycle of `WS /dict/session`, which `register_dict_routes` mounts in
  * `server.py` behind the same `?token=` guard `/rec/session` uses — no Electron
- * hop in the data path. These four are thin, honest, throwing stubs, exactly
+ * hop in the data path. The remaining three are thin throwing stubs, exactly
  * `recBridge.ts`'s `recPushAudio` pattern (§5), and they ARE IPC-wired for the
  * same reason that one is: so a stale renderer bundle calling the old channel
  * names fails with an instruction instead of "no handler registered".
@@ -172,15 +173,16 @@ import * as path from "node:path";
 import type { IpcMain, IpcMainInvokeEvent } from "electron";
 import type Database from "better-sqlite3-multiple-ciphers";
 
-import type { SttStatus } from "../shared/apiTypes.js";
+import type { DictSessionInfo, SttStatus } from "../shared/apiTypes.js";
 import type { RoomSource } from "./recIpc.js";
 import { generate } from "./ollamaGenerate.js";
 import { resolvedBaseUrl, stripThinkSpans } from "./engineRouting.js";
 import { modelSetting } from "./gatherContext.js";
 import { runsOnThisMac } from "./capabilities.js";
 import { bestLocalDefault } from "./ollamaModels.js";
-import { authedHeaders, busy, ensureUp } from "./sidecar.js";
+import { authToken, authedHeaders, busy, ensureUp } from "./sidecar.js";
 import type { SidecarChatMessage } from "./sidecar.js";
+import { DICT_STOP_BASE_SECS, DICT_STOP_PER_AUDIO_SEC } from "./dictStopTimeout.js";
 
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
@@ -935,25 +937,47 @@ export async function shapeText(
 }
 
 // ============================================================================
-// ---- dict_start / dict_push_audio / dict_stop / dict_cancel — RETIRED ------
+// ---- dict_start bootstrap + retired audio/control IPC -----------------------
 // ============================================================================
 
 /** Why these four throw — see the module doc's "RETIRED" section. */
 export const DICT_RETIRED_REASON =
   'Dictation audio no longer streams through Electron: the renderer connects directly to "WS ' +
   '/dict/session" on the Python sidecar (electron-python-migration-plan-2026-08-22.md line 349; ' +
-  "sidecar/arcelle_sidecar/stt/dictation.py, whose own module doc §1 says the four Rust commands " +
-  "\"collapse into the socket's own lifecycle\"). dict_start/dict_push_audio/dict_stop/" +
-  "dict_cancel are retired IPC handlers, kept only so a stale renderer bundle fails loudly with " +
+  "sidecar/arcelle_sidecar/stt/dictation.py. dict_push_audio/dict_stop/dict_cancel " +
+  "are retired IPC handlers, kept only so a stale renderer bundle fails loudly with " +
   'an instruction instead of "no handler registered" — the same treatment recBridge.ts gives ' +
   "rec_push_audio. dictStopTimeout.ts still owns the one piece of this flow Electron keeps: " +
   "dict_stop_timeout's formula, for the renderer's own stop-wait.";
 
-/** Retired: see {@link DICT_RETIRED_REASON}. `Promise<never>` for the same
- * reason `recBridge.ts`'s `recPushAudio` uses it — the function has no success
- * value, and `never` still satisfies every `ipc-contract.ts` result type. */
-export async function dictStart(): Promise<never> {
-  throw new Error(DICT_RETIRED_REASON);
+export interface DictSessionDeps {
+  ensureUp: () => Promise<string>;
+  authToken: () => string;
+}
+
+const defaultDictSessionDeps: DictSessionDeps = { ensureUp, authToken };
+
+/** Provision the authenticated direct socket without proxying any audio
+ * through Electron. The main process remains the only place allowed to read
+ * the sidecar token and resolve the on-disk model path. */
+export async function dictStart(
+  userDataDir: string,
+  resourcesPath: string | null,
+  deps: DictSessionDeps = defaultDictSessionDeps
+): Promise<DictSessionInfo> {
+  const modelPath = sttEffectiveModel(userDataDir, resourcesPath);
+  if (modelPath === null) throw new Error("STT_MODEL_MISSING");
+  const base = new URL(await deps.ensureUp());
+  base.protocol = base.protocol === "https:" ? "wss:" : "ws:";
+  base.pathname = "/dict/session";
+  base.search = "";
+  base.searchParams.set("token", deps.authToken());
+  base.searchParams.set("modelPath", modelPath);
+  return {
+    url: base.toString(),
+    stopBaseMs: DICT_STOP_BASE_SECS * 1000,
+    stopPerAudioSecondMs: DICT_STOP_PER_AUDIO_SEC * 1000,
+  };
 }
 
 /** Retired: see {@link DICT_RETIRED_REASON}. */
@@ -993,13 +1017,15 @@ export interface SttToolsIpcDeps {
   /** Test seams; production passes neither. */
   shapeTextDeps?: ShapeTextDeps;
   downloadDeps?: SttDownloadDeps;
+  dictSessionDeps?: DictSessionDeps;
 }
 
 /**
  * Register every channel this module owns on `ipcMain`. Channel names match
  * `ipc-contract.ts` exactly, so the renderer side needs no rename.
  *
- * The four retired `dict_*` channels ARE registered, deliberately: an
+ * The three retired dictation data/control channels ARE registered,
+ * deliberately: an
  * unregistered channel makes a stale renderer bundle fail with "no handler
  * registered", which says nothing, whereas the registered stub answers with
  * {@link DICT_RETIRED_REASON} — the precedent `recIpc.ts` sets by wiring
@@ -1046,7 +1072,9 @@ export function registerSttToolsIpc(ipcMain: Pick<IpcMain, "handle">, deps: SttT
       deps.shapeTextDeps
     )
   );
-  handle("dict_start", () => dictStart());
+  handle("dict_start", () =>
+    dictStart(deps.userDataDir, deps.resourcesPath, deps.dictSessionDeps)
+  );
   handle("dict_push_audio", (args: { rate: number; dataB64: string }) =>
     dictPushAudio(args.rate, args.dataB64)
   );

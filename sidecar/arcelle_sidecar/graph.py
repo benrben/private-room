@@ -449,6 +449,16 @@ class AgentState(TypedDict, total=False):
     #: the always-on connector proxy pair so a step can't jump the queue and
     #: send before earlier steps finish (live e2e caught exactly that).
     plan_multi: bool
+    #: Number of specialist steps Arcelle planned for the hub at prepare time.
+    #: A successful artifact-producing one-step delegation is terminal work:
+    #: the next round summarizes its receipt instead of dispatching new agents
+    #: to "verify" an operation the room bridge already confirmed.
+    planned_step_count: int
+    #: True when one successful artifact-producing delegation completes every
+    #: specialist obligation Arcelle could identify for this turn. This covers
+    #: a clean one-step plan and the planner's single-domain abstain fallback;
+    #: it excludes mixed planned/unplanned and unavailable work.
+    artifact_delegation_is_terminal: bool
     #: request_tools groups opened mid-turn (monotonic within the step).
     unlocked_groups: set[str]
     #: Refs of tool results THIS loop parked whole (:mod:`.results`), in the
@@ -940,11 +950,26 @@ async def prepare(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
                 groups="; ".join(TOOL_GROUP_LABELS[g] for g in locked)
             )
 
+    artifact_delegation_is_terminal = bool(
+        plan is not None
+        and (
+            plan.reason == "abstained"
+            or (
+                plan.reason == "planned"
+                and len(plan.steps) == 1
+                and not plan.unplanned
+                and not plan.unavailable
+            )
+        )
+    )
+
     return {
         "tools": tools,
         "served_specs": served_specs,
         "messages": messages,
         "seen": set(),
+        "planned_step_count": len(plan.steps) if plan is not None else 0,
+        "artifact_delegation_is_terminal": artifact_delegation_is_terminal,
         "force_synthesis": False,
         "stalls": 0,
         "round": 0,
@@ -955,6 +980,28 @@ async def prepare(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
         "cancelled": deps.cancel.cancelled,
         "stop": False,
     }
+
+
+def _dedupe_hub_delegations(calls: list[ToolCall]) -> list[ToolCall]:
+    """Keep the first delegation to each domain in one hub model round.
+
+    A domain call carries an arbitrary instruction, so two calls to the same
+    specialist are not two capabilities — they are a model-invented expansion
+    of one domain step. The worker can receive both requested file operations
+    in one instruction, while two File agents race blind and can contradict
+    each other's receipts. Room tools are left untouched; workers legitimately
+    call the same verb for different files.
+    """
+    seen: set[str] = set()
+    kept: list[ToolCall] = []
+    for call in calls:
+        is_delegation = call.name in AGENT_TOOL_NAMES or call.name == BATCH_TOOL_NAME
+        if is_delegation and call.name in seen:
+            continue
+        if is_delegation:
+            seen.add(call.name)
+        kept.append(call)
+    return kept
 
 
 async def call_model(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
@@ -1072,6 +1119,9 @@ async def call_model(state: AgentState, config: RunnableConfig) -> dict[str, Any
     await deps.emit(
         {"t": "usage", "node": node, **build_usage_event(rnd, usage, breakdown_chars)}
     )
+
+    if get_agent(str(state.get("agent_id", ""))).main:
+        calls = _dedupe_hub_delegations(calls)
 
     cancelled = deps.cancel.cancelled
     stop = last or cancelled or not calls
@@ -2153,6 +2203,7 @@ class _ToolPass:
     tools_update: list[dict[str, Any]] | None = None
     all_dup: bool = True
     cancelled: bool = False
+    artifact_delegation_done: bool = False
 
     @classmethod
     def for_round(
@@ -2442,6 +2493,8 @@ class _ToolPass:
         for ref in plan_refs:
             if ref not in self.referents:
                 self.referents.append(ref)
+        if plan_refs:
+            self.artifact_delegation_done = True
         if ok:
             self.reports_so_far.append(("specialists", report))
         await self.deps.emit({"t": "step_status", "ok": ok, "node": self.node})
@@ -2513,6 +2566,8 @@ class _ToolPass:
         for ref in worker_refs:
             if ref not in self.referents:
                 self.referents.append(ref)
+        if worker_refs:
+            self.artifact_delegation_done = True
         if ok:
             # Into the FINDINGS baton, so the NEXT round's specialists get
             # this verbatim instead of the hub having to restate it.
@@ -2645,6 +2700,15 @@ class _ToolPass:
         force_synthesis = (
             bool(self.state.get("force_synthesis", False))
             or bool(budget and budget > 0 and stalls >= budget)
+            # A sole planned specialist has returned a successful write
+            # receipt. Give the hub one tool-less final round to report that
+            # evidence; launching a differently-worded confirmation agent can
+            # only duplicate work or contradict the room's actual file state.
+            or bool(
+                self.agent.main
+                and self.state.get("artifact_delegation_is_terminal", False)
+                and self.artifact_delegation_done
+            )
         )
 
         updates: dict[str, Any] = {
@@ -3154,7 +3218,17 @@ async def stream_events(req: RunRequest, deps_factory: Callable[[Emit], Deps]):
 
     async def driver() -> None:
         try:
-            await run_agent(req, deps)
+            if req.harness == "deep":
+                from .deep_harness import run_deep_agent
+
+                await run_deep_agent(
+                    req.question,
+                    deps,
+                    write_enabled=req.resolved_write(),
+                    max_rounds=req.resolved_max_rounds(),
+                )
+            else:
+                await run_agent(req, deps)
         except asyncio.CancelledError:
             # `finally` below still queues the sentinel, so the NDJSON stream closes
             # CLEANLY — with neither `final` nor `error`. The host read that as a

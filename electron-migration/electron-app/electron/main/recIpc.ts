@@ -95,7 +95,11 @@ function openDb(room: RoomSource): Database.Database {
 export function registerRecIpc(
   ipcMain: Pick<IpcMain, "handle">,
   ctx: RecBridgeCtx,
-  room: RoomSource
+  room: RoomSource,
+  live: {
+    readStart?: (db: Database.Database, ctx: RecBridgeCtx, id: string) => Promise<string>;
+    retranscribe?: (db: Database.Database, ctx: RecBridgeCtx, id: string) => Promise<unknown>;
+  } = {}
 ): void {
   const handle = <A extends unknown[], R>(channel: string, fn: (...args: A) => R): void => {
     ipcMain.handle(channel, (_event: IpcMainInvokeEvent, ...args: A) => fn(...args));
@@ -127,7 +131,8 @@ export function registerRecIpc(
   handle("rec_set_speaker_name", (args: { id: string; speaker: string; name: string }) =>
     recSetSpeakerName(openDb(room), ctx, args.id, args.speaker, args.name)
   );
-  handle("rec_read_start", (args: { id: string }) => recReadStart(openDb(room), ctx, args.id));
+  handle("rec_read_start", (args: { id: string }) =>
+    (live.readStart ?? recReadStart)(openDb(room), ctx, args.id));
   handle(
     "rec_note_add",
     (args: { id: string; t0: number; kind: string; text: string; who?: string | null }) =>
@@ -156,5 +161,6 @@ export function registerRecIpc(
   handle("rec_translate", (args: { id: string; language: string }) =>
     recTranslate(openDb(room), ctx, args.id, args.language)
   );
-  handle("rec_retranscribe", (args: { id: string }) => recRetranscribe(openDb(room), ctx, args.id));
+  handle("rec_retranscribe", (args: { id: string }) =>
+    (live.retranscribe ?? recRetranscribe)(openDb(room), ctx, args.id));
 }

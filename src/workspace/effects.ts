@@ -1,7 +1,5 @@
 import { useEffect, useLayoutEffect, useRef } from "react";
-import { getCurrentWindow } from "@tauri-apps/api/window";
-import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { listen } from "@tauri-apps/api/event";
+import { listen, onDragDropEvent, setWindowTitle } from "../platform";
 import { api, AskTurn, RoomInfo } from "../api";
 import { configureMic, stopMicTap } from "./liveRec";
 import { handleAgentUiRequest } from "../agent/driver";
@@ -12,6 +10,7 @@ import { WSState } from "./state";
 import { WSActions } from "./actions";
 import { ownerOf as ownsEvent } from "./runIdentity";
 import { applyRecState } from "./recSession";
+import { startRecordingTransport } from "./recordingTransport";
 
 /** How many of the assistant's organization changes Activity keeps. A record of
  * this session, not an archive — the transcript is where every one of them is
@@ -50,8 +49,7 @@ export function useWorkspaceEffects(
       s.pushToast("error", `Could not read this room's ${what}: ${String(e)}`);
     if (!s.seededRef.current) {
       s.seededRef.current = true;
-      getCurrentWindow()
-        .setTitle(`${info.name} — Arcelle`)
+      setWindowTitle(`${info.name} — Arcelle`)
         .catch(() => {});
       // The reads that FILL the room.
       api.listFiles().then(s.setFiles).catch(readFailed("files"));
@@ -348,7 +346,7 @@ export function useWorkspaceEffects(
         s.setPullPercent(e.payload.percent);
       },
     );
-    const unlistenDrop = getCurrentWebview().onDragDropEvent(async (event) => {
+    const unlistenDrop = onDragDropEvent(async (event) => {
       const p = event.payload;
       if (s.internalDragRef.current) return;
       if (p.type === "enter" || p.type === "over") {
@@ -453,11 +451,13 @@ export function useWorkspaceEffects(
         });
       })
       .catch(() => {});
-    // GH #4: microphone clean-up is on unless the user opted out. Cached in
+    // GH #30: microphone clean-up is off unless the user opted in. macOS voice
+    // processing can reconfigure the shared input underneath Teams/Slack.
+    // Cached in
     // liveRec because acquireMic can't await IPC without losing the gesture.
     void api
       .getSetting("mic_voice_processing")
-      .then((v) => configureMic(v !== "0"))
+      .then((v) => configureMic(v === "1"))
       .catch(() => {});
     // Idea 3: the spoken voice's per-room config + the hands-free re-arm.
     void Promise.all([
@@ -610,7 +610,10 @@ export function useWorkspaceEffects(
     // to a session that survived a reload, and refresh the open view when a
     // pause/stop lands fresh audio bytes.
     void api.recLiveStatus().then((r) => {
-      if (r) s.setRecLive({ fileId: r.fileId, status: r.status });
+      if (r) {
+        if (r.sessionUrl) startRecordingTransport(r.sessionUrl, r.fileId);
+        s.setRecLive({ fileId: r.fileId, status: r.status });
+      }
     }).catch(() => {});
     const unlistenRecState = api.onRecState((p) => {
       // "saved" is not the only terminal status — a final write that failed

@@ -57,9 +57,9 @@ _SOCKET_TIMEOUT = 30.0
 #: ``mcp__hub__ask_jobs_agent``. Distinct from the room bridge's ``room``.
 HUB_SERVER_NAME = "hub"
 
-#: What a captured delegation returns to the CLI. It must read as SUCCESS (the
-#: specialist really is about to run) while stopping the harness from ANSWERING
-#: — the real report arrives as the next round's transcript.
+#: What a captured tool call returns to the CLI. It must read as SUCCESS while
+#: stopping the harness from claiming the action is already complete — the
+#: graph executes the captured call and supplies its real result next round.
 #:
 #: It used to say "do not call another tool", which serialized the one thing the
 #: hub is built for: `_Delegator.launch` fans out every delegation in a round
@@ -67,10 +67,11 @@ HUB_SERVER_NAME = "hub"
 #: three specialists at once instead took three round trips, at three times the
 #: cost. Delegating MORE is explicitly allowed; everything else still waits.
 DELEGATION_ACK = (
-    "Delegated. That specialist is running now; its report will reach you in "
-    "your next turn. If this request needs other specialists too, ask them now "
-    "in this same turn — they run together. Do not do the work yourself and do "
-    "not write the answer yet: you do not have any report back."
+    "Accepted. Arcelle will execute this tool call and return its real result "
+    "in your next turn. You may call other independent tools now in this same "
+    "turn; they run "
+    "together. Do not claim the action succeeded and do not write the answer "
+    "yet: you do not have the result back."
 )
 
 

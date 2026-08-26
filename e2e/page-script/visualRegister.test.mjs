@@ -132,7 +132,7 @@ test("the two hardcoded copies of the palette still match the tokens", () => {
    * failure this test exists to make loud.
    */
   const monaco = read("src/viewers/monacoSetup.ts");
-  const docs = read("src-tauri/src/commands/docs_html.rs");
+  const docs = read("electron-migration/electron-app/electron/main/docsHtml.ts");
   const wrong = [];
 
   // monaco writes hex without the '#', and names the token in a trailing note.
@@ -150,7 +150,7 @@ test("the two hardcoded copies of the palette still match the tokens", () => {
   const upToContrast = docs.slice(0, printBlock);
   for (const [, token, value] of upToContrast.matchAll(/(--mk-[a-z-]+):(#[0-9a-f]{6})/g)) {
     const ok = [THEMES.dark[token], THEMES.light[token]].includes(value);
-    if (!ok) wrong.push(`docs_html.rs: ${token} = ${value}`);
+    if (!ok) wrong.push(`docsHtml.ts: ${token} = ${value}`);
   }
 
   assert.deepEqual(wrong, [], "a hardcoded copy has drifted from tokens.css");

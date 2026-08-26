@@ -557,15 +557,22 @@ describe("videoTrim", () => {
         expect(name).toBe("clip.mov");
       });
 
-      it("disambiguates a second trim of the same span with available_name", async () => {
-        freshRoom();
-        const { id } = insertVideoFile("clip.mov", fixtureClipBytes!);
-        const first = await videoTrim(roomSource({ open: true, epoch: 1 }), id, 1, 3);
-        const second = await videoTrim(roomSource({ open: true, epoch: 1 }), id, 1, 3);
-        expect(first.name).toBe("clip (trim 0-01 to 0-03).mov");
-        expect(second.name).toBe("clip (trim 0-01 to 0-03) (2).mov");
-        expect(second.id).not.toBe(first.id);
-      });
+      it(
+        "disambiguates a second trim of the same span with available_name",
+        async () => {
+          freshRoom();
+          const { id } = insertVideoFile("clip.mov", fixtureClipBytes!);
+          const first = await videoTrim(roomSource({ open: true, epoch: 1 }), id, 1, 3);
+          const second = await videoTrim(roomSource({ open: true, epoch: 1 }), id, 1, 3);
+          expect(first.name).toBe("clip (trim 0-01 to 0-03).mov");
+          expect(second.name).toBe("clip (trim 0-01 to 0-03) (2).mov");
+          expect(second.id).not.toBe(first.id);
+        },
+        // This intentionally performs two real macOS avconvert subprocesses.
+        // Five seconds is enough in isolation but not while the full suite is
+        // also exercising native media tools; the product path has not hung.
+        15_000,
+      );
 
       it("with NO injected probe, a real cut stores the CLIP'S OWN real media_meta — video.rs's a_real_cut_lands_and_leaves_a_probeable_clip", async () => {
         // The end-to-end shape of Rust's own test: cut 2 s out of the fixture

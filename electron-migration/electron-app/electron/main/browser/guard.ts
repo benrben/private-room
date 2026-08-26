@@ -6,6 +6,11 @@
 
 import { lookup } from "node:dns/promises";
 
+type ResolvedAddress = { address: string; family: number };
+type LookupAll = (host: string) => Promise<ResolvedAddress[]>;
+
+const lookupAll: LookupAll = async (host) => await lookup(host, { all: true });
+
 /** Same wording as web.rs's PRIVATE_BLOCKED constant. */
 const PRIVATE_BLOCKED = "This address points to a private network and was blocked.";
 
@@ -238,10 +243,11 @@ export function checkPublicHttpUrl(url: string): URL {
 export async function resolvePublicAddr(
   host: string,
   port: number,
+  resolveAll: LookupAll = lookupAll,
 ): Promise<{ address: string; port: number }> {
-  let addrs: { address: string; family: number }[];
+  let addrs: ResolvedAddress[];
   try {
-    addrs = await lookup(host, { all: true });
+    addrs = await resolveAll(host);
   } catch {
     throw new Error(`Could not resolve the address for ${host}.`);
   }
@@ -251,11 +257,19 @@ export async function resolvePublicAddr(
   if (addrs.some((a) => !isPublicIp(a.address))) {
     throw new Error(PRIVATE_BLOCKED);
   }
-  const first = addrs[0];
-  if (!first) {
+  // Pinning prevents DNS rebinding, but pinning the first answer verbatim is
+  // stricter than a normal fetch in the wrong way: dual-stack hosts commonly
+  // publish AAAA first, while many Macs and office/VPN networks have no usable
+  // IPv6 route. A browser/curl falls back to IPv4; the pinned OAuth request
+  // instead died at "fetch failed" before its sign-in page could open (GH #33,
+  // reproduced against Datadog's official MCP endpoint). Every answer has
+  // already passed the public-address check above, so prefer a public IPv4
+  // address when one exists and retain IPv6 for IPv6-only hosts.
+  const selected = addrs.find((a) => a.family === 4) ?? addrs[0];
+  if (!selected) {
     throw new Error(`Could not resolve the address for ${host}.`);
   }
-  return { address: first.address, port };
+  return { address: selected.address, port };
 }
 
 /**

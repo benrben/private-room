@@ -110,8 +110,8 @@ void _unionCovered;
 /** Whether a string off disk still names a real area. A remembered place
  * outlives the build that wrote it, so a retired area name has to degrade to
  * the default rather than put the room into a state that no longer renders. */
-export function isWorkArea(value: string): value is Exclude<WorkArea, "files"> {
-  return value !== "files" && (WORK_AREAS as readonly string[]).includes(value);
+export function isWorkArea(value: string): value is WorkArea {
+  return (WORK_AREAS as readonly string[]).includes(value);
 }
 
 /** Whether `area` actually CONTAINS the open file.

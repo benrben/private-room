@@ -262,6 +262,7 @@ function buildPaletteActions(
     // were all navigable from the old rail and absent from this list, so
     // anyone who navigated by ⌘K concluded the app did not have them.
     { id: "go-home", label: "Go to Room home", hint: "Recent work and capabilities", run: () => { leaveAreas(); s.setArea("home"); } },
+    { id: "go-files", label: "Open Library", hint: "Add, find, organize, and remove room files", run: () => { leaveAreas(); s.setArea("files"); s.setLibraryTab("browse"); layout?.showPane("library"); } },
     { id: "go-recordings", label: "Open Recordings", hint: "Mic and Mac audio, transcribed here", run: () => { leaveAreas(); s.setArea("recordings"); } },
     { id: "go-browser", label: "Open the private browser", hint: "Read the web with no history kept", run: () => a.revealBrowser() },
     { id: "go-sketch", label: "Open Sketch", hint: "Draw by hand, or ask the room to draw", run: () => { leaveAreas(); s.setArea("sketch"); } },
@@ -913,6 +914,9 @@ export default function Overlays({
                   Apply for the rest of this answer
                 </button>
               )}
+              <button onClick={() => void a.alwaysAllowEdits(pendingEdit)}>
+                Always allow in this room
+              </button>
               <button
                 className="danger"
                 onClick={() => a.resolveEditApproval(pendingEdit, "deny")}

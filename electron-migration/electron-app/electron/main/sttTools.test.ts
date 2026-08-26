@@ -1122,9 +1122,31 @@ describe("shapeText", () => {
 // retired dict_* stubs
 // ============================================================================
 
-describe("retired dict_start / dict_push_audio / dict_stop / dict_cancel", () => {
-  it("all four throw the same explaining error, never a fabricated result", async () => {
-    await expect(dictStart()).rejects.toThrow(DICT_RETIRED_REASON);
+describe("dictation socket bootstrap and retired data IPC", () => {
+  it("dict_start resolves the model and returns an authenticated direct socket", async () => {
+    await fsp.mkdir(path.dirname(sttModelPath(scratch)), { recursive: true });
+    await fsp.writeFile(sttModelPath(scratch), "weights");
+    const info = await dictStart(scratch, null, {
+      ensureUp: async () => "http://127.0.0.1:8420",
+      authToken: () => "tok&en",
+    });
+    const url = new URL(info.url);
+    expect(url.protocol).toBe("ws:");
+    expect(url.pathname).toBe("/dict/session");
+    expect(url.searchParams.get("token")).toBe("tok&en");
+    expect(url.searchParams.get("modelPath")).toBe(sttModelPath(scratch));
+    expect(info).toMatchObject({ stopBaseMs: 120_000, stopPerAudioSecondMs: 2_000 });
+  });
+
+  it("dict_start refuses before opening the sidecar when the model is missing", async () => {
+    const ensureUp = vi.fn();
+    await expect(
+      dictStart(scratch, null, { ensureUp, authToken: () => "token" }),
+    ).rejects.toThrow("STT_MODEL_MISSING");
+    expect(ensureUp).not.toHaveBeenCalled();
+  });
+
+  it("the three old data/control commands throw the same explaining error", async () => {
     await expect(dictPushAudio(16000, "AAAA")).rejects.toThrow(DICT_RETIRED_REASON);
     await expect(dictStop()).rejects.toThrow(DICT_RETIRED_REASON);
     await expect(dictCancel()).rejects.toThrow(DICT_RETIRED_REASON);
@@ -1314,10 +1336,19 @@ describe("registerSttToolsIpc", () => {
     expect(result).toBe("shaped");
   });
 
-  it("the retired dict_* channels reject with the instruction, not 'no handler registered'", async () => {
+  it("dict_start provisions the socket while retired data channels reject clearly", async () => {
     const ipcMain = fakeIpcMain();
-    register(ipcMain);
-    await expect(ipcMain.handlers.get("dict_start")!()).rejects.toThrow(DICT_RETIRED_REASON);
+    await fsp.mkdir(path.dirname(sttModelPath(scratch)), { recursive: true });
+    await fsp.writeFile(sttModelPath(scratch), "weights");
+    register(ipcMain, {
+      dictSessionDeps: {
+        ensureUp: async () => "http://127.0.0.1:8420",
+        authToken: () => "token",
+      },
+    });
+    await expect(ipcMain.handlers.get("dict_start")!()).resolves.toMatchObject({
+      url: expect.stringContaining("/dict/session"),
+    });
     await expect(
       ipcMain.handlers.get("dict_push_audio")!({ rate: 16000, dataB64: "AAAA" })
     ).rejects.toThrow(DICT_RETIRED_REASON);

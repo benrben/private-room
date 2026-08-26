@@ -24,8 +24,8 @@ const load = (rel) => {
 };
 
 const { KIND_DEFAULTS, KIND_LABELS } = await load("../../src/workspace/workflows/kinds.ts");
-const WORKFLOW_RS = readFileSync(
-  join(here, "../../src-tauri/src/commands/jobs/workflow.rs"),
+const WORKFLOW_HOST = readFileSync(
+  join(here, "../../electron-migration/electron-app/electron/main/workflowModel.ts"),
   "utf8",
 );
 
@@ -39,11 +39,11 @@ test("a condition step is seeded with op and value only", () => {
 
 test("the engine's Condition variant really has no input field", () => {
   // The claim above is only worth something if the Rust side still agrees.
-  const variant = WORKFLOW_RS.slice(
-    WORKFLOW_RS.indexOf("    Condition {"),
-    WORKFLOW_RS.indexOf("    Condition {") + 200,
+  const variant = WORKFLOW_HOST.slice(
+    WORKFLOW_HOST.indexOf('{ kind: "condition"'),
+    WORKFLOW_HOST.indexOf('{ kind: "condition"') + 100,
   );
-  assert.ok(variant.includes("op: String"), variant);
+  assert.ok(variant.includes("op: string"), variant);
   assert.equal(/\binput\s*:/.test(variant), false, variant);
 });
 

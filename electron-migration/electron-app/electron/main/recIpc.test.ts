@@ -40,7 +40,10 @@ function roomSource(open: boolean): RoomSource {
 }
 
 function ctxFor(source: RoomSource): RecBridgeCtx {
-  return createRecBridgeCtx({ currentRoom: () => source.currentRoom() });
+  return createRecBridgeCtx({
+    currentRoom: () => source.currentRoom(),
+    sessionWsUrl: async (fileId) => `ws://127.0.0.1/rec/session?token=test&fileId=${fileId}`,
+  });
 }
 
 /** Every channel `registerRecIpc` registers, in order — pinned so a channel
@@ -140,7 +143,11 @@ describe("registerRecIpc", () => {
     ctx.state.liveStatus = "paused";
     // Deliberately NOT Rust's `RecLive` — `durationCs` and the per-source
     // health are only observable on the renderer's own `WS /rec/session`.
-    expect(await listener(handle, "rec_live_status")({})).toEqual({ fileId: "f1", status: "paused" });
+    expect(await listener(handle, "rec_live_status")({})).toEqual({
+      fileId: "f1",
+      status: "paused",
+      sessionUrl: "ws://127.0.0.1/rec/session?token=test&fileId=f1",
+    });
   });
 
   it("rec_push_audio is registered and refuses unconditionally", async () => {

@@ -180,6 +180,7 @@ export async function dialogOpen(
   const properties: NonNullable<ElectronOpenDialogOptions["properties"]> = [
     args.directory === true ? "openDirectory" : "openFile",
   ];
+  if (args.room === true && !properties.includes("openDirectory")) properties.push("openDirectory");
   if (args.multiple === true) {
     properties.push("multiSelections");
   }

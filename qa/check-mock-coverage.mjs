@@ -148,20 +148,16 @@ const isRead = (c) => /^(list|get|read|load|fetch)_/.test(c) || READ_LIKE.has(c)
  * --bridge=electron
  * ============================================================================
  * `electron/shared/ipc-contract.ts`'s `Commands` interface is the migration's
- * authoritative command list, and on that side it plays BOTH roles the Tauri
- * check keeps apart — "what the host registers" and "what the frontend
- * invokes" — because it was extracted byte-faithfully from `src/api.ts`'s own
- * invoke call sites. So the only question worth asking here is the coverage
- * one: which of those commands does qa-mock.js actually have a fixture for.
+ * authoritative renderer/host command list. Runtime registration completeness
+ * is enforced by the Electron registry tests; this report answers the separate
+ * QA question: which commands does qa-mock.js have a fixture for?
  *
  * Report-only, exit 0, deliberately. The Tauri DRIFT checks below compare two
  * lists that are written down INDEPENDENTLY (Rust's `generate_handler!` and
  * the frontend's invoke calls), which is what makes a mismatch mean something.
- * There is no second, independently-drifting Electron list yet — no live
- * renderer calls these channels — so a mismatch here would only be this file
- * disagreeing with itself, and a gate that is red the day it lands is a gate
- * someone switches off (the same reasoning the fixture-gap figures below
- * already carry).
+ * The renderer now calls this bridge in production. Missing fixtures remain
+ * informational because not every command needs a visual QA state; registry
+ * and allowlist tests provide the hard command-drift gates.
  *
  * Runs BEFORE the Tauri-only file reads below on purpose: it must keep working
  * in a tree where `src-tauri/` has been deleted, which is where the migration
@@ -211,8 +207,7 @@ function electronReport() {
     );
   }
   console.log(
-    "\nElectron coverage is informational: nothing on that side invokes these channels yet, " +
-      "so there is no second list for a wrong name to drift against.",
+    "\nElectron QA fixture coverage is informational; registry and allowlist tests enforce command drift.",
   );
 }
 

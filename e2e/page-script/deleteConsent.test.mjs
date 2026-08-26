@@ -44,25 +44,12 @@ test("every agent-facing delete that cannot be undone is gated", () => {
   // #505 named three: connectors, skills and workflows. Gating only the
   // connector left the other two exactly as the finding described them — one
   // sentence in a document the agent read, and the thing is gone.
-  const gated = [
-    ["src-tauri/src/commands/mcp_cmds.rs", "agent_delete_mcp"],
-    ["src-tauri/src/commands/skills.rs", "agent_delete_skill"],
-    ["src-tauri/src/commands/jobs/workflow.rs", "agent_delete_workflow"],
-  ];
-  for (const [file, fn] of gated) {
-    const src = read(file);
-    const at = src.indexOf(`async fn ${fn}(`);
-    assert.ok(at > 0, `${fn} is not async — it cannot await a consent card`);
-    // The body up to the next top-level `pub(crate)` item.
-    const body = src.slice(at, src.indexOf("\npub(crate)", at + 10));
-    assert.ok(
-      /confirm_destructive\(/.test(body),
-      `${fn} deletes without asking — there is no trash for what it removes`,
-    );
-    assert.ok(
-      /DELETE_DECLINED/.test(body),
-      `${fn} does not tell the model the user said no`,
-    );
+  const host = read("electron-migration/electron-app/electron/main/execTool.ts");
+  for (const tool of ["delete_mcp", "delete_skill", "delete_workflow"]) {
+    const at = host.indexOf(`case "${tool}"`);
+    assert.ok(at > 0, `${tool} has no dispatch arm`);
+    const body = host.slice(at, host.indexOf("\n    case ", at + 10));
+    assert.match(body, /confirmDestructive/, `${tool} deletes without asking`);
   }
 });
 

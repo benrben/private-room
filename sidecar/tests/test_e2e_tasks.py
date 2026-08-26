@@ -125,7 +125,7 @@ class Engine:
         self.seen_by: dict[str, list[list[Message]]] = {}
         self.cancels: list[Any] = []
 
-    def who(self, names: set[str]) -> str:
+    def who(self, names: set[str], messages: list[Message] | None = None) -> str:
         """Which AGENT is asking, resolved from the catalog it was offered.
 
         Keyed on each agent's real box (`toolbox_for` over the served room), not
@@ -136,6 +136,14 @@ class Engine:
         """
         if any(n.startswith("ask_") for n in names):
             return "main"
+        # A forced synthesis round intentionally offers no tools. The product
+        # still knows this is the Main agent from state; the scripted harness
+        # must use the same system identity instead of guessing File agent from
+        # an empty-catalog Jaccard tie.
+        if not names and messages:
+            system = str(messages[0].get("content") or "")
+            if "You are the MAIN AGENT" in system:
+                return "main"
         from arcelle_sidecar.agents import REGISTRY, toolbox_for
 
         served = set(ROOM_TOOLS)
@@ -169,7 +177,7 @@ class Engine:
         self.seen_messages.append([dict(m) for m in messages])
         self.cancels.append(cancel)
         names = {t["function"]["name"] for t in tools}
-        who = self.who(names)
+        who = self.who(names, messages)
         self.seen_by.setdefault(who, []).append([dict(m) for m in messages])
         turn = self.turns.get(who, 0)
         self.turns[who] = turn + 1

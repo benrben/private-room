@@ -334,6 +334,24 @@ export function makeMiscActions(
     s.setEditApprovals((q) => q.filter((r) => r.id !== req.id));
   }
 
+  /** GH #28: make the standing room permission available at the point where
+   * the repeated prompts happen. This is deliberately per encrypted room, not
+   * a device-wide bypass. Saving the preference comes first: if that fails we
+   * leave the approval card in place and do not pretend the permission stuck. */
+  async function alwaysAllowEdits(req: EditApproveRequest) {
+    try {
+      await api.setSetting("edit_approval", "off");
+      await api.resolveEditApproval(req.id, "once");
+      s.setEditApprovals((q) => q.filter((r) => r.id !== req.id));
+      s.pushToast(
+        "success",
+        "AI file changes are now allowed for this room. Every change remains versioned and undoable; turn prompts back on in Settings → Behavior.",
+      );
+    } catch (error) {
+      s.pushToast("error", `Couldn't save the permanent permission: ${String(error)}`);
+    }
+  }
+
   /** Open the Memory & Scratch Pad area (the center-pane manager). */
   function revealMemory() {
     s.setShowMap(false);
@@ -420,7 +438,7 @@ export function makeMiscActions(
     connectedTools, approveMcp, keepMcpOff, loadFrontPage,
     saveSuggestedMemory, enableMemoryAutoSave, openScratchPad,
     copyReceipt, playSealSound, addMemory, saveMemoryEdit, activateResult,
-    resolveMcpApproval, resolveEditApproval, resolveBrowseConsent,
+    resolveMcpApproval, resolveEditApproval, alwaysAllowEdits, resolveBrowseConsent,
     revealMemory, revealBrowser, focusComposer, changeModel, engineLabelOf,
     recordEngineModels,
     askConfirm, cancelConfirm,

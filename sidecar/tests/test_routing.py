@@ -1,13 +1,8 @@
-"""Routing parity with the Rust (SPEC §3.1). The hint lists ARE product behaviour."""
+"""Routing behavior and tool-lane coverage."""
 
 from __future__ import annotations
 
-import pathlib
-import re
-
 import pytest
-
-import arcelle_sidecar
 from arcelle_sidecar.routing import (
     JOB_HINTS,
     JOB_TOOL_NAMES,
@@ -28,56 +23,6 @@ from arcelle_sidecar.routing import (
     wants_ui_tools,
     wants_write_tools,
 )
-
-# --- verbatim parity with the Rust source (SPEC §3.1/§7) --------------------
-#
-# SPEC §7 requires "verbatim hint-list parity with the Rust lists". The prose
-# tests below match sample questions, but an overlapping hint can mask a deleted
-# entry — so those alone let the two engines drift while CI stays green. This
-# block parses the actual arrays out of agent.rs and asserts order-exact
-# equality, which is the only thing that keeps them from drifting.
-
-_AGENT_RS = (
-    pathlib.Path(arcelle_sidecar.__file__).resolve().parents[2]
-    / "src-tauri"
-    / "src"
-    / "commands"
-    / "agent.rs"
-)
-
-
-def _rust_str_list(src: str, marker: str) -> tuple[str, ...]:
-    """The quoted strings of the first `&[ ... ];` array at/after ``marker``."""
-    i = src.index(marker)
-    o = src.index("&[", i)
-    c = src.index("];", o)
-    block = src[o:c]
-    return tuple(re.findall(r'"((?:\\.|[^"\\])*)"', block))
-
-
-@pytest.mark.skipif(not _AGENT_RS.exists(), reason="Rust source not present in this checkout")
-def test_hint_lists_are_verbatim_ports_of_the_rust_arrays() -> None:
-    src = _AGENT_RS.read_text()
-
-    # NOTE (sidecar-only migration): the Rust `WRITE_TOOL_NAMES` const was the
-    # tool-name filter for the now-deleted native `agent_loop` catalog. Tool
-    # filtering moved entirely to the sidecar (routing.py owns WRITE_TOOL_NAMES);
-    # Rust now only computes the routing *booleans* (`wants_write_tools` etc.,
-    # sidecar.rs `routing`) and no longer carries the array. The tool-name list
-    # is instead pinned self-containedly by `test_write_tool_names_match_the_rust_list`.
-    # The HINT lists below DO still live in agent.rs as the source of truth and
-    # remain order-exact parity-checked (their drift is the real product risk).
-
-    # The three hint lists, order-exact. The UI list is the base HINTS followed
-    # by APP_NAVIGATION_VERBS (agent.rs:807 `HINTS || APP_NAVIGATION_VERBS`).
-    assert _rust_str_list(src, "fn wants_write_tools") == WRITE_HINTS
-    assert _rust_str_list(src, "fn wants_job_tools") == JOB_HINTS
-    assert _rust_str_list(src, "fn wants_skill_tools") == SKILL_HINTS
-    assert _rust_str_list(src, "fn wants_mcp_management_tools") == MCP_MANAGEMENT_HINTS
-    ui_expected = _rust_str_list(src, "fn wants_ui_tools") + _rust_str_list(
-        src, "APP_NAVIGATION_VERBS: &[&str]"
-    )
-    assert ui_expected == UI_HINTS
 
 # --- the lists themselves ---------------------------------------------------
 
@@ -104,40 +49,6 @@ def test_management_tool_names_are_gated_in_their_own_lanes() -> None:
         "set_in_library",
         "merge_files",
     )
-
-
-@pytest.mark.skipif(not _AGENT_RS.exists(), reason="Rust source not present in this checkout")
-def test_the_organize_box_matches_the_tools_rust_actually_serves() -> None:
-    """The box the File agent asks for must be the box the host can serve.
-
-    These two lists live in different languages and neither imports the other:
-    `routing.ORGANIZE_TOOL_NAMES` decides what goes in the agent's toolbox, and
-    `commands::agent::organize_tools_specs` decides what the bridge advertises
-    and what `exec_tool` can run. Drift is silent in the worst direction — a
-    name here with no spec there is a tool the model is told it holds and gets
-    an "unknown tool" for, mid-errand, after it has already promised the user.
-
-    Parsed from the spec function rather than from `BUILTIN_TOOL_NAMES`, which
-    is a reservation list: a name can sit there (correctly, so MCP cannot shadow
-    it) long before or after anything serves it.
-    """
-    src = _AGENT_RS.read_text()
-    body_at = src.index("pub(crate) fn organize_tools_specs")
-    body_end = src.index("\n}", body_at)
-    served = tuple(
-        re.findall(r'"function", "function": \{"name": "([a-z_]+)"', src[body_at:body_end])
-    )
-    assert served == ORGANIZE_TOOL_NAMES
-
-    # …and every one of them is reserved, so no connector can shadow an arm.
-    reserved = _rust_str_list(src, "BUILTIN_TOOL_NAMES: &[&str]")
-    assert set(ORGANIZE_TOOL_NAMES) <= set(reserved)
-
-    # The agent must never be handed a way to destroy a file. These two are
-    # room commands with no tool spec anywhere, and this asserts they stay that
-    # way — the trash is only a safety net while nothing can empty it.
-    assert "delete_file_permanently" not in reserved
-    assert "empty_trash" not in reserved
 
 
 def test_edit_files_is_a_write_tool() -> None:

@@ -9,8 +9,9 @@ import { configureMic, micVoiceProcessing } from "../workspace/liveRec";
  * macOS it moves the shared input device's real gain and other apps on the same
  * microphone hear that as their own volume dropping. The remaining voice
  * processing (echo cancellation + noise suppression) earns its keep on
- * speakers, which is why it defaults on — but it also takes the device into
- * macOS's voice-processing mode, so anyone on headphones can hand it back. */
+ * speakers, but it also takes the device into macOS's voice-processing mode.
+ * It therefore defaults off so Teams, Slack, Zoom and Meet retain the shared
+ * input unchanged; users recording through speakers can opt in. */
 export default function MicSection() {
   const [on, setOn] = useState(micVoiceProcessing());
   const [saved, setSaved] = useState(false);
@@ -19,7 +20,7 @@ export default function MicSection() {
     void api
       .getSetting("mic_voice_processing")
       .then((v) => {
-        const next = v !== "0";
+        const next = v === "1";
         setOn(next);
         configureMic(next);
       })
@@ -44,7 +45,8 @@ export default function MicSection() {
       <p className="settings-hint">
         Applies to recordings and dictation. Arcelle never changes your
         microphone's input level — your other apps keep the volume you set for
-        them.
+        them. Cleanup starts off so Teams, Slack, Zoom, and Meet can continue
+        using the microphone normally while Arcelle records.
       </p>
 
       <label className="rec-opt">

@@ -1,11 +1,10 @@
-import { invoke } from "@tauri-apps/api/core";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { invoke, listen, type UnlistenFn } from "./platform";
 import {
   open,
   save,
   type OpenDialogOptions,
   type SaveDialogOptions,
-} from "@tauri-apps/plugin-dialog";
+} from "./platform";
 
 export * from "./apiTypes";
 import type {
@@ -88,6 +87,7 @@ import type {
   Specialist,
   ImageBox,
   SttStatus,
+  DictSessionInfo,
   AiActionDef,
   AgentOpenFilePayload,
   AgentUiRequest,
@@ -158,8 +158,12 @@ function askEvent<T>(
 export const api = {
   /** `name` is the name the user TYPED on the Create screen. Omit it and the
    *  room is named after its file, as it always was. */
-  createRoom: (path: string, password: string, name?: string) =>
-    invoke<RoomInfo>("create_room", { path, password, name: name ?? null }),
+  createRoom: (
+    path: string,
+    password: string,
+    name?: string,
+    format: "sealed-db" | "workspace-folder" = "workspace-folder",
+  ) => invoke<RoomInfo>("create_room", { path, password, name: name ?? null, format }),
   openRoom: (path: string, password: string) =>
     invoke<RoomInfo>("open_room", { path, password }),
   closeRoom: () => invoke<void>("close_room"),
@@ -1000,7 +1004,7 @@ export const api = {
   // ---- Streaming dictation (Metal wave): partials while you speak ----
   /** Open a streaming dictation session. Rejects with STT_MODEL_MISSING
    *  before any audio flows when the voice model isn't installed. */
-  dictStart: () => invoke<void>("dict_start"),
+  dictStart: () => invoke<DictSessionInfo>("dict_start"),
   /** ~250ms of mic samples, same wire format as recPushAudio. */
   dictPushAudio: (rate: number, dataB64: string) =>
     invoke<void>("dict_push_audio", { rate, dataB64 }),
@@ -1401,6 +1405,7 @@ export const api = {
   setUnsavedEdits: (on: boolean) => invoke<void>("set_unsaved_edits", { on }),
   /** Answered the quit question with "no": re-arm the door, buffer still dirty. */
   quitGuardRearm: () => invoke<void>("quit_guard_rearm"),
+  quitGuardConfirm: () => invoke<void>("quit_guard_confirm"),
   /** Rust held a ⌘Q so this window can ask about those edits. Whoever listens
    *  OWNS finishing the quit — Rust will not hold the next one. */
   onQuitRequested: (cb: () => void): Promise<UnlistenFn> =>

@@ -40,7 +40,8 @@ const TYPES = read("src/workspace/types.ts");
 const SHELL = read("src/Workspace.tsx");
 const SIDEBAR = read("src/workspace/Sidebar.tsx");
 const LAYOUT = read("src/shell/useLayout.ts");
-const SCHEMA = read("src-tauri/src/db/schema.rs");
+const SCHEMA = read("electron-migration/electron-app/electron/main/db-host/schema.sql");
+const MIGRATE = read("electron-migration/electron-app/electron/main/db-host/migrate.ts");
 
 /** Every destination the rail can reach, read out of the runtime list so this
  * file cannot fall behind the union. */
@@ -138,12 +139,12 @@ test("⌘T and ⌘W have ONE owner, and it is the native menu", () => {
   // a window `keydown` listener here never hears from, which is why a
   // React-only ⌘T did nothing in the very destination that needs it. Two
   // owners for one key means the press is handled twice.
-  const MENU = read("src-tauri/src/menu.rs");
-  assert.match(MENU, /id: "file\.new-item",[\s\S]{0,80}accel: Some\("CmdOrCtrl\+T"\)/);
-  assert.match(MENU, /id: "file\.close-item",[\s\S]{0,80}accel: Some\("CmdOrCtrl\+W"\)/);
+  const MENU = read("electron-migration/electron-app/electron/main/menu.ts");
+  assert.match(MENU, /id: NEW_ID,[\s\S]{0,120}accelerator: "CmdOrCtrl\+T"/);
+  assert.match(MENU, /id: CLOSE_ID,[\s\S]{0,120}accelerator: "CmdOrCtrl\+W"/);
   // The predefined Close Window row owns ⌘W unconditionally and closes the
   // WINDOW — in a single-window app, that is ⌘W quitting Arcelle mid-page.
-  assert.doesNotMatch(MENU, /Row::Platform\(Platform::CloseWindow\)/);
+  assert.doesNotMatch(MENU, /role: "close"/);
   const keys = SHELL.slice(SHELL.indexOf("function onKey"));
   const handler = keys.slice(0, keys.indexOf("window.addEventListener"));
   assert.doesNotMatch(handler, /e\.key === "w"/);
@@ -163,7 +164,7 @@ test("⌘W closes an item, and only closes the window as a last resort", () => {
     body.indexOf('area === "browser" && pages.activeId'),
     body.indexOf("tabsRef.current.activeId"),
     body.indexOf("s.openFileRef.current"),
-    body.indexOf("getCurrentWindow().close()"),
+    body.indexOf("closeWindow()"),
   ];
   assert.ok(order.every((at) => at >= 0), "every case must be handled");
   assert.deepEqual(order, [...order].sort((x, y) => x - y), "…in that order");
@@ -271,7 +272,10 @@ test("a page with no address yet is named the way Rust names it", () => {
   assert.equal(pages.pageLabel({ id: "1", title: "  ", url: "https://x.test/a" }), "x.test");
   // …and the same words on both sides, so a row does not rename itself the
   // moment the first reconciliation lands.
-  assert.match(read("src-tauri/src/browser.rs"), /unwrap_or_else\(\|\| "New page"\.to_string\(\)\)/);
+  assert.match(
+    read("electron-migration/electron-app/electron/main/browser/tabs.ts"),
+    /return "New page"/,
+  );
 });
 
 test("a row's second line never repeats its first", () => {
@@ -325,7 +329,7 @@ test("everything a room already held stays visible in Home", () => {
   assert.match(SCHEMA, /origin_destination TEXT NOT NULL DEFAULT 'library'/);
   assert.match(SCHEMA, /library_visibility TEXT NOT NULL DEFAULT 'linked'/);
   assert.match(
-    SCHEMA,
+    MIGRATE,
     /ALTER TABLE files ADD COLUMN library_visibility TEXT NOT NULL DEFAULT 'linked'/,
     "existing rooms must take the same default, or their files would vanish",
   );
@@ -369,10 +373,10 @@ test("promotion states the value instead of toggling it, so it is idempotent", (
   const actions = read("src/workspace/fileActions.ts");
   assert.match(actions, /api\.setFileInLibrary\(id, linked\)/);
   assert.doesNotMatch(actions, /setFileInLibrary\(id, !/, "a toggle would race the agent");
-  const rust = read("src-tauri/src/db/files.rs");
-  assert.match(rust, /SET library_visibility = \?2/, "the value is stated");
+  const host = read("electron-migration/electron-app/electron/main/db-host/files.ts");
+  assert.match(host, /SET files SET library_visibility|UPDATE files SET library_visibility/, "the value is stated");
   // Removing the Home reference must never touch the object itself.
-  assert.doesNotMatch(rust, /set_library_visibility[\s\S]{0,400}DELETE/);
+  assert.doesNotMatch(host, /setLibraryVisibility[\s\S]{0,500}DELETE/);
 });
 
 test("removing from the Library says, in the UI, that it does not delete", () => {
@@ -383,19 +387,22 @@ test("removing from the Library says, in the UI, that it does not delete", () =>
 });
 
 test("the agent may promote, but is told not to do it on its own", () => {
-  const agent = read("src-tauri/src/commands/agent.rs");
-  const spec = agent.slice(agent.indexOf('"name": "set_in_library"'));
-  const description = spec.slice(0, spec.indexOf('"parameters"'));
+  const agent = read("electron-migration/electron-app/electron/main/toolSpecs.ts");
+  const spec = agent.slice(agent.indexOf('name: "set_in_library"'));
+  const description = spec.slice(0, spec.indexOf('parameters:'));
   assert.match(description, /never automatically/);
   assert.match(description, /nothing is exported or copied/i);
   // …and the act is reported, like any other room write.
-  const arm = agent.slice(agent.indexOf('"set_in_library" => {'));
-  assert.match(arm.slice(0, 1200), /effects\.wrote = true/);
-  assert.match(arm.slice(0, 1200), /no copy was made/);
+  const arm = read("electron-migration/electron-app/electron/main/organizeTools.ts");
+  assert.match(arm, /effects\.wrote = true/);
+  assert.match(arm, /no copy was made/);
 });
 
 test("the agent can tell a section-only object from a Library one", () => {
-  assert.match(read("src-tauri/src/db/files.rs"), /section only — in \{origin\}/);
+  assert.match(
+    read("electron-migration/electron-app/electron/main/db-host/files.ts"),
+    /section only — in \$\{origin\}/,
+  );
 });
 
 /* ---------- 5b. demotion changes one list, and nothing else ---------- */

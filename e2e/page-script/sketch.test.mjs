@@ -27,7 +27,10 @@ const js = transformSync(readFileSync(SRC, "utf8"), {
 }).code;
 const M = await import(`data:text/javascript;base64,${Buffer.from(js).toString("base64")}`);
 
-const RUST = readFileSync(join(root, "src-tauri/src/commands/sketchdoc.rs"), "utf8");
+const HOST = readFileSync(
+  join(root, "electron-migration/electron-app/electron/main/sketchDoc.ts"),
+  "utf8",
+);
 const SRC_TEXT = readFileSync(SRC, "utf8");
 const VIEW = readFileSync(join(root, "src/viewers/SketchView.tsx"), "utf8");
 
@@ -37,18 +40,18 @@ test("the page size matches the one Rust clamps to", () => {
   // A frontend that thought the page was bigger would let the user draw where
   // the agent can never place anything, and every such shape would come back
   // from a Rust round trip moved.
-  const w = RUST.match(/CANVAS_W: i32 = (\d+)/)[1];
-  const h = RUST.match(/CANVAS_H: i32 = (\d+)/)[1];
+  const w = HOST.match(/CANVAS_W = (\d+)/)[1];
+  const h = HOST.match(/CANVAS_H = (\d+)/)[1];
   assert.equal(M.CANVAS_W, Number(w));
   assert.equal(M.CANVAS_H, Number(h));
 });
 
-test("the five pens are the five Rust will accept", () => {
+test("the five pens are the five the Electron host accepts", () => {
   // Rust refuses an unknown colour outright, so a sixth pen here would be a
   // swatch that draws shapes the agent can never recolour or reproduce.
-  const arm = RUST.slice(RUST.indexOf("enum Ink"), RUST.indexOf("impl Ink"));
-  const rustInks = [...arm.matchAll(/^\s{4}(\w+),$/gm)].map((m) => m[1].toLowerCase());
-  assert.deepEqual([...M.INKS].sort(), rustInks.sort());
+  const arm = HOST.match(/export type Ink = ([^;]+);/)?.[1] ?? "";
+  const hostInks = [...arm.matchAll(/"(\w+)"/g)].map((m) => m[1]);
+  assert.deepEqual([...M.INKS].sort(), hostInks.sort());
 });
 
 test("a drawing that will not parse opens as an empty page instead of nothing", () => {
@@ -443,10 +446,10 @@ test("a connector can only hang off a real shape", () => {
   assert.equal(M.canConnect(null), false);
 });
 
-test("the editor and Rust route connectors by the same rule", () => {
+test("the editor and Electron host route connectors by the same rule", () => {
   // Two implementations of one connector's geometry disagree the first time
   // either is touched, and the file would then draw differently from the page.
-  assert.ok(/fn edge_point/.test(RUST), "Rust owns edge_point");
+  assert.ok(/function edgePoint/.test(HOST), "the host owns edgePoint");
   assert.ok(/export function edgePoint/.test(SRC_TEXT), "and the editor ports it");
 });
 

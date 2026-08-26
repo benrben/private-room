@@ -27,10 +27,12 @@ const root = join(here, "../..");
 const view = readFileSync(join(root, "src/viewers/AudioView.tsx"), "utf8");
 
 test("the stages the backend ends on are the stages the viewer branches on", () => {
-  const rust = readFileSync(join(root, "src-tauri/src/commands/stt_cmds.rs"), "utf8");
-  // Both endings are emitted by run_stt_job and neither is a "failed:" one.
-  assert.match(rust, /"stt-progress", \(&job\.name, "model-missing"\)/);
-  assert.match(rust, /"stt-progress", \(&job\.name, "none"\.to_string\(\)\)/);
+  const host = readFileSync(
+    join(root, "electron-migration/electron-app/electron/main/speechSttSurfaceIpc.ts"),
+    "utf8",
+  );
+  assert.match(host, /\[name, "model-missing"\]/);
+  assert.match(host, /text\.trim\(\) === "" \? "none" : "done"/);
   for (const stage of ["model-missing", "none"]) {
     assert.match(view, new RegExp(`sttStage === "${stage}"`), `${stage} is not branched on`);
   }

@@ -10,7 +10,7 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, promises as fs, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -26,6 +26,7 @@ import {
   createPeakCache,
   DECODE_NON_WAV_NOT_IMPLEMENTED,
   decodeAudioBytes,
+  decodeAudioBytesWith,
   DEFAULT_BUCKETS,
   describeDecodeError,
   envelope,
@@ -271,16 +272,22 @@ describe("decodeAudioBytes", () => {
     expect(decoded.sampleRate).toBe(44_100);
   });
 
-  it("refuses non-WAV bytes with the labelled NOT_IMPLEMENTED reason, never a fabricated decode", async () => {
+  it("transcodes non-WAV bytes and decodes the converter's private WAV output", async () => {
     const bytes = Buffer.from("ID3 not really an mp3 file", "utf8");
-    await expect(decodeAudioBytes(bytes, "mp3", "audio")).rejects.toThrow(DECODE_NON_WAV_NOT_IMPLEMENTED);
-    expect(DECODE_NON_WAV_NOT_IMPLEMENTED).toMatch(/^NOT_IMPLEMENTED: /);
+    const decoded = await decodeAudioBytesWith(bytes, "mp3", "audio", async (_source, wav) => {
+      await fs.writeFile(wav, encodeWav(new Float32Array([0.25, -0.25])), { mode: 0o600 });
+    });
+    expect(decoded.sampleRate).toBe(SAMPLE_RATE);
+    expect(Array.from(decoded.samples)).toHaveLength(2);
   });
 
-  it("refuses an mp4/mov container the same honest way — kind alone never grants a fabricated decode", async () => {
-    await expect(decodeAudioBytes(Buffer.from([0, 0, 0, 1]), "mp4", "video")).rejects.toThrow(
-      DECODE_NON_WAV_NOT_IMPLEMENTED
-    );
+  it("passes video kind to the converter so it can extract the audio track first", async () => {
+    let seen = "";
+    await decodeAudioBytesWith(Buffer.from([0, 0, 0, 1]), "mp4", "video", async (_source, wav, kind) => {
+      seen = kind;
+      await fs.writeFile(wav, encodeWav(new Float32Array([0.1])));
+    });
+    expect(seen).toBe("video");
   });
 
   it("a WAV-shaped file that fails to parse for a REAL reason keeps its own words, not NOT_IMPLEMENTED", async () => {
@@ -294,15 +301,15 @@ describe("decodeAudioBytes", () => {
   // already guaranteed 16 kHz upstream), so its failure modes have no Rust
   // counterpart to inherit and have to be pinned here.
   it("an EMPTY buffer is refused, never decoded as a zero-length silence", async () => {
-    await expect(decodeAudioBytes(Buffer.alloc(0), "wav", "audio")).rejects.toThrow(
-      DECODE_NON_WAV_NOT_IMPLEMENTED
-    );
+    await expect(decodeAudioBytesWith(Buffer.alloc(0), "wav", "audio", async () => {
+      throw new Error("audio decode failed: empty input");
+    })).rejects.toThrow("audio decode failed: empty input");
   });
 
   it("a truncated RIFF header (under the 44-byte minimum) is refused, not read past the end", async () => {
-    await expect(decodeAudioBytes(Buffer.from("RIFF", "ascii"), "wav", "audio")).rejects.toThrow(
-      DECODE_NON_WAV_NOT_IMPLEMENTED
-    );
+    await expect(decodeAudioBytesWith(Buffer.from("RIFF", "ascii"), "wav", "audio", async () => {
+      throw new Error("audio decode failed: truncated input");
+    })).rejects.toThrow("audio decode failed: truncated input");
   });
 
   it("a chunk walk over a zero-sized junk chunk terminates rather than spinning", async () => {
@@ -452,10 +459,13 @@ describe("audioPeaks", () => {
     expect(cache.map.size).toBe(1);
   });
 
-  it("refuses a non-WAV audio file with the labelled NOT_IMPLEMENTED reason (describeDecodeError passthrough)", async () => {
+  it("reports a real converter failure for non-WAV audio", async () => {
     freshRoom();
     const id = insertFile(db, "song.mp3", "audio/mpeg", Buffer.from("not really an mp3"), null, "upload").id;
-    await expect(audioPeaks(db, cache, id, null)).rejects.toThrow(DECODE_NON_WAV_NOT_IMPLEMENTED);
+    const decode: DecodeToPcmFn = (bytes, ext, kind) => decodeAudioBytesWith(bytes, ext, kind, async () => {
+      throw new Error("audio decode failed: bad container");
+    });
+    await expect(audioPeaks(db, cache, id, null, decode)).rejects.toThrow("audio decode failed: bad container");
   });
 
   // ADVERSARIAL: the three "there is nothing here" shapes, and the one

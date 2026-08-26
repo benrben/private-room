@@ -234,16 +234,20 @@ def set_vad_model_path(path: str) -> None:
 
 def _vad_model_path() -> str:
     """Where the VAD model actually is: the override path if
-    `set_vad_model_path` was ever called, else the dev/test fallback under
-    this repo's real `src-tauri/resources/models` directory — see the
-    module docstring's "`_vad_model_path()`'s fallback" section for why this
-    is the correct directory (matching Rust's `CARGO_MANIFEST_DIR`-relative
-    fallback, and every other model-dependent test in this migration).
+    `set_vad_model_path` was ever called, else the Electron development model
+    directory. Packaged launches pass an explicit resource path.
     """
     if _vad_model_path_override is not None:
         return _vad_model_path_override
     repo_root = Path(__file__).resolve().parents[3]
-    return str(repo_root / "src-tauri" / "resources" / "models" / VAD_MODEL_FILE)
+    return str(
+        repo_root
+        / "electron-migration"
+        / "electron-app"
+        / "assets"
+        / "models"
+        / VAD_MODEL_FILE
+    )
 
 
 # --------------------------------------------------------------- NeuralVad

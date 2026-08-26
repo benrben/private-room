@@ -61,7 +61,7 @@ from arcelle_sidecar.diar.windows import window_prints
 from arcelle_sidecar.media import decode as media_decode
 from arcelle_sidecar.rec.meta import RecSegment, RecWord
 
-MODEL_PATH = "/Users/benreich/private-room/src-tauri/resources/models/nemo_en_titanet_small.onnx"
+MODEL_PATH = "/Users/benreich/private-room/electron-migration/electron-app/assets/models/nemo_en_titanet_small.onnx"
 requires_model = pytest.mark.skipif(
     not Path(MODEL_PATH).exists(),
     reason="real TitaNet ONNX model not present on this machine",

@@ -1179,11 +1179,15 @@ export default function ChatPane({
               {s.memSuggestion.fact}
             </div>
             <div className="memory-suggestion-actions">
-              <button className="primary" onClick={a.saveSuggestedMemory}>
+              <button type="button" className="primary" onClick={a.saveSuggestedMemory}>
                 Save to memory
               </button>
               <button
+                type="button"
                 className="subtle"
+                // GH #19: Ignore dismisses only this optional memory card. It
+                // never submits the composer, deletes messages, or regenerates
+                // the already-persisted answer above it.
                 onClick={() => s.setMemSuggestion(null)}
               >
                 Ignore
@@ -1192,6 +1196,7 @@ export default function ChatPane({
                   consent; the agent driver still can't press it (the chip is
                   data-agent-blocked). Off-switch: Settings → Behavior. */}
               <button
+                type="button"
                 className="subtle"
                 title="Save this and every future suggestion automatically (turn off in Settings → Behavior)"
                 onClick={a.enableMemoryAutoSave}

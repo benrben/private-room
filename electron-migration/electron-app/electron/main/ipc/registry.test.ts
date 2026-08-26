@@ -24,15 +24,21 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import type { IpcMain, IpcMainInvokeEvent } from "electron";
 
-import type { RoomInfo } from "../../shared/apiTypes.js";
+import type { FileContent, RoomInfo } from "../../shared/apiTypes.js";
 import type { DialogDeps } from "../dialogTools.js";
+import { insertFile } from "../db-host/files.js";
+import { setRecMeta } from "../db-host/recordings.js";
+import {
+  invalidateFileContentCacheForEvent,
+  type FileRuntimeStores,
+} from "../fileRuntimeSurfaceIpc.js";
 import type { RoomManagerState } from "../roomManager.js";
 import {
   ALL_COMMAND_NAMES,
@@ -42,6 +48,7 @@ import {
   buildExplicitModel,
   checkCompleteness,
   createDefaultRoomManagerDeps,
+  createLiveRecBridgeCtx,
   createRoomManagerState,
   registerAllIpc,
   readViewMenuState,
@@ -99,6 +106,7 @@ interface Built {
   state: RoomManagerState;
   userDataDir: string;
   emitted: [string, unknown][];
+  runtimeStores: FileRuntimeStores;
   /** What the host bridge was asked to do — the four channels whose whole
    * job is to reach `main/index.ts`'s quit door, live menu and app exit.
    * Recorded rather than executed, since none of those exists outside a real
@@ -133,6 +141,13 @@ function build(): Built {
       rearmQuitGuard: () => hostCalls.push(["rearmQuitGuard", null]),
       confirmQuit: () => hostCalls.push(["confirmQuit", null]),
       syncMenu: (view) => hostCalls.push(["syncMenu", view]),
+      appVersion: () => "0.25.0",
+      osVersion: () => "macOS test",
+      checkForUpdate: async () => null,
+      installUpdate: async () => {},
+      windowContentView: () => null,
+      focusMainWindow: () => {},
+      openPath: async () => {},
     },
     dialog: {
       dialog: {
@@ -189,6 +204,25 @@ function build(): Built {
 describe("registerAllIpc — registration", () => {
   it("registers every wired module with no duplicate-channel conflict", () => {
     expect(() => build()).not.toThrow();
+  });
+
+  it("lets recording use the same installed voice model reported by stt_status", async () => {
+    const built = build();
+    const modelDir = path.join(built.userDataDir, "models");
+    mkdirSync(modelDir, { recursive: true });
+    writeFileSync(path.join(modelDir, "ggml-large-v3-turbo-q5_0.bin"), "lmgg-test-model");
+
+    expect(built.handlers.get("stt_status")!({} as IpcMainInvokeEvent)).toMatchObject({
+      installed: true,
+    });
+
+    // The production recording-context factory must resolve that same file.
+    // The regression left this dependency at createRecBridgeCtx's default
+    // null resolver even though stt_status above said installed=true.
+    const recCtx = createLiveRecBridgeCtx(() => null, built.userDataDir, null);
+    expect(recCtx.deps.resolveSttModel()).toBe(
+      path.join(modelDir, "ggml-large-v3-turbo-q5_0.bin"),
+    );
   });
 
   it("records exactly the channels the underlying ipcMain received", () => {
@@ -273,14 +307,9 @@ describe("registerAllIpc — completeness", () => {
     expect(report.unexpectedChannels).toEqual(["not_a_real_command"]);
   });
 
-  it("checkCompleteness flags a documented gap that has actually been registered", () => {
-    const oneExtra = new Set<string>([
-      ...ALL_COMMAND_NAMES.filter((c) => !KNOWN_UNREGISTERED_COMMANDS.has(c)),
-      "ask",
-    ]);
-    const report = checkCompleteness(oneExtra);
-    expect(report.ok).toBe(false);
-    expect(report.goneStale).toEqual(["ask"]);
+  it("has no documented command gaps after the migration is complete", () => {
+    expect([...KNOWN_UNREGISTERED_COMMANDS]).toEqual([]);
+    expect(checkCompleteness(new Set(ALL_COMMAND_NAMES)).goneStale).toEqual([]);
   });
 });
 
@@ -360,6 +389,57 @@ describe("registerAllIpc — one shared room across module boundaries", () => {
     // ...and safetyTools.ts's, which reads a DIFFERENT adapter shape
     // (`conn`/`password`, not `db`) off the same state.
     expect(await handlers.get("file_versions_kept")!(fakeEvent, {})).toEqual(expect.any(Number));
+  });
+
+  it("reuses a staged media token until a file-change event invalidates it", async () => {
+    const { handlers, runtimeStores, state, userDataDir } = build();
+    const roomPath = path.join(userDataDir, `pr-media-${randomUUID()}.roomai`);
+    await handlers.get("create_room")!(fakeEvent, {
+      path: roomPath,
+      password: "correct horse battery staple",
+      name: null,
+    });
+    const id = insertFile(
+      state.room!.conn,
+      "large-enough-to-stage.mp4",
+      "video/mp4",
+      Buffer.alloc(1024 * 1024, 7),
+      null,
+      "import",
+    ).id;
+
+    const first = handlers.get("get_file_content")!(fakeEvent, { id }) as FileContent;
+    const second = handlers.get("get_file_content")!(fakeEvent, { id }) as FileContent;
+    expect(first.mediaToken).toBeTruthy();
+    expect(second.mediaToken).toBe(first.mediaToken);
+    expect(runtimeStores.mediaStreams.next).toBe(1);
+
+    invalidateFileContentCacheForEvent(runtimeStores, "file-updated");
+    const afterChange = handlers.get("get_file_content")!(fakeEvent, { id }) as FileContent;
+    expect(afterChange.mediaToken).not.toBe(first.mediaToken);
+    expect(runtimeStores.mediaStreams.next).toBe(2);
+  });
+
+  it("routes a WAV with recording metadata to the recording editor", async () => {
+    const { handlers, state, userDataDir } = build();
+    await handlers.get("create_room")!(fakeEvent, {
+      path: path.join(userDataDir, `pr-recording-${randomUUID()}.roomai`),
+      password: "correct horse battery staple",
+      name: null,
+    });
+    const file = insertFile(
+      state.room!.conn,
+      "Recording.wav",
+      "audio/wav",
+      Buffer.from("RIFF fixture"),
+      "(live recording)\n",
+      "recording",
+    );
+    setRecMeta(state.room!.conn, file.id, "{}");
+
+    const content = handlers.get("get_file_content")!(fakeEvent, { id: file.id }) as FileContent;
+    expect(content.kind).toBe("recording");
+    expect(content.mediaToken).toBeTruthy();
   });
 });
 

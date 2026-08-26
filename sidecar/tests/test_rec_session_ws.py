@@ -81,7 +81,7 @@ _DOWNLOADED_MODEL = (
     / "ggml-large-v3-turbo-q5_0.bin"
 )
 _BUNDLED_MODEL = Path(
-    "/Users/benreich/private-room/src-tauri/resources/models/ggml-large-v3-turbo-q5_0.bin"
+    "/Users/benreich/private-room/electron-migration/electron-app/assets/models/ggml-large-v3-turbo-q5_0.bin"
 )
 MODEL_PATH = str(_DOWNLOADED_MODEL if _DOWNLOADED_MODEL.exists() else _BUNDLED_MODEL)
 #: A path that certainly holds no model. Every test that never decodes real
@@ -1627,10 +1627,20 @@ def test_a_whole_recording_over_the_real_wire(tmp_path: Path, fox_pcm: np.ndarra
                     np.zeros(SAMPLE_RATE // 2, np.float32), fox_pcm,
                     np.zeros(SAMPLE_RATE, np.float32),
                 ]))
-                _wait_until(lambda: any(
-                    e.get("type") == "final"
-                    and "quick brown fox" in e.get("segment", {}).get("text", "").lower()
-                    for e in received
+                # `emit()` deliberately queues the final first and derives the
+                # language-lock event immediately afterward. Wait for both so
+                # the collector thread cannot lose a race between consuming
+                # those adjacent, ordered messages and this assertion.
+                _wait_until(lambda: (
+                    any(
+                        e.get("type") == "final"
+                        and "quick brown fox" in e.get("segment", {}).get("text", "").lower()
+                        for e in received
+                    )
+                    and any(
+                        e.get("type") == "lang-locked" and e.get("lang") == "en"
+                        for e in received
+                    )
                 ), timeout=120)
                 assert any(e.get("type") == "lang-locked" and e.get("lang") == "en" for e in received)
                 assert any(e.get("type") == "level" for e in received)

@@ -152,6 +152,13 @@ export interface ArcelleApi {
   dialog: ArcelleDialogApi;
   /** `@tauri-apps/plugin-opener`'s three functions — see the module doc. */
   shell: ArcelleShellApi;
+  /** Resolve renderer `File` objects to native paths without exposing
+   * Electron's `webUtils` object or any filesystem primitive. */
+  files: ArcelleFilesApi;
+}
+
+export interface ArcelleFilesApi {
+  paths(files: readonly unknown[]): string[];
 }
 
 // ============================================================================
@@ -213,7 +220,10 @@ export interface ArcelleShellApi {
  * testable against a fake. {@link installArcelleBridge} calls this with the
  * REAL `ipcRenderer` when this file runs as an actual preload script.
  */
-export function createArcelleApi(ipcRenderer: IpcRendererLike): ArcelleApi {
+export function createArcelleApi(
+  ipcRenderer: IpcRendererLike,
+  getPathForFile: (file: unknown) => string = () => ""
+): ArcelleApi {
   /** Every `arcelle.dialog`/`arcelle.shell` call goes through the SAME
    * allowlist check the public `invoke` does — the namespaces are sugar over
    * this bridge, never a second way past it. */
@@ -295,6 +305,9 @@ export function createArcelleApi(ipcRenderer: IpcRendererLike): ArcelleApi {
   return {
     dialog,
     shell,
+    files: {
+      paths: (files) => files.map((file) => getPathForFile(file)).filter((path) => path.length > 0),
+    },
     invoke(channel: string, args?: unknown): Promise<unknown> {
       return call(channel, args);
     },
@@ -324,9 +337,10 @@ export interface ContextBridgeLike {
  */
 export function installArcelleBridge(
   contextBridge: ContextBridgeLike,
-  ipcRenderer: IpcRendererLike
+  ipcRenderer: IpcRendererLike,
+  getPathForFile?: (file: unknown) => string
 ): void {
-  contextBridge.exposeInMainWorld("arcelle", createArcelleApi(ipcRenderer));
+  contextBridge.exposeInMainWorld("arcelle", createArcelleApi(ipcRenderer, getPathForFile));
 }
 
 // ============================================================================
@@ -354,6 +368,11 @@ if (typeof process !== "undefined" && process.versions?.electron !== undefined) 
   const electron = nodeRequire("electron") as {
     contextBridge: ContextBridgeLike;
     ipcRenderer: IpcRendererLike;
+    webUtils: { getPathForFile(file: unknown): string };
   };
-  installArcelleBridge(electron.contextBridge, electron.ipcRenderer);
+  installArcelleBridge(
+    electron.contextBridge,
+    electron.ipcRenderer,
+    (file) => electron.webUtils.getPathForFile(file)
+  );
 }

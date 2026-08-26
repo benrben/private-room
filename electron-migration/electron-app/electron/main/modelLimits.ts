@@ -37,6 +37,9 @@ export const CLAUDE_FALLBACK_MAX_CONTEXT = 200_000;
 /** A conservative floor for when the live Codex catalog can't be read at all. */
 export const CODEX_MAX_CONTEXT = 272_000;
 
+/** Antigravity's current catalog contains one-million-token-class models. */
+export const ANTIGRAVITY_MAX_CONTEXT = 1_048_576;
+
 /**
  * The best-known max context for an external-CLI engine, absent a live hint
  * (see the module doc — for Codex, prefer the live catalog lookup first; this
@@ -51,6 +54,8 @@ export function externalMaxContext(engine: string): number {
   switch (engine) {
     case "codex-cli":
       return CODEX_MAX_CONTEXT;
+    case "antigravity-cli":
+      return ANTIGRAVITY_MAX_CONTEXT;
     default:
       return CLAUDE_FALLBACK_MAX_CONTEXT;
   }

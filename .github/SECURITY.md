@@ -27,7 +27,7 @@ public disclosure, or less if the issue is being actively exploited.
   that gets past the privacy gatekeeper's redaction of outbound text.
 - Forging or downgrading an auto-update (the updater's minisign verification).
 - Code execution from an imported file, a saved web page, or the private
-  browser, escaping into the app's Tauri command surface.
+  browser, escaping into the app's isolated Electron IPC surface.
 - Recovering plaintext from a workspace file, temporary files, or caches after
   the room is closed.
 

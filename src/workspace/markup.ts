@@ -5,7 +5,7 @@ import { isRelayedModel } from "./localModel";
  * composite "engine::submodel" selection from the Cloud picker. */
 export function isExternalEngine(model: string): boolean {
   const [engine] = splitExternalModel(model);
-  return engine === "claude-cli" || engine === "codex-cli" || engine === "openrouter";
+  return engine === "claude-cli" || engine === "codex-cli" || engine === "antigravity-cli" || engine === "openrouter";
 }
 
 /** An Ollama relayed model: listed alongside local models and driven through

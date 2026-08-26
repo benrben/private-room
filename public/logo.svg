@@ -19,11 +19,10 @@
     rather than a rounded rect, so it matches the macOS icon shape and renders
     identically in every engine.
 
-    The geometry is TRACED from the brand artwork: src-tauri/icons/source.png
-    is the source of truth and src-tauri/icons/trace.py derives these 0..100
-    paths from it, mapped here by scale(0.64). Changing the mark means
-    replacing source.png FIRST, rerunning generate.py and trace.py, and
-    carrying the new paths into src/icons/nav.tsx, index.html and this file.
+    The geometry is shared with the master artwork in art/appicon.svg and
+    mapped here by scale(0.64). Changing the mark means updating the master
+    artwork first and carrying the paths into src/icons/nav.tsx, index.html,
+    and this file.
   -->
   <defs>
     <clipPath id="arcelle-tile">

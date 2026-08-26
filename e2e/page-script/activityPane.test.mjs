@@ -110,6 +110,9 @@ function loadReal(absPath, stubbed, cache = new Map()) {
         .map((ext) => base + ext)
         .find(existsSync);
       assert.ok(target, `cannot resolve ${spec} from ${absPath}`);
+      if (target.endsWith("/platform.ts")) {
+        return swap(stubModule(clause, { invoke: INVOKE_RECORDER }));
+      }
       if (stubbed.has(target)) return swap(stubModule(clause));
       return swap(loadReal(target, stubbed, cache));
     }

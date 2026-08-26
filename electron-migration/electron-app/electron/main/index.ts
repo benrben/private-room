@@ -314,12 +314,15 @@ import type {
 import * as obs from "./obs.js";
 import { GeometryStore, MIN_H, MIN_W, type Screen as GeometryScreen } from "./windowGeometry.js";
 import {
-  createDefaultRoomManagerDeps,
+  createLiveRoomManagerDeps,
   createRoomManagerState,
   registerAllIpc,
   type CompletenessReport,
   type HostBridge,
 } from "./ipc/registry.js";
+import { invalidateFileContentCacheForEvent, type FileRuntimeStores } from "./fileRuntimeSurfaceIpc.js";
+import { createLiveUpdater } from "./updater/liveUpdater.js";
+import { mediaResponse } from "./mediaTools.js";
 import { buildTemplate, dispatch, menuSync, type DispatchDeps, type MainWindowLike } from "./menu.js";
 import { QuitDoor, QUIT_REQUESTED } from "./quitDoor.js";
 import type { DialogDeps } from "./dialogTools.js";
@@ -457,6 +460,9 @@ export interface BootstrapElectron {
   desktopCapturer: {
     getSources(options: { types: Array<"screen" | "window"> }): Promise<DisplayMediaVideo[]>;
   };
+  protocol?: {
+    handle(scheme: string, handler: (request: Request) => Response | Promise<Response>): void;
+  };
 }
 
 export interface BootstrapOptions {
@@ -476,6 +482,10 @@ export interface BootstrapOptions {
    * script and the boot stub page. Defaults to this module's own directory;
    * a test overrides it only when it needs to. */
   distDir?: string;
+  /** Real renderer entry. Tests omit both and retain the tiny boot fixture. */
+  rendererFile?: string;
+  /** Development Vite server; takes precedence over `rendererFile`. */
+  rendererUrl?: string;
   /** `shellTools.ts`'s `/usr/bin/open -a <app> <target>` bridge. Defaults to
    * the real {@link execFileOpenWithApp}; overridden ONLY by a test, which must
    * never spawn a real process — the one seam in this bootstrap that is not an
@@ -528,7 +538,9 @@ export async function bootstrap(opts: BootstrapOptions): Promise<BootstrapResult
 
   const state = createRoomManagerState();
   let mainWindowRef: BrowserWindowType | null = null;
+  let fileRuntimeStores: FileRuntimeStores | null = null;
   const emit = (event: string, payload: unknown): void => {
+    if (fileRuntimeStores) invalidateFileContentCacheForEvent(fileRuntimeStores, event);
     if (mainWindowRef !== null && !mainWindowRef.isDestroyed()) {
       mainWindowRef.webContents.send(event, payload);
     }
@@ -559,6 +571,11 @@ export async function bootstrap(opts: BootstrapOptions): Promise<BootstrapResult
   Menu.setApplicationMenu(appMenu);
 
   // ---- 6. register all IPC handlers (compile-checked complete) -------------
+  const updater = createLiveUpdater({
+    currentVersion: app.getVersion(),
+    execPath: process.execPath,
+    quit: () => app.quit(),
+  });
   const host: HostBridge = {
     setUnsavedEdits: (on) => quitDoor.setUnsavedEdits(on),
     rearmQuitGuard: () => quitDoor.rearm(),
@@ -574,11 +591,25 @@ export async function bootstrap(opts: BootstrapOptions): Promise<BootstrapResult
       setImmediate(() => app.quit());
     },
     syncMenu: (view) => menuSync(appMenu, view),
+    appVersion: () => app.getVersion(),
+    osVersion: () => process.getSystemVersion?.() ?? "macOS",
+    checkForUpdate: () => updater.check(),
+    installUpdate: () => updater.install(),
+    windowContentView: () => liveWindow()?.contentView ?? null,
+    focusMainWindow: () => {
+      const win = liveWindow();
+      if (!win) throw new Error("The app window is gone.");
+      win.focus();
+    },
+    openPath: async (target) => {
+      const error = await shell.openPath(target);
+      if (error) throw new Error(error);
+    },
   };
   const dialogDeps: DialogDeps = { dialog, getMainWindow: liveWindow };
   const shellDeps: ShellDeps = { shell, openWithApp: opts.openWithApp ?? execFileOpenWithApp };
-  const deps = createDefaultRoomManagerDeps(userDataDir, emit);
-  const { registeredChannels, completeness } = registerAllIpc({
+  const deps = createLiveRoomManagerDeps(state, userDataDir, emit);
+  const { registeredChannels, completeness, runtimeStores } = registerAllIpc({
     ipcMain,
     state,
     deps,
@@ -589,6 +620,7 @@ export async function bootstrap(opts: BootstrapOptions): Promise<BootstrapResult
     userDataDir,
     resourcesPath: opts.resourcesPath,
   });
+  fileRuntimeStores = runtimeStores;
   if (!completeness.ok) {
     // A hard boot invariant, not a warning: see the module doc's step 6.
     throw new Error(
@@ -597,6 +629,30 @@ export async function bootstrap(opts: BootstrapOptions): Promise<BootstrapResult
         `goneStale=${JSON.stringify(completeness.goneStale)} ` +
         `unexpectedChannels=${JSON.stringify(completeness.unexpectedChannels)}`
     );
+  }
+
+  // The old Tauri custom protocols, now backed by Electron's protocol API.
+  // Register before the renderer loads so an iframe/media element can never
+  // race its handler during first paint.
+  if (opts.electron.protocol) {
+    opts.electron.protocol.handle("roomdoc", (request) => {
+      const token = new URL(request.url).pathname.replace(/^\/+/, "");
+      const html = runtimeStores.htmlPreviews.map.get(token);
+      if (html === undefined) return new Response("preview not staged", { status: 404 });
+      return new Response(html, {
+        status: 200,
+        headers: {
+          "Content-Type": "text/html; charset=utf-8",
+          "Cache-Control": "no-store",
+          "Content-Security-Policy": "default-src 'none'; img-src data: blob:; style-src 'unsafe-inline'; script-src 'unsafe-inline'",
+        },
+      });
+    });
+    opts.electron.protocol.handle("roommedia", (request) => {
+      const url = new URL(request.url);
+      const result = mediaResponse(runtimeStores.mediaStreams, url.pathname, request.headers.get("range"));
+      return new Response(result.body, { status: result.status, headers: result.headers });
+    });
   }
   obs.info("ipc_registered", [["count", obs.count(registeredChannels.size)]]);
 
@@ -726,7 +782,11 @@ export async function bootstrap(opts: BootstrapOptions): Promise<BootstrapResult
   const readyToShow = new Promise<void>((resolve) => {
     win.once("ready-to-show", () => resolve());
   });
-  await win.loadFile(path.join(distDir, BOOT_STUB_FILE));
+  if (opts.rendererUrl) {
+    await win.loadURL(opts.rendererUrl);
+  } else {
+    await win.loadFile(opts.rendererFile ?? path.join(distDir, BOOT_STUB_FILE));
+  }
   await readyToShow;
 
   // ---- 11. show — deliberately deferred by default; see module doc --------
@@ -764,6 +824,10 @@ if (
   process.type === "browser"
 ) {
   const electronModule = await import("electron");
+  electronModule.protocol.registerSchemesAsPrivileged([
+    { scheme: "roomdoc", privileges: { standard: true, secure: true, supportFetchAPI: true } },
+    { scheme: "roommedia", privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true } },
+  ]);
   void bootstrap({
     electron: {
       app: electronModule.app,
@@ -774,9 +838,14 @@ if (
       desktopCapturer: electronModule.desktopCapturer,
       dialog: electronModule.dialog,
       shell: electronModule.shell,
+      protocol: electronModule.protocol,
     },
     resourcesPath: electronModule.app.isPackaged ? process.resourcesPath : null,
-    showWindow: process.env.ARCELLE_SHOW_WINDOW === "1",
+    rendererUrl: process.env.ARCELLE_RENDERER_URL,
+    rendererFile: process.env.ARCELLE_RENDERER_URL || process.env.ARCELLE_USE_BOOT_STUB === "1"
+      ? undefined
+      : path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "renderer", "index.html"),
+    showWindow: process.env.ARCELLE_SHOW_WINDOW !== "0",
     userDataDirOverride: process.env.ARCELLE_USER_DATA_DIR,
   }).catch((err: unknown) => {
     console.error("Arcelle failed to boot:", err);

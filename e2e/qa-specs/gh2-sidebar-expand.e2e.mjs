@@ -32,7 +32,7 @@ import { openApp, widthOf } from "./helpers.mjs";
 const RAIL = ".activity-rail";
 const EXPANDER = '[data-testid="rail-expander"]';
 const MORE_TOOLS = '[data-testid="more-tools"]';
-const SPLIT_A = '[aria-label="Resize the Library pane"]';
+const SPLIT_A = '[aria-label="Resize the sidebar"]';
 
 /** The shipped sidebar: four destinations at rest, seven behind More tools.
  * Kept in step with shell/navPrefs.tsx — if a destination is added to the

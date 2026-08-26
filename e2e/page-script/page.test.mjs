@@ -1,5 +1,5 @@
 /* Tests for the browser's injected page script
- * (`src-tauri/src/browser/page.js`), run against the hand-rolled DOM in
+ * (`electron-migration/electron-app/electron/main/browser/page.js`), run against the hand-rolled DOM in
  * `dom-stub.mjs`:
  *
  *     node --test e2e/page-script/
@@ -20,7 +20,10 @@ import { dirname, join } from "node:path";
 import { El, install, currentDocument, setSelection, fireWindow } from "./dom-stub.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const SOURCE = readFileSync(join(here, "../../src-tauri/src/browser/page.js"), "utf8");
+const SOURCE = readFileSync(
+  join(here, "../../electron-migration/electron-app/electron/main/browser/page.js"),
+  "utf8",
+);
 
 function fresh() {
   const api = install(SOURCE);

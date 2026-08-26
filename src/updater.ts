@@ -1,6 +1,4 @@
-import { check } from "@tauri-apps/plugin-updater";
-import { relaunch } from "@tauri-apps/plugin-process";
-import { confirm, message } from "@tauri-apps/plugin-dialog";
+import { checkForUpdate, confirm, installUpdate, message } from "./platform";
 
 /** Launch-time updates.
  *
@@ -82,9 +80,9 @@ export async function checkForUpdatesQuietly(): Promise<void> {
     return;
   }
 
-  let update: Awaited<ReturnType<typeof check>> = null;
+  let update: Awaited<ReturnType<typeof checkForUpdate>> = null;
   try {
-    update = await check();
+    update = await checkForUpdate();
   } catch (e) {
     // Offline / rate-limited / no release yet — stay visually silent on launch,
     // but log distinguishably so a genuine failure isn't invisible.
@@ -133,22 +131,8 @@ export async function checkForUpdatesQuietly(): Promise<void> {
 
   const progress = showDownloadProgress(update.version);
   try {
-    let total = 0;
-    let got = 0;
-    await update.downloadAndInstall((ev) => {
-      if (ev.event === "Started") {
-        total = ev.data.contentLength ?? 0;
-        // 0% is a MEASUREMENT. Without a `Content-Length` there is no share to
-        // be at the start of, so the same `null` the Progress branch sends.
-        progress.set(total > 0 ? 0 : null);
-      } else if (ev.event === "Progress") {
-        got += ev.data.chunkLength;
-        progress.set(total > 0 ? Math.min(99, Math.round((got / total) * 100)) : null);
-      } else if (ev.event === "Finished") {
-        progress.set(100);
-      }
-    });
-    await relaunch();
+    progress.set(null);
+    await installUpdate();
   } catch (e) {
     console.error("[updater] install failed:", e);
     await message(

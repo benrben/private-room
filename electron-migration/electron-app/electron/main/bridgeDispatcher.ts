@@ -881,6 +881,32 @@ export interface RoomToolDispatcherOptions {
    * be misread as "no tool ran"). Optional because most callers/tests have
    * nothing listening for it yet. */
   markToolRan?: () => void;
+  /** Trusted workspace filesystem projection used by Deep Agents. It accepts
+   * only virtual room paths and never exposes the SQLCipher key or host path. */
+  workspace?: {
+    call(operation: string, args: Record<string, unknown>): Promise<Record<string, unknown>>;
+  } | null;
+}
+
+const WORKSPACE_TOOL_SPECS: ToolSpec[] = ([
+  ["workspace_list", "List normal files and folders in one workspace directory."],
+  ["workspace_read", "Read a line range from a normal text file."],
+  ["workspace_write", "Create or atomically replace a normal text file."],
+  ["workspace_edit", "Replace exact text in a normal text file."],
+  ["workspace_delete", "Move one normal file to Arcelle Trash."],
+  ["workspace_glob", "Find normal workspace files by a glob pattern."],
+  ["workspace_grep", "Search normal workspace text files for literal text."],
+] as const).map(([name, description]) => ({
+  name,
+  description,
+  inputSchema: { type: "object", additionalProperties: true },
+}));
+
+function workspaceTools(scope: ToolScope, workspace: RoomToolDispatcherOptions["workspace"]): ToolSpec[] {
+  if (workspace == null) return [];
+  return scope.kind === "LocalEngine" || scope.kind === "CloudEngine" || scope.kind === "ExternalAgent"
+    ? WORKSPACE_TOOL_SPECS
+    : [];
 }
 
 /**
@@ -912,7 +938,10 @@ export class RoomToolDispatcher implements ToolDispatcher {
   constructor(private readonly opts: RoomToolDispatcherOptions) {}
 
   listTools(scope: ToolScope): ToolSpec[] {
-    return servedToolsWith(this.opts.webEnabled, this.opts.lanes, scope, this.opts.advisor, this.opts.routes);
+    return [
+      ...servedToolsWith(this.opts.webEnabled, this.opts.lanes, scope, this.opts.advisor, this.opts.routes),
+      ...workspaceTools(scope, this.opts.workspace),
+    ];
   }
 
   async callTool(scope: ToolScope, name: string, rawArgs: Record<string, unknown>): Promise<ToolCallResult> {
@@ -930,7 +959,10 @@ export class RoomToolDispatcher implements ToolDispatcher {
     // Only an advertised tool for THIS scope is callable, even if a client
     // fabricates a name — checked against the SAME served list `tools/list`
     // returns, so the two can never disagree.
-    const served = servedToolsWith(opts.webEnabled, opts.lanes, scope, opts.advisor, opts.routes);
+    const served = [
+      ...servedToolsWith(opts.webEnabled, opts.lanes, scope, opts.advisor, opts.routes),
+      ...workspaceTools(scope, opts.workspace),
+    ];
     if (!served.some((t) => t.name === name)) {
       // See this class's doc: an ordinary refusal, folded into isError:true
       // rather than thrown.
@@ -947,6 +979,17 @@ export class RoomToolDispatcher implements ToolDispatcher {
     if (cloudPolicy !== null) {
       const restored = cloudPolicy.restoreValue(args);
       args = normalizeArguments(restored);
+    }
+
+    if (name.startsWith("workspace_") && opts.workspace != null) {
+      const operation = name.slice("workspace_".length);
+      const payload = await opts.workspace.call(operation, args);
+      const isError = typeof payload.error === "string" && payload.error.length > 0;
+      const text = JSON.stringify(payload);
+      if (cloudPolicy !== null) {
+        return toolResult(cloudPolicy.redact(text).text, isError, []);
+      }
+      return toolResult(text, isError, []);
     }
 
     if (name === "consult_advisor") {

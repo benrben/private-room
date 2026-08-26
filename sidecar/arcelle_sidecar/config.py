@@ -116,6 +116,9 @@ class RunRequest(BaseModel):
 
     model: str
     question: str
+    #: Provider-neutral agent runtime. Classic remains the compatibility default;
+    #: the host enables Deep Harness only after its capability probe passes.
+    harness: Literal["classic", "deep"] = "classic"
     messages: list[Message] = Field(default_factory=list)
     temperature: float | None = None
     ollama_base_url: str = "http://127.0.0.1:11434"
@@ -233,6 +236,7 @@ class EmbedRequest(BaseModel):
     keep_alive: str | None = None
     #: PRIV-1: room privacy policy payload (see :class:`RunRequest`).
     privacy: dict[str, Any] | None = None
+    provider: ProviderConfig | None = None
 
 
 class GenerateRequest(BaseModel):
@@ -569,6 +573,25 @@ class VisionLocateRequest(BaseModel):
     #: PRIV-1: room privacy policy payload (see :class:`RunRequest`).
     privacy: dict[str, Any] | None = None
     provider: ProviderConfig | None = None
+
+
+class QuickLookRequest(BaseModel):
+    """Body of ``POST /quicklook`` for the macOS preview fallback."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    name: str
+    data_b64: str
+
+
+class OcrRequest(BaseModel):
+    """Body of ``POST /ocr`` for on-device Vision text recognition."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    mime: str
+    ext: str
+    data_b64: str
 
 
 class KnowledgeExtractRequest(BaseModel):

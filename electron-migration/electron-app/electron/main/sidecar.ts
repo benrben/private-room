@@ -312,6 +312,25 @@ export function baseUrlIfRunning(): string | null {
   return currentBaseUrl();
 }
 
+/** Best-effort room-teardown purge; never starts a sidecar merely to forget. */
+export function forgetRoomMemory(): void {
+  const base = currentBaseUrl();
+  if (base === null) return;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 1_500);
+  timer.unref?.();
+  void fetch(`${base}/forget`, {
+    method: "POST",
+    headers: { ...authedHeaders(), "content-type": "application/json" },
+    body: "{}",
+    signal: controller.signal,
+  }).then((response) => {
+    if (!response.ok) console.error(`[sidecar] /forget refused (status ${response.status})`);
+  }).catch((error: unknown) => {
+    console.error("[sidecar] /forget did not reach the AI service:", error instanceof Error ? error.message : String(error));
+  }).finally(() => clearTimeout(timer));
+}
+
 /**
  * Stop the sidecar WE spawned (if any) and forget what we knew about it.
  * Used both by {@link ensureUp}'s replace path and by {@link stopIfOurs}.
@@ -1271,6 +1290,19 @@ export type ChunkStep =
  * `wait_for_cancel` polls at. */
 const CANCEL_POLL_MS = 100;
 
+/** Give the sidecar's model loop one polling turn to close its upstream model
+ * socket after `/cancel` is acknowledged. Closing our `/run` body immediately
+ * races that cleanup and can cancel the ASGI task first, leaving the Ollama
+ * connection alive until its long transport timeout. */
+const CANCEL_UPSTREAM_DRAIN_MS = 350;
+
+async function drainCancelledUpstream(): Promise<void> {
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, CANCEL_UPSTREAM_DRAIN_MS);
+    timer.unref?.();
+  });
+}
+
 /**
  * Wait for the next stream chunk while staying answerable to Stop.
  *
@@ -1678,6 +1710,7 @@ export async function streamRun(
       }
       if (step.kind === "cancelled") {
         await deliverCancel(base, runId);
+        await drainCancelledUpstream();
         return doneFromCancellation(state);
       }
       if (step.kind === "ended") {
@@ -1690,6 +1723,7 @@ export async function streamRun(
         // Checked per LINE, not just per chunk — see this function's doc.
         if (signal?.aborted) {
           await deliverCancel(base, runId);
+          await drainCancelledUpstream();
           return doneFromCancellation(state);
         }
         let parsed: unknown;

@@ -14,9 +14,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # TypeScript type-check (src + vite.config.ts) and the page-script contract
-  # tests that run under plain node.
-  frontend:
+  # Renderer + Electron main process. Both package-lock files are installed
+  # because the host keeps its native/build dependencies in the Electron app.
+  electron:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
@@ -25,8 +25,13 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-      - run: npm run typecheck
+      - run: npm ci
+        working-directory: electron-migration/electron-app
+      - run: npm run build
+      - run: npm run test:electron
       - run: npm run test:page
+      - run: npm run test:packaging
+      - run: npm run e2e
 
   # The Python agent sidecar. `uv run` is mandatory: a bare `pytest` resolves to
   # a different, unpinned environment and fails on imports.
@@ -43,53 +48,3 @@ jobs:
       - run: uv sync --extra dev
       - run: uv run pytest -q
       - run: uvx ruff check .
-
-  # The Rust host. Two things have to exist before it will even compile:
-  #   * ../dist — tauri's generate_context! reads the built frontend;
-  #   * every path in tauri.conf.json's bundle.resources — tauri_build::build()
-  #     copies every one of them on any cargo build, so a missing path fails
-  #     even `cargo test` ("resource path … doesn't exist").
-  # The two small models are fetched for real. The sidecar binary and the
-  # 574 MB Whisper model are stubbed instead: nothing CI runs reads their
-  # contents — the Rust tests never launch the packaged sidecar, and every test
-  # that puts audio through Whisper is #[ignore]d (they resolve the model from
-  # src-tauri/resources/models themselves, so a stub is never transcribed).
-  rust:
-    runs-on: macos-14
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-      - run: npm ci
-      - run: npm run build
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: src-tauri
-      - name: Fetch or stub every bundled resource
-        run: |
-          mkdir -p src-tauri/resources/models
-          curl -fsSL -o src-tauri/resources/models/nemo_en_titanet_small.onnx \
-            https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/nemo_en_titanet_small.onnx
-          curl -fsSL -o src-tauri/resources/models/ggml-silero-v5.1.2.bin \
-            https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin
-          # Stub, not a 574 MB download — see the comment above this job. A
-          # release build fetches the real weights (RELEASING.md).
-          touch src-tauri/resources/models/ggml-large-v3-turbo-q5_0.bin
-          mkdir -p src-tauri/resources/sidecar/arcelle-sidecar
-      - run: cargo test --manifest-path src-tauri/Cargo.toml
-      # Report-only on purpose: a gate that fails on day one just gets switched
-      # off. Deferred, not forgotten — measured 2026-08-18 with
-      # `npm run lint:rust`: 53 distinct findings (118 lines, the lib being
-      # linted again through its test targets), no bugs among them. The biggest
-      # groups are `map_or`, needless borrows, `vec!` in tests, and eight
-      # `assertions_on_constants` — those last are the deliberate
-      # constant-invariant tests, so they want an `#[allow]` with a reason
-      # rather than a rewrite. Clear the 53, then delete `continue-on-error`.
-      - name: clippy (report only)
-        continue-on-error: true
-        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets

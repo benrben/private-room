@@ -119,8 +119,9 @@
  */
 
 import { randomUUID, createDecipheriv } from "node:crypto";
-import { open as openFile } from "node:fs/promises";
+import { open as openFile, unlink } from "node:fs/promises";
 import * as os from "node:os";
+import path from "node:path";
 import type Database from "better-sqlite3-multiple-ciphers";
 
 import { authToken, authedHeaders, busy, ensureUp } from "./sidecar.js";
@@ -187,6 +188,7 @@ export interface RecStart {
   fileId: string;
   name: string;
   meta: RecMeta;
+  sessionUrl: string;
 }
 
 export interface RecFile {
@@ -209,6 +211,8 @@ export interface RecFile {
 export interface RecLiveControl {
   fileId: string;
   status: RecLiveStatus;
+  /** Fresh renderer-owned socket URL so a reloaded renderer can reattach. */
+  sessionUrl: string;
 }
 
 export type RecLiveStatus = "recording" | "paused" | "saving";
@@ -265,6 +269,8 @@ export interface RecBridgeDeps {
   sidecarPost: (path: string, body: unknown) => Promise<{ status: number; json: unknown }>;
   /** Open `WS /rec/host?token=&fileId=` for one live session. */
   connectHostWs: (fileId: string) => HostWsLike;
+  /** Provision the authenticated renderer-owned `/rec/session` URL. */
+  sessionWsUrl: (fileId: string) => Promise<string>;
   /** Read + decrypt one AES-256-GCM spool frame at `range` (byte offsets into
    * the session's spool file) — see {@link readSpoolFrame}. */
   readSpoolFrame: (spoolPath: string, range: readonly [number, number], key: Buffer) => Promise<Buffer>;
@@ -318,6 +324,10 @@ export function createRecBridgeCtx(
       ...deps,
       sidecarPost: deps.sidecarPost ?? defaultSidecarPost,
       connectHostWs: deps.connectHostWs ?? defaultConnectHostWs,
+      sessionWsUrl:
+        deps.sessionWsUrl ??
+        (async (fileId: string) =>
+          recHostWsUrl(await ensureUp(), fileId, authToken()).replace("/rec/host?", "/rec/session?")),
       readSpoolFrame: deps.readSpoolFrame ?? readSpoolFrame,
       resolveSttModel: deps.resolveSttModel ?? ((): string | null => null),
       spoolDir: deps.spoolDir ?? ((): string => os.tmpdir()),
@@ -943,7 +953,34 @@ export async function recStart(
 
   let resp: Record<string, unknown>;
   try {
-    resp = await postControl(ctx, "/rec/start", body);
+    try {
+      resp = await postControl(ctx, "/rec/start", body);
+    } catch (err) {
+      if (!(err instanceof RecControlError) || err.code !== "REC_SPOOL_EXISTS") throw err;
+
+      // A spool is encrypted under a random key that existed only in the
+      // terminated app process. After restart it is intentionally
+      // undecryptable; the recoverable audio is the acknowledged `rec_chunks`
+      // already spliced above. Remove exactly this validated file-id's stale
+      // spool and retry once, otherwise one crash blocks Resume forever.
+      if (fileId === "." || fileId === ".." || path.basename(fileId) !== fileId) {
+        throw new Error("This recording has an invalid file id.");
+      }
+      const staleSpool = path.join(ctx.deps.spoolDir(), `${fileId}.spool`);
+      try {
+        await unlink(staleSpool);
+      } catch (unlinkError) {
+        const code = (unlinkError as NodeJS.ErrnoException).code;
+        if (code !== "ENOENT") {
+          throw new Error(
+            `The previous recording session's temporary spool could not be cleared: ${
+              unlinkError instanceof Error ? unlinkError.message : String(unlinkError)
+            }`,
+          );
+        }
+      }
+      resp = await postControl(ctx, "/rec/start", body);
+    }
   } catch (err) {
     // THE FRESH ROW MUST NOT OUTLIVE A START THAT FAILED — the same reasoning
     // `session_ws.py` gives for unlinking its own spool file on every way out
@@ -972,7 +1009,8 @@ export async function recStart(
   attachHostWs(ctx, ctx.state.hostWs);
 
   ctx.deps.notifyFilesChanged?.();
-  return { fileId, name, meta };
+  const sessionUrl = await ctx.deps.sessionWsUrl(fileId);
+  return { fileId, name, meta, sessionUrl };
 }
 
 /**
@@ -1041,11 +1079,16 @@ export async function recStop(ctx: RecBridgeCtx): Promise<RecMeta> {
 /** The live session, if any — lets a reopened view re-attach to a recording
  * that kept running while the user looked at other files. See
  * {@link RecLiveControl} for what this can and cannot honestly report. */
-export function recLiveStatus(ctx: RecBridgeCtx): RecLiveControl | null {
+export async function recLiveStatus(ctx: RecBridgeCtx): Promise<RecLiveControl | null> {
   if (ctx.state.liveFileId === null) {
     return null;
   }
-  return { fileId: ctx.state.liveFileId, status: ctx.state.liveStatus ?? "recording" };
+  const fileId = ctx.state.liveFileId;
+  return {
+    fileId,
+    status: ctx.state.liveStatus ?? "recording",
+    sessionUrl: await ctx.deps.sessionWsUrl(fileId),
+  };
 }
 
 // =============================================================================

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { listen } from "@tauri-apps/api/event";
+import { listen } from "../platform";
 import { api, ConnectorPowers, McpServerStatus } from "../api";
 
 /** Each server whose `Authorization` header exists in `stored` (what the room

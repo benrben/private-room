@@ -34,8 +34,9 @@ export type { WorkArea };
  * window belongs and where its keyboard shortcut can finally be printed
  * beside it. Focus went with them: it is a mode, not a place.
  *
- * THE LIBRARY IS DELIBERATELY NOT IN THIS LIST. It is a pane — see
- * shell/navPrefs.tsx, which owns the catalog and says so at length.
+ * Library is a first-class destination. It returns the contextual pane to the
+ * complete file-management surface (Browse / Sources / Trash), which is more
+ * than merely showing or hiding that pane through Layout.
  *
  * ----- the three things that survived unchanged, on purpose -----
  *

@@ -498,10 +498,26 @@ async function guardedRequest(
     connect: {
       lookup: (
         _hostname: string,
-        _options: unknown,
-        callback: (err: Error | null, address: string, family: number) => void
+        options: { all?: boolean } | undefined,
+        callback: (
+          err: Error | null,
+          address: string | Array<{ address: string; family: number }>,
+          family?: number,
+        ) => void
       ) => {
-        callback(null, addr.address, family);
+        // Node 20+ asks custom lookup functions for `all: true` while its
+        // Happy-Eyeballs connector is active. Returning the legacy
+        // `(address, family)` shape to that request makes node:net read
+        // `address.address` from a string and throw ERR_INVALID_IP_ADDRESS.
+        // Every OAuth metadata request then surfaced only "fetch failed" —
+        // including Datadog's — even after a public address was resolved and
+        // pinned correctly. Preserve the single checked address, but answer in
+        // the result shape the caller requested.
+        if (options?.all === true) {
+          callback(null, [{ address: addr.address, family }]);
+        } else {
+          callback(null, addr.address, family);
+        }
       },
     },
   });

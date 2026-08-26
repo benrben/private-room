@@ -3145,6 +3145,59 @@ async def test_a_successful_write_lands_in_BOTH_batons() -> None:
     assert updates["produced"] == ["create_file: notes.md"]
 
 
+async def test_one_planned_write_delegation_forces_a_receipt_only_final_round(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Do not re-dispatch a completed one-step rename just to verify it.
+
+    Live Codex QA changed the file successfully, then launched two differently
+    worded File agents. The last duplicated the folder prefix and falsely
+    reported failure even though the Library showed the new name. A successful
+    artifact baton is the room bridge's receipt and should end delegation.
+    """
+
+    async def _stub(
+        state: Any,
+        config: Any,
+        worker_id: str,
+        instruction: str,
+        referents: list[str],
+        node_key: str,
+        upstream: tuple[str, ...] = (),
+    ) -> WorkerOutcome:
+        return WorkerOutcome(
+            "Report from the File agent:\nDID: renamed it to codex-final.md",
+            True,
+            False,
+            ["rename_file: codex-final.md"],
+        )
+
+    monkeypatch.setattr("arcelle_sidecar.graph._run_worker", _stub)
+    p = _pass(agent_id="chat.answer")
+    p.state["artifact_delegation_is_terminal"] = True
+    delegation = call(
+        "ask_file_agent",
+        instruction="rename Proof/local-proof.md to Proof/codex-final.md",
+    )
+
+    await p.fan_out([delegation])
+    await p.run([delegation])
+
+    updates = p.to_updates([])
+    assert updates["force_synthesis"] is True
+    assert updates["referents"] == ["rename_file: codex-final.md"]
+
+
+def test_one_hub_round_keeps_only_one_delegation_per_domain() -> None:
+    """A provider cannot expand one File step into racing verification agents."""
+    first = call("ask_file_agent", instruction="rename the file")
+    duplicate_domain = call("ask_file_agent", instruction="verify the rename")
+    other_domain = call("ask_web_agent", instruction="check the source")
+    calls = [first, duplicate_domain, other_domain]
+
+    assert graph._dedupe_hub_delegations(calls) == [first, other_domain]
+
+
 async def test_a_failed_write_records_no_referent() -> None:
     """The other half of the gate: recorded on SUCCESS ONLY, or every claim
     looks supported and `verify_claims` can never fire."""

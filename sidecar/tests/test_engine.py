@@ -30,7 +30,7 @@ from arcelle_sidecar.media.decode import MediaKind, decode_to_pcm
 from arcelle_sidecar.stt import engine
 from pywhispercpp.model import Model
 
-MODEL_PATH = "/Users/benreich/private-room/src-tauri/resources/models/ggml-large-v3-turbo-q5_0.bin"
+MODEL_PATH = "/Users/benreich/private-room/electron-migration/electron-app/assets/models/ggml-large-v3-turbo-q5_0.bin"
 _HAS_MODEL = Path(MODEL_PATH).exists()
 _HAS_SAY = Path("/usr/bin/say").exists()
 _HAS_AFCONVERT = Path("/usr/bin/afconvert").exists()
@@ -68,17 +68,6 @@ def say_pcm(tmp_path_factory: pytest.TempPathFactory) -> np.ndarray:
     pcm = decode_to_pcm(aiff, MediaKind.AUDIO)
     assert pcm.shape[0] > 16000, "decoded under a second of audio"
     return pcm
-
-
-# --------------------------------------------------------------- constants
-
-
-def test_model_constants_match_rust_source() -> None:
-    assert engine.MODEL_FILE == "ggml-large-v3-turbo-q5_0.bin"
-    assert engine.MODEL_URL == (
-        "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin"
-    )
-    assert engine.MODEL_SIZE_MB == 574
 
 
 # --------------------------------------------------------------- format_stamp

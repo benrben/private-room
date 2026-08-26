@@ -887,7 +887,7 @@ export function applyMerge(mode: string, separator: string | null, inputs: reado
 
 /** A headless agent-turn runner, injected by the concrete spawner so the
  * generic executor stays mock-drivable. Ported from `AgentRunFn`. */
-export type AgentRunFn = (question: string) => Promise<string>;
+export type AgentRunFn = (question: string, cancel?: CancelFlag, roomPath?: string) => Promise<string>;
 
 export const AGENT_RUN_NOT_IMPLEMENTED =
   "NOT_IMPLEMENTED: run_agent_headless (workflow.rs:2429-2535, past this batch's range — a headless " +
@@ -1474,7 +1474,7 @@ export async function runWorkflowNode(
     case "agent_run": {
       const q = interpolate(deps.rooms, roomPath, node.question, inputsJoined);
       const agentRun = deps.agentRun ?? agentRunNotImplemented;
-      artifact = { ...DEFAULT_WF_ARTIFACT, result: await agentRun(q) };
+      artifact = { ...DEFAULT_WF_ARTIFACT, result: await agentRun(q, cancel, roomPath) };
       break;
     }
     case "save_file": {

@@ -111,7 +111,7 @@ import {
   updateSkill as updateSkillDb,
   upsertSkillResource as upsertSkillResourceDb,
 } from "./db-host/skills.js";
-import { agentDeleteSkill } from "./skillsCmds.js";
+import { agentDeleteSkill, agentSaveSkill } from "./skillsCmds.js";
 import {
   execAnnotateFile,
   execListRoomFiles,
@@ -546,6 +546,19 @@ export interface ExecToolDeps {
    * builds one wires both the button and the agent tool from it.
    */
   runStudioDeps?: RunStudioDeps;
+  /** Live renderer driver for app controls, screenshots, and staged media frames. */
+  agentUi?: (
+    kind: "ui_snapshot" | "ui_act" | "view_screenshot" | "media_frame",
+    args: Record<string, unknown>
+  ) => Promise<unknown>;
+  /** App-wide implementations for tool arms whose engines live in host
+   * surfaces (browser, scripts, extraction, STT and durable jobs). Returning
+   * `null` means this runtime does not own the requested tool. */
+  runtimeTool?: (
+    name: string,
+    args: Record<string, unknown>,
+    effects: ToolEffects,
+  ) => Promise<ToolOutcome | null>;
 }
 
 /** What an injected connector call returns: the tool's text plus any images it
@@ -908,63 +921,13 @@ function execReadSkillResource(deps: ExecToolDeps, args: Record<string, unknown>
 }
 
 function execSaveSkill(deps: ExecToolDeps, args: Record<string, unknown>): ToolOutcome {
-  const rawName = asString(args["name"]);
-  const description = asString(args["description"]);
-  const instructions = asString(args["instructions"]);
-  const agentOwner = asString(args["agent"]).trim();
-  if (agentOwner !== "" && !(SKILL_AGENT_IDS as readonly string[]).includes(agentOwner)) {
-    return fail(
-      `agent must be one of: ${SKILL_AGENT_IDS.join(", ")} — or omit it for a skill any agent may ` +
-        `use. Got ${JSON.stringify(agentOwner)}; nothing was saved.`
-    );
-  }
-  const nameResult = validateSkillFields(rawName, description, instructions);
-  if (!nameResult.ok) return fail(nameResult.error);
-  const sourceNames = Array.isArray(args["source_files"])
-    ? (args["source_files"] as unknown[])
-        .filter((v): v is string => typeof v === "string")
-        .map((s) => s.trim())
-        .filter((s) => s !== "")
-    : [];
-  if (sourceNames.length > 0) {
-    // Genuinely partial: everything BELOW works today against skills.ts;
-    // only the source_files→room-file resolution/snapshot step needs
-    // files.ts, which is not committed to this migration yet.
-    return notImplemented(
-      "save_skill's source_files → room-file snapshot step needs db-host/files.ts — Batch D. " +
-        "save_skill WITHOUT source_files is implemented for real; nothing was saved here"
-    );
-  }
   const room = requireRoom(deps);
   if (!room.ok) return fail(room.error);
-  const existing = findSkillDb(room.db, nameResult.value);
-  let id: string;
-  let updated: boolean;
-  if (existing !== null) {
-    const owner = agentOwner === "" ? existing.agent : agentOwner;
-    updateSkillDb(room.db, existing.id, nameResult.value, description.trim(), instructions, owner);
-    setSkillEnabledDb(room.db, existing.id, false);
-    id = existing.id;
-    updated = true;
-  } else {
-    id = createSkillDb(
-      room.db,
-      nameResult.value,
-      description.trim(),
-      instructions,
-      false,
-      "agent",
-      agentOwner
-    );
-    updated = false;
+  try {
+    return ok(agentSaveSkill(room.db, args, deps.emit));
+  } catch (error) {
+    return fail(errMessage(error));
   }
-  emitSafely(deps, "skills-changed", undefined);
-  // No "bundled N room file snapshot(s)" clause here (unlike Rust's own
-  // reply) — source_files is handled above, and always empty by the time
-  // this line runs, so there is nothing bundled to report.
-  return ok(
-    `${updated ? "Updated" : "Created"} skill "${nameResult.value}" as a disabled draft (id: ${id}). The user can review and enable it in Skills.`
-  );
 }
 
 function execWriteSkillResource(deps: ExecToolDeps, args: Record<string, unknown>): ToolOutcome {
@@ -1617,6 +1580,10 @@ export async function execTool(
     return fail(missing);
   }
 
+  if (isBrowseTool(name) && deps.runtimeTool !== undefined) {
+    const live = await deps.runtimeTool(name, args, effects);
+    if (live !== null) return live;
+  }
   if (isBrowseTool(name)) {
     return notImplemented(
       "the private browser's command surface (commands/browse.rs -> electron/main/browser/) is a separate, in-progress porting effort this batch did not wire into exec_tool"
@@ -1674,7 +1641,12 @@ export async function execTool(
     // -------------------------------------------------- REAL: the organize box
     case "mark_image": {
       const room = requireRoom(deps);
-      return room.ok ? execMarkImage(room.db, args, effects) : fail(room.error);
+      if (!room.ok) return fail(room.error);
+      if (deps.runtimeTool !== undefined) {
+        const liveMark = await deps.runtimeTool(name, args, effects);
+        if (liveMark !== null) return liveMark;
+      }
+      return execMarkImage(room.db, args, effects);
     }
     case "create_file": {
       const room = requireRoom(deps);
@@ -1721,25 +1693,37 @@ export async function execTool(
     case "edit_files":
     case "write_file":
     case "set_cells":
+      if (deps.runtimeTool !== undefined) {
+        const liveEdit = await deps.runtimeTool(name, args, effects);
+        if (liveEdit !== null) return liveEdit;
+      }
       return notImplemented("the edit_match.rs port (diff-preview gate + fuzzy/section matching) — Batch D");
 
     // --------------------------------------------------------------- UI bridge
     case "ui_snapshot":
     case "ui_act":
     case "view_screenshot":
-    case "view_media_frame":
-      // The raw native-capture primitive (`snapshot.rs`'s `capture_png`) IS
-      // now ported and tested as `snapshotUtil.ts`'s `captureWebviewPng` — do
-      // not re-port it. What is still missing for these four arms is the
-      // AgentUi screen-driving bridge (request_ui/UI state that `ui_snapshot`/
-      // `ui_act` need, and the driver-composite fallback `view_screenshot`
-      // falls back to), plus `downscale_png_b64` and `perceive_image` that
-      // `view_screenshot` wraps the capture with, and the video frame-grab
-      // path `view_media_frame` needs. All still Batch D.
-      return notImplemented(
-        "the AgentUi screen-driving bridge, downscale_png_b64/perceive_image, and the video " +
-          "frame-grab path — Batch D"
-      );
+    case "view_media_frame": {
+      if (deps.agentUi === undefined) {
+        return notImplemented("the live renderer AgentUi broker is not attached to this tool context");
+      }
+      try {
+        const kind = name === "view_media_frame" ? "media_frame" : name;
+        const payload = await deps.agentUi(kind, args);
+        const value = typeof payload === "object" && payload !== null
+          ? payload as Record<string, unknown>
+          : { value: payload };
+        if (typeof value.error === "string") return fail(value.error);
+        if (typeof value.imageB64 === "string" && value.imageB64 !== "") {
+          effects.pendingImages.push(value.imageB64);
+          const note = typeof value.note === "string" ? value.note : "Image captured for inspection.";
+          return ok(note);
+        }
+        return ok(JSON.stringify(value, null, 2));
+      } catch (e) {
+        return fail(errMessage(e));
+      }
+    }
 
     // ------------------------------------------------------------- web/download
     case "web_search":
@@ -1747,6 +1731,10 @@ export async function execTool(
     case "fetch_page":
       return execFetchPage(deps, args);
     case "save_link":
+      if (deps.runtimeTool !== undefined) {
+        const liveSaveLink = await deps.runtimeTool(name, args, effects);
+        if (liveSaveLink !== null) return liveSaveLink;
+      }
       // NOT `commands/organize.rs` (ported) and NOT `web/fetch.rs` (ported —
       // `web.ts`'s `fetchReadable`/`youtubeTranscript` ARE the two engines this
       // arm reads with). What is missing is the INGESTION half:
@@ -1759,6 +1747,10 @@ export async function execTool(
           "and tested as web.ts's fetchReadable/youtubeTranscript; do not re-port web/fetch.rs"
       );
     case "download_url":
+      if (deps.runtimeTool !== undefined) {
+        const liveDownload = await deps.runtimeTool(name, args, effects);
+        if (liveDownload !== null) return liveDownload;
+      }
       // Unlike download_media (wired for real just below), this arm needs
       // `files.rs`'s `import_download` — the staged-file → room-file import —
       // which has no Electron port. The FETCH half is done: `web.ts`'s
@@ -1781,6 +1773,10 @@ export async function execTool(
     // ------------------------------------------------------------------ scripts
     case "list_scripts":
     case "run_script":
+      if (deps.runtimeTool !== undefined) {
+        const liveScript = await deps.runtimeTool(name, args, effects);
+        if (liveScript !== null) return liveScript;
+      }
       return notImplemented("the Scripts subsystem (fingerprint consent + script execution) — Batch D");
 
     // -------------------------------------------------------------------- sketch
@@ -1847,6 +1843,10 @@ export async function execTool(
     case "stt_status":
     case "read_recording":
     case "retranscribe_file":
+      if (deps.runtimeTool !== undefined) {
+        const liveStt = await deps.runtimeTool(name, args, effects);
+        if (liveStt !== null) return liveStt;
+      }
       return notImplemented("rec/engine.py's on-device STT surface — Batch C/D");
 
     // --------------------------------------------- skills: the two gated verbs
@@ -1876,6 +1876,10 @@ export async function execTool(
       }
     }
     case "run_skill_script":
+      if (deps.runtimeTool !== undefined) {
+        const liveSkillScript = await deps.runtimeTool(name, args, effects);
+        if (liveSkillScript !== null) return liveSkillScript;
+      }
       return notImplemented("skill script execution (fingerprint consent + the script runner) — Batch D");
 
     // ----------------------------------------------------------- REAL: MCP mgmt
@@ -1944,6 +1948,10 @@ export async function execTool(
     // -------------------------------------------------------- jobs/workflows
     case "start_file_pass":
     case "job_status":
+      if (deps.runtimeTool !== undefined) {
+        const liveJob = await deps.runtimeTool(name, args, effects);
+        if (liveJob !== null) return liveJob;
+      }
       return notImplemented("the jobs/workflows backend (no db-host/jobs.ts yet) — Batch C");
 
     // ------------------------------------------------------- REAL: workflows
@@ -2043,6 +2051,10 @@ export async function execTool(
 
     // ------------------------------------------------------------ local_generate
     case "local_generate":
+      if (deps.runtimeTool !== undefined) {
+        const liveLocal = await deps.runtimeTool(name, args, effects);
+        if (liveLocal !== null) return liveLocal;
+      }
       return notImplemented("Ollama local-model execution (ollama.rs) — Batch D");
 
     // ---------------------------------------------------- REAL: consult_advisor

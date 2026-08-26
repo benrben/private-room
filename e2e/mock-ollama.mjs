@@ -1,18 +1,18 @@
 #!/usr/bin/env node
-// Mock Ollama server for Arcelle's HLT-8 end-to-end smoke test.
+// Deterministic Ollama server for Arcelle's Electron end-to-end tests.
 //
 // It replays canned responses for the handful of Ollama endpoints the app
 // touches, so `npm run e2e` runs with NO real model and NO network. The app is
 // pointed at this server via the ARCELLE_OLLAMA_URL env var (see
-// src-tauri/src/ollama.rs :: base_url()).
+// Electron's engine-routing base URL).
 //
-// The interesting part is /api/chat: it emulates one round of tool-calling.
-//   Round 1 (no prior tool result in the message list): the "model" emits a
-//           single `annotate_file` tool call whose quoted text is a verbatim
-//           line from e2e/fixtures/notes.txt. The Rust agent loop executes it,
-//           producing the 📍 annotation chip.
-//   Round 2 (a message with role:"tool" is now present): the "model" streams a
-//           final plain-text answer with no further tool calls, ending the loop.
+// /api/chat understands the tools offered on each round. It exercises the real
+// v3 route instead of pretending the supervisor owns room tools:
+//
+//   Main agent -> ask_file_agent -> File agent -> search_room -> reports -> Main
+//
+// Tool-less calls receive a small deterministic answer, which also keeps model
+// preflights and command error-path tests local and repeatable.
 //
 // No dependencies beyond Node's built-in http module.
 
@@ -21,10 +21,9 @@ import http from "node:http";
 const PORT = Number(process.env.MOCK_OLLAMA_PORT || 11434);
 const MODEL = "qwen3.5:4b"; // matches DEFAULT_MODEL so best_default() selects it
 
-// Must be an exact (case-insensitive, whitespace-collapsed) substring of
-// e2e/fixtures/notes.txt, or annotate_file rejects it.
-const ANNOTATION_QUOTE = "landed twelve people on the Moon";
-const ANNOTATION_FILE = "notes.txt";
+let nextToolCall = 1;
+let activeStalls = 0;
+let unknownRequests = 0;
 
 function readBody(req) {
   return new Promise((resolve) => {
@@ -51,8 +50,59 @@ function json(res, obj) {
   res.end(JSON.stringify(obj));
 }
 
+function toolNames(body) {
+  return new Set(
+    (Array.isArray(body.tools) ? body.tools : [])
+      .map((tool) => tool?.function?.name)
+      .filter((name) => typeof name === "string"),
+  );
+}
+
+function toolCall(res, name, args) {
+  return ndjson(res, [
+    {
+      model: MODEL,
+      created_at: new Date().toISOString(),
+      message: {
+        role: "assistant",
+        content: "",
+        tool_calls: [
+          {
+            id: `mock-call-${nextToolCall++}`,
+            function: { name, arguments: args },
+          },
+        ],
+      },
+      done: true,
+      done_reason: "stop",
+    },
+  ]);
+}
+
+function answer(res, content, stream = true) {
+  if (!stream) {
+    return json(res, {
+      model: MODEL,
+      created_at: new Date().toISOString(),
+      message: { role: "assistant", content },
+      done: true,
+      done_reason: "stop",
+    });
+  }
+  const midpoint = Math.max(1, Math.floor(content.length / 2));
+  return ndjson(res, [
+    { model: MODEL, message: { role: "assistant", content: content.slice(0, midpoint) }, done: false },
+    { model: MODEL, message: { role: "assistant", content: content.slice(midpoint) }, done: false },
+    { model: MODEL, message: { role: "assistant", content: "" }, done: true, done_reason: "stop" },
+  ]);
+}
+
 const server = http.createServer(async (req, res) => {
   const url = req.url || "";
+
+  if (req.method === "GET" && url === "/__e2e/stats") {
+    return json(res, { activeStalls, unknownRequests });
+  }
 
   // GET /api/tags — model inventory. One model, named to match DEFAULT_MODEL
   // so the app reports AI "running" and picks it as the default.
@@ -70,43 +120,77 @@ const server = http.createServer(async (req, res) => {
     });
   }
 
-  // POST /api/chat — streaming chat with tool-calling, the demo path.
+  // GET /api/version — Ollama SDK reachability probe used before agent turns.
+  if (req.method === "GET" && url.startsWith("/api/version")) {
+    return json(res, { version: "0.0.0-arcelle-e2e" });
+  }
+
+  // POST /api/chat — streaming chat with real supervisor/specialist routing.
   if (req.method === "POST" && url.startsWith("/api/chat")) {
     const body = await readBody(req);
     const messages = Array.isArray(body.messages) ? body.messages : [];
+    const allText = messages
+      .map((message) => (typeof message?.content === "string" ? message.content : ""))
+      .join("\n");
+    const streams = body.stream !== false;
+    if (messages.some((message) => typeof message?.content === "string" && message.content.includes("E2E_STALL"))) {
+      activeStalls += 1;
+      const finish = () => { activeStalls = Math.max(0, activeStalls - 1); };
+      req.once("aborted", finish);
+      res.once("close", finish);
+      res.writeHead(200, { "Content-Type": "application/x-ndjson" });
+      return;
+    }
     const toolAlreadyRan = messages.some((m) => m && m.role === "tool");
+    const offered = toolNames(body);
 
-    if (!toolAlreadyRan) {
-      // Round 1: emit the annotate_file tool call, then done.
-      return ndjson(res, [
-        {
-          model: MODEL,
-          created_at: new Date().toISOString(),
-          message: {
-            role: "assistant",
-            content: "",
-            tool_calls: [
-              {
-                function: {
-                  name: "annotate_file",
-                  arguments: { name: ANNOTATION_FILE, text: ANNOTATION_QUOTE },
-                },
-              },
-            ],
-          },
-          done: true,
-          done_reason: "stop",
-        },
-      ]);
+    // Structured AI actions use Ollama's non-streaming form. The deep double
+    // used to answer every request as two NDJSON records, so JSON-mode calls
+    // failed with "Extra data" even though the shipping provider contract was
+    // fine. Keep one deterministic durable-memory answer for the manual GH #19
+    // journey and a plain response for every other structured action.
+    if (allText.includes("long-term memory") && allText.includes("durable fact")) {
+      return answer(
+        res,
+        JSON.stringify({
+          worth_remembering: true,
+          fact: "The manual QA user prefers concise status updates.",
+        }),
+        streams,
+      );
     }
 
-    // Round 2: stream a final answer (a few deltas) and finish.
-    return ndjson(res, [
-      { model: MODEL, message: { role: "assistant", content: "According to your files, " }, done: false },
-      { model: MODEL, message: { role: "assistant", content: "Apollo landed twelve people on the Moon " }, done: false },
-      { model: MODEL, message: { role: "assistant", content: "between 1969 and 1972." }, done: false },
-      { model: MODEL, message: { role: "assistant", content: "" }, done: true, done_reason: "stop" },
-    ]);
+    // Manual GH #28 journey: route a direct File-agent request into a real
+    // edit tool so the renderer displays its genuine before/after approval.
+    if (allText.includes("E2E_EDIT_APPROVAL") && offered.has("write_file")) {
+      if (!toolAlreadyRan) {
+        return toolCall(res, "write_file", {
+          name: "Note",
+          content: "The sky is blue.\nThe approval journey reached the real edit tool.\n",
+        });
+      }
+      return answer(res, "Updated the QA note after approval.", streams);
+    }
+
+    if (offered.has("ask_file_agent")) {
+      if (!toolAlreadyRan) {
+        return toolCall(res, "ask_file_agent", {
+          instruction: "Search this room for the Apollo fact and report the exact wording and source file.",
+        });
+      }
+      return answer(res, "According to notes.txt, Apollo landed twelve people on the Moon between 1969 and 1972.", streams);
+    }
+
+    if (offered.has("search_room")) {
+      if (!toolAlreadyRan) return toolCall(res, "search_room", { query: "Apollo Moon" });
+      return answer(
+        res,
+        "FOUND: Apollo landed twelve people on the Moon between 1969 and 1972. Source: notes.txt.",
+        streams,
+      );
+    }
+
+    return answer(res, "Arcelle deterministic end-to-end model response.", streams);
   }
 
   // POST /api/show — a model's metadata, WITHOUT loading it. The sidecar's
@@ -148,6 +232,7 @@ const server = http.createServer(async (req, res) => {
   // capabilities: the call succeeded, the answer was empty, and nothing in the
   // run mentioned it.
   console.warn(`[mock-ollama] NO FIXTURE for ${req.method} ${url} — answering {}`);
+  unknownRequests += 1;
   json(res, {});
 });
 

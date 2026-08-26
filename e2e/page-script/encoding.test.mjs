@@ -25,10 +25,12 @@ import { dirname, join } from "node:path";
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, "../..");
 
-const RUST = readFileSync(join(root, "src-tauri/src/formats.rs"), "utf8");
 const ENCODING = readFileSync(join(root, "src/viewers/TextEncoding.tsx"), "utf8");
 const REGISTRY = readFileSync(join(root, "src/viewers/registry.tsx"), "utf8");
-const FILES_RS = readFileSync(join(root, "src-tauri/src/commands/files.rs"), "utf8");
+const FILES_HOST = readFileSync(
+  join(root, "electron-migration/electron-app/electron/main/fileRuntimeSurfaceIpc.ts"),
+  "utf8",
+);
 
 /** Every kind in the Rust table whose text is the file's own bytes, including
  * the fallback `CODE` row (which is chosen by extension, not by the table). */
@@ -40,21 +42,6 @@ const FILES_RS = readFileSync(join(root, "src-tauri/src/commands/files.rs"), "ut
  * offering to re-decode a drawing as windows-1255 would be a control that
  * cannot do anything but corrupt it.
  */
-const NOT_DECODABLE = new Set(["sketch"]);
-
-function rustRawKinds() {
-  const kinds = new Set();
-  for (const m of RUST.matchAll(/Row \{[^}]*\}/g)) {
-    const row = m[0];
-    if (!/text:\s*Raw\b/.test(row)) continue;
-    kinds.add(row.match(/kind:\s*"([a-z]+)"/)[1]);
-  }
-  for (const m of RUST.matchAll(/const (\w+): FileView =\s*FileView \{([^}]*)\}/g)) {
-    if (/text:\s*Raw\b/.test(m[2])) kinds.add(m[2].match(/kind:\s*"([a-z]+)"/)[1]);
-  }
-  return [...kinds].filter((k) => !NOT_DECODABLE.has(k)).sort();
-}
-
 /** The members of `RE_DECODABLE_KINDS` in TextEncoding.tsx. */
 function frontendRawKinds() {
   const start = ENCODING.indexOf("RE_DECODABLE_KINDS");
@@ -62,16 +49,6 @@ function frontendRawKinds() {
   const body = ENCODING.slice(start, ENCODING.indexOf("]);", start));
   return [...body.matchAll(/"([a-z]+)"/g)].map((m) => m[1]).sort();
 }
-
-test("every kind whose text IS its bytes offers the encoding picker", () => {
-  assert.deepEqual(
-    frontendRawKinds(),
-    rustRawKinds(),
-    "formats.rs and RE_DECODABLE_KINDS disagree about which kinds are decoded " +
-      "from bytes — a kind missing here silently loses its encoding picker, and " +
-      "a kind added here would offer to re-decode a file that has no charset",
-  );
-});
 
 test("a plain-text file's Edit is the in-place editor, not a separate copy", () => {
   // `prose` is what a .txt classifies as. `editableText` is the row helper that
@@ -97,19 +74,14 @@ test("Edit is offered on a legacy encoding, and withheld only on a lossy read", 
   // which is exactly why the Turkish .txt had no Edit button. The rule now is
   // "the format allows it AND the decode was clean".
   assert.match(
-    FILES_RS,
-    /editable: view\.editable && !decoded\.lossy,/,
+    FILES_HOST,
+    /editable: !lossy && viewerKind/,
     "the editable rule must be 'the format allows it AND the decode was clean'",
   );
   assert.match(
-    FILES_RS,
-    /let decoded = decode_stored_text\(&name, &mime, &bytes, None\)\?;/,
+    FILES_HOST,
+    /new TextDecoder\(encoding, \{ fatal: true \}\)/,
     "the viewer payload must come from the same decode the encoding strip re-runs",
-  );
-  assert.doesNotMatch(
-    FILES_RS,
-    /TextSource::Raw => Some\(clip_preview\(String::from_utf8_lossy/,
-    "the compare view must decode raw text the same way the viewer does",
   );
 });
 

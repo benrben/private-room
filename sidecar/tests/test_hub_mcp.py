@@ -20,6 +20,7 @@ import httpx
 import pytest
 
 from arcelle_sidecar import external_llm, hub_mcp, mcp_client
+from arcelle_sidecar.agents import main_prompt
 from arcelle_sidecar.hub_mcp import (
     DELEGATION_ACK,
     HubToolServer,
@@ -603,6 +604,168 @@ async def test_a_native_delegation_becomes_an_ordinary_tool_call(monkeypatch) ->
     # …and the delegation is NOT also described in the text protocol, which is
     # the prose that made the harness narrate instead of act.
     assert "ask_jobs_agent" not in captured["system"]
+
+
+@pytest.mark.asyncio
+async def test_codex_gets_rename_and_organize_as_real_scoped_tools(monkeypatch) -> None:
+    """Regression: Codex used to receive only a prose catalog and denied the
+    same file operations Claude could perform. Its per-round MCP now exposes
+    exactly the tools offered by the File agent and captures the real call for
+    the unchanged graph executor."""
+    rename = {
+        "type": "function",
+        "function": {
+            "name": "rename_file",
+            "description": "Rename one room file",
+            "parameters": {"type": "object", "properties": {"name": {"type": "string"}}},
+        },
+    }
+    organize = {
+        "type": "function",
+        "function": {
+            "name": "organize_files",
+            "description": "Rename or move several room files",
+            "parameters": {"type": "object", "properties": {"files": {"type": "array"}}},
+        },
+    }
+    model = external_llm.ExternalChatModel("codex-cli::gpt-5.6-sol")
+    seen: dict[str, Any] = {}
+
+    async def fake_run(self, prompt, cancel=None, system="", bridge_tools=None, hub=None, hub_tools=None):
+        seen["system"] = system
+        seen["hub_tools"] = list(hub_tools or [])
+        listed = rpc(hub, "tools/list").json()["result"]["tools"]
+        seen["listed"] = [tool["name"] for tool in listed]
+        rpc(
+            hub,
+            "tools/call",
+            {"name": "arcelle_organize_files", "arguments": {"files": []}},
+        )
+        return '\n'.join([
+            json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "working"}}),
+            json.dumps({"type": "turn.completed", "usage": {"input_tokens": 10, "output_tokens": 1}}),
+        ])
+
+    monkeypatch.setattr(external_llm.ExternalChatModel, "_run", fake_run)
+    text, calls, _usage = await model.stream(
+        [{"role": "system", "content": "You are the File agent."},
+         {"role": "user", "content": "organize these files"}],
+        [rename, organize],
+        _noop,
+    )
+
+    assert seen["hub_tools"] == ["arcelle_rename_file", "arcelle_organize_files"]
+    assert seen["listed"] == ["arcelle_rename_file", "arcelle_organize_files"]
+    assert "tool_calls" not in seen["system"]
+    assert [call.name for call in calls] == ["organize_files"]
+    assert text == ""
+
+
+@pytest.mark.asyncio
+async def test_codex_delegation_names_avoid_harness_agent_collision(monkeypatch) -> None:
+    """Codex's stock harness treats ``ask_*_agent`` as its own sub-agent
+    machinery and refused a mounted tool with that name in the packaged app.
+    It sees a neutral Arcelle capability name, while the graph receives its
+    unchanged stable tool name back."""
+    delegate = {
+        "type": "function",
+        "function": {
+            "name": "ask_file_agent",
+            "description": "Work with this room's files",
+            "parameters": {
+                "type": "object",
+                "properties": {"instruction": {"type": "string"}},
+                "required": ["instruction"],
+            },
+        },
+    }
+    model = external_llm.ExternalChatModel("codex-cli::gpt-5.6-sol")
+    seen: dict[str, Any] = {}
+
+    async def fake_run(
+        self,
+        prompt,
+        cancel=None,
+        system="",
+        bridge_tools=None,
+        hub=None,
+        hub_tools=None,
+    ):
+        seen["prompt"] = prompt
+        seen["system"] = system
+        seen["hub_tools"] = list(hub_tools or [])
+        listed = rpc(hub, "tools/list").json()["result"]["tools"]
+        seen["listed"] = [tool["name"] for tool in listed]
+        rpc(
+            hub,
+            "tools/call",
+            {
+                "name": "work_with_room_files",
+                "arguments": {"instruction": "Rename alpha.md to beta.md"},
+            },
+        )
+        return json.dumps(
+            {
+                "type": "turn.completed",
+                "usage": {"input_tokens": 10, "output_tokens": 1},
+            }
+        )
+
+    monkeypatch.setattr(external_llm.ExternalChatModel, "_run", fake_run)
+    text, calls, _usage = await model.stream(
+        [
+            {
+                "role": "system",
+                "content": "Call ask_file_agent for every room file change.",
+            },
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "ask_file_agent",
+                            "arguments": {"instruction": "List files"},
+                        }
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_name": "ask_file_agent",
+                "content": "FOUND alpha.md",
+            },
+            {"role": "user", "content": "rename it"},
+        ],
+        [delegate],
+        _noop,
+    )
+
+    assert seen["hub_tools"] == ["work_with_room_files"]
+    assert seen["listed"] == ["work_with_room_files"]
+    assert "ask_file_agent" not in seen["system"]
+    assert "ask_file_agent" not in seen["prompt"]
+    assert "work_with_room_files" in seen["prompt"]
+    assert [(call.name, call.arguments) for call in calls] == [
+        (
+            "ask_file_agent",
+            {"instruction": "Rename alpha.md to beta.md"},
+        )
+    ]
+    assert text == ""
+
+
+def test_codex_replaces_harness_shaped_main_prompt_with_app_controls() -> None:
+    original = main_prompt(["file"], web_off=True)
+    [rendered] = external_llm._codex_messages(  # noqa: SLF001 - regression seam
+        [{"role": "system", "content": original}]
+    )
+    content = rendered["content"]
+    assert "ROOM COORDINATOR" in content
+    assert "direct controls for the Arcelle application" in content
+    assert "work_with_room_files" in content
+    assert "you never touch files or tools yourself" not in content.lower()
+    assert "ask_file_agent" not in content
 
 
 @pytest.mark.asyncio

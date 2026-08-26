@@ -52,10 +52,12 @@ test("a decode failure carries its reason; every other stage stays empty", () =>
 });
 
 test("the backend's prefix and the viewer's are the same string", () => {
-  const rust = readFileSync(join(root, "src-tauri/src/commands/stt_cmds.rs"), "utf8");
-  // `format!("failed: {why}")` — if the Rust side is reworded, this test is
+  const host = readFileSync(
+    join(root, "electron-migration/electron-app/electron/main/speechSttSurfaceIpc.ts"),
+    "utf8",
+  );
   // where the frontend finds out rather than in a silent fall-through.
-  assert.match(rust, /format!\("failed: \{why\}"\)/);
+  assert.match(host, /`failed: \$\{message\}`/);
   assert.equal(STT_FAILED_PREFIX, "failed: ");
 });
 

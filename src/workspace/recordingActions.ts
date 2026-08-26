@@ -1,4 +1,4 @@
-import { openUrl } from "@tauri-apps/plugin-opener";
+import { openUrl } from "../platform";
 import { api, FileTarget } from "../api";
 import { fileToBase64 } from "./composer";
 import {
@@ -9,8 +9,10 @@ import {
   noteLiveStt,
   stopMicTap,
 } from "./liveRec";
+import { closeRecordingTransport, startRecordingTransport } from "./recordingTransport";
 import { WSState } from "./state";
 import { base64ToBytes } from "../viewers/util";
+import { connectDictSession, type DictSession } from "./dictSession";
 
 /** Below this RMS (PCM samples in [-1, 1]) counts as silence for hands-free
  * auto-send — comfortably above the mic's noise floor (echoCancellation /
@@ -202,15 +204,15 @@ export function makeRecordingActions(
         fail(e instanceof Error ? e.message : String(e));
         return;
       }
-      let unlisten: (() => void) | null = null;
+      let session: DictSession | null = null;
       let tapDown: (() => Promise<void>) | null = null;
       try {
-        await api.dictStart(); // the model check runs before any audio flows
-        unlisten = await api.onDictPartial((text) => {
+        const info = await api.dictStart(); // model check + authenticated WS URL
+        session = await connectDictSession(info, (text) => {
           s.setDictPartial(text);
           onPartial?.(text);
         });
-        const push = (rate: number, b64: string) => api.dictPushAudio(rate, b64);
+        const push = (rate: number, b64: string) => session!.push(rate, b64);
         // Hands-free: once you've said something, going quiet for a beat
         // ends your turn and sends it — the same "stop and send" the mic
         // button/capture dock already do, just triggered by silence instead
@@ -223,8 +225,7 @@ export function makeRecordingActions(
         );
       } catch (e) {
         mic.getTracks().forEach((t) => t.stop());
-        unlisten?.();
-        void api.dictCancel().catch(() => {});
+        session?.cancel();
         if (String(e).includes("STT_MODEL_MISSING")) {
           s.setDictState("idle");
           s.setDictOwner(null);
@@ -244,11 +245,11 @@ export function makeRecordingActions(
         s.setDictState("busy");
         void (async () => {
           try {
-            // Teardown AWAITS the final flush, so dict_stop is ordered after
-            // the last samples and the closing word is never clipped.
+            // Teardown AWAITS the final flush, so the socket's Stop message is
+            // ordered after the last samples and the closing word is not clipped.
             await tapDown!();
             mic.getTracks().forEach((t) => t.stop());
-            const raw = (await api.dictStop()).trim();
+            const raw = (await session!.stop()).trim();
             if (!raw) {
               onPartial?.(""); // wipe any painted partials
               s.pushToast("info", "No speech detected.");
@@ -272,7 +273,6 @@ export function makeRecordingActions(
             onPartial?.("");
             s.pushToast("error", `Dictation failed: ${e}`);
           } finally {
-            unlisten?.();
             s.setDictPartial("");
             s.setDictState("idle");
             s.setDictOwner(null);
@@ -408,6 +408,7 @@ export function makeRecordingActions(
     // as a failure to start, and nothing below may tear the microphone down.
     // The engine always starts with live transcription ON — sync the
     // session-scoped UI mirror (a previous session may have turned it off).
+    startRecordingTransport(res.sessionUrl, res.fileId);
     noteLiveStt(true);
     s.setRecLive({ fileId: res.fileId, status: "recording" });
     if (micError) {
@@ -419,7 +420,7 @@ export function makeRecordingActions(
       // `resumeLiveRecording` asks the same question of a session whose lanes
       // are long since settled, which is why it can read the lane directly.
       const live = await api.recLiveStatus().catch(() => null);
-      const nothingCaptured = !withSystem || live?.sys[0] === "error";
+      const nothingCaptured = !withSystem || live?.sys?.[0] === "error";
       // The remedy belongs only to the case it actually fixes. With the box
       // ticked there is nothing left to tick: the lane was asked for and did
       // not come up (in practice the Screen Recording permission), which
@@ -475,7 +476,7 @@ export function makeRecordingActions(
       const live = await api.recLiveStatus().catch(() => null);
       s.pushToast(
         "error",
-        live?.sys[0] === "on"
+        live?.sys?.[0] === "on"
           ? `${msg} (the Mac's audio keeps recording)`
           : `${msg} — and the Mac's audio is not being recorded, so nothing at all is being captured.`,
       );
@@ -510,6 +511,8 @@ export function makeRecordingActions(
       );
     } catch (e) {
       s.pushToast("error", String(e));
+    } finally {
+      closeRecordingTransport();
     }
     s.setRecLive(null);
     try {

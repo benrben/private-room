@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { revealItemInDir } from "@tauri-apps/plugin-opener";
+import { revealItemInDir } from "../platform";
 import { api, ENGINE_LABELS, RoomInfo, splitExternalModel } from "../api";
 import {
   ChevronDownIcon,

@@ -157,9 +157,16 @@ def test_cmdline_codex_matches_rust_flags() -> None:
     )
 
 
+def test_cmdline_antigravity_matches_headless_flags() -> None:
+    assert build_cmdline("antigravity-cli", None, None) == (
+        "agy --sandbox --mode plan --input-format stream-json --output-format stream-json --print-timeout 5m"
+    )
+    assert build_cmdline("antigravity-cli", "gemini-3.7-flash-high", None).endswith("--model 'gemini-3.7-flash-high'")
+
+
 def test_cmdline_rejects_unknown_engine() -> None:
     with pytest.raises(ValueError):
-        build_cmdline("gemini-cli", None, None)
+        build_cmdline("unknown-cli", None, None)
 
 
 # The model string is read from the ROOM FILE, which can arrive from someone
@@ -594,6 +601,20 @@ def test_agent_cmdline_asks_for_the_machine_readable_envelope() -> None:
     assert external_llm.build_agent_cmdline("claude-cli", "opus", "xhigh").endswith(
         "--model 'opus' --effort 'xhigh'"
     )
+    assert external_llm.build_agent_cmdline("antigravity-cli", "gemini-3.7-flash-high", None) == (
+        "agy --sandbox --mode plan --input-format stream-json --output-format stream-json --print-timeout 5m --model 'gemini-3.7-flash-high'"
+    )
+
+
+def test_antigravity_stream_reads_answer_and_usage() -> None:
+    stream = "\n".join(
+        [
+            json.dumps({"event": "init", "conversation_id": "test"}),
+            json.dumps({"event": "step_update", "step_update": {"step_type": "agent_response", "text_delta": "hello world"}}),
+            json.dumps({"event": "result", "result": {"status": "SUCCESS", "response": "hello world", "usage": {"input_tokens": 42}}}),
+        ]
+    )
+    assert external_llm.parse_antigravity_json_stream(stream) == ("hello world", 42, None)
 
 
 def test_the_streamed_envelope_parses_exactly_like_the_plain_one() -> None:
@@ -660,6 +681,38 @@ def test_agent_cmdline_shuts_off_the_clis_own_toolset() -> None:
     assert "--sandbox read-only" in codex
     assert "--disable shell_tool" in codex
     assert codex.endswith(" -")
+
+
+def test_codex_agent_cmdline_mounts_only_the_ephemeral_loopback_tool_server() -> None:
+    cmd = external_llm.build_agent_cmdline(
+        "codex-cli",
+        None,
+        None,
+        codex_mcp_url="http://127.0.0.1:43123/mcp",
+    )
+    assert 'url="http://127.0.0.1:43123/mcp"' in cmd
+    assert 'bearer_token_env_var="ARCELLE_CODEX_MCP_TOKEN"' in cmd
+    assert 'default_tools_approval_mode="approve"' in cmd
+    assert "Bearer" not in cmd
+    assert "--ignore-rules" in cmd
+    assert "--sandbox read-only" in cmd
+    assert "--disable shell_tool" in cmd
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://127.0.0.1:43123/mcp",
+        "http://example.com:43123/mcp",
+        "http://127.0.0.1:43123/other",
+        "http://127.0.0.1/mcp",
+    ],
+)
+def test_codex_agent_cmdline_rejects_any_non_arcelle_mcp_endpoint(url: str) -> None:
+    with pytest.raises(ValueError, match="loopback"):
+        external_llm.build_agent_cmdline(
+            "codex-cli", None, None, codex_mcp_url=url
+        )
 
 
 def test_the_creativity_slider_is_not_kept_where_it_cannot_be_used() -> None:

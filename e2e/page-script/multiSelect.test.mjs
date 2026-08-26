@@ -42,7 +42,7 @@ const SIDEBAR = read("src/workspace/Sidebar.tsx");
 const OVERLAYS = read("src/workspace/Overlays.tsx");
 const TRASH = read("src/workspace/TrashPanel.tsx");
 const API = read("src/api.ts");
-const LIB = read("src-tauri/src/lib.rs");
+const IPC = read("electron-migration/electron-app/electron/main/fileSurfaceIpc.ts");
 const MOCK = read("qa/qa-mock.js");
 
 /** A TS/TSX function body, by brace matching from a signature fragment.
@@ -154,9 +154,9 @@ test("every batch command is registered, invoked and faked", () => {
   ]) {
     assert.match(API, new RegExp(`"${cmd}"`), `${cmd} is not invoked from api.ts`);
     assert.match(
-      LIB,
-      new RegExp(`commands::${cmd},`),
-      `${cmd} is missing from lib.rs invoke_handler`,
+      IPC,
+      new RegExp(`handle\\("${cmd}"`),
+      `${cmd} is missing from the Electron file IPC surface`,
     );
     assert.match(MOCK, new RegExp(`\\b${cmd}:`), `${cmd} has no qa-mock fixture`);
   }

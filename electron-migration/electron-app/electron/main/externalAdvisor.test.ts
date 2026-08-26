@@ -46,6 +46,7 @@ import {
   makeRunAdvisorCli,
   parseClaudeJsonResult,
   parseCodexJsonStream,
+  parseAntigravityJsonStream,
   realRunAdvisorCli,
   runAdvisorCli,
   runExternalCli,
@@ -155,6 +156,27 @@ describe("buildCommandLine", () => {
     expect(withModel).not.toContain("--effort");
     // The trailing `-` (read the prompt from stdin) stays last, after every flag.
     expect(withModel.endsWith(" -")).toBe(true);
+  });
+
+  it("antigravity: uses sandboxed streamed JSON in read-only plan mode", () => {
+    expect(buildCommandLine("antigravity-cli", { submodel: null, effort: null })).toBe(
+      "agy --sandbox --mode plan --input-format stream-json --output-format stream-json --print-timeout 5m"
+    );
+    expect(buildCommandLine("antigravity-cli", { submodel: "gemini-3.7-flash-high", effort: null })).toContain("--model 'gemini-3.7-flash-high'");
+  });
+});
+
+describe("parseAntigravityJsonStream", () => {
+  it("reads the terminal answer and token stats", () => {
+    const stdout = [
+      JSON.stringify({ event: "init", conversation_id: "test" }),
+      JSON.stringify({ event: "step_update", step_update: { step_type: "agent_response", text_delta: "hello world" } }),
+      JSON.stringify({ event: "result", result: { status: "SUCCESS", response: "hello world", usage: { input_tokens: 42, output_tokens: 2 } } }),
+    ].join("\n");
+    expect(parseAntigravityJsonStream(stdout)).toEqual({
+      text: "hello world",
+      usage: { inputTokens: 42, outputTokens: 2 },
+    });
   });
 });
 

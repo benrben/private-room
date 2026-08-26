@@ -1,5 +1,5 @@
 import { KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
-import { openUrl } from "@tauri-apps/plugin-opener";
+import { openUrl, type UnlistenFn } from "../platform";
 import Waveform, {
   SPEAKER_TONES,
   SpeakerRegion,
@@ -26,7 +26,6 @@ import {
   segmentAt,
   showsChoicesInline,
 } from "./recReview";
-import type { UnlistenFn } from "@tauri-apps/api/event";
 
 /** How far back "Mark this moment" reaches while recording. You press it AFTER
  * hearing the thing worth keeping, so a mark that started at the press would
@@ -751,8 +750,8 @@ export default function RecordingView({
       .recLiveStatus()
       .then((r) => {
         if (dead || !r || r.fileId !== fileId) return;
-        setSysNote(r.sys[0] === "error" ? r.sys[1] : null);
-        setMicNote(r.mic[0] === "error" ? r.mic[1] : null);
+        setSysNote(r.sys?.[0] === "error" ? r.sys[1] : null);
+        setMicNote(r.mic?.[0] === "error" ? r.mic[1] : null);
       })
       .catch(() => {});
     const subs: Promise<UnlistenFn>[] = [

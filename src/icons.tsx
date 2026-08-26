@@ -7,8 +7,8 @@
  * everywhere; the accent is now the PINK PEN, and it means selection and
  * active state — nothing else reaches for it. The logomark is a theme-ink
  * fill with the fold's underside in the yellow highlighter tokens (see
- * ./icons/nav.tsx); the brand plum and gold live only in src-tauri/icons
- * and public/logo.svg.
+ * ./icons/nav.tsx); the brand plum and gold live only in the master artwork
+ * under art/, the packaged macOS icons, and public/logo.svg.
  *
  * This module is a barrel: the icons are grouped by theme into sibling
  * files under ./icons/ and re-exported here so every `import { XIcon }

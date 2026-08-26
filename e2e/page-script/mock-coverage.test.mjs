@@ -22,10 +22,11 @@ import { dirname, join } from "node:path";
 const root = join(dirname(fileURLToPath(import.meta.url)), "../..");
 
 test("no frontend/host/qa-mock command drift", () => {
-  const run = spawnSync(process.execPath, [join(root, "qa/check-mock-coverage.mjs")], {
-    cwd: root,
-    encoding: "utf8",
-  });
+  const run = spawnSync(
+    process.execPath,
+    [join(root, "qa/check-mock-coverage.mjs"), "--bridge=electron"],
+    { cwd: root, encoding: "utf8" },
+  );
   assert.equal(
     run.status,
     0,

@@ -373,7 +373,10 @@ FILES_PROMPT = (
     "section 8)."
     # --- organizing ---
     "\n\nYOU ALSO KEEP THIS ROOM TIDY. list_room_files shows each file's "
-    'folder as "Folder/name" — pass that back exactly as listed. To file, '
+    'folder as "Folder/name" — that is already the complete path relative to '
+    'the room root, so pass it back exactly as listed. NEVER prepend its folder '
+    'again: "Proof/note.md" stays "Proof/note.md", never '
+    '"Proof/Proof/note.md". To file, '
     "rename or re-folder ANYTHING MORE THAN ONE FILE, use organize_files once "
     "with every change in it, never a string of move_file/rename_file calls. "
     "For a big reorganization run it with dry_run: true first, show the user "

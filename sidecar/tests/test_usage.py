@@ -13,9 +13,6 @@ the two constants that still have to agree.
 
 from __future__ import annotations
 
-import re
-from pathlib import Path
-
 import pytest
 
 from arcelle_sidecar import model_limits
@@ -28,9 +25,6 @@ from arcelle_sidecar.usage import (
     build_usage_event,
     categorize_messages,
 )
-
-_RUST = Path(__file__).resolve().parents[2] / "src-tauri" / "src" / "token_usage.rs"
-
 
 @pytest.fixture(autouse=True)
 def _cold_ratio():
@@ -136,33 +130,3 @@ def test_a_real_total_survives_an_empty_estimate() -> None:
     assert event["total_tokens"] == 700
     assert event["estimated"] is False
     assert "round" not in event
-
-
-# --------------------------------------------------------------------------- #
-# the twin on the app side
-# --------------------------------------------------------------------------- #
-
-
-def test_the_rust_twin_still_agrees_with_this_module() -> None:
-    """`token_usage.rs` still fills the bar once — the placeholder snapshot right
-    after a context handoff — so the two buckets it names have to be the two this
-    module names. Drift is a bar that reports one thing on one engine and another
-    thing on another, which is exactly the class of bug this app shipped once.
-
-    It no longer carries a twin of the categorization itself: the hand-copied
-    `FILE_TOOL_NAMES` list, and the four-bucket split that read it, were dead once
-    every real turn started being categorized here, and were deleted. So there is
-    no tool-name list left to drift, and nothing here to check for one.
-    """
-    if not _RUST.exists():  # pragma: no cover - only outside the repo checkout
-        pytest.skip("the Rust host is not part of this checkout")
-    src = _RUST.read_text()
-
-    per_token = re.search(r"const CHARS_PER_TOKEN: u64 = (\d+);", src)
-    assert per_token and int(per_token.group(1)) == CHARS_PER_TOKEN
-
-    categories = re.search(r"const CATEGORIES: &\[&str\] = &\[(.*?)\];", src, re.S)
-    assert categories
-    assert tuple(re.findall(r'"([^"]+)"', categories.group(1))) == CATEGORIES
-
-    assert "FILE_TOOL_NAMES" not in src

@@ -14,7 +14,7 @@
  */
 
 import { createCipheriv, randomBytes, randomUUID } from "node:crypto";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 import os from "node:os";
@@ -112,6 +112,7 @@ function makeCtx(db: Database.Database | null, overrides: Partial<RecBridgeDeps>
     currentRoom: (): OpenRoom | null => (db === null ? null : { db, path: roomPath }),
     resolveSttModel: () => "/models/whisper.bin",
     spoolDir: () => tmpDir,
+    sessionWsUrl: async (fileId) => `ws://127.0.0.1/rec/session?token=test&fileId=${fileId}`,
     ...overrides,
   });
 }
@@ -395,6 +396,29 @@ describe("recStart", () => {
     expect((body.meta as RecMeta).durationCs).toBe(250);
   });
 
+  it("clears an unrecoverable stale spool after restart and retries Resume once", async () => {
+    const db = freshRoom();
+    const id = addRecording(db, "interrupted.wav", defaultRecMeta());
+    const stale = path.join(tmpDir, `${id}.spool`);
+    writeFileSync(stale, "encrypted-with-a-lost-process-key");
+    let starts = 0;
+    const post = fakePost({
+      "/rec/start": () => {
+        starts += 1;
+        return starts === 1
+          ? { status: 409, json: { error: "stale", code: "REC_SPOOL_EXISTS" } }
+          : ok({ spoolKey: "", spoolPath: "" });
+      },
+    });
+    const ctx = makeCtx(db, { sidecarPost: post, connectHostWs: () => fakeHostWs() });
+
+    await expect(recStart(db, ctx, { fileId: id, systemAudio: false })).resolves.toMatchObject({
+      fileId: id,
+    });
+    expect(starts).toBe(2);
+    expect(existsSync(stale)).toBe(false);
+  });
+
   it("still starts when the voice table cannot be read — a recording that names nobody beats none", async () => {
     const db = freshRoom();
     db.exec("DROP TABLE voice_ids");
@@ -447,7 +471,7 @@ describe("pause / resume / set_live_* / stop / live status", () => {
     await expect(recSetLiveStt(ctx, true)).rejects.toThrowError("No live recording.");
     await expect(recSetLiveTranslate(ctx, "es")).rejects.toThrowError("No live recording.");
     await expect(recStop(ctx)).rejects.toThrowError("No live recording.");
-    expect(recLiveStatus(ctx)).toBeNull();
+    await expect(recLiveStatus(ctx)).resolves.toBeNull();
   });
 
   it("post the plain bodies and track the coarse local status", async () => {
@@ -462,9 +486,17 @@ describe("pause / resume / set_live_* / stop / live status", () => {
     const { ctx, fileId } = await live(db, post);
 
     await recPause(ctx);
-    expect(recLiveStatus(ctx)).toEqual({ fileId, status: "paused" });
+    await expect(recLiveStatus(ctx)).resolves.toEqual({
+      fileId,
+      status: "paused",
+      sessionUrl: `ws://127.0.0.1/rec/session?token=test&fileId=${fileId}`,
+    });
     await recResume(ctx);
-    expect(recLiveStatus(ctx)).toEqual({ fileId, status: "recording" });
+    await expect(recLiveStatus(ctx)).resolves.toEqual({
+      fileId,
+      status: "recording",
+      sessionUrl: `ws://127.0.0.1/rec/session?token=test&fileId=${fileId}`,
+    });
     await recSetLiveStt(ctx, false);
     await recSetLiveTranslate(ctx, "es");
     await recSetLiveTranslate(ctx, "   "); // whitespace-only turns it OFF
@@ -1469,6 +1501,32 @@ describe("recTranslate", () => {
     expect(content).toContain("only one line came back");
     expect(content).toContain("[0:01] You: dos");
     expect(content).toContain("1 line(s) came back untranslated");
+  });
+
+  it("GH #24: translates a 45-minute transcript through every batch instead of stopping near minute two", async () => {
+    const db = freshRoom();
+    const segments = Array.from({ length: 45 }, (_, minute) =>
+      phrase([word(`Hebrew line ${minute + 1}`, minute * 6_000, minute * 6_000 + 100)])
+    );
+    const id = addRecording(db, "long-hebrew.wav", {
+      ...defaultRecMeta(),
+      durationCs: 45 * 60 * 100,
+      segments,
+    });
+    let calls = 0;
+    const ctx = makeCtx(db, {
+      generate: async (prompt) => {
+        calls++;
+        return prompt.slice(prompt.indexOf("\n\n") + 2);
+      },
+    });
+
+    const file = await recTranslate(db, ctx, id, "English");
+    const content = getFileExtractedText(db, file.id) as string;
+    expect(calls).toBe(4);
+    expect(content).toContain("[0:00] You: Hebrew line 1");
+    expect(content).toContain("[44:00] You: Hebrew line 45");
+    expect(content.match(/Hebrew line/g)).toHaveLength(45);
   });
 
   it("refuses an empty language, a silent recording, and an unavailable model", async () => {

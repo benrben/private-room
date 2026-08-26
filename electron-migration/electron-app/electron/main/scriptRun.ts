@@ -1067,6 +1067,20 @@ function groupAlive(pid: number): boolean {
   }
 }
 
+/** Wait until POSIX reports that the whole process group is gone. Signal
+ * delivery is asynchronous: immediately returning after `kill(-pgid,
+ * SIGKILL)` leaves a small but real window where a cancelled grandchild still
+ * exists. Keep the wait bounded so a process wedged in uninterruptible I/O
+ * can never pin Arcelle's single script slot forever. */
+async function groupGoneWithin(pid: number, ms: number): Promise<boolean> {
+  const deadline = Date.now() + ms;
+  while (groupAlive(pid)) {
+    if (Date.now() >= deadline) return false;
+    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+  }
+  return true;
+}
+
 /**
  * SIGTERM the group, wait a grace period, then SIGKILL and confirm — the
  * `ollama_lifecycle` kill pattern, applied to the whole group so `uv`'s python
@@ -1085,6 +1099,7 @@ async function terminateGroup(child: ChildProcess, pid: number): Promise<void> {
   if (!(await exitedWithin(child, KILL_GRACE_MS))) {
     killGroup(pid, "SIGKILL");
     await exitedWithin(child, KILL_GRACE_MS);
+    await groupGoneWithin(pid, KILL_GRACE_MS);
     return;
   }
   // The direct child is gone — the GROUP may not be. `uv` exits on SIGTERM
@@ -1093,7 +1108,10 @@ async function terminateGroup(child: ChildProcess, pid: number): Promise<void> {
   // grandchild running FOREVER as an orphan — burning CPU, holding this run's
   // stdio pipes open in the main process, and outliving the timeout that was
   // supposed to end it. SIGKILL cannot be ignored.
-  if (groupAlive(pid)) killGroup(pid, "SIGKILL");
+  if (groupAlive(pid)) {
+    killGroup(pid, "SIGKILL");
+    await groupGoneWithin(pid, KILL_GRACE_MS);
+  }
 }
 
 /**

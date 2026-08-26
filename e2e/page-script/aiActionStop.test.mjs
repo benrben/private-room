@@ -25,7 +25,7 @@ const read = (rel) => readFileSync(join(root, rel), "utf8");
 const modal = read("src/workspace/AiActionModal.tsx");
 const actions = read("src/workspace/studioActions.ts");
 const api = read("src/api.ts");
-const host = read("src-tauri/src/commands/moonshot/ai_actions.rs");
+const host = read("electron-migration/electron-app/electron/main/moonshotAiActions.ts");
 
 test("the AI action modal offers Stop while it is running", () => {
   assert.match(modal, /a\.stopAiAction\(\)/, "no Stop control in the modal");
@@ -58,17 +58,17 @@ test("Stop reaches the host through the id the run was started with", () => {
 });
 
 test("the host registers the run under that id and refuses to save a stopped one", () => {
-  assert.match(host, /op_id: Option<String>/, "the command takes no cancel id");
+  assert.match(host, /opId: string \| null/, "the command takes no cancel id");
   assert.match(
     host,
-    /register_studio_cancel\(&state, &op_id/,
+    /registerAiActionCancel\(deps\.cancelState, opId/,
     "the flag is never put in the registry the Stop button reaches",
   );
   assert.match(
     host,
-    /sidecar_json_cancellable\("\/ai_action"/,
+    /post\("\/ai_action", body, cancel\)/,
     "the model call cannot be abandoned",
   );
   // The whole point: a stopped run writes nothing into the room.
-  assert.match(host, /guard_commit\(&cancel/, "a stopped run could still save its file");
+  assert.match(host, /guardCommit\(cancel,/, "a stopped run could still save its file");
 });

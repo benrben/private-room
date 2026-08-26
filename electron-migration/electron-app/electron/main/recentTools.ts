@@ -226,9 +226,10 @@ export function mergeRecent(list: readonly RecentRoom[], entry: RecentRoom): Rec
 export function renameRecent(
   list: readonly RecentRoom[],
   roomPath: string,
-  name: string
+  name: string,
+  newPath: string = roomPath,
 ): RecentRoom[] {
-  return list.map((r) => (r.path === roomPath ? { ...r, name } : r));
+  return list.map((r) => (r.path === roomPath ? { ...r, name, path: newPath } : r));
 }
 
 /**

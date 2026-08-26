@@ -127,7 +127,7 @@ def test_constants_match_rust_source() -> None:
 # ------------------------------------------------------- _vad_model_path()
 
 
-def test_vad_model_path_fallback_is_the_real_repo_resources_dir() -> None:
+def test_vad_model_path_fallback_is_the_electron_development_models_dir() -> None:
     """No override set -> the CARGO_MANIFEST_DIR-relative fallback,
     independently verified against this exact checkout's real layout (not
     merely re-deriving the module's own computation) — the SAME directory
@@ -135,11 +135,11 @@ def test_vad_model_path_fallback_is_the_real_repo_resources_dir() -> None:
     paths against.
     """
     assert vad._vad_model_path_override is None
-    expected = f"{REPO_ROOT}/src-tauri/resources/models/silero_vad.onnx"
+    expected = f"{REPO_ROOT}/electron-migration/electron-app/assets/models/silero_vad.onnx"
     assert vad._vad_model_path() == expected
     # The directory genuinely exists on this machine (it holds the OTHER
     # vendored models) even though the ONNX file itself does not yet.
-    assert Path(REPO_ROOT, "src-tauri", "resources", "models").is_dir()
+    assert Path(REPO_ROOT, "electron-migration", "electron-app", "assets", "models").is_dir()
 
 
 def test_set_vad_model_path_overrides_and_is_callable_repeatedly() -> None:

@@ -25,7 +25,8 @@ import { IconProps } from "./types";
  * everywhere; the accent is the BERRY PEN, and it means selection and active
  * state — nothing else reaches for it. The logomark is a theme-ink fill with
  * the fold's underside in the yellow highlighter tokens (see ./icons/nav.tsx);
- * the brand plum and gold live only in src-tauri/icons and public/logo.svg.
+ * the brand plum and gold live only in art/, the packaged macOS icons, and
+ * public/logo.svg.
  */
 
 export function Stroke({

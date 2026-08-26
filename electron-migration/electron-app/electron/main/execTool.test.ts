@@ -1031,20 +1031,17 @@ describe("save_skill", () => {
     expect(listSkills(room, false)).toEqual([]);
   });
 
-  it("reports NOT_IMPLEMENTED for source_files, without writing anything", async () => {
+  it("bundles source_files into the disabled draft", async () => {
     const room = freshRoom();
     const ctx = deps({ db: room });
+    insertFile(room, "notes.md", "text/markdown", Buffer.from("Supplier evidence"), "Supplier evidence", "user");
     const result = await execTool("save_skill", { name: "x", description: "d", instructions: "i", source_files: ["notes.md"] }, effects(), ctx);
-    expect(result.ok).toBe(false);
-    // The merged convention is A's machine-readable `NOT_IMPLEMENTED:` prefix
-    // (the exhaustive coverage test keys off it), naming the owning batch.
-    if (!result.ok) {
-      expect(result.error).toMatch(/^NOT_IMPLEMENTED: /);
-      expect(result.error).toContain("files.ts");
-    }
-    // Genuinely partial, and the partiality must not leak: a save that
-    // refused half-way would leave a draft the user never asked for.
-    expect(listSkills(room, false)).toEqual([]);
+    expect(result.ok).toBe(true);
+    const skill = findSkill(room, "x")!;
+    expect(skill.enabled).toBe(false);
+    expect(listSkillResources(room, skill.id).map((resource) => resource.path)).toEqual([
+      "references/source-files/notes-md.md",
+    ]);
   });
 
   it("validates fields (empty description) before touching the room", async () => {

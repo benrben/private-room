@@ -1,7 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { confirm } from "@tauri-apps/plugin-dialog";
-import { getCurrentWindow } from "@tauri-apps/api/window";
-import { exit } from "@tauri-apps/plugin-process";
+import { closeWindow, confirm } from "./platform";
 import { Props, WorkArea, areaHoldsFile, isWorkArea } from "./workspace/types";
 import { useTabs, tabId, type Tab } from "./workspace/tabs";
 import { useBrowserPages } from "./workspace/browserPages";
@@ -109,55 +107,6 @@ export default function Workspace({ info, onLock, onRenamed }: Props) {
   // preferences it edits are their own device-wide store (shell/navPrefs).
   const [showCustomize, setShowCustomize] = useState(false);
 
-  // ...and the same question on the way out of the app. Closing the window is
-  // the one exit that never passes through the lock path, so it asks here.
-  // Anything unexpected (no dialog available, a rejected prompt) lets the
-  // close proceed — a door that can't be answered must never trap the user.
-  useEffect(() => {
-    const win = getCurrentWindow();
-    const unlisten = win.onCloseRequested(async (e) => {
-      // Registering ANY close listener makes the Rust side prevent every
-      // native close and hand it to JS (tauri calls `prevent_close` whenever a
-      // window has a JS listener), so from here on this handler owns closing
-      // the window — including when there is nothing to ask about.
-      e.preventDefault();
-      if (s.editModeRef.current && s.editorDirtyRef.current) {
-        const go = await confirm(
-          "This file has edits you haven't saved yet. Quitting Arcelle loses them.",
-          { title: "Unsaved edits", kind: "warning", okLabel: "Quit and discard" },
-        ).catch(() => true);
-        if (!go) return;
-        s.editorDirtyRef.current = false;
-      }
-      // Answered — so the ⌘Q door below must not ask the same question again
-      // on the way through `RunEvent::ExitRequested`.
-      await api.setUnsavedEdits(false).catch(() => {});
-      // `destroy()` is the documented move and now has its grant
-      // (core:window:allow-destroy in capabilities/default.json — core:default
-      // does NOT include it, and without it the ACL rejected the call and the
-      // window simply stopped closing). Quitting the process is the same thing
-      // for a single-window app and runs the same RunEvent::Exit teardown, so
-      // it stays as the fallback. Both denied has to be loud: a red button that
-      // does nothing is the worst outcome.
-      await win
-        .destroy()
-        .catch(() => exit(0))
-        .catch((err) => {
-          console.error("[shell] couldn't close the window:", err);
-          s.pushToast("error", "Couldn't close the window — use Arcelle → Quit.");
-        });
-    });
-    return () => {
-      void unlisten.then((fn) => fn()).catch(() => {});
-    };
-    // Mount-once: the handler reads refs only, while `s` is a fresh object
-    // every render — re-registering per render costs two IPC round-trips each
-    // time, and because the removal is asynchronous the outgoing listener is
-    // still live while the incoming one is added, which is two "Unsaved edits"
-    // dialogs on one close.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
   // ⌘Q raises NO window close request on macOS (the menu's Quit goes through
   // NSApplication terminate:, and tao only emits CloseRequested from
   // windowShouldClose:), so the guard above never sees it and the buffer went
@@ -195,7 +144,7 @@ export default function Workspace({ info, onLock, onRenamed }: Props) {
       }
       s.editorDirtyRef.current = false;
       await api.setUnsavedEdits(false).catch(() => {});
-      await exit(0).catch(() => {});
+      await api.quitGuardConfirm().catch(() => {});
     });
     return () => {
       window.clearInterval(timer);
@@ -245,7 +194,7 @@ export default function Workspace({ info, onLock, onRenamed }: Props) {
   /** Put the app into the state a tab describes. The tab list is the source of
    * truth; these flags are the machinery it drives. */
   const showArea = useCallback(
-    (next: Exclude<WorkArea, "files">) => {
+    (next: WorkArea) => {
       // Leaving a full-pane view is explicit; entering one uses its real
       // action so refresh side-effects keep firing.
       if (next === "workflows") {
@@ -410,7 +359,7 @@ export default function Workspace({ info, onLock, onRenamed }: Props) {
       guardLeave("Closing this file", () => s.setOpenFile(null));
       return;
     }
-    void getCurrentWindow().close();
+    void closeWindow();
   }, [area, pages, closeTab, guardLeave, s]);
 
   // Rail click = go there. Places used to earn a TAB as well, which is what
@@ -456,7 +405,7 @@ export default function Workspace({ info, onLock, onRenamed }: Props) {
   const lastFileRef = useRef<Partial<Record<WorkArea, string>>>({});
 
   const openArea = useCallback(
-    (next: Exclude<WorkArea, "files">) => {
+    (next: WorkArea) => {
       guardLeave("Opening this area", () => {
         // Remember what was open HERE before leaving — but only if this
         // destination actually held it. A document showing over a destination
@@ -564,7 +513,7 @@ export default function Workspace({ info, onLock, onRenamed }: Props) {
     // area tabs in their settings, and this is the tick between them being
     // read back and the prune below dropping them. Applying it keeps that tick
     // honest — the room opens where it was left.
-    showArea(tab.ref as Exclude<WorkArea, "files">);
+    showArea(tab.ref as WorkArea);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tabs.active?.id]);
 

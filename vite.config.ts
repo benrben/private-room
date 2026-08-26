@@ -1,35 +1,22 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
-// `tauri dev --host` injects TAURI_DEV_HOST. Read through globalThis so this
-// file type-checks (`npm run typecheck`) whether or not @types/node happens to
-// be resolvable — it is only a transitive dependency here.
-const host = (globalThis as { process?: { env?: Record<string, string | undefined> } })
-  .process?.env?.TAURI_DEV_HOST;
-
 // https://vite.dev/config/
 export default defineConfig(async () => ({
   plugins: [react()],
+  // Electron loads the packaged renderer from a file inside app.asar.  Every
+  // emitted asset therefore uses a relative URL rather than a web-root URL.
+  base: "./",
 
-  // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
-  //
-  // 1. prevent Vite from obscuring rust errors
+  // Keep the renderer server stable for Electron main's ARCELLE_RENDERER_URL.
   clearScreen: false,
-  // 2. tauri expects a fixed port, fail if that port is not available
   server: {
     port: 1420,
     strictPort: true,
-    host: host || false,
-    hmr: host
-      ? {
-          protocol: "ws",
-          host,
-          port: 1421,
-        }
-      : undefined,
+    host: "127.0.0.1",
+    hmr: { protocol: "ws" },
     watch: {
-      // 3. tell Vite to ignore watching `src-tauri`
-      ignored: ["**/src-tauri/**"],
+      ignored: ["**/electron-migration/electron-app/dist_package/**"],
     },
   },
 }));

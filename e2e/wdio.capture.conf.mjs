@@ -1,7 +1,7 @@
 // WebdriverIO config for the SCREENSHOT CAPTURE run (e2e/capture-specs/*.mjs).
 //
 // Same vehicle as wdio.qa.conf.mjs — the real React app in Chrome against
-// dist/qa.html, with qa/qa-mock.js standing in for Rust — but the job is
+// dist/qa.html, with qa/qa-mock.js standing in for Electron IPC — but the job is
 // different: instead of asserting, it walks every screen, state, theme and
 // viewport and writes PNGs for the vision dataset.
 //

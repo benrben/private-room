@@ -27,12 +27,12 @@ CHAT/AGENT parity: :class:`ExternalChatModel` implements the same one-method
 ``chat.ChatModel`` seam the local engine uses, so the agent hub (main agent +
 domain agents, ``agents.py``/``manager.py``/``graph.py``) runs on a cloud CLI
 through *exactly the same code* — same registry, same scoped tool boxes, same
-``plan``/``agent`` roster events. The CLIs expose no structured tool-call API
-in ``-p``/``exec`` mode (their own tool loop is MCP-side and invisible to us),
-so the seam speaks a text tool protocol: the catalog is rendered into the
-prompt and one JSON envelope comes back. Deltas are emitted only once the
-reply is known NOT to be a tool call — a half-streamed envelope would spray
-JSON into the transcript.
+``plan``/``agent`` roster events. Claude and Codex receive the exact per-agent
+catalog through ephemeral, loopback-only MCP endpoints; Antigravity currently
+uses the equivalent text tool protocol because its print mode has no
+per-invocation MCP-config flag. Deltas are emitted only once the reply is known
+NOT to be a tool call — a half-streamed envelope would spray JSON into the
+transcript.
 """
 
 from __future__ import annotations
@@ -45,6 +45,7 @@ import secrets
 import tempfile
 import time
 from typing import Any, Optional
+from urllib.parse import urlsplit
 
 from . import hub_mcp
 from .hub_mcp import HUB_SERVER_NAME, HubToolServer
@@ -53,7 +54,7 @@ from .model_text import recover_json
 from .prompts import READ_RESULT_TOOL
 
 #: Engine ids that name a cloud coding CLI (mirror external.rs).
-EXTERNAL_ENGINES = ("claude-cli", "codex-cli")
+EXTERNAL_ENGINES = ("claude-cli", "codex-cli", "antigravity-cli")
 
 #: How long an external CLI may produce NOTHING before it is presumed wedged.
 #:
@@ -363,7 +364,7 @@ def _tool_result_block(name: str, content: str) -> str:
 
 #: Hub-internal tool names: resolved inside the graph, never on the room
 #: bridge. They reach a harness engine through the hub's OWN MCP endpoint
-#: (:mod:`.hub_mcp`), and fall back to the text protocol for Codex.
+#: (:mod:`.hub_mcp`).
 #:
 #: `read_result` belongs here for exactly the reason `request_tools` does — it
 #: is minted by `execute_tools` and the bridge has no such tool. Left out, it
@@ -371,6 +372,80 @@ def _tool_result_block(name: str, content: str) -> str:
 #: its OWN runtime that the tool does not exist, which is the "No such tool
 #: available" failure this split was written to end.
 _HUB_ONLY_TOOLS = ("request_tools", READ_RESULT_TOOL)
+
+
+#: Codex itself uses "agent" and "sub-agent" as privileged concepts. Even
+#: with an MCP tool named ``ask_file_agent`` visibly mounted, its stock harness
+#: prompt refused the call as unavailable/forbidden (live packaged-app proof,
+#: 2026-08-26). Ordinary room verbs on the same endpoint worked. Give only
+#: Codex neutral APPLICATION capability names, then map captured calls back to
+#: the graph's stable names before execution. This is presentation, not a new
+#: execution path: Arcelle still resolves the specialist and owns every
+#: approval/commit gate.
+_CODEX_NATIVE_TOOL_ALIASES: dict[str, str] = {
+    "ask_file_agent": "work_with_room_files",
+    "ask_web_agent": "work_with_the_web",
+    "ask_app_agent": "operate_arcelle_ui",
+    "ask_jobs_agent": "manage_jobs_and_workflows",
+    "ask_skills_agent": "work_with_arcelle_skills",
+    "ask_connector_agent": "work_with_connectors",
+    "ask_agents": "coordinate_room_work",
+}
+_CODEX_NATIVE_TOOL_DESCRIPTIONS: dict[str, str] = {
+    "ask_file_agent": (
+        "Use this connected Arcelle application control for any operation on "
+        "this room's files, notes, recordings, scripts, drawings, or generated "
+        "artifacts, including reading, creating, editing, renaming, moving, "
+        "organizing, deleting, transcribing, and running room scripts."
+    ),
+    "ask_web_agent": (
+        "Use this connected Arcelle application control to search the web or "
+        "open and operate pages in the room's private browser."
+    ),
+    "ask_app_agent": (
+        "Use this connected Arcelle application control to inspect or operate "
+        "Arcelle's own interface."
+    ),
+    "ask_jobs_agent": (
+        "Use this connected Arcelle application control for workflows, "
+        "schedules, background jobs, and whole-file passes."
+    ),
+    "ask_skills_agent": (
+        "Use this connected Arcelle application control to list, read, run, "
+        "create, or edit the room's reusable skills."
+    ),
+    "ask_connector_agent": (
+        "Use this connected Arcelle application control for configured "
+        "third-party connectors and their tools."
+    ),
+    "ask_agents": (
+        "Use this connected Arcelle application control when the request has "
+        "several independent parts. Submit every part together in tasks."
+    ),
+}
+
+_MAIN_AGENT_PROMPT_START = "\n\nYou are the MAIN AGENT."
+_MAIN_AGENT_PROMPT_END = (
+    "Greetings, thanks and general knowledge you answer directly."
+)
+_CODEX_COORDINATOR_PROMPT = """
+
+You are Arcelle's ROOM COORDINATOR. The MCP tools in your live tool list are
+direct controls for the Arcelle application. They are NOT Codex agents or
+sub-agents, and they do NOT touch your Codex workspace. Your own sandbox may be
+read-only while the Arcelle room is writable; that does not limit these tools.
+For any request about this room or any requested change, call the matching
+Arcelle control: room files use work_with_room_files; web pages use
+work_with_the_web; Arcelle's interface uses operate_arcelle_ui; automation uses
+manage_jobs_and_workflows; reusable skills use work_with_arcelle_skills; and
+connectors use work_with_connectors. For several parts, call
+coordinate_room_work once with every part. After a control returns, answer
+from its report. Never claim the
+workspace, file controls, browser, jobs, skills, or connectors are unavailable
+while the matching control is present in your live MCP tool list. Greetings,
+thanks, and general knowledge that need no Arcelle data may be answered
+directly.
+""".rstrip()
 
 
 def _is_hub_only(name: str) -> bool:
@@ -381,7 +456,10 @@ def _tool_name_of(tool: dict[str, Any]) -> str:
     return str((tool.get("function") or {}).get("name") or "")
 
 
-def _hub_calls(captured: list[tuple[str, dict[str, Any]]]) -> list[ToolCall]:
+def _hub_calls(
+    captured: list[tuple[str, dict[str, Any]]],
+    names: dict[str, str] | None = None,
+) -> list[ToolCall]:
     """Delegations captured by the hub endpoint, as ordinary tool calls.
 
     Same shape `parse_tool_calls` produces, so everything downstream — the
@@ -390,6 +468,7 @@ def _hub_calls(captured: list[tuple[str, dict[str, Any]]]) -> list[ToolCall]:
     """
     calls: list[ToolCall] = []
     for i, (name, args) in enumerate(captured):
+        name = (names or {}).get(name, name)
         call_id = f"hub_{i}"
         calls.append(
             ToolCall(
@@ -404,6 +483,116 @@ def _hub_calls(captured: list[tuple[str, dict[str, Any]]]) -> list[ToolCall]:
             )
         )
     return calls
+
+
+def _codex_tool(
+    tool: dict[str, Any], aliases: dict[str, str]
+) -> dict[str, Any]:
+    """A tool spec with Codex's collision-free display name, if needed."""
+    fn = tool.get("function")
+    if not isinstance(fn, dict):
+        return tool
+    name = str(fn.get("name") or "")
+    alias = aliases.get(name)
+    if not alias:
+        return tool
+    params = json.loads(json.dumps(fn.get("parameters") or {}))
+
+    def neutralize_descriptions(value: Any) -> None:
+        if isinstance(value, dict):
+            description = value.get("description")
+            if isinstance(description, str):
+                description = re.sub(
+                    r"\bspecialists?\b", "Arcelle controls", description, flags=re.I
+                )
+                description = re.sub(
+                    r"\bagents?\b", "Arcelle controls", description, flags=re.I
+                )
+                value["description"] = description
+            for child in value.values():
+                neutralize_descriptions(child)
+        elif isinstance(value, list):
+            for child in value:
+                neutralize_descriptions(child)
+
+    neutralize_descriptions(params)
+    return {
+        **tool,
+        "function": {
+            **fn,
+            "name": alias,
+            "description": _CODEX_NATIVE_TOOL_DESCRIPTIONS.get(
+                name,
+                (
+                    "Connected Arcelle application control for the encrypted "
+                    "room. It operates through Arcelle's own approval and "
+                    "commit gates, not the Codex workspace. "
+                    + str(fn.get("description") or "")
+                ),
+            ),
+            "parameters": params,
+        },
+    }
+
+
+def _codex_system(content: str, aliases: dict[str, str]) -> str:
+    """Replace the graph's harness-shaped coordinator prose for Codex only."""
+    start = content.find(_MAIN_AGENT_PROMPT_START)
+    if start >= 0:
+        end = content.find(_MAIN_AGENT_PROMPT_END, start)
+        if end >= 0:
+            end += len(_MAIN_AGENT_PROMPT_END)
+            content = content[:start] + _CODEX_COORDINATOR_PROMPT + content[end:]
+    for name, alias in sorted(
+        aliases.items(), key=lambda item: len(item[0]), reverse=True
+    ):
+        content = content.replace(name, alias)
+    # A deterministic plan may follow the replaced coordinator paragraph. It
+    # describes the same application controls; avoid reintroducing Codex's
+    # privileged agent/sub-agent vocabulary in that tail.
+    content = re.sub(r"\bspecialists?\b", "Arcelle controls", content, flags=re.I)
+    return content
+
+
+def _codex_messages(
+    messages: list[Message], aliases: dict[str, str] | None = None
+) -> list[Message]:
+    """Render graph history with the same neutral names Codex sees over MCP.
+
+    The Main-agent prompt and later-round tool history contain the graph's
+    stable ``ask_*_agent`` names. Leaving those untouched while the live MCP
+    catalog uses aliases creates a contradictory instruction and, after the
+    first call, teaches the model to repeat a tool it no longer sees.
+    """
+    aliases = aliases or _CODEX_NATIVE_TOOL_ALIASES
+    out: list[Message] = []
+    for message in messages:
+        current: Message = dict(message)
+        content = current.get("content")
+        if current.get("role") == "system" and isinstance(content, str):
+            current["content"] = _codex_system(content, aliases)
+        calls = current.get("tool_calls")
+        if isinstance(calls, list):
+            rendered: list[dict[str, Any]] = []
+            for call in calls:
+                if not isinstance(call, dict):
+                    rendered.append(call)
+                    continue
+                fn = call.get("function")
+                if not isinstance(fn, dict):
+                    rendered.append(call)
+                    continue
+                name = str(fn.get("name") or "")
+                alias = aliases.get(name)
+                rendered.append(
+                    {**call, "function": {**fn, "name": alias or name}}
+                )
+            current["tool_calls"] = rendered
+        tool_name = current.get("tool_name")
+        if isinstance(tool_name, str):
+            current["tool_name"] = aliases.get(tool_name, tool_name)
+        out.append(current)
+    return out
 
 
 def _bridge_tools(tools: list[dict[str, Any]]) -> list[str]:
@@ -461,10 +650,48 @@ CLAUDE_NO_TOOLS_FLAGS = " --strict-mcp-config --allowedTools 'mcp__none__*'"
 #: approval. The agent hub reaches the room through OUR bridge, so the CLI's own
 #: machinery for touching the outside world stays off.
 CODEX_ARCELLE_FLAGS = (
-    " --ignore-user-config --ephemeral --skip-git-repo-check"
+    " --ignore-user-config --ignore-rules --ephemeral --skip-git-repo-check"
     " --sandbox read-only -c 'approval_policy=\"never\"' --disable shell_tool"
     " --disable unified_exec -c 'web_search=\"disabled\"'"
 )
+
+_CODEX_MCP_TOKEN_ENV = "ARCELLE_CODEX_MCP_TOKEN"
+
+
+def _codex_mcp_flags(url: str | None) -> str:
+    """Wire Codex to Arcelle's per-turn loopback MCP without exposing its token.
+
+    The URL comes from :class:`HubToolServer`, but validate it at this shell
+    boundary before interpolation. Remote connectors stay behind the room's
+    approval and redaction bridge; this direct lane is loopback-only.
+    """
+    if not url:
+        return ""
+    parsed = urlsplit(url)
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname not in {"127.0.0.1", "localhost"}
+        or parsed.port is None
+        or parsed.path != "/mcp"
+        or parsed.query
+        or parsed.fragment
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise ValueError("Codex MCP endpoint must be Arcelle's loopback /mcp URL")
+    safe_url = f"http://127.0.0.1:{parsed.port}/mcp"
+    # Override the WHOLE table. With --ignore-user-config, current Codex builds
+    # apply an inline table but silently drop equivalent dotted mcp_servers.*
+    # overrides (live CLI proof 2026-08-26). The explicit approval mode is safe
+    # because this endpoint only CAPTURES calls; Arcelle's own tool executor
+    # still owns every user confirmation and commit gate.
+    return (
+        " -c 'mcp_servers={hub={"
+        f'url="{safe_url}",'
+        f'bearer_token_env_var="{_CODEX_MCP_TOKEN_ENV}",'
+        'default_tools_approval_mode="approve"'
+        "}}'"
+    )
 
 
 #: What a model slug / effort level is allowed to look like before it may be
@@ -493,6 +720,7 @@ def build_agent_cmdline(
     mcp_path: str | None = None,
     allowed: list[str] | None = None,
     hub_allowed: list[str] | None = None,
+    codex_mcp_url: str | None = None,
 ) -> str:
     """The CLI invocation for one AGENT round, mirroring ``external.rs``.
 
@@ -551,7 +779,16 @@ def build_agent_cmdline(
         )
     if engine == "codex-cli":
         effort_flag = f" -c 'model_reasoning_effort={effort}'" if effort else ""
-        return f"codex exec --json{CODEX_ARCELLE_FLAGS}{model_flag}{effort_flag} -"
+        return (
+            f"codex exec --json{CODEX_ARCELLE_FLAGS}{_codex_mcp_flags(codex_mcp_url)}"
+            f"{model_flag}{effort_flag} -"
+        )
+    if engine == "antigravity-cli":
+        return (
+            "agy --sandbox --mode plan --input-format stream-json "
+            "--output-format stream-json --print-timeout 5m"
+            f"{model_flag}"
+        )
     raise ValueError(f"Unknown external engine: {engine}")
 
 
@@ -733,6 +970,44 @@ def parse_codex_json_stream(stdout: str) -> tuple[str, int | None, int | None]:
     return text, input_tokens, None
 
 
+def parse_antigravity_json_stream(stdout: str) -> tuple[str, int | None, int | None]:
+    """``(text, input_tokens, None)`` from Antigravity's stream-json JSONL.
+
+    Assistant message deltas form the answer and the terminal result carries
+    aggregate token statistics. Raw stdout is preserved on schema drift.
+    """
+    text = ""
+    input_tokens: int | None = None
+    parsed_any = False
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        parsed_any = True
+        if event.get("event") == "step_update":
+            update = event.get("step_update")
+            if (
+                isinstance(update, dict)
+                and update.get("step_type") == "agent_response"
+                and isinstance(update.get("text_delta"), str)
+            ):
+                text += update["text_delta"]
+        elif event.get("event") == "result":
+            result = event.get("result")
+            if isinstance(result, dict):
+                if isinstance(result.get("response"), str):
+                    text = result["response"]
+                usage = result.get("usage")
+                if isinstance(usage, dict) and isinstance(usage.get("input_tokens"), int):
+                    input_tokens = usage["input_tokens"]
+    if not parsed_any:
+        text = stdout.strip()
+    return text, input_tokens, None
+
+
 def build_cmdline(engine: str, submodel: str | None, effort: str | None) -> str:
     """The exact CLI invocation Rust uses (external.rs), minus MCP bridging —
     pipeline generation is a pure text call, the CLI is not an agent here.
@@ -751,6 +1026,11 @@ def build_cmdline(engine: str, submodel: str | None, effort: str | None) -> str:
     if engine == "codex-cli":
         effort_flag = f" -c 'model_reasoning_effort={effort}'" if effort else ""
         return f"codex exec --skip-git-repo-check{model_flag}{effort_flag} -"
+    if engine == "antigravity-cli":
+        return (
+            "agy --sandbox --mode plan --input-format stream-json "
+            f"--output-format stream-json --print-timeout 5m{model_flag}"
+        )
     raise ValueError(f"Unknown external engine: {engine}")
 
 
@@ -782,11 +1062,17 @@ async def generate_external(
             "zsh",
             "-ilc",
             fenced_cmdline(cmdline),
+            cwd=tempfile.gettempdir() if engine == "antigravity-cli" else None,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await drain_with_idle(proc, prompt.encode("utf-8"), idle, cancel)
+        wire_prompt = (
+            json.dumps({"event": "user", "message": {"role": "user", "content": prompt}}) + "\n"
+            if engine == "antigravity-cli"
+            else prompt
+        )
+        stdout, stderr = await drain_with_idle(proc, wire_prompt.encode("utf-8"), idle, cancel)
     except _Wedged as exc:
         # Silent for the whole idle budget: stopped rather than hung forever.
         # This raise is NOT caught by the generic `except Exception` below — an
@@ -809,6 +1095,8 @@ async def generate_external(
             "ENGINE_ERROR",
             f"{engine} failed: {cli_failure_reason(out, strip_shell_banner(stderr))}",
         )
+    if engine == "antigravity-cli":
+        return parse_antigravity_json_stream(out)[0].strip()
     return out.strip()
 
 
@@ -1228,8 +1516,9 @@ class ExternalChatModel:
         instructions and the tool catalog (kilobytes, arbitrary user text), so
         quoting it into a `zsh -ilc` command line would be both fragile and an
         injection surface. ``bridge_tools`` names this agent's box, handed to
-        Claude as a real MCP allowlist; ``hub`` is the per-round delegation
-        endpoint (:mod:`.hub_mcp`) when this round offers ask_*_agent tools.
+        Claude as a real MCP allowlist; ``hub`` is the per-round captured-tool
+        endpoint (:mod:`.hub_mcp`). Claude uses it for delegation and Codex
+        uses it for its entire exact scoped catalog.
         Both files live for the call only.
         """
         paths: list[str] = []
@@ -1259,6 +1548,9 @@ class ExternalChatModel:
                 mcp_path,
                 bridge_tools or [],
                 hub_tools=hub_tools or [],
+                codex_mcp=(hub.url, hub.token)
+                if self.engine == "codex-cli" and hub is not None
+                else None,
             )
         finally:
             for path in paths:
@@ -1275,6 +1567,7 @@ class ExternalChatModel:
         mcp_path: str | None = None,
         allowed: list[str] | None = None,
         hub_tools: list[str] | None = None,
+        codex_mcp: tuple[str, str] | None = None,
     ) -> str:
         from .llm import LlmError  # local import: llm.py imports this module
 
@@ -1287,14 +1580,20 @@ class ExternalChatModel:
                 mcp_path=mcp_path,
                 allowed=allowed,
                 hub_allowed=hub_tools,
+                codex_mcp_url=codex_mcp[0] if codex_mcp is not None else None,
             )
         except ValueError as exc:  # doctored model string — never reaches a shell
             raise LlmError("ENGINE_ERROR", str(exc)) from exc
         try:
+            child_env = os.environ.copy()
+            if codex_mcp is not None:
+                child_env[_CODEX_MCP_TOKEN_ENV] = codex_mcp[1]
             proc = await asyncio.create_subprocess_exec(
                 "zsh",
                 "-ilc",
                 fenced_cmdline(cmdline),
+                cwd=tempfile.gettempdir() if self.engine == "antigravity-cli" else None,
+                env=child_env,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -1309,8 +1608,13 @@ class ExternalChatModel:
         # wrong instrument and what replaced it.
         idle = external_idle_secs()
         try:
+            wire_prompt = (
+                json.dumps({"event": "user", "message": {"role": "user", "content": prompt}}) + "\n"
+                if self.engine == "antigravity-cli"
+                else prompt
+            )
             stdout, stderr = await drain_with_idle(
-                proc, prompt.encode("utf-8"), idle, cancel
+                proc, wire_prompt.encode("utf-8"), idle, cancel
             )
         except _Wedged as exc:
             raise LlmError(
@@ -1343,14 +1647,26 @@ class ExternalChatModel:
         send = await self._compact(send, tools, self._stated_context, cancel)
         if _stopped(cancel):
             return "", [], self._usage()
+        codex_aliases = (
+            {
+                name: _CODEX_NATIVE_TOOL_ALIASES.get(name, f"arcelle_{name}")
+                for name in (_tool_name_of(t) for t in tools)
+                if name
+            }
+            if self.engine == "codex-cli"
+            else {}
+        )
+        rendered_messages = (
+            _codex_messages(send, codex_aliases)
+            if self.engine == "codex-cli"
+            else send
+        )
         # WHICH TOOLS ARE REAL. Claude Code is an agent harness: describe a tool
         # to it and it CALLS it through its own machinery — live QA 2026-07-24
         # showed a worker doing exactly that and reporting back "No such tool
         # available: search_mcp_tools" (its runtime's words, not ours). So room
         # tools are given to it as REAL MCP tools on the room bridge, scoped by
-        # an allowlist to this agent's box, and it drives them natively. Only
-        # the hub's own ask_*_agent delegation — which exists nowhere but
-        # graph.py — stays on the text protocol, where it works.
+        # an allowlist to this agent's box, and it drives them natively.
         native = _bridge_tools(tools) if self._takes_system_prompt and self.mcp_url else []
         # …AND SO IS DELEGATION. Live QA 2026-07-25 proved the exemption above
         # was wrong: handed ask_jobs_agent in prose, Claude Code answered "the
@@ -1359,26 +1675,37 @@ class ExternalChatModel:
         # So the hub's own tools get a real endpoint too (see `hub_mcp`) — it
         # CAPTURES the call and we return it as an ordinary ToolCall, leaving
         # graph.py to run the specialist exactly as it does for a local model.
-        # Defined by NAME, not as the complement of `native`: a round whose
-        # room tools are on the text protocol (no bridge url) must not have
-        # them swept into the hub endpoint, which serves delegation only.
-        hub_tools = (
-            [t for t in tools if _is_hub_only(_tool_name_of(t))]
-            if self._takes_system_prompt
-            else []
-        )
+        # Claude needs this endpoint only for delegation because its room MCP
+        # bridge executes specialist tools directly. Codex receives EVERY
+        # offered tool here: the endpoint exposes the exact per-agent box and
+        # captures calls for graph.py to execute through Arcelle's normal
+        # approval and commit gates. This avoids the unreliable prose-only
+        # catalog that made Codex deny rename/organize capabilities.
+        if self.engine == "claude-cli":
+            hub_source_tools = [
+                t for t in tools if _is_hub_only(_tool_name_of(t))
+            ]
+            hub_tools = hub_source_tools
+        elif self.engine == "codex-cli":
+            hub_source_tools = list(tools)
+            hub_tools = [_codex_tool(t, codex_aliases) for t in hub_source_tools]
+        else:
+            hub_source_tools = []
+            hub_tools = []
         hub_names = [_tool_name_of(t) for t in hub_tools]
+        hub_source_names = {_tool_name_of(t) for t in hub_source_tools}
         # Whatever neither channel can serve natively stays on the text
-        # protocol — Codex (no --mcp-config on this path) drives entirely here.
+        # protocol. Antigravity uses this equivalent fallback because its
+        # print mode exposes no per-invocation MCP-config flag.
         protocol_tools = [
             t
             for t in tools
-            if _tool_name_of(t) not in set(native) | set(hub_names)
+            if _tool_name_of(t) not in set(native) | hub_source_names
         ]
         system = self._system(
-            send, protocol_tools, native=bool(native or hub_names)
+            rendered_messages, protocol_tools, native=bool(native or hub_names)
         )
-        prompt = self._prompt(send, protocol_tools)
+        prompt = self._prompt(rendered_messages, protocol_tools)
         hub: HubToolServer | None = None
         try:
             if hub_names:
@@ -1388,9 +1715,13 @@ class ExternalChatModel:
                     prompt, cancel, system, native, hub=hub, hub_tools=hub_names
                 )
             else:
-                # Codex: no system-prompt flag, so instructions lead the prompt.
+                # Codex/Antigravity have no system-prompt flag, so instructions
+                # lead the prompt. Codex's exact tool box rides the hub MCP.
                 stdout = await self._run(
-                    f"{system}\n\n{prompt}" if system else prompt, cancel
+                    f"{system}\n\n{prompt}" if system else prompt,
+                    cancel,
+                    hub=hub,
+                    hub_tools=hub_names,
                 )
             captured = list(hub.calls) if hub is not None else []
         finally:
@@ -1401,6 +1732,8 @@ class ExternalChatModel:
 
         if self.engine == "claude-cli":
             text, input_tokens, window = parse_claude_json_result(stdout)
+        elif self.engine == "antigravity-cli":
+            text, input_tokens, window = parse_antigravity_json_stream(stdout)
         else:
             text, input_tokens, window = parse_codex_json_stream(stdout)
         # The engine's own report wins over the host's hint for THIS round:
@@ -1414,7 +1747,12 @@ class ExternalChatModel:
         # The text protocol stays as the fallback for Codex and for a Claude
         # round that answered in an envelope anyway.
         offered = {_tool_name_of(t) for t in tools} - {""}
-        calls = _hub_calls(captured) or (
+        calls = _hub_calls(
+            captured,
+            {alias: name for name, alias in codex_aliases.items()}
+            if self.engine == "codex-cli"
+            else None,
+        ) or (
             parse_tool_calls(text, offered) if tools else []
         )
         if calls:
@@ -1466,6 +1804,7 @@ __all__ = [
     "claude_result_object",
     "parse_claude_json_result",
     "parse_codex_json_stream",
+    "parse_antigravity_json_stream",
     "parse_tool_calls",
     "render_catalog",
     "split_external_model",

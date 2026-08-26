@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { confirm as askConfirm } from "@tauri-apps/plugin-dialog";
+import { confirm as askConfirm } from "../platform";
 import { api, type AiProviderStatus } from "../api";
 import { CheckIcon, CloseIcon } from "../icons";
 

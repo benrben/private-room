@@ -190,6 +190,9 @@ async function launchArcelle(dir: string): Promise<ElectronApplication> {
     }
   }
   env.ARCELLE_USER_DATA_DIR = dir;
+  // This suite exercises the host/preload boundary with the deliberately tiny
+  // fixture page. The production build always supplies dist_package/renderer.
+  env.ARCELLE_USE_BOOT_STUB = "1";
   return electron.launch({
     args: [
       "--headless",
@@ -307,13 +310,13 @@ describe("real Electron boot (index.ts, compiled + launched for real)", () => {
     expect(marker?.completenessOk).toBe(true);
     // 296 extracted from api.ts + the 7 this migration added for the surfaces
     // Tauri answered with plugins (see `channelAllowlist.test.ts`).
-    expect(marker?.totalCommandCount).toBe(303);
+    expect(marker?.totalCommandCount).toBe(306);
     // 167 real Commands keys wired by the registry's room-scoped modules, + 6
     // for `dialogTools.ts`/`shellTools.ts`, + the 5 the registry registers
     // itself (`run_command`, `set_unsaved_edits`, `quit_guard_rearm`,
     // `quit_guard_confirm`, `menu_sync` — see its "THE HOST BRIDGE" doc), + the
     // 2 documented non-Commands extras (restore_memory, dict-stop-timeout).
-    expect(marker?.registeredChannelCount).toBe(180);
+    expect(marker?.registeredChannelCount).toBe(308);
   });
 
   it("the documented stdout ready-marker line was actually printed by the real process", () => {
@@ -949,24 +952,12 @@ describe("real Electron boot (index.ts, compiled + launched for real)", () => {
   // The webRequest funnel — reachable, and deliberately not reached YET
   // ==========================================================================
 
-  it("the browser_* surface really is unwired: the preload passes it, ipcMain has no handler", async () => {
-    // `index.ts` claims the funnel is unreachable end to end because the
-    // owner-gated `browser_*` batch above it has not shipped — NOT because
-    // its own wiring is wrong. That is a checkable claim, and the two
-    // possible failures look nothing alike: a preload refusal names the
-    // allowlist, a missing handler is Electron's own. This asserts it is the
-    // second, so "unwired" cannot quietly become "the allowlist forgot it".
-    const message = await window.evaluate(async () => {
+  it("the private-browser IPC surface is live in the real main process", async () => {
+    const info = await window.evaluate(async () => {
       const api = (window as unknown as { arcelle: RendererArcelle }).arcelle;
-      try {
-        await api.invoke("browser_info", {});
-        return null;
-      } catch (e) {
-        return e instanceof Error ? e.message : String(e);
-      }
+      return api.invoke("browser_info", {});
     });
-    expect(message).not.toContain("not a known IPC command channel");
-    expect(message?.toLowerCase()).toContain("no handler registered");
+    expect(info).toEqual({ open: false });
   });
 
   it("registerWebRequestFunnel really attaches to a fresh ephemeral session inside the real process", async () => {

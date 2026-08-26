@@ -191,14 +191,14 @@ test("the create job kind is dispatchable and resumable, not just startable", ()
   // The quiet failure: a job that starts once, then can never be pumped off
   // the queue or resumed after a crash. Neither shows up as a type error.
   assert.match(
-    read("src-tauri/src/commands/jobs/queue.rs"),
-    /"create" => start_create_row/,
-    "queue.rs has no dispatch arm — a queued generation could never start",
+    read("electron-migration/electron-app/electron/main/creativeJobSurfaceIpc.ts"),
+    /setStarter\(queue, "create", createStarter/,
+    "the Electron queue has no create starter",
   );
   assert.match(
-    read("src-tauri/src/commands/jobs.rs"),
-    /\|\s*"create"/,
-    "jobs.rs resume whitelist is missing 'create'",
+    read("electron-migration/electron-app/electron/main/jobQueue.ts"),
+    /"create"/,
+    "the Electron job kind list is missing 'create'",
   );
 });
 
@@ -206,18 +206,19 @@ test("both create commands are registered with the host", () => {
   // The frontend calls these by name through `invoke`; an unregistered command
   // is a runtime rejection, which is exactly what the mock-coverage gate and
   // this assertion exist to catch early.
-  const lib = read("src-tauri/src/lib.rs");
-  assert.match(lib, /commands::list_create_models/);
-  assert.match(lib, /commands::start_create_job/);
+  const models = read("electron-migration/electron-app/electron/main/modelCatalogSurfaceIpc.ts");
+  const jobs = read("electron-migration/electron-app/electron/main/creativeJobSurfaceIpc.ts");
+  assert.match(models, /handle\("list_create_models"/);
+  assert.match(jobs, /handle\("start_create_job"/);
 });
 
 test("generation capability is its own question, separate from vision", () => {
-  const caps = read("src-tauri/src/commands/capabilities.rs");
-  assert.match(caps, /ImageGeneration/);
-  assert.match(caps, /VideoGeneration/);
+  const caps = read("electron-migration/electron-app/electron/main/capabilities.ts");
+  assert.match(caps, /"image_generation"/);
+  assert.match(caps, /"video_generation"/);
   // The catalog field the whole gate reads from.
   assert.match(
-    read("src-tauri/src/commands/providers.rs"),
+    read("electron-migration/electron-app/electron/main/providers.ts"),
     /output_modalities/,
     "the OpenRouter parse must read output_modalities, not infer from the slug",
   );

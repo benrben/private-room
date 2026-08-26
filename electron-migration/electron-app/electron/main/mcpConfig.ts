@@ -940,6 +940,24 @@ export function readMcpConnectorPowers(userDataDir: string): Record<string, Conn
   return parseConnectorPowers(readFileIfExists(mcpConnectorPowersFile(userDataDir)) ?? "{}");
 }
 
+/** Persist one per-connector override and return its canonical wire JSON. */
+export function writeMcpConnectorPower(
+  userDataDir: string,
+  server: string,
+  power: string,
+  value: boolean | null,
+): string {
+  const next = setConnectorPower(
+    readFileIfExists(mcpConnectorPowersFile(userDataDir)) ?? "{}",
+    server,
+    parseConnectorPower(power),
+    value,
+  );
+  mkdirSync(userDataDir, { recursive: true });
+  writeFileSync(mcpConnectorPowersFile(userDataDir), next);
+  return next;
+}
+
 /**
  * Forget every permission this Mac holds for ONE connector: its per-connector
  * overrides on disk and its "always allow" for this session.

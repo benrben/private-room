@@ -62,8 +62,13 @@ export function registerRoomManagerIpc(
 
   handle(
     "create_room",
-    (args: { path: string; password: string; name: string | null }): RoomInfo =>
-      createRoom(state, deps, args.path, args.password, args.name)
+    (args: {
+      path: string;
+      password: string;
+      name: string | null;
+      format?: "sealed-db" | "workspace-folder";
+    }): RoomInfo =>
+      createRoom(state, deps, args.path, args.password, args.name, args.format)
   );
   handle(
     "open_room",

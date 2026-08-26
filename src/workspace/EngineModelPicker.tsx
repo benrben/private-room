@@ -173,7 +173,7 @@ export default function EngineModelPicker({
           disabled={!hasCloud}
           title={
             !hasCloud
-              ? "No cloud AI models or CLIs (Claude Code, Codex) detected on this Mac"
+              ? "No cloud AI models or CLIs (Claude Code, Codex, Antigravity) detected on this Mac"
               : undefined
           }
         >

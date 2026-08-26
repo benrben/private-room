@@ -27,16 +27,16 @@ const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, "../..");
 const read = (p) => readFileSync(join(root, p), "utf8");
 
-/** Rust line comments, gone — the comments around these seams necessarily
- * DESCRIBE the door, so a comment-blind grep reads documentation as code. */
+/** Line comments, gone — comments around these seams necessarily describe
+ * the door, so a comment-blind grep would read documentation as code. */
 const stripComments = (src) => src.replace(/\/\/[^\n]*/g, "");
 
-const AUDIO = stripComments(read("src-tauri/src/commands/studios/podcast_audio.rs"));
-const SPEECH = stripComments(read("src-tauri/src/commands/speech_cmds.rs"));
-const PODCAST = read("src-tauri/src/commands/studios/podcast.rs");
+const AUDIO = stripComments(read("electron-migration/electron-app/electron/main/studiosPodcastAudio.ts"));
+const PODCAST = read("electron-migration/electron-app/electron/main/studiosPodcast.ts");
+const JOBS = read("electron-migration/electron-app/electron/main/creativeJobSurfaceIpc.ts");
 const PANEL = read("src/workspace/PodcastPanel.tsx");
 const API = read("src/api.ts");
-const LIB = read("src-tauri/src/lib.rs");
+const CONTRACT = read("electron-migration/electron-app/electron/shared/ipc-contract.ts");
 const MOCK = read("qa/qa-mock.js");
 const CATALOG = read("src/settings/voiceCatalog.ts");
 const SETTINGS = read("src/settings/VoiceSection.tsx");
@@ -47,23 +47,26 @@ test("every line of an episode goes through the same door one sentence does", ()
   // service around it.
   assert.match(
     AUDIO,
-    /speech_cmds::speakable_text\(/,
-    "the recording path must go through speakable_text",
+    /speakableText\(anyOpenDb\(rooms\), t\.line\)/,
+    "the recording path must go through speakableText",
   );
   // The ONLY sidecar call in the recording path is the synthesis one, and the
   // text it sends is what came back OUT of the door.
   // Any of the `sidecar_json*` family — the synthesis call is the cancellable
   // one now (Stop must reach it mid-episode), and counting only the plain name
   // would have gone quiet on exactly the line it is here to watch.
-  const sidecarCalls = AUDIO.match(/sidecar_json\w*\(/g) || [];
+  const renderAt = AUDIO.indexOf("export async function renderPodcastAudio");
+  const renderEnd = AUDIO.indexOf("export function timedTranscript", renderAt);
+  const render = AUDIO.slice(renderAt, renderEnd);
+  const sidecarCalls = render.match(/sidecarJsonCancellable\(/g) || [];
   assert.equal(sidecarCalls.length, 1, "one outbound call, and it is the audited one");
-  assert.match(AUDIO, /"\/tts\/podcast"/);
+  assert.match(render, /"\/tts\/podcast"/);
   // The per-host Preview is the same act on a smaller scale and rides the same
   // shared body rather than a path of its own.
-  assert.match(AUDIO, /speech_cmds::speak_one\(/);
+  assert.match(AUDIO, /return speakOne\(db, text, voice, rate, pitch\)/);
   assert.match(
-    SPEECH,
-    /pub\(crate\) async fn speak_one[\s\S]{0,600}speakable_text\(/,
+    AUDIO,
+    /export async function speakOne[\s\S]{0,900}speakableText\(db, trimmed\)/,
     "the shared speak body must itself go through the door",
   );
 });
@@ -73,7 +76,7 @@ test("the transcript records what was spoken, not what the script said", () => {
   // original beside audio of the placeholder would be the app disagreeing with
   // itself about what left this Mac.
   assert.match(AUDIO, /spoken\.push\(text\)/);
-  assert.match(AUDIO, /fn timed_transcript\([\s\S]{0,400}spoken: &\[String\]/);
+  assert.match(AUDIO, /export function timedTranscript\([\s\S]{0,500}spoken: readonly string\[\]/);
 });
 
 test("the panel states the redaction consequence before the Record button", () => {
@@ -106,9 +109,9 @@ test("the generated page no longer promises audio as a future feature", () => {
 test("the podcast studio is structured-first so its turns survive as data", () => {
   // Turns that exist only as markup cannot be spoken. This is the inversion the
   // whole feature rests on, and it is one bool away from silently reverting.
-  assert.match(PODCAST, /structured_first: true/);
-  assert.match(PODCAST, /after_save: Some\(store_podcast\)/);
-  assert.match(PODCAST, /"hosts":/, "the schema asks for the cast explicitly");
+  assert.match(PODCAST, /structuredFirst: true/);
+  assert.match(PODCAST, /afterSave: storePodcast/);
+  assert.match(PODCAST, /hosts:\s*\{/, "the schema asks for the cast explicitly");
 });
 
 test("both voice pickers name voices through one module", () => {
@@ -145,9 +148,13 @@ test("every podcast command is registered, invoked and faked", () => {
     "start_podcast_audio_job",
   ]) {
     assert.match(API, new RegExp(`"${cmd}"`), `${cmd} is not invoked from api.ts`);
-    assert.match(LIB, new RegExp(`commands::${cmd},`), `${cmd} is missing from lib.rs`);
+    assert.match(CONTRACT, new RegExp(`\\b${cmd}:`), `${cmd} is missing from the Electron contract`);
     assert.match(MOCK, new RegExp(`\\b${cmd}:`), `${cmd} has no qa-mock fixture`);
   }
+  assert.match(AUDIO, /handle\("get_podcast"/);
+  assert.match(AUDIO, /"set_podcast_cast"/);
+  assert.match(AUDIO, /"preview_podcast_voice"/);
+  assert.match(JOBS, /handle\("start_podcast_audio_job"/);
   // The mock's fixture casts its two hosts in DIFFERENT voices — one that did
   // not would make the panel look right while hiding the collision case.
   const a = MOCK.indexOf('name: "Ada", voice: "');
@@ -164,7 +171,7 @@ test("the cast a host is saved under is trimmed, or their lines fall to the defa
   // Ada's own lines, and the whole episode reads her in the default voice,
   // discovered after a multi-minute cloud render. The panel is the only writer
   // of a typed name, so it trims on the way in.
-  assert.match(AUDIO, /h\.name\.eq_ignore_ascii_case\(t\.speaker\.trim\(\)\)/);
+  assert.match(AUDIO, /eqIgnoreAsciiCase\(h\.name, t\.speaker\.trim\(\)\)/);
   const sent = PANEL.match(/setPodcastCast\(fileId,\s*([A-Za-z_]\w*)\)/);
   assert.ok(sent, "the panel saves the cast through setPodcastCast");
   assert.match(

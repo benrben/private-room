@@ -1,0 +1,172 @@
+{
+  "version": 1,
+  "defaults": {
+    "timeoutSeconds": 3600,
+    "maxRounds": 10000,
+    "privacy": "inherit-parent",
+    "outputSchema": "text-with-did-found-missing",
+    "permission": "read"
+  },
+  "agents": [
+    {
+      "id": "chat.answer",
+      "label": "Main agent",
+      "tag": "",
+      "graph": "supervisor",
+      "instructions": "Coordinate the specialists. Use only specialists that are available. Give one grounded final answer.",
+      "tools": [],
+      "permission": "read",
+      "capability": "tool-calling"
+    },
+    {
+      "id": "files.read",
+      "label": "File agent",
+      "tag": "file",
+      "graph": "react_verify",
+      "instructions": "Read and organize room files. Verify every write before reporting success.",
+      "tools": ["organize_files", "trash_files", "set_in_library", "merge_files"],
+      "permission": "write",
+      "capability": "tool-calling"
+    },
+    {
+      "id": "scripts.run",
+      "label": "Scripts agent",
+      "tag": "scripts",
+      "graph": "recall_act_check",
+      "instructions": "List room scripts before running one. Use only Arcelle's approved script sandbox.",
+      "tools": ["list_scripts", "run_script"],
+      "permission": "write",
+      "capability": "tool-calling"
+    },
+    {
+      "id": "chat.web",
+      "label": "Web agent",
+      "tag": "web",
+      "graph": "chain_stage",
+      "instructions": "Search and read web pages. Do not operate interactive pages or invent web facts.",
+      "tools": ["web_search", "fetch_page", "save_link", "download_url", "download_media"],
+      "permission": "read",
+      "capability": "tool-calling-web"
+    },
+    {
+      "id": "chat.browse",
+      "label": "Browser agent",
+      "tag": "browse",
+      "graph": "perceive_act",
+      "instructions": "Operate a named live web page. Observe again after every action.",
+      "tools": ["browse_open", "browse_read", "browse_find", "browse_snapshot", "browse_do", "browse_look", "browse_save"],
+      "permission": "read",
+      "capability": "vision-tools"
+    },
+    {
+      "id": "app.ui",
+      "label": "App agent",
+      "tag": "app",
+      "graph": "perceive_act",
+      "instructions": "Operate Arcelle's visible interface. Observe before and after actions.",
+      "tools": ["ui_snapshot", "ui_act", "view_screenshot", "view_media_frame"],
+      "permission": "read",
+      "capability": "vision-tools"
+    },
+    {
+      "id": "jobs.run",
+      "label": "Jobs agent",
+      "tag": "jobs",
+      "graph": "route_act",
+      "instructions": "Start or inspect durable whole-file jobs. Do not claim a queued job is finished.",
+      "tools": ["start_file_pass", "job_status"],
+      "permission": "read",
+      "capability": "tool-calling"
+    },
+    {
+      "id": "jobs.workflows",
+      "label": "Workflow agent",
+      "tag": "workflows",
+      "graph": "recall_act_check",
+      "instructions": "List workflows first. New workflows stay drafts until the user enables them.",
+      "tools": ["list_workflows", "save_workflow", "update_workflow", "delete_workflow", "run_workflow", "test_workflow"],
+      "permission": "write",
+      "capability": "tool-calling"
+    },
+    {
+      "id": "skills.use",
+      "label": "Skills agent",
+      "tag": "skills",
+      "graph": "recall_act_check",
+      "instructions": "List and read a skill before following it. This agent does not edit skills.",
+      "tools": ["list_skills", "read_skill", "read_skill_resource", "run_skill_script"],
+      "permission": "read",
+      "capability": "tool-calling"
+    },
+    {
+      "id": "skills.author",
+      "label": "Skill-builder agent",
+      "tag": "skillbuilder",
+      "graph": "recall_act_check",
+      "instructions": "Read existing skills before editing. Saved skills remain disabled drafts.",
+      "tools": ["save_skill", "write_skill_resource", "delete_skill_resource", "delete_skill"],
+      "permission": "write",
+      "capability": "tool-calling"
+    },
+    {
+      "id": "connectors.admin",
+      "label": "Connector setup agent",
+      "tag": "connectorsetup",
+      "graph": "react",
+      "instructions": "Inspect connector settings before changing them. Never request or store credentials.",
+      "tools": ["list_mcps", "read_mcp", "save_mcp", "delete_mcp"],
+      "permission": "read",
+      "capability": "tool-calling"
+    },
+    {
+      "id": "connectors.use",
+      "label": "Connector agent",
+      "tag": "connector",
+      "graph": "react_verify",
+      "instructions": "Discover a connector tool before calling it. Do not guess recipients or external targets.",
+      "tools": ["search_mcp_tools", "run_mcp_tool"],
+      "permission": "read",
+      "capability": "tool-calling"
+    },
+    {
+      "id": "media.transcribe",
+      "label": "Transcription agent",
+      "tag": "transcribe",
+      "graph": "probe_gate_act",
+      "instructions": "Check local speech support first. Never invent or silently clean a transcript.",
+      "tools": ["stt_status", "retranscribe_file", "read_recording"],
+      "permission": "read",
+      "capability": "tool-calling"
+    },
+    {
+      "id": "media.video",
+      "label": "Video agent",
+      "tag": "video",
+      "graph": "react",
+      "instructions": "Inspect several relevant frames and report exact timestamps.",
+      "tools": ["view_media_frame"],
+      "permission": "read",
+      "capability": "vision-tools"
+    },
+    {
+      "id": "creator.studio",
+      "label": "Studio agent",
+      "tag": "studio",
+      "graph": "route_act",
+      "instructions": "Create one grounded artifact from room material and report the saved file.",
+      "tools": ["studio_flashcards", "studio_mindmap", "generate_podcast_script"],
+      "permission": "write",
+      "capability": "tool-calling"
+    },
+    {
+      "id": "creator.draw",
+      "label": "Drawing agent",
+      "tag": "sketch",
+      "graph": "react_verify",
+      "instructions": "Read an existing drawing before editing it. Measure and correct the final drawing.",
+      "tools": ["draw", "read_drawing"],
+      "permission": "write",
+      "capability": "tool-calling"
+    }
+  ]
+}

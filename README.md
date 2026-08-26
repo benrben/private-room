@@ -142,13 +142,13 @@ Here's where it actually shows up:
 
 | Layer | Technology |
 |---|---|
-| Shell | [Tauri 2](https://tauri.app) (Rust) · [React 19](https://react.dev) + TypeScript · [Vite](https://vite.dev) |
-| Core | Rust — crypto, extraction, indexing, jobs, schedules, MCP server |
+| Shell | [Electron](https://www.electronjs.org/) · [React 19](https://react.dev) + TypeScript · [Vite](https://vite.dev) |
+| Core | TypeScript — crypto, extraction orchestration, indexing, jobs, schedules, MCP server |
 | AI engine | Python 3.13 + [LangGraph](https://langchain-ai.github.io/langgraph/), as a bundled localhost sidecar |
-| Storage | [SQLCipher](https://www.zetetic.net/sqlcipher/) (AES-256) via `rusqlite` |
+| Storage | [SQLCipher](https://www.zetetic.net/sqlcipher/) (AES-256) via `better-sqlite3-multiple-ciphers` |
 | Models | [Ollama](https://ollama.com) · Ollama `:cloud` · Claude Code / Codex CLI · [OpenRouter](https://openrouter.ai) |
-| On-device ML | [whisper.cpp](https://github.com/ggerganov/whisper.cpp) on Metal · Apple Vision OCR · TitaNet speaker embeddings (ONNX via `tract`) |
-| Web | WKWebView (the private browser) · [Model Context Protocol](https://modelcontextprotocol.io) connectors |
+| On-device ML | [whisper.cpp](https://github.com/ggerganov/whisper.cpp) on Metal · Apple Vision OCR · TitaNet speaker embeddings via ONNX Runtime |
+| Web | Electron `WebContentsView` (the private browser) · [Model Context Protocol](https://modelcontextprotocol.io) connectors |
 | Viewers | PDF.js · docx-preview · SheetJS · Monaco |
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
@@ -164,8 +164,9 @@ Here's where it actually shows up:
   brew install ollama            # or download it from https://ollama.com
   ```
 
-  You don't need to start it — the app starts the daemon on demand and stops it
-  after five idle minutes, and never touches a daemon you started yourself.
+  Start Ollama before using a local model (opening the Ollama app is enough).
+  Arcelle detects and uses the local service but does not take ownership of or
+  terminate a daemon you started.
 
 Dictation, transcription, and OCR need nothing extra: the Whisper voice model
 is bundled inside the app.
@@ -550,16 +551,12 @@ meeting test set that took speaker mix-ups from 17.9% to 1.3%. Phantom speakers
 are gone too: a voice has to carry real speech mass before it counts as a
 person, so a couple of seconds of laughter or overlap joins the nearest real
 voice instead of minting a "Speaker 4". Those numbers come from an acceptance
-harness that ships with the code (`src-tauri/tests/diar_bench.rs`): it runs the
-shipping pipeline over real meetings with RTTM ground truth and **fails** when
-a row misses its diarization-error bar, so a regression is caught rather than
-eyeballed. It is opt-in rather than part of `cargo test`, because the audio it
-scores is other people's recordings and can't be committed — point it at your
-own set:
+harness that runs the shipping Python pipeline over meetings with RTTM ground
+truth and fails when a row misses its diarization-error bar, so a regression is
+caught rather than eyeballed. The focused checked-in speech suite runs with:
 
 ```sh
-PR_BENCH_MANIFEST=…/manifest.tsv PR_BENCH_RESULTS=…/out.jsonl \
-  cargo test --release --test diar_bench -- --ignored --nocapture
+scripts/accuracy-tests.sh
 ```
 
 ### Memory you can see
@@ -637,19 +634,9 @@ are already there.
   Visual-order Hebrew PDFs — the ones that extract as mirrored gibberish
   everywhere else — are detected and repaired at import, vowel points and
   all.
-- **Dictation & transcription.** A Whisper engine is *compiled into* the app
-  (whisper.cpp on Metal) and the release DMG **ships the voice model**, so
+- **Dictation & transcription.** The bundled Python sidecar runs whisper.cpp
+  on-device and the release DMG **ships the voice model**, so
   transcription works offline the moment you open it — no download.
-- **A room is readable without the app.** Every install also carries a small
-  command-line tool, `roomai`, at
-  `/Applications/Arcelle.app/Contents/MacOS/roomai`. It can `verify` a room
-  file's integrity, print `info` about it, `export` its contents, and open one
-  with a `recover`y code — each only after you give it the room's own password
-  or recovery code, since it opens the same SQLCipher database the app does
-  and has no other way in. (The tool keeps its original `roomai` name — it
-  reads both `.arcelle` and `.roomai` rooms.) It exists so a
-  room file is never hostage to the app that wrote it; nothing in the app
-  calls it, and deleting it costs you only that escape hatch.
 - **Web is off until you ask.** No online tool is offered to the model — the
   browser's address bar refuses to load anything, and Add → Web link, the
   video import and the download-job button all refuse too — until you turn the
@@ -658,7 +645,7 @@ are already there.
   to paste and no provider to choose: search is built in, and one query fans
   out to seven independent engines at once, merged into a single relevance
   ranking so a blocked or rate-limited engine just drops out, with each hit
-  carrying the engine that found it. Fetches run in Rust behind a
+  carrying the engine that found it. Fetches run in the Electron main process behind a
   private-network guard (CGNAT, multicast, reserved ranges, and
   IPv4-mapped-IPv6 tricks included), responses are capped at 8 MB, arrive a
   bounded chunk at a time so one heavy page can't blow the model's context,
@@ -678,7 +665,7 @@ flowchart LR
     end
     subgraph app ["Arcelle.app"]
         UI["React shell<br/>rail · tabs · three panes · status bar"]
-        CORE["Rust core — Tauri<br/>crypto · extraction · indexing<br/>jobs · schedules · MCP server"]
+        CORE["TypeScript core — Electron<br/>crypto · extraction · indexing<br/>jobs · schedules · MCP server"]
         AI["AI engine sidecar<br/>Python · LangGraph<br/>hub + domain specialists<br/>summaries · studios"]
         LOCAL["On-device: whisper.cpp<br/>Vision OCR · TitaNet"]
         WEB["Private browser<br/>child webview · no disk state"]
@@ -702,7 +689,7 @@ flowchart LR
 1. **Create / unlock** — your password is the SQLCipher key. A wrong password
    can't read a single byte.
 2. **Import** — files are stored as encrypted blobs; readable text is
-   extracted by built-in Rust extractors, with on-device OCR / Whisper as
+   extracted by the bundled sidecar, with on-device OCR / Whisper as
    fallbacks, then chunked and indexed automatically in the background.
 3. **Ask** — your question is scored against every chunk in the room, the
    best excerpts are sent to the engine through the bundled AI sidecar, tools
@@ -714,12 +701,12 @@ flowchart LR
 
 The sidecar binds to localhost only, never sees the room key, and is spawned,
 health-checked, and shut down by the app. Its behavior is covered by 1,500+
-tests across Rust and Python.
+tests across TypeScript and Python.
 
 ### Engineered for a 4B model
 
 Arcelle targets a 4B local model on a 16 GB Mac — small enough to run
-comfortably, small enough to wander. So judgment lives in deterministic Rust,
+comfortably, small enough to wander. So judgment lives in deterministic code,
 not in the model's good intentions:
 
 - **Constrained decoding.** Grounding boxes, field extraction, room summaries,
@@ -742,7 +729,7 @@ not in the model's good intentions:
 
 ## Development
 
-Requires **Rust**, **Node**, [**uv**](https://docs.astral.sh/uv/) (builds and
+Requires **Node**, [**uv**](https://docs.astral.sh/uv/) (builds and
 runs the Python sidecar), and [**Ollama**](https://ollama.com). Pull a model
 from inside the app (Settings → Model manager) or `ollama pull qwen3.5:4b`.
 
@@ -750,8 +737,11 @@ from inside the app (Settings → Model manager) or `ollama pull qwen3.5:4b`.
 git clone https://github.com/benrben/private-room.git
 cd private-room
 npm install
-npm run tauri dev            # run the app
-npm run tauri build          # build Arcelle.app ONLY (registers .arcelle/.roomai)
+npm run dev                  # run the Electron app + Vite renderer
+npm run build                # compile renderer, preload, and main process
+npm run clean:dry-run        # show generated files npm run clean will remove
+npm run clean                # remove build/test output; keep deps and models
+npm run package:dir          # unsigned local Arcelle.app proof
 scripts/release.sh           # the DMG + signed updater payload come from here
 ```
 
@@ -764,7 +754,7 @@ one-time fetch, signing, and the full release pipeline.
 | Path | What's in it |
 |---|---|
 | [src/](src/) | React + TypeScript shell — panes, viewers, areas, chat |
-| [src-tauri/](src-tauri/) | Rust core — crypto, extraction, indexing, jobs, browser, MCP server |
+| [electron-migration/electron-app/](electron-migration/electron-app/) | Electron main process, preload bridge, packaging, and backend TypeScript |
 | [sidecar/](sidecar/) | Python + LangGraph AI engine (agents, workflows, studios) |
 | [e2e/](e2e/README.md) | End-to-end suites (real app, and browser-hosted UI with mock IPC) |
 | [qa/](qa/) | Manual QA harness and the every-button UA checklist |
@@ -776,11 +766,11 @@ one-time fetch, signing, and the full release pipeline.
 ### Tests
 
 ```sh
-npm test                # the first four, in one go (a few minutes)
+npm test                # Electron/TypeScript and Python sidecar suites
 
-npm run test:rust       # Rust: crypto, extraction, routing, browser (688 tests)
-npm run test:sidecar    # Python: the AI engine sidecar (1213 tests)
-npm run test:page       # the browser page-script + QA-mock contracts (51 tests)
+npm run test:electron   # Electron main process and backend TypeScript
+npm run test:sidecar    # Python: the AI engine sidecar (2,636 passing locally)
+npm run test:page       # browser page-script + QA-mock contracts (943 tests)
 npm run build           # TypeScript type-check + the production bundle
 npm run e2e:qa          # UI regressions in Chrome against a mock backend
 npm run build && node qa/make-qa.mjs && npx vite preview
@@ -788,23 +778,21 @@ npm run build && node qa/make-qa.mjs && npx vite preview
 ```
 
 Before a release, `npm run preflight` adds the checks a publish needs on top of
-those suites — that the version agrees across all seven files that carry it,
-and that `CHANGELOG.md` has an entry for it (`scripts/preflight.sh --checks`
-does just those two, in seconds). Nothing installs any of this as a git hook:
-it runs when you run it, never behind your back. `npm run lint` (ruff for
-Python, clippy for Rust) is advisory and deliberately outside `npm test`.
+those suites — including version agreement and command-contract drift
+(`scripts/preflight.sh --checks` runs the fast checks only). Nothing installs any of this as a git hook:
+it runs when you run it, never behind your back. `npm run lint` also runs the
+Python checks.
 
 > **Notes.** Running pytest by hand inside `sidecar/` needs `uv run pytest` —
 > a bare `pytest` picks up the wrong environment. The counts above move with
 > every wave of work; the suites are the source of truth, not this table.
 >
-> One more suite exists, `npm run e2e`, which drives the *real* packaged app
-> through `tauri-driver` — it **cannot run on macOS** (WKWebView has no
-> WebDriver), so on the machine this app is developed on, `npm run e2e:qa` is
-> the end-to-end suite that actually runs. It covers the real components,
-> state and event wiring against `qa/qa-mock.js`, but not the Rust commands.
-> The mock still fakes only about half of them — `node qa/check-mock-coverage.mjs`
-> names the rest, and anything it has no fixture for is recorded on
+> `npm run e2e` launches the compiled Electron app through Playwright and
+> verifies the real renderer/preload boundary. `npm run e2e:qa` covers the
+> broad visual state matrix against `qa/qa-mock.js`.
+> `node qa/check-mock-coverage.mjs --bridge=electron` reports fixture coverage;
+> registry and allowlist tests enforce complete command-contract coverage.
+> Anything without a usable QA fixture is recorded on
 > `window.__qaUnhandled` and shouted on the page itself, so a list that is
 > empty because the *mock* has no data can never be mistaken for a real empty
 > state. The one thing no harness can show is the browser's page: it is a
@@ -869,12 +857,12 @@ Next:
       only "fetch an authed asset no link points at"
 - [ ] **Save as PDF** from the browser (needs `WKPDFConfiguration`)
 - [ ] Notarized releases (Developer ID)
-- [ ] Windows port — a **rebuild, not a recompile**. Tauri itself is portable;
+- [ ] Windows port — a **rebuild, not a recompile**. Electron is portable;
       these are not, and each needs a Windows implementation written from
       scratch or a deliberate "not on Windows":
       recording the computer's own sound (ScreenCaptureKit),
       reading text from images (Apple Vision),
-      the private browser (WKWebView),
+      the private browser (`WebContentsView`),
       the protected key store (Keychain),
       audio decoding and conversion (AVFoundation / `afconvert`),
       spoken output (the macOS neural voices),
@@ -896,8 +884,8 @@ like to send code:
 
 1. Fork the repo and create a branch (`git checkout -b feature/thing`).
 2. Make the change, and add a test next to the code you touched.
-3. Keep every suite green — `npm test` runs the Rust, Python, page-script and
-   TypeScript checks in one go.
+3. Keep every suite green — `npm test` runs Electron/TypeScript and Python;
+   `npm run test:page` covers the browser and QA contracts.
 4. Open a pull request describing the behavior change, not just the diff.
 
 User-facing changes belong in [CHANGELOG.md](CHANGELOG.md), written the way
@@ -932,12 +920,12 @@ Related docs: [RELEASING.md](RELEASING.md) (release pipeline),
 
 Arcelle stands on a lot of other people's work:
 
-- [Tauri](https://tauri.app) and [wry](https://github.com/tauri-apps/wry) — the shell and the webviews
+- [Electron](https://www.electronjs.org/) — the shell and isolated web contents
 - [SQLCipher](https://www.zetetic.net/sqlcipher/) — encryption at rest
 - [Ollama](https://ollama.com) — local model serving
 - [LangGraph](https://langchain-ai.github.io/langgraph/) — the agent engine
 - [whisper.cpp](https://github.com/ggerganov/whisper.cpp) — on-device speech-to-text
-- [NVIDIA NeMo TitaNet](https://catalog.ngc.nvidia.com/models) and [tract](https://github.com/sonos/tract) — speaker embeddings
+- [NVIDIA NeMo TitaNet](https://catalog.ngc.nvidia.com/models) and ONNX Runtime — speaker embeddings
 - [PDF.js](https://mozilla.github.io/pdf.js/), [SheetJS](https://sheetjs.com), [docx-preview](https://github.com/VolodymyrBaydalka/docxjs), [Monaco](https://microsoft.github.io/monaco-editor/) — the viewers
 - [Model Context Protocol](https://modelcontextprotocol.io) — the tool bridge in both directions
 

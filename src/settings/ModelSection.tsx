@@ -4,6 +4,20 @@ import { CircleCheckIcon } from "../icons";
 import EngineModelPicker from "../workspace/EngineModelPicker";
 import DeleteControl from "../workspace/DeleteControl";
 
+/** A small, understandable starting shelf from Ollama's public model library.
+ * The free-form field stays below it, so this never prevents installing a new
+ * or private registry tag. Sizes are approximate download sizes and are shown
+ * before a multi-gigabyte pull begins. */
+export const DOWNLOAD_MODEL_CHOICES = [
+  { value: "qwen3.5:0.8b", label: "Qwen 3.5 0.8B — about 1 GB" },
+  { value: "qwen3.5:2b", label: "Qwen 3.5 2B — about 2.7 GB" },
+  { value: "qwen3.5:4b", label: "Qwen 3.5 4B — about 3.4 GB" },
+  { value: "qwen3.5:4b-mlx", label: "Qwen 3.5 4B MLX — about 4 GB, recommended on Apple silicon" },
+  { value: "qwen3.5:9b", label: "Qwen 3.5 9B — about 6.6 GB" },
+  { value: "gemma3:1b", label: "Gemma 3 1B — about 815 MB" },
+  { value: "gemma3:4b", label: "Gemma 3 4B — about 3.3 GB" },
+] as const;
+
 interface Props {
   ai: AiStatus | null;
   model: string;
@@ -193,6 +207,27 @@ export default function ModelSection({
                 )}
               </>
             )}
+            <label className="settings-label" htmlFor="download-model-choice">
+              Choose a model to download
+            </label>
+            <select
+              id="download-model-choice"
+              data-testid="download-model-choice"
+              value={DOWNLOAD_MODEL_CHOICES.some((choice) => choice.value === pullName) ? pullName : ""}
+              disabled={pulling}
+              onChange={(event) => setPullName(event.target.value)}
+            >
+              <option value="">Select a model and size…</option>
+              {DOWNLOAD_MODEL_CHOICES.map((choice) => (
+                <option key={choice.value} value={choice.value}>
+                  {choice.label}
+                </option>
+              ))}
+            </select>
+            <p className="settings-hint">
+              Or enter any Ollama library tag below. The installed-model list above shows exact versions,
+              tool and vision capabilities, and a delete control for every inactive local model.
+            </p>
             <div className="pull-row">
               {/* This field holds a registry identifier, not prose. macOS's
                   "capitalize words automatically" applies to WebKit text

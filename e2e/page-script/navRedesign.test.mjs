@@ -41,8 +41,8 @@ const TOPBAR = read("src/workspace/TopBar.tsx");
 
 /** Every destination key in NAV_AREAS, in catalog order. */
 const CATALOG = [...NAV.matchAll(/\{ key: "(\w+)", label:/g)].map((m) => m[1]);
-/** The WorkArea runtime list, minus the default lens. */
-const AREAS = [...TYPES.matchAll(/^\s{2}"(\w+)",$/gm)].map((m) => m[1]).filter((k) => k !== "files");
+/** The complete WorkArea runtime list, including the Library's `files` lens. */
+const AREAS = [...TYPES.matchAll(/^\s{2}"(\w+)",$/gm)].map((m) => m[1]);
 
 /* ---------- transpile the pure half of navPrefs ---------- */
 
@@ -51,7 +51,7 @@ const slice = NAV.slice(
   NAV.indexOf("export interface NavPrefsApi"),
 );
 const PRELUDE = `
-const WORK_AREAS = ${JSON.stringify(["files", ...AREAS])};
+const WORK_AREAS = ${JSON.stringify(AREAS)};
 const CANONICAL = ${JSON.stringify(CATALOG)};
 `;
 const JS = ts.transpileModule(PRELUDE + slice, {
@@ -90,15 +90,12 @@ test("the sidebar catalog covers every area, and only real areas", () => {
     "NAV_AREAS and WORK_AREAS disagree — areaDef() throws at runtime for a " +
       "union member with no catalog row, and an extra row navigates nowhere",
   );
-  // The Library is a PANE. A row for it here would be a mode wearing a
-  // destination's clothes, which is the confusion the redesign removed.
-  assert.ok(!CATALOG.includes("library"), "the Library is not a destination");
-  assert.ok(!CATALOG.includes("files"), "'files' is the default lens, not a place");
+  assert.ok(CATALOG.includes("files"), "the Library must be directly reachable from the sidebar");
 });
 
-test("the shipped sidebar pins four and holds the rest back", () => {
+test("the shipped sidebar pins Library with the four primary areas and holds the rest back", () => {
   const { pinned, more } = nav.splitPrefs(nav.defaultPrefs());
-  assert.deepEqual(pinned, ["home", "recordings", "browser", "sketch"]);
+  assert.deepEqual(pinned, ["home", "files", "recordings", "browser", "sketch"]);
   assert.equal(pinned.length + more.length, CATALOG.length, "a destination went missing");
   assert.ok(more.includes("create"), "Create belongs under More tools");
 });
@@ -136,7 +133,7 @@ test("an EMPTY pinned list is a real choice; an ABSENT one is not", () => {
   withStore(JSON.stringify({ order: CATALOG }));
   assert.deepEqual(
     nav.loadPrefs().pinned,
-    ["home", "recordings", "browser", "sketch"],
+    ["home", "files", "recordings", "browser", "sketch"],
     "no pinned key at all means never customized — take the defaults",
   );
 });
@@ -154,11 +151,11 @@ test("a row moves within its own group and never across it", () => {
   const prefs = nav.defaultPrefs();
   const before = nav.splitPrefs(prefs);
 
-  // Recordings is pinned and second. Down one → it swaps with Private browser,
+  // Recordings is pinned and third. Down one → it swaps with Private browser,
   // and the More tools group is untouched.
   const moved = nav.moveWithin(prefs, "recordings", 1);
   const after = nav.splitPrefs(moved);
-  assert.deepEqual(after.pinned, ["home", "browser", "recordings", "sketch"]);
+  assert.deepEqual(after.pinned, ["home", "files", "browser", "recordings", "sketch"]);
   assert.deepEqual(after.more, before.more, "the other group moved");
 
   // Same for a row inside More tools: Room Map up one steps past Create,

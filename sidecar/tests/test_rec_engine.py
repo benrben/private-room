@@ -98,11 +98,11 @@ _DOWNLOADED_MODEL = (
     / "ggml-large-v3-turbo-q5_0.bin"
 )
 _BUNDLED_MODEL = Path(
-    "/Users/benreich/private-room/src-tauri/resources/models/ggml-large-v3-turbo-q5_0.bin"
+    "/Users/benreich/private-room/electron-migration/electron-app/assets/models/ggml-large-v3-turbo-q5_0.bin"
 )
 MODEL_PATH = str(_DOWNLOADED_MODEL if _DOWNLOADED_MODEL.exists() else _BUNDLED_MODEL)
 DIAR_MODEL_PATH = (
-    "/Users/benreich/private-room/src-tauri/resources/models/nemo_en_titanet_small.onnx"
+    "/Users/benreich/private-room/electron-migration/electron-app/assets/models/nemo_en_titanet_small.onnx"
 )
 VAD_ONNX_PATH = str(
     Path.home() / "Library" / "Caches" / "arcelle-sidecar" / "models" / "silero_vad.onnx"

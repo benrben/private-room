@@ -9,7 +9,7 @@ on:
   pull_request:
     paths:
       - package-lock.json
-      - src-tauri/Cargo.lock
+      - electron-migration/electron-app/package-lock.json
       - sidecar/uv.lock
   workflow_dispatch:
 
@@ -31,12 +31,9 @@ jobs:
       # see .github/dependabot.yml.
       - name: npm audit (runtime dependencies)
         run: npm audit --omit=dev --audit-level=high
-
-      - uses: dtolnay/rust-toolchain@stable
-      - name: cargo audit
-        run: |
-          cargo install cargo-audit --locked
-          cargo audit --file src-tauri/Cargo.lock
+      - name: npm audit (Electron runtime dependencies)
+        working-directory: electron-migration/electron-app
+        run: npm audit --omit=dev --audit-level=high
 
       - uses: astral-sh/setup-uv@v5
       - name: pip-audit

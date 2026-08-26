@@ -60,6 +60,8 @@ function fnSource(src, signature) {
 
 const MODULE = [
   "export function makeRec(s, api, viewFile, acquireMic, attachMicTap, stopMicTap, noteLiveStt) {",
+  "const startRecordingTransport = () => {};",
+  "const closeRecordingTransport = () => {};",
   fnSource(SRC, "async function startLiveRecording("),
   fnSource(SRC, "async function stopLiveRecording("),
   "  return { startLiveRecording, stopLiveRecording };",

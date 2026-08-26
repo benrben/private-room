@@ -1,6 +1,6 @@
 /* Does the release flow keep the updater signing key off every command line?
  *
- * `TAURI_SIGNING_PRIVATE_KEY` is the one secret that, if copied, lets someone
+ * `MINISIGN_SECRET_KEY` is the one secret that, if copied, lets someone
  * publish a fake "Arcelle update" that every installed copy verifies and
  * installs. On macOS a process's argv is readable by anything else running as
  * you (`ps -ww`), and `npm run` echoes the command it is about to execute into
@@ -24,6 +24,8 @@ const root = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const read = (rel) => readFileSync(join(root, rel), "utf8");
 
 // Flags that put the secret (or its password) into argv. Long and short forms.
+// Minisign's `-s` takes a key FILE path, not the secret key bytes; that path
+// is safe in argv. Flags that inline key material or a password are not.
 const SECRET_FLAGS = /(^|\s)(--private-key|--password|-k|-p)(\s|=)/;
 
 for (const rel of ["scripts/release.sh", "RELEASING.md"]) {
@@ -38,7 +40,7 @@ for (const rel of ["scripts/release.sh", "RELEASING.md"]) {
           // nothing; the WHY-comment explaining this rule lives on one.
           !line.trimStart().startsWith("#") &&
           SECRET_FLAGS.test(line) &&
-          /TAURI_SIGNING_PRIVATE_KEY/.test(line),
+          /MINISIGN_SECRET_KEY/.test(line),
       )
       .map(([n, line]) => `${rel}:${n}: ${line.trim()}`);
     assert.deepEqual(
@@ -52,12 +54,6 @@ for (const rel of ["scripts/release.sh", "RELEASING.md"]) {
 test("release.sh still signs the updater payload", () => {
   // The fix above removes flags; it must not have removed the signing step.
   const sh = read("scripts/release.sh");
-  assert.match(sh, /tauri signer sign/, "the updater tar is no longer signed");
-  // An UNSET password makes the signer prompt (the key of record has none), so
-  // the release would hang instead of failing; the default must stay explicit.
-  assert.match(
-    sh,
-    /TAURI_SIGNING_PRIVATE_KEY_PASSWORD="\$\{TAURI_SIGNING_PRIVATE_KEY_PASSWORD-\}"/,
-    "the empty-password default is gone — signing would prompt and hang",
-  );
+  assert.match(sh, /minisign -S/, "the updater tar is no longer signed");
+  assert.match(sh, /MINISIGN_SECRET_KEY is required/, "a missing signing key must fail fast");
 });

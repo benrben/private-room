@@ -517,7 +517,7 @@ export interface ExtractionDeps {
   /** `extraction::extract_text(name, bytes)`. `null` = could not extract — a
    * real, expected Rust outcome (`Option<String>`) both sweeps skip a file
    * on, not an error. */
-  extractText: (name: string, bytes: Buffer) => string | null;
+  extractText: (name: string, bytes: Buffer) => string | null | Promise<string | null>;
 }
 
 const EXTRACT_TEXT_NOT_IMPLEMENTED_REASON =
@@ -594,7 +594,7 @@ export async function runReextractBackfill(deps: ReextractBackfillDeps): Promise
     if (isImage(mime) || isOcrCandidate(mime, ext) || mediaKind(mime, ext) !== null) {
       continue;
     }
-    const text = deps.extractText(name, bytes);
+    const text = await deps.extractText(name, bytes);
     if (text === null) {
       continue;
     }
@@ -681,7 +681,7 @@ export async function runLegacyTextRepair(deps: LegacyTextRepairDeps): Promise<v
 
   let fixed = 0;
   for (const [id, name, , bytes] of candidates) {
-    const text = deps.extractText(name, bytes);
+    const text = await deps.extractText(name, bytes);
     if (text === null) {
       continue;
     }

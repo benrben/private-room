@@ -699,20 +699,22 @@ describe("scriptOutput (real job artifacts)", () => {
 });
 
 // ============================================================================
-// NOT_IMPLEMENTED stubs — each fails loudly, naming its real blocker
+// Read surfaces are live; legacy injectable defaults still fail loudly.
 // ============================================================================
 
-describe("stubs blocked on jobs/script_run.rs and/or jobs/workflow.rs", () => {
-  it("the manifest-dependent reads name script_run.rs", () => {
+describe("script read surfaces and legacy injectable defaults", () => {
+  it("the Scripts page and agent read the real parsed manifest", () => {
     const db = freshRoom();
     const dir = freshUserDataDir();
-    expect(() => listScripts(db, dir)).toThrow(/NOT_IMPLEMENTED: list_scripts[\s\S]*script_run\.rs/);
-    expect(() => getScriptManifest(db, "f1")).toThrow(
-      /NOT_IMPLEMENTED: get_script_manifest[\s\S]*script_run\.rs/
+    const bytes = Buffer.from(
+      '# /// script\n# dependencies = ["requests"]\n# ///\nprint(\'ok\')\n',
     );
-    expect(() => agentListScripts(db, dir)).toThrow(
-      /NOT_IMPLEMENTED: agent_list_scripts[\s\S]*script_run\.rs/
-    );
+    const file = insertFile(db, "report.py", "text/x-python", bytes, null, "upload");
+    const rows = listScripts(db, dir);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ fileId: file.id, name: "report.py", lang: "py", deps: ["requests"] });
+    expect(getScriptManifest(db, file.id).deps).toEqual(["requests"]);
+    expect(agentListScripts(db, dir)).toContain("report.py (py, needs requests)");
   });
 
   it("the run arms name BOTH script_run.rs and workflow.rs", async () => {
@@ -740,7 +742,7 @@ describe("stubs blocked on jobs/script_run.rs and/or jobs/workflow.rs", () => {
   it("no stub fabricates a success", async () => {
     const db = freshRoom();
     const dir = freshUserDataDir();
-    expect(() => listScripts(db, dir)).toThrow();
+    expect(listScripts(db, dir)).toEqual([]);
     await expect(runScript(db, dir, "f1")).rejects.toBeInstanceOf(Error);
     await expect(approveWorkflowScripts({})).rejects.toBeInstanceOf(Error);
   });

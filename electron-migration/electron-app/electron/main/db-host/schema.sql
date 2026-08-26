@@ -15,6 +15,19 @@ CREATE TABLE IF NOT EXISTS files (
   size_bytes INTEGER NOT NULL DEFAULT 0,
   source TEXT NOT NULL DEFAULT 'upload',
   original_bytes BLOB,
+  -- Workspace rooms keep the current bytes in a normal file. Legacy rooms
+  -- continue to use original_bytes. No absolute path is stored in the room.
+  storage_kind TEXT NOT NULL DEFAULT 'blob'
+    CHECK (storage_kind IN ('blob', 'workspace')),
+  relative_path TEXT,
+  path_key TEXT,
+  content_sha256 TEXT,
+  mtime_ns INTEGER,
+  fs_identity TEXT,
+  index_state TEXT NOT NULL DEFAULT 'ready'
+    CHECK (index_state IN ('pending', 'ready', 'stale', 'offline', 'unsupported', 'failed')),
+  index_error TEXT,
+  last_seen_at TEXT,
   extracted_text TEXT,
   folder_id TEXT,
   -- ADD-17: cached one-line "what is this file" summary, cleared whenever the
@@ -242,6 +255,80 @@ CREATE TABLE IF NOT EXISTS file_versions (
   pinned INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_file_versions_file ON file_versions(file_id);
+
+-- Workspace rooms keep private historical bytes outside SQLite in immutable,
+-- authenticated encrypted objects. The hash is inside the encrypted database;
+-- the on-disk object name is opaque and does not reveal content identity.
+CREATE TABLE IF NOT EXISTS content_objects (
+  id TEXT PRIMARY KEY,
+  sha256 TEXT NOT NULL,
+  size_bytes INTEGER NOT NULL,
+  encryption_version INTEGER NOT NULL DEFAULT 1,
+  nonce BLOB NOT NULL,
+  relative_object_path TEXT NOT NULL UNIQUE,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+  UNIQUE(sha256, size_bytes)
+);
+CREATE TABLE IF NOT EXISTS content_object_refs (
+  owner_type TEXT NOT NULL,
+  owner_id TEXT NOT NULL,
+  object_id TEXT NOT NULL REFERENCES content_objects(id) ON DELETE CASCADE,
+  role TEXT NOT NULL,
+  PRIMARY KEY (owner_type, owner_id, object_id, role)
+);
+CREATE INDEX IF NOT EXISTS idx_content_object_refs_object
+  ON content_object_refs(object_id);
+CREATE INDEX IF NOT EXISTS idx_files_workspace_hash
+  ON files(storage_kind, content_sha256);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_files_workspace_path
+  ON files(path_key)
+  WHERE storage_kind = 'workspace' AND trashed_at IS NULL;
+
+-- Filesystem and database writes cannot share one transaction. This journal
+-- makes every cross-boundary operation recoverable after a crash.
+CREATE TABLE IF NOT EXISTS fs_operations (
+  operation_id TEXT PRIMARY KEY,
+  operation_type TEXT NOT NULL,
+  phase TEXT NOT NULL CHECK (phase IN
+    ('prepared', 'filesystem_committed', 'database_committed', 'completed', 'failed')),
+  file_id TEXT,
+  old_path TEXT,
+  new_path TEXT,
+  old_hash TEXT,
+  new_hash TEXT,
+  agent_run_id TEXT,
+  error TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_fs_operations_phase ON fs_operations(phase);
+
+CREATE TABLE IF NOT EXISTS agent_runs (
+  run_id TEXT PRIMARY KEY,
+  room_id TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  harness TEXT NOT NULL,
+  model TEXT NOT NULL,
+  privacy_mode TEXT NOT NULL,
+  status TEXT NOT NULL,
+  baseline_completed INTEGER NOT NULL DEFAULT 0,
+  rollback_status TEXT NOT NULL DEFAULT 'none',
+  started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+  completed_at TEXT
+);
+CREATE TABLE IF NOT EXISTS agent_run_files (
+  run_id TEXT NOT NULL REFERENCES agent_runs(run_id) ON DELETE CASCADE,
+  file_id TEXT NOT NULL,
+  baseline_path TEXT,
+  baseline_hash TEXT,
+  baseline_object_id TEXT REFERENCES content_objects(id) ON DELETE SET NULL,
+  final_path TEXT,
+  final_hash TEXT,
+  change_type TEXT,
+  PRIMARY KEY (run_id, file_id)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_run_files_object
+  ON agent_run_files(baseline_object_id);
 -- ART-1: the staging area for AI-generated artifacts. A generator writes its
 -- bytes HERE, they are validated here, and only then does one transaction move
 -- them into `files`. A crash, a Stop, or a failed validation therefore leaves

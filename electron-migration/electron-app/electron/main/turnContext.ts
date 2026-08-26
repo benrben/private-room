@@ -99,7 +99,7 @@ export function handoffBudgetBytes(maxContext: number): number {
 export function splitExternalModel(model: string): [string, string | undefined, string | undefined] {
   const first = model.indexOf("::");
   const engine = first === -1 ? model : model.slice(0, first);
-  if (engine !== "claude-cli" && engine !== "codex-cli" && engine !== "openrouter") {
+  if (engine !== "claude-cli" && engine !== "codex-cli" && engine !== "antigravity-cli" && engine !== "openrouter") {
     return [model, undefined, undefined];
   }
   if (first === -1) {
@@ -113,7 +113,7 @@ export function splitExternalModel(model: string): [string, string | undefined, 
 /** `external.rs::is_external_engine` — any non-local engine. */
 export function isExternalEngine(model: string): boolean {
   const base = splitExternalModel(model)[0];
-  return base === "claude-cli" || base === "codex-cli" || base === "openrouter";
+  return base === "claude-cli" || base === "codex-cli" || base === "antigravity-cli" || base === "openrouter";
 }
 
 /** `external.rs::is_cli_engine` — only the CLI-backed engines run as a
@@ -121,7 +121,7 @@ export function isExternalEngine(model: string): boolean {
  * provider-aware sidecar. */
 export function isCliEngine(model: string): boolean {
   const base = splitExternalModel(model)[0];
-  return base === "claude-cli" || base === "codex-cli";
+  return base === "claude-cli" || base === "codex-cli" || base === "antigravity-cli";
 }
 
 // ---------------------------------------------------------------- models.rs

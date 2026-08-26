@@ -144,6 +144,11 @@
  */
 
 import type { IpcMain, IpcMainInvokeEvent } from "electron";
+import { execFile } from "node:child_process";
+import { promises as fs } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { promisify } from "node:util";
 import type Database from "better-sqlite3-multiple-ciphers";
 import type { AudioPeaks } from "../shared/apiTypes.js";
 import type { OpenRoom } from "./turnEngine.js";
@@ -403,6 +408,39 @@ export interface DecodedPcm {
  * dependency. */
 export type DecodeToPcmFn = (bytes: Buffer, ext: string, kind: MediaKind) => Promise<DecodedPcm>;
 
+export type TranscodeToWav = (source: string, wav: string, kind: MediaKind, tempDir: string) => Promise<void>;
+
+const execFileAsync = promisify(execFile);
+
+function processError(prefix: string, error: unknown): Error {
+  const row = typeof error === "object" && error !== null ? error as { code?: unknown; stderr?: unknown; message?: unknown } : {};
+  if (row.code === "ENOENT") {
+    return new Error(`${prefix} failed to start: ${typeof row.message === "string" ? row.message : String(error)}`);
+  }
+  const stderr = typeof row.stderr === "string" ? row.stderr : Buffer.isBuffer(row.stderr) ? row.stderr.toString("utf8") : "";
+  return new Error(`${prefix}: ${stderr.slice(0, 200)}`);
+}
+
+export const transcodeWithMacOs: TranscodeToWav = async (source, wav, kind, tempDir) => {
+  let audioSource = source;
+  const m4a = path.join(tempDir, "audio.m4a");
+  if (kind === "video") {
+    try {
+      await execFileAsync("/usr/bin/avconvert", ["-p", "PresetAppleM4A", "-s", source, "-o", m4a], { maxBuffer: 1024 * 1024 });
+      await fs.chmod(m4a, 0o600).catch(() => undefined);
+      audioSource = m4a;
+    } catch (error) {
+      throw processError("no readable audio track", error);
+    }
+  }
+  try {
+    await execFileAsync("/usr/bin/afconvert", ["-f", "WAVE", "-d", "LEI16@16000", audioSource, wav], { maxBuffer: 1024 * 1024 });
+    await fs.chmod(wav, 0o600).catch(() => undefined);
+  } catch (error) {
+    throw processError("audio decode failed", error);
+  }
+};
+
 /** The labelled reason {@link decodeAudioBytes} falls back to for anything
  * that isn't WAV bytes. Exported so a caller or a test can recognize it
  * without hand-copying the string. */
@@ -462,14 +500,30 @@ function wavSampleRate(bytes: Buffer): number | null {
  * The default {@link DecodeToPcmFn}: a real decode for WAV bytes, an honest
  * refusal for everything else. See this module's doc for the full reasoning.
  */
-export const decodeAudioBytes: DecodeToPcmFn = async (bytes) => {
+export async function decodeAudioBytesWith(
+  bytes: Buffer,
+  ext: string,
+  kind: MediaKind,
+  transcode: TranscodeToWav,
+): Promise<DecodedPcm> {
   let samples: Float32Array;
   try {
     samples = decodeWav(bytes);
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e);
     if (message === NOT_A_WAV_FILE) {
-      throw new Error(DECODE_NON_WAV_NOT_IMPLEMENTED);
+      const safeExt = /^[a-z0-9]{1,10}$/iu.test(ext) ? ext : "bin";
+      const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "arcelle-peaks-"));
+      const source = path.join(tempDir, `source.${safeExt}`);
+      const wav = path.join(tempDir, "decoded.wav");
+      try {
+        await fs.writeFile(source, bytes, { mode: 0o600, flag: "wx" });
+        await transcode(source, wav, kind, tempDir);
+        samples = decodeWav(await fs.readFile(wav));
+        return { samples, sampleRate: SAMPLE_RATE };
+      } finally {
+        await fs.rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
+      }
     }
     // A real WAV that fails to parse for some other reason (no data chunk,
     // truncated bytes) is a genuine decode failure — keep decodeWav's own
@@ -478,7 +532,10 @@ export const decodeAudioBytes: DecodeToPcmFn = async (bytes) => {
     throw e instanceof Error ? e : new Error(message);
   }
   return { samples, sampleRate: wavSampleRate(bytes) ?? SAMPLE_RATE };
-};
+}
+
+export const decodeAudioBytes: DecodeToPcmFn = (bytes, ext, kind) =>
+  decodeAudioBytesWith(bytes, ext, kind, transcodeWithMacOs);
 
 // -------------------------------------------------------------- room access
 

@@ -532,7 +532,7 @@ interface OAuthFixture {
 
 /** A minimal, REAL OAuth authorization server + protected-resource metadata
  * host, all on one loopback `node:http` server, differentiated by path. */
-function startOAuthFixture(): Promise<OAuthFixture> {
+function startOAuthFixture(publicHost = "127.0.0.1"): Promise<OAuthFixture> {
   const registeredClientIds: string[] = [];
   const issuedCodes = new Map<string, { clientId: string; codeChallenge: string; redirectUri: string }>();
   const tokenRequests: URLSearchParams[] = [];
@@ -640,7 +640,7 @@ function startOAuthFixture(): Promise<OAuthFixture> {
     server.listen(0, "127.0.0.1", () => {
       const addr = server.address();
       const port = typeof addr === "object" && addr !== null ? addr.port : 0;
-      baseUrl = `http://127.0.0.1:${port}`;
+      baseUrl = `http://${publicHost}:${port}`;
       resolve({ baseUrl, server, registeredClientIds, issuedCodes, tokenRequests });
     });
   });
@@ -671,6 +671,24 @@ function driveBrowser(): (url: string) => Promise<void> {
 }
 
 describe("real end-to-end OAuth wire (loopback fixture, permissive test guard)", () => {
+  it("pinned metadata requests answer Node's lookup-all shape", async () => {
+    const fixture = await startOAuthFixture("oauth.example");
+    const pinnedGuard: OutboundGuard = {
+      checkEndpoint: (url) => new URL(url),
+      resolveAddr: async (_host, port) => ({ address: "127.0.0.1", port }),
+    };
+    try {
+      const result = await discover(
+        [`${fixture.baseUrl}/.well-known/oauth-protected-resource`],
+        pinnedGuard,
+      );
+      expect(result.meta.authorizationEndpoint).toBe(`${fixture.baseUrl}/authorize`);
+      expect(result.meta.tokenEndpoint).toBe(`${fixture.baseUrl}/token`);
+    } finally {
+      await closeServer(fixture.server);
+    }
+  });
+
   it("discovers, registers, and drives the whole authorize flow to a stored token", async () => {
     const fixture = await startOAuthFixture();
     try {

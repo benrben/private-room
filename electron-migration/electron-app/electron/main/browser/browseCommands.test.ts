@@ -316,27 +316,11 @@ describe("browserNavigate / browserNewTab", () => {
     db.close();
   });
 
-  /**
-   * REGRESSION TRAP, and a REAL defect in the already-ported core, out of this
-   * batch's scope to fix.
-   *
-   * The decision above is right and matches `browser_new_tab`. But
-   * `Browser.newTab` (browser.ts) re-guards ANY destination through
-   * `guardDestination` → `checkPublicHttpUrl`, which requires an http(s)
-   * scheme and therefore refuses `about:blank` — while Rust's `browser::create`
-   * only requires the string to parse as SOME URL (`reqwest::Url::parse`). So
-   * against the REAL core, opening an empty tab throws.
-   *
-   * Asserted as it behaves TODAY so the day `browser.ts` accepts the idle
-   * document the way Rust does, this goes red and gets rewritten into the real
-   * assertion — that an empty new tab actually opens.
-   */
-  it("cannot actually open that idle document against the real core yet", async () => {
+  it("opens the idle document against the real core without treating it as a network URL", async () => {
     const db = freshRoom();
     const { browser } = harness(db);
-    await expect(browserNewTab(baseDeps(db, browser), "")).rejects.toThrow(
-      "Only http(s) URLs can be fetched.",
-    );
+    await expect(browserNewTab(baseDeps(db, browser), "")).resolves.toBe("0");
+    expect(browser.activeUrl()).toBe("about:blank");
     db.close();
   });
 });

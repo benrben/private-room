@@ -1,7 +1,5 @@
 import { useEffect, useState } from "react";
-import { check } from "@tauri-apps/plugin-updater";
-import { relaunch } from "@tauri-apps/plugin-process";
-import { getVersion } from "@tauri-apps/api/app";
+import { checkForUpdate, getVersion, installUpdate, type AvailableUpdate } from "../platform";
 import {
   AlertIcon,
   CircleCheckIcon,
@@ -15,7 +13,7 @@ import { autoUpdateCheckEnabled, setAutoUpdateCheck } from "../updater";
 
 /** The update handle `check()` hands back (typed off the plugin so we don't
  * depend on an un-exported class name). */
-type UpdateHandle = NonNullable<Awaited<ReturnType<typeof check>>>;
+type UpdateHandle = AvailableUpdate;
 
 type Phase = "idle" | "checking" | "available" | "downloading" | "uptodate" | "error";
 
@@ -52,7 +50,7 @@ export default function AboutSection() {
     setErr("");
     setUpdate(null);
     try {
-      const u = await check();
+      const u = await checkForUpdate();
       if (!u) {
         setPhase("uptodate");
         return;
@@ -71,21 +69,10 @@ export default function AboutSection() {
     setPct(0);
     setErr("");
     try {
-      let total = 0;
-      let got = 0;
-      await update.downloadAndInstall((ev) => {
-        if (ev.event === "Started") {
-          total = ev.data.contentLength ?? 0;
-          setPct(0);
-        } else if (ev.event === "Progress") {
-          got += ev.data.chunkLength;
-          setPct(total > 0 ? Math.min(99, Math.round((got / total) * 100)) : null);
-        } else if (ev.event === "Finished") {
-          setPct(100);
-        }
-      });
-      // Installed on disk — relaunch into the new version (this never returns).
-      await relaunch();
+      setPct(null);
+      // The main process downloads, verifies the minisign payload, installs it
+      // and relaunches. A successful call normally never returns to this page.
+      await installUpdate();
     } catch (e) {
       setErr(errText(e));
       setPhase("error");

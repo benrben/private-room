@@ -2,6 +2,7 @@ import { useCallback, useSyncExternalStore, type ReactElement } from "react";
 import {
   BookOpenIcon,
   CreateIcon,
+  FolderIcon,
   GlobeIcon,
   GraphIcon,
   HomeIcon,
@@ -14,9 +15,10 @@ import {
 } from "../icons";
 import { WORK_AREAS, type WorkArea } from "../workspace/types";
 
-/** A place the sidebar can navigate to. Every area except "files", which is
- * the default document lens rather than a destination of its own. */
-export type NavArea = Exclude<WorkArea, "files">;
+/** A place the sidebar can navigate to. `files` is the dedicated Library
+ * destination: Home is the dashboard, while Library is where files are added,
+ * selected, moved, removed, restored, and managed. */
+export type NavArea = WorkArea;
 
 /** The catalog: every destination, its name, and its glyph — in the order a
  * customized sidebar starts out in.
@@ -25,12 +27,10 @@ export type NavArea = Exclude<WorkArea, "files">;
  * from it, and `navPrefs` validates stored keys against it, so a destination
  * cannot exist in one of those three and be missing from another.
  *
- * The Library is deliberately absent, and that is the whole point of the
- * redesign's first decision: the library is a PANE, not a place. It is shown
- * and hidden from the Layout menu (or ⌘1) like the Assistant is, and a row in
- * this list would be a mode wearing a destination's clothes — the exact
- * confusion the old rail created by putting three pane toggles at the top of
- * its list of nine places. */
+ * Library is a destination as well as the contextual file-management pane.
+ * Selecting it always returns that pane to its complete Browse/Sources/Trash
+ * surface, which makes file management reachable even after navigating into a
+ * destination whose second column lists something else. */
 export const NAV_AREAS: {
   key: NavArea;
   label: string;
@@ -40,6 +40,7 @@ export const NAV_AREAS: {
   icon: (size: number) => ReactElement;
 }[] = [
   { key: "home", label: "Home", blurb: "Recent work, and what needs you", icon: (s) => <HomeIcon size={s} /> },
+  { key: "files", label: "Library", blurb: "Add, find, organize, and remove room files", icon: (s) => <FolderIcon size={s} /> },
   { key: "recordings", label: "Recordings", blurb: "Mic and Mac audio, transcribed here", icon: (s) => <MicIcon size={s} /> },
   { key: "browser", label: "Private browser", blurb: "Read the web with no history kept", icon: (s) => <GlobeIcon size={s} /> },
   { key: "sketch", label: "Sketch", blurb: "Draw by hand, or ask the room to draw", icon: (s) => <SketchIcon size={s} /> },
@@ -64,7 +65,7 @@ const CANONICAL: NavArea[] = NAV_AREAS.map((a) => a.key);
 
 /** What a new install pins.
  *
- * Four, not the ten the rail used to show at once. These are the places a
+ * Five, not the ten the rail used to show at once. These are the places a
  * room is USED from — where material arrives and where you start. Everything
  * that operates on material already in the room (workflows, scripts, skills,
  * connectors, memory, the map) is real, frequently valuable, and not something
@@ -74,7 +75,7 @@ const CANONICAL: NavArea[] = NAV_AREAS.map((a) => a.key);
  * Create sits with them rather than in this list on the room owner's call: a
  * generation is an occasional act, and it lands as an ordinary room file, so
  * the Library is where its output is actually worked with. */
-export const DEFAULT_PINNED: NavArea[] = ["home", "recordings", "browser", "sketch"];
+export const DEFAULT_PINNED: NavArea[] = ["home", "files", "recordings", "browser", "sketch"];
 
 const KEY = "prNav:v1";
 
@@ -88,7 +89,7 @@ export interface NavPrefs {
 }
 
 function isArea(v: unknown): v is NavArea {
-  return typeof v === "string" && v !== "files" && (WORK_AREAS as readonly string[]).includes(v);
+  return typeof v === "string" && (WORK_AREAS as readonly string[]).includes(v);
 }
 
 export function defaultPrefs(): NavPrefs {
@@ -289,8 +290,6 @@ export function areaDef(key: NavArea) {
 /** The sidebar's own name for a place, reused by anything that has to name
  * one, so two surfaces can never disagree about what somewhere is called. */
 export function areaLabel(key: WorkArea): string {
-  // "files" is Home's other name and the only key not on the rail; anything
-  // else is a destination this build does not know. Both land on the place the
-  // app opens in — never on "Library", which is the name of a COLUMN.
+  // Unknown values land on the place the app opens in.
   return NAV_AREAS.find((a) => a.key === key)?.label ?? "Home";
 }

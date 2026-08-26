@@ -973,7 +973,8 @@ describe("trash / undo", () => {
   it("an_older_room_gains_the_trash_columns_when_it_is_migrated", () => {
     const db = freshRoom();
     db.exec(
-      `ALTER TABLE files DROP COLUMN trashed_at;
+      `DROP INDEX idx_files_workspace_path;
+       ALTER TABLE files DROP COLUMN trashed_at;
        ALTER TABLE files DROP COLUMN trashed_by;
        ALTER TABLE files DROP COLUMN trashed_by_id;
        DROP TABLE trashed_chunks;`

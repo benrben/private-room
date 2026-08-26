@@ -36,8 +36,8 @@
  *     exact channel strings each one actually registers — no guessing, no
  *     re-declaring. {@link checkCompleteness} then diffs that observed set
  *     against {@link ALL_COMMAND_NAMES}, using
- *     {@link KNOWN_UNREGISTERED_COMMANDS} (this step's honestly-documented gap
- *     list) as the EXPECTED difference. A test asserts the diff equals that
+ *     {@link KNOWN_UNREGISTERED_COMMANDS} (now empty after cutover) as the
+ *     EXPECTED difference. A test asserts the diff equals that
  *     list exactly in BOTH directions — so a channel silently dropped from a
  *     module fails the build (missing and undocumented), and so does a stale
  *     entry left behind once a future step actually wires it (documented but
@@ -111,12 +111,9 @@
  *     `grounding_model_for_room` answer for the room the user actually has
  *     open rather than always falling back to a global default.
  *
- * Where a module's deps interface has an OPTIONAL seam this step has no live
- * implementation for yet (a room-server bridge dispatcher, an
- * embedding-backfill kick, an STT job enqueue), the module's OWN
- * already-shipped `NOT_IMPLEMENTED`/`SKIPPED` default is left in place —
- * nothing here fabricates a working answer for a seam its author already
- * documented as open.
+ * Optional dependency seams retain explicit defaults for isolated unit tests.
+ * The production bootstrap overlays the live room server, backfill, STT, job,
+ * workflow, browser, connector, privacy, and turn-engine services.
  *
  * ============================================================================
  * THE HOST BRIDGE — five channels this file registers directly
@@ -155,19 +152,15 @@
  * of keeping this file free of `handle` calls.
  *
  * ============================================================================
- * NOT WIRED HERE, deliberately (SCOPE BOUNDARIES)
+ * PRODUCTION SURFACES ASSEMBLED BY SIBLING REGISTRARS
  * ============================================================================
- * The rest of the turn engine (`ask`/`cancel_ask`/`handoff_chat`) and the
- * wider `exec_tool` dispatch surface both need a live, per-run room MCP bridge
- * (`turnEngine.ts`'s required `AskDeps.mcp`) that neither this file nor
- * `liveContext.ts` builds — see that module's own doc on the app-wide
- * `McpManager` and consent surface this migration has never stood up.
- * `liveExecToolDeps` is real and ready for whichever batch does.
+ * The turn engine, `exec_tool`, MCP, browser, jobs/workflows, files, scripts,
+ * speech, and creative surfaces are registered through the focused surface
+ * registrars imported below. They share this registry's room state and live
+ * service graph.
  *
- * The ad-blocker/webRequest funnel and DB `utilityProcess` isolation are
- * untouched by this file too — each is its own sequenced step. Their command
- * surface (the `mcp_*` family, `browser_*`, jobs/workflows CRUD) is exactly
- * the bulk of {@link KNOWN_UNREGISTERED_COMMANDS} below.
+ * The ad-blocker/webRequest funnel and DB isolation remain owned by their
+ * dedicated modules rather than duplicated here.
  */
 
 import type { IpcMain, IpcMainInvokeEvent } from "electron";
@@ -183,11 +176,27 @@ import {
 import type { SafetyOpenRoom, SafetyRoomSource } from "../safetyTools.js";
 import type { EventSender } from "../turn.js";
 import { modelSetting } from "../gatherContext.js";
-import { SttModelState } from "../sttTools.js";
+import { SttModelState, sttEffectiveModel } from "../sttTools.js";
+import { retranscribeFile } from "../speechSttSurfaceIpc.js";
 import { createPeakCache } from "../peaksTools.js";
 import { createSlideCache } from "../officeTools.js";
-import { createRecBridgeCtx } from "../recBridge.js";
-import type { RoomServerSlot } from "../moonshotServer.js";
+import { createRecBridgeCtx, recStop, type RecBridgeCtx } from "../recBridge.js";
+import type { OpenRoom } from "../turnEngine.js";
+import { createJobQueueState, defaultRowStarters } from "../jobQueue.js";
+import { startRecRead } from "../recRead.js";
+import { listModels } from "../engineRouting.js";
+import { bestLocalDefault } from "../ollamaModels.js";
+import { runsOnThisMac } from "../capabilities.js";
+import { createSchedulerState, startWorkflowRunNotImplemented } from "../jobScheduler.js";
+import type { JobProgressPayload } from "../jobs.js";
+import {
+  createRemoveDiscovery,
+  createRoomServerDeps,
+  createSpawnRoomServerIfEnabled,
+  roomServerRoomSource,
+  roomServerSlotOver,
+  type RoomServerDepsOptions,
+} from "../roomServerLive.js";
 
 import { registerRoomManagerIpc } from "../roomManagerIpc.js";
 import { registerRoomCheckpointsIpc } from "../roomCheckpoints.js";
@@ -203,9 +212,10 @@ import { registerRoomGraphIpc } from "../moonshotGraph.js";
 import { registerRolesIpc } from "../moonshotRoles.js";
 import { registerMoonshotServerIpc } from "../moonshotServer.js";
 import { registerOfficeIpc } from "../officeTools.js";
-import { registerOllamaModelsIpc } from "../ollamaModels.js";
+import { defaultAiStatusDeps, registerOllamaModelsIpc } from "../ollamaModels.js";
+import { detectedExternal, ollamaInstalled } from "../externalDetection.js";
 import { registerPeaksIpc } from "../peaksTools.js";
-import { registerPreviewIpc } from "../previewTools.js";
+import { registerPreviewIpc, renderQuickLook } from "../previewTools.js";
 import { registerRecIpc } from "../recIpc.js";
 import { registerRecentIpc } from "../recentTools.js";
 import { registerRuntimesIpc } from "../runtimesCmds.js";
@@ -219,13 +229,42 @@ import { registerSttToolsIpc } from "../sttTools.js";
 import { registerStudiosPodcastAudioIpc } from "../studiosPodcastAudio.js";
 import { registerVideoIpc } from "../videoTools.js";
 import { registerVisionIpc } from "../visionTools.js";
-import { registerWorkflowComposeIpc } from "../workflowCompose.js";
+import {
+  generateTextAnyEngine,
+  registerWorkflowComposeIpc,
+  withRealOllamaGenerate,
+} from "../workflowCompose.js";
 // The two plugin-surface modules. Like every module above they import
 // `electron` for TYPES only, so pulling them in here costs this file nothing at
 // runtime; the real `dialog`/`shell` objects arrive through
 // {@link RegisterAllIpcOptions}, injected by `main/index.ts`.
 import { registerDialogIpc, type DialogDeps } from "../dialogTools.js";
 import { registerShellIpc, type ShellDeps } from "../shellTools.js";
+import { registerCoreSurfaceIpc } from "../coreSurfaceIpc.js";
+import { registerFileSurfaceIpc } from "../fileSurfaceIpc.js";
+import { createMcpRuntime, registerMcpSurfaceIpc } from "../mcpSurfaceIpc.js";
+import { registerBrowserSurfaceIpc } from "../browserSurfaceIpc.js";
+import type { WindowContentView } from "../browser/webviewManager.js";
+import { registerJobWorkflowSurfaceIpc } from "../jobWorkflowSurfaceIpc.js";
+import { registerFileRuntimeSurfaceIpc, type FileRuntimeStores } from "../fileRuntimeSurfaceIpc.js";
+import { registerMediaDownloadSurfaceIpc } from "../mediaDownloadSurfaceIpc.js";
+import { registerScriptSurfaceIpc } from "../scriptSurfaceIpc.js";
+import { registerModelCatalogSurfaceIpc } from "../modelCatalogSurfaceIpc.js";
+import { registerSpeechSttSurfaceIpc } from "../speechSttSurfaceIpc.js";
+import { registerChatTurnSurfaceIpc } from "../chatTurnSurfaceIpc.js";
+import { createWorkflowAgentRun } from "../workflowAgentRun.js";
+import { registerAgentUiSurfaceIpc } from "../agentUiSurfaceIpc.js";
+import { registerCreativeJobSurfaceIpc } from "../creativeJobSurfaceIpc.js";
+import { createLiveAutoIndex } from "../autoIndexLive.js";
+import { refreshMcpConnections, type LiveAppServices } from "../liveAppServices.js";
+import {
+  createEmbedBackfillState,
+  spawnEmbeddingBackfill,
+  spawnLegacyTextRepair,
+  spawnReextractBackfill,
+} from "../retrievalBackfill.js";
+import { forgetRoomMemory } from "../sidecar.js";
+import { extractDocumentText } from "../documentExtraction.js";
 
 // ---- the host bridge's own three dependencies (see the module doc) --------
 import { runCommand, type RunCommandRequest } from "../chatCommands.js";
@@ -250,150 +289,18 @@ import { ALL_COMMAND_NAMES } from "../../shared/channelAllowlist.js";
  * `registry.test.ts`), NOT hand-maintained here — a hardcoded count is exactly
  * the kind of claim that goes quietly wrong (one candidate shipped
  * `moduleCount: 30` next to 31 real calls, with a test asserting the 30). */
-export const WIRED_MODULE_COUNT = 33;
+export const WIRED_MODULE_COUNT = 43;
 
 // ============================================================================
 // The honest gap list (see module doc, point 2)
 // ============================================================================
 
 /**
- * Every `Commands` key neither the 33 wired `registerXIpc` modules nor this
- * file's own host-bridge block covers. Every one belongs to a subsystem with
- * no `registerXIpc` module yet (the rest of the turn engine —
- * `ask`/`cancel_ask`/`handoff_chat`, which need the room MCP bridge
- * `run_command` does not — the `mcp_*` connector family, every `browser_*`
- * channel, jobs/workflows CRUD, file trash/versions beyond what
- * `safetyTools.ts` covers, the privacy command surface, and a handful of
- * others) — none is a channel a wired module silently dropped.
- * {@link checkCompleteness} re-verifies this set against the OBSERVED gap on
- * every run, so it cannot go stale without a failing test.
+ * The set is intentionally empty after the complete command cutover.
+ * {@link checkCompleteness} re-verifies it against the observed registry on
+ * every run, so any missing channel immediately fails tests and bootstrap.
  */
 export const KNOWN_UNREGISTERED_COMMANDS: ReadonlySet<string> = new Set<string>([
-  "add_privacy_block",
-  "app_diag",
-  "approve_mcp",
-  "ask",
-  "browser_clear_journal",
-  "browser_clear_scope",
-  "browser_close_tab",
-  "browser_focus_app",
-  "browser_go",
-  "browser_info",
-  "browser_journal",
-  "browser_navigate",
-  "browser_new_tab",
-  "browser_page_selection",
-  "browser_page_text",
-  "browser_peek",
-  "browser_preview",
-  "browser_retry_protection",
-  "browser_save_page",
-  "browser_search",
-  "browser_search_summary",
-  "browser_select_tab",
-  "browser_set_bounds",
-  "browser_set_takeover",
-  "browser_tabs",
-  "browser_verify_private",
-  "cancel_ask",
-  "cancel_job",
-  "cancel_media_download",
-  "connect_ai_provider",
-  "decode_file_text",
-  "delete_file_permanently",
-  "delete_files_permanently",
-  "delete_job",
-  "delete_workflow",
-  "disconnect_ai_provider",
-  "empty_trash",
-  "engine_capabilities",
-  "engine_preflight",
-  "engine_support_matrix",
-  "feedback_draft",
-  "get_file_content",
-  "get_job_step_artifact",
-  "get_mcp_auto_approve",
-  "get_mcp_connector_powers",
-  "get_mcp_outbound_unmask",
-  "get_workflow_runs",
-  "get_workflow_schedule",
-  "handoff_chat",
-  "import_files",
-  "import_link",
-  "import_media_url",
-  "import_search_result",
-  "list_ai_providers",
-  "list_chat_commands",
-  "list_create_models",
-  "list_engine_models",
-  "list_files",
-  "list_jobs",
-  "list_media_formats",
-  "list_neural_voices",
-  "list_scripts",
-  "list_specialists",
-  "list_trashed_files",
-  "list_workflows",
-  "mcp_apply_config",
-  "mcp_get_config",
-  "mcp_get_tool_prefs",
-  "mcp_oauth_authorize",
-  "mcp_oauth_sign_out",
-  "mcp_oauth_status",
-  "mcp_registry_optin_status",
-  "mcp_registry_search",
-  "mcp_remove_server",
-  "mcp_set_server_enabled",
-  "mcp_set_tool_enabled",
-  "mcp_status",
-  "move_files_to_folder",
-  "open_html_in_browser",
-  "open_scratch_pad",
-  "privacy_preview",
-  "privacy_status",
-  "remove_privacy_entity",
-  "rename_file",
-  "resolve_agent_ui",
-  "resolve_mcp_call",
-  "resolve_script_run",
-  "restore_file",
-  "restore_files",
-  "resume_job",
-  "retranscribe_file",
-  "reveal_logs",
-  "run_script",
-  "run_workflow",
-  "save_generated_file",
-  "save_workflow",
-  "set_file_in_library",
-  "set_mcp_auto_approve",
-  "set_mcp_connector_power",
-  "set_mcp_outbound_unmask",
-  "set_mcp_registry_optin",
-  "set_privacy_concepts",
-  "set_privacy_global",
-  "set_privacy_room",
-  "set_script_schedule",
-  "set_workflow_pinned",
-  "set_workflow_schedule",
-  "set_workflow_status",
-  "speak_text_neural",
-  "stage_preview_html",
-  "start_create_job",
-  "start_deep_summary",
-  "start_download_job",
-  "start_podcast_audio_job",
-  "start_privacy_scan",
-  "start_shot_list_job",
-  "start_studio_job",
-  "story_film_plan",
-  "studio_prompts",
-  "trash_file",
-  "trash_files",
-  "update_file_content",
-  "update_workflow",
-  "validate_workflow",
-  "web_search_test",
 ]);
 
 /**
@@ -560,6 +467,14 @@ export interface HostBridge {
   /** `menuSync(theInstalledMenu, view)` — push the window's layout state onto
    * the live native menu. */
   syncMenu(view: ViewMenuState): void;
+  /** Electron app metadata and the signed bridge updater. */
+  appVersion(): string;
+  osVersion(): string;
+  checkForUpdate(): Promise<{ version: string; notes?: string } | null>;
+  installUpdate(): Promise<void>;
+  windowContentView(): WindowContentView | null;
+  focusMainWindow(): void;
+  openPath(target: string): Promise<void>;
 }
 
 /**
@@ -616,6 +531,20 @@ export interface RegisterAllIpcOptions {
 export interface RegisterAllIpcResult {
   registeredChannels: ReadonlySet<string>;
   completeness: CompletenessReport;
+  runtimeStores: FileRuntimeStores;
+}
+
+/** Production recording context. Kept as a named factory so the critical
+ * Settings/recording STT resolver wiring is directly regression-testable. */
+export function createLiveRecBridgeCtx(
+  currentRoom: () => OpenRoom | null,
+  userDataDir: string,
+  resourcesPath: string | null,
+): RecBridgeCtx {
+  return createRecBridgeCtx({
+    currentRoom,
+    resolveSttModel: () => sttEffectiveModel(userDataDir, resourcesPath),
+  });
 }
 
 /** Build the default {@link RoomManagerDeps} the registry boots with when the
@@ -634,6 +563,56 @@ export function createDefaultRoomManagerDeps(
     userDataDir,
     emit,
     spawnRoomServerIfEnabled: spawnRoomServerIfEnabledNotImplemented,
+  };
+}
+
+/** Production room-lifecycle dependencies. This closes the interrupted
+ * migration's three live-wiring gaps: queued jobs are pumped after unlock,
+ * the workflow scheduler performs its catch-up pass, and the persistent room
+ * MCP server is started/stopped through the same RoomManagerState used by the
+ * Settings IPC. */
+export function createLiveRoomManagerDeps(
+  state: RoomManagerState,
+  userDataDir: string,
+  emit: EventSender,
+  roomServerOptions: RoomServerDepsOptions = {}
+): RoomManagerDeps {
+  const rooms = toJobsRoomSource(state);
+  const embedState = createEmbedBackfillState();
+  const roomServerDeps = createRoomServerDeps(state, emit, roomServerOptions);
+  return {
+    userDataDir,
+    emit,
+    scheduler: {
+      deps: { rooms, startWorkflowRun: startWorkflowRunNotImplemented },
+      state: createSchedulerState(),
+    },
+    jobQueue: {
+      state: createJobQueueState(),
+      rooms,
+      sink: {
+        emit: (payload: JobProgressPayload): void => emit("job-progress", payload),
+      },
+      cancelState: state.cancel,
+      starters: defaultRowStarters(),
+    },
+    policy: { room: rooms, userDataDir },
+    spawnEmbeddingBackfill: () => { spawnEmbeddingBackfill({ rooms }, embedState); },
+    spawnReextractBackfill: () => spawnReextractBackfill({
+      rooms,
+      roomEpoch: () => state.roomEpoch,
+      extractText: extractDocumentText,
+      notifyFilesChanged: () => emit("room-files-changed", {}),
+    }),
+    spawnLegacyTextRepair: () => spawnLegacyTextRepair({
+      rooms,
+      roomEpoch: () => state.roomEpoch,
+      extractText: extractDocumentText,
+    }),
+    noteRoomClosed: () => undefined,
+    forgetRoomMemory,
+    spawnRoomServerIfEnabled: createSpawnRoomServerIfEnabled(state, roomServerDeps),
+    removeDiscovery: createRemoveDiscovery(roomServerOptions.discoveryHome),
   };
 }
 
@@ -685,14 +664,19 @@ export function registerAllIpc(opts: RegisterAllIpcOptions): RegisterAllIpcResul
   // ---- room lifecycle + checkpoints + chat — the real RoomManagerState ----
   registerRoomManagerIpc(recordingIpcMain, state, deps);
   registerRoomCheckpointsIpc(recordingIpcMain, state, deps);
-  registerChatIpc(recordingIpcMain, state);
+  registerChatIpc(recordingIpcMain, state, {
+    enqueueStt: (job) => {
+      void retranscribeFile(state, userDataDir, resourcesPath, emit, job.id, (roomPath) => deps.scheduleAutoIndex?.(roomPath)).catch((error) =>
+        emit("stt-progress", [job.id, error instanceof Error ? error.message : String(error)]));
+    },
+  });
 
   // ---- the host bridge: the four channels this file registers itself ------
   // See the module doc's "THE HOST BRIDGE" for why these are here rather than
   // in `main/index.ts`, and why they go through `recordingIpcMain` like
   // everything else. `assembleLiveContext` closes over the SAME `state`/`emit`
   // as every module above, so a `#command` sees the room `open_room` opened.
-  const liveContext = assembleLiveContext(state, emit);
+  const liveContext = assembleLiveContext(state, emit, { userDataDir, resourcesPath });
   recordingIpcMain.handle("run_command", (_event: IpcMainInvokeEvent, args: unknown) =>
     runCommand(args as RunCommandRequest, liveContext.runCommandDeps)
   );
@@ -716,10 +700,88 @@ export function registerAllIpc(opts: RegisterAllIpcOptions): RegisterAllIpcResul
   recordingIpcMain.handle("menu_sync", (_event: IpcMainInvokeEvent, args: unknown): void => {
     host.syncMenu(readViewMenuState(args));
   });
+  recordingIpcMain.handle("app_version", (): string => host.appVersion());
+  recordingIpcMain.handle("updater_check", () => host.checkForUpdate());
+  recordingIpcMain.handle("updater_install", () => host.installUpdate());
 
   // ---- the two plugin surfaces: arcelle.dialog / arcelle.shell ------------
   registerDialogIpc(recordingIpcMain, dialog);
   registerShellIpc(recordingIpcMain, shell);
+  registerCoreSurfaceIpc(recordingIpcMain, state, userDataDir, emit, host, deps);
+  registerFileSurfaceIpc(recordingIpcMain, state, emit);
+  const mcpRuntime = createMcpRuntime();
+  deps.mcp = mcpRuntime.manager;
+  registerMcpSurfaceIpc(
+    recordingIpcMain,
+    state,
+    userDataDir,
+    emit,
+    mcpRuntime,
+    (url) => shell.shell.openExternal(url).then(() => undefined),
+  );
+  const agentUiRuntime = registerAgentUiSurfaceIpc(
+    recordingIpcMain,
+    deps,
+  );
+  const browserRuntime = registerBrowserSurfaceIpc(recordingIpcMain, state, deps, userDataDir, emit, host);
+  const runtimeStores = registerFileRuntimeSurfaceIpc(
+    recordingIpcMain, state, deps, userDataDir, emit, host,
+  );
+  registerMediaDownloadSurfaceIpc(
+    recordingIpcMain,
+    state,
+    deps,
+    userDataDir,
+    emit,
+  );
+  const sttModelState = new SttModelState();
+  const liveServices: LiveAppServices = {
+    roomDeps: deps,
+    userDataDir,
+    mcp: mcpRuntime,
+    agentUi: agentUiRuntime,
+    files: runtimeStores,
+    browser: browserRuntime,
+    sttModelState,
+    resourcesPath,
+  };
+  deps.workflowAgentRun = createWorkflowAgentRun(state, emit, liveServices);
+  registerJobWorkflowSurfaceIpc(recordingIpcMain, state, deps, userDataDir, emit);
+  deps.refreshMcp = () => refreshMcpConnections(state, liveServices);
+  const liveRoomServerDeps = createRoomServerDeps(state, emit, { services: liveServices });
+  deps.spawnRoomServerIfEnabled = createSpawnRoomServerIfEnabled(state, liveRoomServerDeps);
+  registerChatTurnSurfaceIpc(
+    recordingIpcMain,
+    state,
+    emit,
+    mcpRuntime,
+    liveServices,
+  );
+  registerScriptSurfaceIpc(
+    recordingIpcMain,
+    state,
+    deps,
+    userDataDir,
+    emit,
+  );
+  registerModelCatalogSurfaceIpc(
+    recordingIpcMain,
+  );
+  registerSpeechSttSurfaceIpc(
+    recordingIpcMain,
+    state,
+    userDataDir,
+    resourcesPath,
+    emit,
+    (roomPath) => deps.scheduleAutoIndex?.(roomPath),
+  );
+  registerCreativeJobSurfaceIpc(
+    recordingIpcMain,
+    state,
+    deps,
+    emit,
+  );
+  deps.scheduleAutoIndex = createLiveAutoIndex(state, deps, emit);
 
   // ---- standalone channels with no room dependency ----
   registerDictIpc(recordingIpcMain);
@@ -733,28 +795,66 @@ export function registerAllIpc(opts: RegisterAllIpcOptions): RegisterAllIpcResul
   registerMoonshotIpc(recordingIpcMain, { rooms: roomSource });
   registerFrontPageIpc(recordingIpcMain, roomSource);
   registerRoomGraphIpc(recordingIpcMain, roomSource);
-  registerOfficeIpc(recordingIpcMain, roomSource, createSlideCache());
+  registerOfficeIpc(recordingIpcMain, roomSource, createSlideCache(), renderQuickLook);
   registerPeaksIpc(recordingIpcMain, roomSource, createPeakCache());
-  registerPreviewIpc(recordingIpcMain, roomSource);
+  registerPreviewIpc(recordingIpcMain, roomSource, renderQuickLook);
   registerSearchIpc(recordingIpcMain, roomSource);
   registerSketchIpc(recordingIpcMain, roomSource, emit);
-  registerSkillsIpc(recordingIpcMain, roomSource, emit);
+  registerSkillsIpc(recordingIpcMain, roomSource, emit, { isRollingBack });
   registerSpreadsheetIpc(recordingIpcMain, roomSource, emit);
   registerStoryIpc(recordingIpcMain, roomSource);
   registerVideoIpc(recordingIpcMain, roomSource, { emit });
   registerVisionIpc(recordingIpcMain, roomSource);
-  registerWorkflowComposeIpc(recordingIpcMain, roomSource, { isRollingBack }, emit);
+  registerWorkflowComposeIpc(recordingIpcMain, roomSource, {
+    isRollingBack,
+    generate: (model, prompt) => generateTextAnyEngine(model, prompt, withRealOllamaGenerate({})),
+  }, emit);
   registerSttToolsIpc(recordingIpcMain, {
     userDataDir,
     resourcesPath,
-    modelState: new SttModelState(),
+    modelState: sttModelState,
     room: roomSource,
   });
-  registerRecIpc(
-    recordingIpcMain,
-    createRecBridgeCtx({ currentRoom: () => roomSource.currentRoom() }),
-    roomSource
-  );
+  // Recording and Settings must resolve the SAME model. Before this explicit
+  // dependency was wired, Settings correctly displayed "Voice model installed"
+  // while createRecBridgeCtx's honest default always made rec_start answer
+  // STT_MODEL_MISSING in the packaged app.
+  const recCtx = createLiveRecBridgeCtx(() => roomSource.currentRoom(), userDataDir, resourcesPath);
+  deps.stopRecordingAndWait = async (timeoutMs) => {
+    if (recCtx.state.liveFileId === null) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        recStop(recCtx),
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => reject(new Error("Timed out while saving the live recording.")), timeoutMs);
+          timer.unref?.();
+        }),
+      ]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  };
+  deps.stopRecordingNoWait = () => {
+    if (recCtx.state.liveFileId !== null) void recStop(recCtx).catch(() => undefined);
+  };
+  registerRecIpc(recordingIpcMain, recCtx, roomSource, {
+    readStart: async (_db, _ctx, id) => {
+      if (deps.jobQueue === undefined) throw new Error("The background job queue is unavailable.");
+      return startRecRead(deps.jobQueue, {
+        resolvePassEngine: async () => {
+          if (state.room === null) throw new Error("No room is open.");
+          const models = await listModels();
+          const model = modelSetting(state.room.conn) ?? bestLocalDefault(models);
+          return { chatModel: model, lane: runsOnThisMac(model) ? "local_llm" : "cloud" };
+        },
+        onReadDone: (event) => emit("rec-read-done", event),
+      }, id);
+    },
+    retranscribe: async (_db, _ctx, id) => {
+      await retranscribeFile(state, userDataDir, resourcesPath, emit, id, (roomPath) => deps.scheduleAutoIndex?.(roomPath));
+    },
+  });
 
   // ---- RoomHandle(+name)-shaped / room-server-shaped RoomSource modules ----
   registerMoonshotAiActionsIpc(recordingIpcMain, {
@@ -762,8 +862,12 @@ export function registerAllIpc(opts: RegisterAllIpcOptions): RegisterAllIpcResul
     cancelState: state.cancel,
     send: emit,
   });
-  const roomServerSlot: RoomServerSlot = { bridge: null };
-  registerMoonshotServerIpc(recordingIpcMain, roomSource, roomServerSlot);
+  registerMoonshotServerIpc(
+    recordingIpcMain,
+    roomServerRoomSource(state),
+    roomServerSlotOver(state),
+    createRoomServerDeps(state, emit, { services: liveServices })
+  );
 
   // ---- jobs.ts-shaped (`.current()`) RoomSource modules ----
   registerLibraryIpc(recordingIpcMain, { room: jobsRoomSource, userDataDir });
@@ -794,11 +898,17 @@ export function registerAllIpc(opts: RegisterAllIpcOptions): RegisterAllIpcResul
     // constant `null`, which would make ai_status/warm_model/grounding answer
     // for a room the user does not have open.
     explicitModel: buildExplicitModel(state),
+    aiStatusDeps: {
+      ...defaultAiStatusDeps,
+      detectedExternal,
+      ollamaInstalled,
+    },
   });
 
   return {
     registeredChannels,
     completeness: checkCompleteness(registeredChannels),
+    runtimeStores,
   };
 }
 

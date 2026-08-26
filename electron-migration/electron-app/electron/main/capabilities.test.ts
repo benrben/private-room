@@ -106,18 +106,20 @@ describe("ported from capabilities.rs", () => {
     expect(engineIdOf("qwen3-vl:235b-cloud")).toBe("ollama-cloud");
     expect(engineIdOf("claude-cli")).toBe("claude-cli");
     expect(engineIdOf("codex-cli::gpt-5.6-sol::high")).toBe("codex-cli");
+    expect(engineIdOf("antigravity-cli::gemini-3.7-flash-high")).toBe("antigravity-cli");
     expect(engineIdOf("openrouter::vendor/model")).toBe("openrouter");
-    for (const model of ["qwen3.5:4b", "minimax-m3:cloud", "claude-cli", "codex-cli", "openrouter::vendor/model"]) {
+    for (const model of ["qwen3.5:4b", "minimax-m3:cloud", "claude-cli", "codex-cli", "antigravity-cli", "openrouter::vendor/model"]) {
       expect(declaredFor(model).id, model).toBe(engineIdOf(model));
     }
   });
 
   /** THE CONVERSION THIS PACKET EXISTS FOR: "can it stream?" used to be
    * `is_cli_engine(model)` written out at the decision point. It is now a
-   * declared field, and the two engines that cannot stream say so once. */
+   * declared field, and CLI engines that cannot stream say so once. */
   it("streaming_is_declared_not_sniffed_from_the_name", () => {
     expect(declaredFor("claude-cli").streaming).toBe("no");
     expect(declaredFor("codex-cli::gpt-5.6-sol::high").streaming).toBe("no");
+    expect(declaredFor("antigravity-cli::gemini-3.7-flash-high").streaming).toBe("no");
     // Everything that speaks a real chat API streams — including the two
     // non-local ones an `is_cli_engine` test got right only by accident.
     expect(declaredFor("qwen3.5:4b").streaming).toBe("yes");
@@ -145,6 +147,7 @@ describe("ported from capabilities.rs", () => {
       "gpt-oss:120b-cloud",
       "claude-cli",
       "codex-cli",
+      "antigravity-cli",
       "openrouter::vendor/model",
     ]) {
       expect(declaredFor(hosted).tier, hosted).toEqual({ kind: "CloudEngine" });

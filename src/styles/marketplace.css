@@ -601,6 +601,35 @@
   font-size: var(--fs-meta);
 }
 
+/* Account authentication lives on the installed connector card. Keep the
+   browser hand-off, fallback link and errors together so a failed remote
+   connector never leaves its recovery action in an unrelated marketplace
+   drawer (GH #33). */
+.conn-oauth {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-2) var(--sp-3);
+  padding: var(--sp-3);
+  border: 1px dashed var(--rule-strong);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--paper-2) 72%, transparent);
+}
+.conn-oauth-connect {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 48%, var(--rule-strong));
+}
+.conn-oauth-hint {
+  flex: 1 1 280px;
+  color: var(--muted);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+}
+.conn-oauth .gate-error {
+  flex-basis: 100%;
+  margin: 0;
+}
+
 /* ----- the two per-connector permissions ----- */
 
 .conn-perms {

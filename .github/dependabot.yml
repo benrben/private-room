@@ -1,6 +1,6 @@
 version: 2
 
-# Dependency updates + vulnerability alerts for all three ecosystems. Weekly and
+# Dependency updates + vulnerability alerts for the app and sidecar. Weekly and
 # grouped, so this is one PR per ecosystem to review, not a stream of noise.
 #
 # Note the blind spot it cannot cover: `xlsx` is fetched from the SheetJS CDN by
@@ -18,13 +18,13 @@ updates:
       npm:
         patterns: ["*"]
 
-  - package-ecosystem: cargo
-    directory: /src-tauri
+  - package-ecosystem: npm
+    directory: /electron-migration/electron-app
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
     groups:
-      cargo:
+      electron:
         patterns: ["*"]
 
   - package-ecosystem: uv

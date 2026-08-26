@@ -115,22 +115,29 @@ describe("JOURNAL_CAP", () => {
    * kept forever, with only the Clear button ever shrinking it — inside a room
    * whose whole promise is that the record stays readable.
    */
-  it("keeps only the newest lines, and it is the NEWEST that survive", () => {
-    const db = freshRoom();
-    for (let i = 0; i < JOURNAL_CAP + 25; i += 1) {
-      insertBrowseJournal(db, "s1", "open", "https://example.com/", `line ${i}`);
-    }
-    const kept = db.prepare("SELECT COUNT(*) AS n FROM browse_journal").get() as { n: number };
-    expect(kept.n, "the trail must not grow without bound").toBe(JOURNAL_CAP);
-    // …and it is the NEWEST lines that survive, not the first ones written.
-    expect(listBrowseJournal(db, 1)[0]?.detail).toBe(`line ${JOURNAL_CAP + 24}`);
-    // The oldest line written is genuinely gone, not merely un-listed.
-    const first = db
-      .prepare("SELECT COUNT(*) AS n FROM browse_journal WHERE detail = 'line 0'")
-      .get() as { n: number };
-    expect(first.n).toBe(0);
-    db.close();
-  });
+  it(
+    "keeps only the newest lines, and it is the NEWEST that survive",
+    () => {
+      const db = freshRoom();
+      for (let i = 0; i < JOURNAL_CAP + 25; i += 1) {
+        insertBrowseJournal(db, "s1", "open", "https://example.com/", `line ${i}`);
+      }
+      const kept = db.prepare("SELECT COUNT(*) AS n FROM browse_journal").get() as { n: number };
+      expect(kept.n, "the trail must not grow without bound").toBe(JOURNAL_CAP);
+      // …and it is the NEWEST lines that survive, not the first ones written.
+      expect(listBrowseJournal(db, 1)[0]?.detail).toBe(`line ${JOURNAL_CAP + 24}`);
+      // The oldest line written is genuinely gone, not merely un-listed.
+      const first = db
+        .prepare("SELECT COUNT(*) AS n FROM browse_journal WHERE detail = 'line 0'")
+        .get() as { n: number };
+      expect(first.n).toBe(0);
+      db.close();
+    },
+    // This is deliberately 5,025 real SQLCipher writes. It completes in a
+    // few seconds in isolation but can cross Vitest's generic five-second
+    // unit-test ceiling while the full native/media suite runs concurrently.
+    15_000,
+  );
 
   /** A room well under the cap loses nothing — the trim must not be a sweep
    *  that fires early on the id arithmetic. */
@@ -140,6 +147,27 @@ describe("JOURNAL_CAP", () => {
       insertBrowseJournal(db, "s1", "open", "https://example.com/", `line ${i}`);
     }
     expect(listBrowseJournal(db, 2000)).toHaveLength(12);
+    db.close();
+  });
+
+  /** AUTOINCREMENT ids do not reset when a user clears the journal. A high id
+   *  therefore does not mean there are cap-sized rows to trim, and gaps must
+   *  never make the retention query remove more than the newest cap rows. */
+  it("keeps the correct rows when cleared AUTOINCREMENT ids contain a large gap", () => {
+    const db = freshRoom();
+    db.prepare(
+      "INSERT INTO browse_journal (kind, url, detail, session) VALUES ('open', '', 'old', '')",
+    ).run();
+    db.prepare("DELETE FROM browse_journal").run();
+    db.prepare("UPDATE sqlite_sequence SET seq = ? WHERE name = 'browse_journal'").run(JOURNAL_CAP * 3);
+
+    for (let i = 0; i < 12; i += 1) {
+      insertBrowseJournal(db, "s1", "open", "https://example.com/", `after-clear ${i}`);
+    }
+
+    expect(listBrowseJournal(db, 2000).map((row) => row.detail)).toEqual(
+      Array.from({ length: 12 }, (_, i) => `after-clear ${11 - i}`),
+    );
     db.close();
   });
 });

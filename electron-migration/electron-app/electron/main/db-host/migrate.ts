@@ -289,6 +289,92 @@ export function migrate(db: Database.Database): void {
     db.exec("ALTER TABLE files ADD COLUMN origin_url TEXT");
   }
 
+  // Workspace rooms: legacy rows stay blob-backed. These columns describe a
+  // normal file relative to the room root and its indexing state. Keeping the
+  // migration additive is important: old room files remain directly usable.
+  if (tableExists(db, "files")) {
+    for (const stmt of [
+      "ALTER TABLE files ADD COLUMN storage_kind TEXT NOT NULL DEFAULT 'blob'",
+      "ALTER TABLE files ADD COLUMN relative_path TEXT",
+      "ALTER TABLE files ADD COLUMN path_key TEXT",
+      "ALTER TABLE files ADD COLUMN content_sha256 TEXT",
+      "ALTER TABLE files ADD COLUMN mtime_ns INTEGER",
+      "ALTER TABLE files ADD COLUMN fs_identity TEXT",
+      "ALTER TABLE files ADD COLUMN index_state TEXT NOT NULL DEFAULT 'ready'",
+      "ALTER TABLE files ADD COLUMN index_error TEXT",
+      "ALTER TABLE files ADD COLUMN last_seen_at TEXT",
+    ]) {
+      addColumnIfMissing(db, stmt);
+    }
+    db.exec("CREATE INDEX IF NOT EXISTS idx_files_content_sha256 ON files(content_sha256)");
+  }
+
+  // Private workspace object storage, crash journal and normalized harness
+  // run history. Declared here as well as schema.sql so every old room gains
+  // the compatibility tables on its next open.
+  db.exec(
+    `CREATE TABLE IF NOT EXISTS content_objects (
+       id TEXT PRIMARY KEY,
+       sha256 TEXT NOT NULL,
+       size_bytes INTEGER NOT NULL,
+       encryption_version INTEGER NOT NULL DEFAULT 1,
+       nonce BLOB NOT NULL,
+       relative_object_path TEXT NOT NULL UNIQUE,
+       created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+       UNIQUE(sha256, size_bytes)
+     );
+     CREATE TABLE IF NOT EXISTS content_object_refs (
+       owner_type TEXT NOT NULL,
+       owner_id TEXT NOT NULL,
+       object_id TEXT NOT NULL REFERENCES content_objects(id) ON DELETE CASCADE,
+       role TEXT NOT NULL,
+       PRIMARY KEY (owner_type, owner_id, object_id, role)
+     );
+     CREATE INDEX IF NOT EXISTS idx_content_object_refs_object
+       ON content_object_refs(object_id);
+     CREATE TABLE IF NOT EXISTS fs_operations (
+       operation_id TEXT PRIMARY KEY,
+       operation_type TEXT NOT NULL,
+       phase TEXT NOT NULL,
+       file_id TEXT,
+       old_path TEXT,
+       new_path TEXT,
+       old_hash TEXT,
+       new_hash TEXT,
+       agent_run_id TEXT,
+       error TEXT,
+       created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+       updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+     );
+     CREATE INDEX IF NOT EXISTS idx_fs_operations_phase ON fs_operations(phase);
+     CREATE TABLE IF NOT EXISTS agent_runs (
+       run_id TEXT PRIMARY KEY,
+       room_id TEXT NOT NULL,
+       provider TEXT NOT NULL,
+       harness TEXT NOT NULL,
+       model TEXT NOT NULL,
+       privacy_mode TEXT NOT NULL,
+       status TEXT NOT NULL,
+       baseline_completed INTEGER NOT NULL DEFAULT 0,
+       rollback_status TEXT NOT NULL DEFAULT 'none',
+       started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+       completed_at TEXT
+     );
+     CREATE TABLE IF NOT EXISTS agent_run_files (
+       run_id TEXT NOT NULL REFERENCES agent_runs(run_id) ON DELETE CASCADE,
+       file_id TEXT NOT NULL,
+       baseline_path TEXT,
+       baseline_hash TEXT,
+       baseline_object_id TEXT REFERENCES content_objects(id) ON DELETE SET NULL,
+       final_path TEXT,
+       final_hash TEXT,
+       change_type TEXT,
+       PRIMARY KEY (run_id, file_id)
+     );
+     CREATE INDEX IF NOT EXISTS idx_agent_run_files_object
+       ON agent_run_files(baseline_object_id);`,
+  );
+
   // Room map: file→file provenance, plus one-off recovery from finished
   // file_pass jobs (their plan names the source, their publish artifact names
   // the output). Best-effort: json_valid guards both blobs so an unparseable
@@ -330,6 +416,13 @@ export function migrate(db: Database.Database): void {
         db.exec(decl);
       }
     }
+    // This partial index is intentionally created only after trashed_at has
+    // been added above. The oldest room schemas do not have that column yet.
+    db.exec(
+      `CREATE UNIQUE INDEX IF NOT EXISTS idx_files_workspace_path
+         ON files(path_key)
+         WHERE storage_kind = 'workspace' AND trashed_at IS NULL AND path_key IS NOT NULL`,
+    );
   }
   // Section-only visibility. THE DEFAULTS ARE THE MIGRATION: every existing row
   // takes 'library' / 'linked', i.e. stays exactly where it already was.

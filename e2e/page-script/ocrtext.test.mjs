@@ -46,12 +46,15 @@ test("the model's prefix never reaches the screen, and empty stays empty", () =>
   assert.equal(ocrBody(`${OCR_PREFIX}\n   `), null, "a blank recognition is not a reading");
 });
 
-test("the Rust side stamps exactly the prefix the viewer strips", () => {
+test("the Electron host stamps exactly the prefix the viewer strips", () => {
   // If these two drift, the prefix shows up on screen under the picture.
-  const rust = readFileSync(join(root, "src-tauri/src/commands/files.rs"), "utf8");
+  const host = readFileSync(
+    join(root, "electron-migration/electron-app/electron/main/ocrTools.ts"),
+    "utf8",
+  );
   assert.ok(
-    rust.includes(`"${OCR_PREFIX}\\n{text}"`),
-    `commands/files.rs no longer writes the ${OCR_PREFIX} prefix this strips`,
+    host.includes(`"${OCR_PREFIX}"`),
+    `ocrTools.ts no longer defines the ${OCR_PREFIX} prefix this strips`,
   );
 });
 

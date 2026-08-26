@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { openUrl } from "@tauri-apps/plugin-opener";
+import { openUrl } from "../platform";
 import { api, AppDiag } from "../api";
 import { SparklesIcon } from "../icons";
 import { useFocusTrap } from "../settings/useFocusTrap";

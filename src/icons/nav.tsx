@@ -11,14 +11,12 @@ import { Stroke } from "./base";
    shows through: the lip along the counter's bottom edge, exactly as the
    artwork has it.
 
-   The geometry is TRACED, not constructed: src-tauri/icons/source.png is
-   the brand artwork and the source of truth, src-tauri/icons/trace.py
-   derives these 0..100 design-space paths from it, mapped here by
+   The geometry is shared with the master artwork in art/, mapped here by
    scale(0.24) into the 24 box. index.html's launch shell carries the same
    numbers, public/logo.svg the same numbers inside its tile, and the
-   application icon is the artwork itself resampled. Change source.png
-   FIRST, rerun generate.py and trace.py, and carry the new paths into the
-   other two — or the brand stops being one brand.
+   application icon is generated from art/appicon.svg. Update the master
+   artwork first and carry the paths into the other two so the brand remains
+   consistent.
 
    PALETTE SPLIT — deliberate, please do not "fix" it:
    the brand plum and gold belong to the APPLICATION ICON and the standalone
