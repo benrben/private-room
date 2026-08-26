@@ -37,5 +37,7 @@ export interface HarnessRun {
 export interface HarnessRuntime {
   readonly name: HarnessName;
   available(): Promise<boolean>;
+  /** Optional provider-specific sandbox/runtime capability probe. */
+  verifyExposure?(workspacePath: string, runtimePath: string, writeEnabled: boolean): Promise<boolean>;
   startTurn(context: HarnessContext, input: HarnessInput): Promise<HarnessRun>;
 }

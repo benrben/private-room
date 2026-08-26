@@ -10,9 +10,11 @@ import {
   type SpawnedProcess,
 } from "@anthropic-ai/claude-agent-sdk";
 import { AsyncEventQueue } from "./eventQueue.js";
+import { claudeAgentDefinitions } from "./agentManifest.js";
 import {
   spawnWithNativeWorkspaceSandbox,
   terminateNativeProcessTree,
+  verifyNativeHarnessExecutable,
 } from "./seatbelt.js";
 import type {
   ApprovalDecision,
@@ -60,12 +62,24 @@ interface PendingApproval {
 export class ClaudeAgentSdkRuntime implements HarnessRuntime {
   readonly name = "claude-agent-sdk" as const;
 
+  private readonly executable = process.env.ARCELLE_CLAUDE_PATH ?? "claude";
+
   async available(): Promise<boolean> {
-    const result = spawnSync(process.env.ARCELLE_CLAUDE_PATH ?? "claude", ["--version"], {
+    const result = spawnSync(this.executable, ["--version"], {
       stdio: "ignore",
       timeout: 5_000,
     });
     return result.status === 0;
+  }
+
+  async verifyExposure(workspacePath: string, runtimePath: string, writeEnabled: boolean): Promise<boolean> {
+    return verifyNativeHarnessExecutable({
+      workspacePath,
+      runtimePath,
+      executable: this.executable,
+      provider: "claude",
+      writeEnabled,
+    }, ["--version"]);
   }
 
   async startTurn(context: HarnessContext, input: HarnessInput): Promise<HarnessRun> {
@@ -76,6 +90,7 @@ export class ClaudeAgentSdkRuntime implements HarnessRuntime {
     const abortController = new AbortController();
     const pending = new Map<string, PendingApproval>();
     const spawned = new Set<SpawnedProcess>();
+    const subagents = new Map<string, string>();
 
     const canUseTool: CanUseTool = async (toolName, toolInput, options) => {
       const requestId = options.requestId || options.toolUseID;
@@ -170,6 +185,11 @@ export class ClaudeAgentSdkRuntime implements HarnessRuntime {
         tool: inputRecord.tool_name ?? "tool",
         toolId: toolUseId,
       });
+      const subagent = toolUseId === undefined ? undefined : subagents.get(toolUseId);
+      if (subagent !== undefined) {
+        events.push({ type: "agent_completed", runId: context.runId, agentId: subagent });
+        if (toolUseId !== undefined) subagents.delete(toolUseId);
+      }
       return {};
     };
 
@@ -201,6 +221,7 @@ export class ClaudeAgentSdkRuntime implements HarnessRuntime {
           ? { type: "preset", preset: "claude_code" }
           : { type: "preset", preset: "claude_code", append: context.systemPrompt },
         tools: { type: "preset", preset: "claude_code" },
+        agents: claudeAgentDefinitions(),
         disallowedTools: ["WebFetch", "WebSearch"],
         permissionMode: "default",
         sandbox: {
@@ -240,13 +261,31 @@ export class ClaudeAgentSdkRuntime implements HarnessRuntime {
       try {
         for await (const message of sdkQuery) {
           const delta = streamText(message);
-          if (delta !== null) events.push({ type: "text_delta", runId: context.runId, text: delta });
+          if (delta !== null) {
+            const parentToolUseId = (message as unknown as { parent_tool_use_id?: string | null }).parent_tool_use_id;
+            events.push({
+              type: "text_delta",
+              runId: context.runId,
+              text: delta,
+              agentId: parentToolUseId == null ? undefined : subagents.get(parentToolUseId),
+            });
+          }
           if (message.type === "system" && message.subtype === "init") {
             events.push({ type: "agent_started", runId: context.runId, agentId: "coordinator", label: "Claude" });
           }
           if (message.type === "assistant") {
             for (const block of message.message.content) {
               if (block.type === "tool_use") {
+                const toolInput = block.input as Record<string, unknown>;
+                if (block.name === "Agent" || block.name === "Task") {
+                  const agentId = typeof toolInput.subagent_type === "string"
+                    ? toolInput.subagent_type
+                    : typeof toolInput.agent === "string"
+                      ? toolInput.agent
+                      : block.id;
+                  subagents.set(block.id, agentId);
+                  events.push({ type: "agent_started", runId: context.runId, agentId, label: agentId });
+                }
                 events.push({
                   type: "tool_started",
                   runId: context.runId,

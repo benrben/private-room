@@ -5,9 +5,11 @@ import path from "node:path";
 import { promisify } from "node:util";
 import readline from "node:readline";
 import { AsyncEventQueue } from "./eventQueue.js";
+import { codexAgentInstructions } from "./agentManifest.js";
 import {
   spawnWithNativeWorkspaceSandbox,
   terminateNativeProcessTree,
+  verifyNativeHarnessExecutable,
 } from "./seatbelt.js";
 import type {
   ApprovalDecision,
@@ -45,6 +47,22 @@ function approvalResult(decision: ApprovalDecision): { decision: string } {
   return { decision: "decline" };
 }
 
+function itemType(item: Record<string, unknown>): string {
+  return String(item.type ?? "tool").replace(/_([a-z])/g, (_match, letter: string) => letter.toUpperCase());
+}
+
+function collabAgentIds(item: Record<string, unknown>): string[] {
+  const direct = item.receiverThreadIds ?? item.receiver_thread_ids;
+  if (Array.isArray(direct)) return direct.filter((value): value is string => typeof value === "string");
+  const single = item.newThreadId ?? item.new_thread_id;
+  return typeof single === "string" ? [single] : [];
+}
+
+function collabStatuses(item: Record<string, unknown>): Array<[string, string]> {
+  const raw = record(item.agentsStates ?? item.agents_states);
+  return Object.entries(raw).map(([id, state]) => [id, String(record(state).status ?? "")]);
+}
+
 export class CodexAppServerRuntime implements HarnessRuntime {
   readonly name = "codex-app-server" as const;
   constructor(private readonly executable = process.env.ARCELLE_CODEX_PATH ?? "codex") {}
@@ -67,6 +85,16 @@ export class CodexAppServerRuntime implements HarnessRuntime {
     } finally {
       await rm(schemaRoot, { recursive: true, force: true });
     }
+  }
+
+  async verifyExposure(workspacePath: string, runtimePath: string, writeEnabled: boolean): Promise<boolean> {
+    return verifyNativeHarnessExecutable({
+      workspacePath,
+      runtimePath,
+      executable: this.executable,
+      provider: "codex",
+      writeEnabled,
+    }, ["app-server", "--help"]);
   }
 
   async startTurn(context: HarnessContext, input: HarnessInput): Promise<HarnessRun> {
@@ -152,25 +180,41 @@ export class CodexAppServerRuntime implements HarnessRuntime {
         if (delta !== null) events.push({ type: "text_delta", runId: context.runId, text: delta });
       } else if (message.method === "item/started") {
         const item = record(params.item);
-        const itemType = String(item.type ?? "tool");
-        if (itemType === "commandExecution" || itemType === "fileChange" || itemType === "mcpToolCall") {
+        const type = itemType(item);
+        if (type === "collabToolCall" || type === "collabAgentToolCall") {
+          const tool = String(item.tool ?? "collaboration");
+          for (const agentId of collabAgentIds(item)) {
+            events.push({ type: "agent_started", runId: context.runId, agentId, label: tool });
+          }
+        }
+        if (type === "commandExecution" || type === "fileChange" || type === "mcpToolCall" || type === "collabToolCall" || type === "collabAgentToolCall") {
           events.push({
             type: "tool_started",
             runId: context.runId,
-            tool: itemType,
+            tool: type,
             toolId: typeof item.id === "string" ? item.id : undefined,
           });
         }
       } else if (message.method === "item/completed") {
         const item = record(params.item);
-        const itemType = String(item.type ?? "tool");
+        const type = itemType(item);
         events.push({
           type: "tool_completed",
           runId: context.runId,
-          tool: itemType,
+          tool: type,
           toolId: typeof item.id === "string" ? item.id : undefined,
           error: item.status === "failed" ? nestedString(item, "error", "message") ?? "Tool failed." : undefined,
         });
+        if (type === "collabToolCall" || type === "collabAgentToolCall") {
+          const statuses = collabStatuses(item);
+          const ids = statuses.length > 0 ? statuses.map(([id]) => id) : collabAgentIds(item);
+          for (const agentId of ids) {
+            const status = statuses.find(([id]) => id === agentId)?.[1];
+            if (status === "completed" || status === "errored" || status === "interrupted" || status === "shutdown" || item.status === "failed") {
+              events.push({ type: "agent_completed", runId: context.runId, agentId });
+            }
+          }
+        }
       } else if (message.method === "turn/diff/updated") {
         const diff = nestedString(params, "diff");
         if (diff !== null) events.push({ type: "plan_updated", runId: context.runId, text: diff });
@@ -233,9 +277,15 @@ export class CodexAppServerRuntime implements HarnessRuntime {
         threadId = nestedString(threadResponse, "thread", "id");
         if (threadId === null) throw new Error("Codex did not return a thread id.");
         events.push({ type: "agent_started", runId: context.runId, agentId: "coordinator", label: "Codex" });
+        const generatedInstructions = codexAgentInstructions();
+        const prompt = [
+          context.systemPrompt,
+          generatedInstructions,
+          `User task:\n${input.text}`,
+        ].filter((part): part is string => typeof part === "string" && part.length > 0).join("\n\n");
         const turnResponse = await request("turn/start", {
           threadId,
-          input: [{ type: "text", text: input.text }],
+          input: [{ type: "text", text: prompt }],
           cwd: context.workspacePath,
           approvalPolicy: "unlessTrusted",
           sandboxPolicy: context.writeEnabled

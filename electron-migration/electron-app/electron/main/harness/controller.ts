@@ -12,6 +12,7 @@ import {
 import { ClaudeAgentSdkRuntime } from "./claudeAgentSdk.js";
 import { CloudRedactedMirror } from "./cloudMirror.js";
 import { CodexAppServerRuntime } from "./codexAppServer.js";
+import { RestrictedLegacyCliRuntime, RuntimeWithFallback } from "./legacyCli.js";
 import { HarnessOrchestrator, type HarnessFinalStatus } from "./orchestrator.js";
 import { RunProtection, type RollbackResult } from "./runProtection.js";
 import { nativeWorkspaceSandboxSupported, verifyNativeHarnessExecutable } from "./seatbelt.js";
@@ -88,13 +89,23 @@ export class HarnessController {
     options: HarnessControllerOptions = {},
   ) {
     this.runtimes = {
-      codex: options.runtimes?.codex ?? new CodexAppServerRuntime(),
-      claude: options.runtimes?.claude ?? new ClaudeAgentSdkRuntime(),
+      codex: options.runtimes?.codex ?? new RuntimeWithFallback(
+        new CodexAppServerRuntime(),
+        new RestrictedLegacyCliRuntime("codex", state),
+      ),
+      claude: options.runtimes?.claude ?? new RuntimeWithFallback(
+        new ClaudeAgentSdkRuntime(),
+        new RestrictedLegacyCliRuntime("claude", state),
+      ),
     };
     this.policy = options.policy ?? activePolicy;
     this.flag = options.flag ?? workspaceHarnessFlag;
-    this.verifyExposure = options.verifyExposure ?? (async (workspacePath, provider, runtimePath, writeEnabled) =>
-      verifyNativeHarnessExecutable({
+    this.verifyExposure = options.verifyExposure ?? (async (workspacePath, provider, runtimePath, writeEnabled) => {
+      const runtime = this.runtimes[provider];
+      if (runtime.verifyExposure !== undefined) {
+        return runtime.verifyExposure(workspacePath, runtimePath, writeEnabled);
+      }
+      return verifyNativeHarnessExecutable({
         workspacePath,
         runtimePath,
         provider,
@@ -102,7 +113,8 @@ export class HarnessController {
         executable: provider === "codex"
           ? process.env.ARCELLE_CODEX_PATH ?? "codex"
           : process.env.ARCELLE_CLAUDE_PATH ?? "claude",
-      }, provider === "codex" ? ["app-server", "--help"] : ["--version"]));
+      }, provider === "codex" ? ["app-server", "--help"] : ["--version"]);
+    });
     this.isolationProven = options.outsideWorkspaceIsolation ?? nativeWorkspaceSandboxSupported();
   }
 
