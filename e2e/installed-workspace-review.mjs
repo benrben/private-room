@@ -159,9 +159,12 @@ try {
   await shot(window, "06-agent-activity");
 
   await window.getByRole("button", { name: "Lock", exact: true }).click();
+  await window.getByText("Recent", { exact: true }).waitFor();
+  await window.getByRole("button", { name: /^Workspace Review/ }).first().click();
+  await window.getByPlaceholder("Password").waitFor();
+  await shot(window, "07-workspace-unlock");
   await window.getByText("This password unlocks chats, memory, search, and history.", { exact: false }).waitFor();
   await window.getByText("normal files in this workspace remain readable in Finder", { exact: false }).waitFor();
-  await shot(window, "07-workspace-unlock");
   await window.getByPlaceholder("Password").fill(password);
   await window.getByRole("button", { name: "Unlock", exact: true }).click();
   await window.locator(".workspace").waitFor({ state: "visible" });
