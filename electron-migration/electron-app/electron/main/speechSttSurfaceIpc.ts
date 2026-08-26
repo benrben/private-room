@@ -3,6 +3,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { pipeline } from "node:stream/promises";
 import type { IpcMain, IpcMainInvokeEvent } from "electron";
 import type { NeuralVoiceInfo } from "../shared/apiTypes.js";
 import type { RoomManagerState } from "./roomManager.js";
@@ -83,7 +84,7 @@ export async function retranscribeFile(
     const extension = path.extname(name).slice(1).toLowerCase();
     const kind = mediaKind(mime, extension);
     if (kind === null) throw new Error("This file isn't audio or video, so there's nothing to transcribe.");
-    if (!bytes) throw new Error("This recording has no stored audio bytes.");
+    if (!bytes && open.workspace === undefined) throw new Error("This recording has no stored audio bytes.");
     const modelPath = sttEffectiveModel(userDataDir, resourcesPath);
     if (!modelPath) {
       emit("stt-progress", [name, "model-missing"]);
@@ -92,7 +93,14 @@ export async function retranscribeFile(
     const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "arcelle-stt-"));
     const staged = path.join(tempDir, `source.${extension || "bin"}`);
     try {
-      await fs.promises.writeFile(staged, bytes, { mode: 0o600 });
+      if (open.workspace === undefined) {
+        await fs.promises.writeFile(staged, bytes!, { mode: 0o600 });
+      } else {
+        await pipeline(
+          open.workspace.readStream(fileId),
+          fs.createWriteStream(staged, { flags: "wx", mode: 0o600 }),
+        );
+      }
       emit("stt-progress", [name, "started"]);
       const outcome = await sidecarJsonCancellable(
         "/stt/transcribe_file",
