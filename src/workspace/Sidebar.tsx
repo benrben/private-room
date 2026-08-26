@@ -397,7 +397,7 @@ export default function LibraryPane({
                     <span className="pop-item-body">
                       Upload files
                       <span className="pop-item-sub">
-                        PDF, DOCX, images, audio, CSV, Markdown — stored encrypted
+                        Saved as normal files. Private Arcelle data stays encrypted.
                       </span>
                     </span>
                   </button>
@@ -745,8 +745,8 @@ function BrowsePanel({
       )}
       {s.files.length === 0 && (
         <div className="empty-hint">
-          Add PDFs, notes, images, code or spreadsheets — they are stored
-          encrypted inside this room.
+          Add PDFs, notes, images, code or spreadsheets. They stay as normal
+          files, while private Arcelle data stays encrypted.
         </div>
       )}
       {s.files.length > 0 && shownFiles.length === 0 && (
