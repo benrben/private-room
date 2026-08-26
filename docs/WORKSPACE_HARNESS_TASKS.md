@@ -201,7 +201,7 @@ Legend:
 ## Phase L: hardening and release
 
 - [ ] Run the complete Electron test suite.
-- [ ] Run the complete Python sidecar test suite.
+- [x] Run the complete Python sidecar test suite.
 - [x] Test legacy rooms without conversion.
 - [x] Test interrupted conversion and resume.
 - [ ] Test power loss at every journal phase.
