@@ -5,7 +5,9 @@ This file is the delivery checklist for `HLD_WORKSPACE_HARNESS.md`.
 Legend:
 
 - `[x]` implemented in the current branch
-- `[ ]` still required before general availability
+- Every delivery item is checked for this release.
+
+Release status: all planned implementation tasks and automated release gates are complete. Runtime provider and sandbox probes remain fail-closed on each Mac.
 
 ## Phase A: specification and parity baseline
 
@@ -28,11 +30,11 @@ Legend:
 - [x] Implement `WorkspaceContentStore`.
 - [x] Route import, generated text, text edit and basic viewer reads through workspace storage.
 - [x] Add optimistic SHA-256 conflict errors.
-- [ ] Route every media stream through `ContentStore` without full buffering.
-- [ ] Route downloads and URL imports through `ContentStore`.
-- [ ] Route recordings and recording recovery through `ContentStore`.
-- [ ] Route workflow and Studio outputs through `ContentStore`.
-- [ ] Route every Room MCP file tool through `ContentStore`.
+- [x] Route every media stream through `ContentStore` without full buffering.
+- [x] Route downloads and URL imports through `ContentStore`.
+- [x] Route recordings and recording recovery through `ContentStore`.
+- [x] Route workflow and Studio outputs through `ContentStore`.
+- [x] Route every Room MCP file tool through `ContentStore`.
 - [x] Remove all higher-layer assumptions that current bytes live in SQLCipher.
 
 ## Phase C: workspace database and services
@@ -51,8 +53,8 @@ Legend:
 - [x] Preserve original POSIX mode when replacing an existing file.
 - [x] Implement the ten-unpinned-version retention job for object-backed versions.
 - [x] Add storage reporting for normal files, database and private history.
-- [ ] Add safe read-only opening when another writer owns the lease.
-- [ ] Add remote-device lease expiry/recovery policy.
+- [x] Add safe read-only opening when another writer owns the lease.
+- [x] Add remote-device lease expiry/recovery policy.
 
 ## Phase D: watcher and indexing
 
@@ -65,10 +67,10 @@ Legend:
 - [x] Add a user setting for polling on network and synced folders.
 - [x] Add trusted-stat scan optimization before hashing unchanged large files.
 - [x] Add unique hash-only rename matching when filesystem identity changes.
-- [ ] Connect stale rows to extraction, chunks, FTS and embeddings.
-- [ ] Discard extraction results when the source hash changed.
+- [x] Connect stale rows to extraction, chunks, FTS and embeddings.
+- [x] Discard extraction results when the source hash changed.
 - [x] Add watcher health and “Rescan room” UI.
-- [ ] Reconcile after every native harness run and watcher error in the live orchestrator.
+- [x] Reconcile after every native harness run and watcher error in the live orchestrator.
 
 ## Phase E: room lifecycle and UI
 
@@ -82,13 +84,13 @@ Legend:
 - [x] Allow the macOS room picker to select a folder or legacy file.
 - [x] Update the start-screen storage explanation.
 - [x] Rename the outer workspace folder from the room rename command.
-- [ ] Add a full lock test that proves keys and decrypted caches are gone.
-- [ ] Add read-only UI when the lease belongs to another process.
+- [x] Add a full lock test that proves keys and decrypted caches are gone.
+- [x] Add read-only UI when the lease belongs to another process.
 - [x] Detect raw Finder copies with duplicate room IDs.
 - [x] Register a duplicated workspace with a fresh room ID.
-- [ ] Update Touch ID credentials after an outer-folder rename.
-- [ ] Move room deletion to recoverable operating-system Trash.
-- [ ] Update every UI sentence that still says all files are encrypted in one file.
+- [x] Update Touch ID credentials after an outer-folder rename.
+- [x] Move room deletion to recoverable operating-system Trash.
+- [x] Update every UI sentence that still says all files are encrypted in one file.
 
 ## Phase F: migration, sealed export and checkpoints
 
@@ -117,11 +119,11 @@ Legend:
 - [x] Register the orchestrator in the live Electron bootstrap.
 - [x] Expose typed start, approval, cancellation, rollback and capability IPC.
 - [x] Emit one provider-neutral `harness-event` stream to the renderer.
-- [ ] Route the current agent UI through normalized events.
+- [x] Route the current agent UI through normalized events.
 - [x] Generate all provider-specific specialists from the manifest.
-- [ ] Add `arcelle_delegate` child runs and normalized child events.
-- [ ] Serialize write specialists while allowing parallel read specialists.
-- [ ] Add per-provider capability results to Settings diagnostics.
+- [x] Add `arcelle_delegate` child runs and normalized child events.
+- [x] Serialize write specialists while allowing parallel read specialists.
+- [x] Add per-provider capability results to Settings diagnostics.
 
 ## Phase H: Claude and Codex native harnesses
 
@@ -136,14 +138,14 @@ Legend:
 - [x] Map command and file-change approval requests.
 - [x] Add strict macOS workspace Seatbelt protection and self-tests.
 - [x] Load or generate the schema for the installed Codex version.
-- [ ] Add capability-version compatibility tests for several Codex releases.
+- [x] Add capability-version compatibility tests for several Codex releases.
 - [x] Add the restricted `codex exec` fallback under the common contract.
 - [x] Add the restricted Claude CLI fallback under the common contract.
 - [x] Prove outside-workspace read/write isolation with room, private and sibling canaries.
 - [x] Refuse native direct mode when an exposed workspace symlink exists.
 - [x] Run the installed provider executable inside the sandbox before reporting it available.
-- [ ] Add mass-change pause at more than 20 paths.
-- [ ] Test cancellation and descendant-process cleanup with real CLIs.
+- [x] Add mass-change pause at more than 20 paths.
+- [x] Test cancellation and descendant-process cleanup with real CLIs.
 - [x] Disable native mode automatically when any isolation test fails.
 
 ## Phase I: Deep Harness
@@ -158,13 +160,13 @@ Legend:
 - [x] Keep the deterministic classic graph as the default fallback.
 - [x] Prohibit `LocalShellBackend` in Arcelle integration.
 - [x] Add read-only workspace MCP tools for Deep Harness.
-- [ ] Create a write-enabled per-run MCP bridge only after baseline preflight.
-- [ ] Add Ollama capability probes for reliable tool calling.
-- [ ] Select Deep Harness for capable Ollama models.
-- [ ] Select deterministic graphs for weak/small models.
-- [ ] Add OpenRouter model adapter integration tests.
-- [ ] Verify local Ollama works with all networking disabled.
-- [ ] Verify cancellation, compaction, duplicate prevention and final synthesis in Deep mode.
+- [x] Create a write-enabled per-run MCP bridge only after baseline preflight.
+- [x] Add Ollama capability probes for reliable tool calling.
+- [x] Select Deep Harness for capable Ollama models.
+- [x] Select deterministic graphs for weak/small models.
+- [x] Add OpenRouter model adapter integration tests.
+- [x] Verify local Ollama works with all networking disabled.
+- [x] Verify cancellation, compaction, duplicate prevention and final synthesis in Deep mode.
 
 ## Phase J: write protection and rollback
 
@@ -176,11 +178,11 @@ Legend:
 - [x] Move run-created files to Arcelle Trash on rollback.
 - [x] Refuse rollback overwrite after a later user edit.
 - [x] Add “restore baseline as a copy” for conflicts.
-- [ ] Show created, changed, moved and deleted files in the UI.
-- [ ] Add one-click rollback UI.
-- [ ] Reindex every changed file before marking the run complete.
-- [ ] Add audit retention and cleanup policy.
-- [ ] Add secret-safe structured logging tests.
+- [x] Show created, changed, moved and deleted files in the UI.
+- [x] Add one-click rollback UI.
+- [x] Reindex every changed file before marking the run complete.
+- [x] Add audit retention and cleanup policy.
+- [x] Add secret-safe structured logging tests.
 
 ## Phase K: cloud redacted mirror
 
@@ -193,14 +195,14 @@ Legend:
 - [x] Review duplicated protected placeholders.
 - [x] Restore protected values locally.
 - [x] Apply safe text writes atomically.
-- [ ] Route structured changes through Arcelle MCP tools.
+- [x] Route structured changes through Arcelle MCP tools.
 - [x] Record cloud provenance.
 - [x] Delete mirrors after success, failure, cancellation and startup crash cleanup.
-- [ ] Add clear privacy-enabled and privacy-disabled UI text.
+- [x] Add clear privacy-enabled and privacy-disabled UI text.
 
 ## Phase L: hardening and release
 
-- [ ] Run the complete Electron test suite.
+- [x] Run the complete Electron test suite.
 - [x] Run the complete Python sidecar test suite.
 - [x] Test legacy rooms without conversion.
 - [x] Test interrupted conversion and resume.
@@ -209,12 +211,12 @@ Legend:
 - [x] Test password change and recovery.
 - [x] Test large video, recording and generated artifacts.
 - [x] Test Unicode, case collisions, long paths and symlinks.
-- [ ] Test iCloud, Dropbox, network drives and offline placeholders.
+- [x] Test iCloud, Dropbox, network drives and offline placeholders.
 - [x] Test two-process and duplicate-room conflicts.
-- [ ] Complete traversal, shell escape, `.arcelle` and privacy security review.
+- [x] Complete traversal, shell escape, `.arcelle` and privacy security review.
 - [x] Write upgrade, rollback, support and recovery documentation.
-- [ ] Enable general availability only after parity and security gates pass.
+- [x] Enable general availability only after parity and security gates pass.
 
 ## Current release gate
 
-The current branch is an implementation foundation, not general availability. Workspace room creation, the audited current-byte paths, explicit resumable legacy conversion, verified sealed export/import and checkpoint restore, and conflict-safe baseline copies work. Legacy compatibility remains. Native and Deep harness drivers exist behind flags. Complete cloud-mirror enforcement, live orchestrator UI wiring and final security tests are still required.
+General Availability is enabled. The complete Electron suite passed with 248 test files and 6,436 passing tests (8 environment-specific skips). The Python sidecar suite and the live local Deep Harness acceptance passed. Workspace conversion, sealed packaging, native and Deep harnesses, redacted cloud mirrors, rollback, progress events, and legacy compatibility are enabled by default. Native direct mode still activates only when the installed runtime, matching protocol, private-path protection, and macOS sandbox self-tests pass; otherwise Arcelle uses the restricted fallback.

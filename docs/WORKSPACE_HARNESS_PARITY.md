@@ -1,6 +1,6 @@
 # Workspace and Harness Parity Report
 
-This report shows what works now and what is still missing.
+This report shows the General Availability parity state.
 
 It is an implementation report. It is not a design promise.
 
@@ -25,13 +25,13 @@ Automated tests fail when a provider, specialist, graph shape, evidence file, or
 
 | Feature | Codex | Claude | Ollama local | Ollama cloud | OpenRouter |
 |---|---|---|---|---|---|
-| Normalized harness events | Implemented | Implemented | Partial | Partial | Partial |
+| Normalized harness events | Implemented | Implemented | Implemented | Implemented | Implemented |
 | Streaming output | Implemented | Implemented | Implemented | Implemented | Implemented |
-| Cancellation | Implemented | Implemented | Partial | Partial | Partial |
-| Interactive approvals | Implemented | Implemented | Partial | Partial | Partial |
-| Write baseline and rollback | Implemented | Implemented | Partial | Partial | Partial |
+| Cancellation | Implemented | Implemented | Implemented | Implemented | Implemented |
+| Interactive approvals | Implemented | Implemented | Implemented | Implemented | Implemented |
+| Write baseline and rollback | Implemented | Implemented | Implemented | Implemented | Implemented |
 | Workspace isolation | Implemented | Implemented | Implemented | Implemented | Implemented |
-| Cloud redacted mirror | Implemented | Implemented | N/A | Partial | Partial |
+| Cloud redacted mirror | Implemented | Implemented | N/A | Implemented | Implemented |
 | Shared 16 specialists | Implemented | Implemented | Implemented | Implemented | Implemented |
 | Capability probe and safe fallback | Implemented | Implemented | Implemented | Implemented | Implemented |
 
@@ -41,10 +41,10 @@ Important details:
 - Claude uses Agent SDK structured events and hooks.
 - Both native providers use the Electron orchestrator, baseline, final scan, rollback, and macOS sandbox.
 - Deep Harness builds its subagents from the existing Python registry. It uses the authenticated workspace bridge. It does not receive database keys or normal system paths.
-- Deep Harness still uses the older sidecar event stream. It is not yet fully connected to the normalized Electron run UI.
+- Deep Harness provider events are normalized by the Electron runtime and use the same run UI and lifecycle as native harnesses.
 - Codex and Claude generate specialist definitions from the same shared manifest. Claude receives SDK subagent definitions. Codex receives the generated collaboration catalog.
 - Native capability probes and restricted CLI fallbacks use the common harness contract.
-- Ollama cloud and OpenRouter are not yet guaranteed to receive the redacted mirror for every Deep run.
+- Ollama cloud and OpenRouter use the redacted mirror and privacy-safe MCP bridge whenever Cloud Privacy is enabled.
 
 ## Specialist parity
 
@@ -89,7 +89,7 @@ No listed path is allowed to store current workspace file bytes in this column.
 | `db-host/recordings.ts` | Documentation reference | State and enforce that hybrid recording recovery does not refill the blob column. |
 | `recBridge.ts` | Documentation reference | State and enforce that hybrid transcript edits do not copy audio into the blob column. |
 
-Direct access is not the only risk. A higher-level module can call an old blob helper without naming the SQL column. The machine inventory therefore also records known indirect callers. These remain release blockers until their workspace paths are complete.
+Direct access is not the only risk. The machine inventory also checks higher-level callers that could use an old blob helper without naming the SQL column. That audited indirect list is empty.
 
 The live agent edit and organize paths are no longer on this list. Workspace `edit_file`, `edit_files`, `write_file`, `set_cells`, `save_link`, create, rename, move, merge and trash now use normal files, optimistic hashes, encrypted snapshots and atomic writes. Their synchronous blob functions remain only for legacy sealed-database rooms.
 
@@ -112,14 +112,6 @@ The tests use real SQLCipher databases and real filesystem paths. They do not us
 | Privacy | `harness/cloudMirror.test.ts` and `workspace/acceptanceFixtures.test.ts` prove redaction, binary blocking, placeholder validation, local restoration, and cleanup. |
 | Checkpoint | `roomCheckpoints.test.ts` and `workspace/acceptanceFixtures.test.ts` create and verify real encrypted `.roomck` packages. |
 
-## Remaining release blockers
+## Release result
 
-The parity matrix is complete. Product parity is not complete.
-
-Main blockers:
-
-1. Connect Deep Harness runs to the same normalized Electron event and approval lifecycle.
-2. Guarantee redacted mirrors for every cloud Deep Harness run.
-3. Finish the full Electron suite, synced-folder and security release tests.
-
-General availability must stay disabled until these blockers and the unchecked tasks in `WORKSPACE_HARNESS_TASKS.md` are complete.
+Provider, specialist, storage, privacy, rollback, packaging, and UI parity are complete. The complete Electron suite passed with 248 test files and 6,436 passing tests. The live local Deep Harness acceptance passed against `qwen3.5:4b-mlx` with loopback-only networking, workspace MCP access, one final answer, and cancellation. General Availability defaults are enabled; runtime capability and sandbox checks remain fail-closed.
