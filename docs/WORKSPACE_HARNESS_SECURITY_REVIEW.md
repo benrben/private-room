@@ -6,10 +6,9 @@ Date: 2026-08-26
 
 The main safety layers are implemented and tested, but this review does **not** approve General Availability.
 
-The following two high-priority issues must be fixed or explicitly accepted by the release owner:
+The following high-priority issue must be fixed or explicitly accepted by the release owner:
 
-1. Cloud Privacy keeps the real relative file and folder names. A protected value inside a name can therefore reach a cloud provider.
-2. Native provider errors and standard-error output can reach normalized failure events without a central secret scrubber.
+1. Native provider errors and standard-error output can reach normalized failure events without a central secret scrubber.
 
 The detailed risks and recommended fixes are listed below.
 
@@ -40,7 +39,7 @@ This was a source-code and automated-test review. It was not an external penetra
 | Unprotected fallback writes | Legacy Codex and Claude fallback modes use an empty read-only workspace and Room MCP only | `legacyCli.test.ts` | Pass |
 | Shell-tool escape in fallback | Codex shell tools and web search are disabled; Claude receives no native tools and only the strict Room MCP config | `legacyCli.test.ts` | Pass for model tool access |
 | Child process left after Stop | Native launchers use a process group; Stop sends a signal to the complete group | `seatbelt.test.ts` starts a real grandchild and proves it exits | Pass with escalation residual risk |
-| Cloud text leak | File content and extracted text are redacted before writing; inline image data is removed | `securityReview.test.ts`, `cloudMirror.test.ts` | Pass for content, not names |
+| Cloud text or path leak | File content, extracted text, and each relative-path component are redacted before writing; inline image data is removed; the real path map remains in trusted process memory | `securityReview.test.ts`, `cloudMirror.test.ts` | Pass |
 | Cloud binary leak | Original binary and image files are not copied; only redacted text companions or stubs are exposed | `securityReview.test.ts`, `cloudMirror.test.ts` | Pass |
 | Placeholder corruption | Unknown or damaged protected tokens are rejected; duplication requires review; restoration happens locally | `securityReview.test.ts`, `cloudMirror.test.ts` | Pass |
 | Mirror path escape | Runtime must be outside the room; room and run IDs use a strict safe character set | `securityReview.test.ts` | Pass |
@@ -48,24 +47,24 @@ This was a source-code and automated-test review. It was not an external penetra
 | MCP bearer token in command line | Codex receives only the environment-variable name, not the value | `legacyCli.test.ts` | Pass |
 | Root and child-run cancellation | Delegated children inherit parent cancellation; Python cancellation uses a shared cancellation tree | `legacyCli.test.ts`, `sidecar/tests/test_server.py`, `sidecar/tests/test_deep_harness.py` | Pass with escalation residual risk |
 
+## Closed Finding
+
+### Protected values in file and folder names — Fixed
+
+Commit `2b06156` redacts each provider-visible file and folder name, resolves redacted-name collisions, and keeps the real-to-mirror path mapping in trusted process memory. Binary companion files now contain only the redacted mirror path.
+
+The adversarial privacy test now creates a binary file with a protected value in its filename, then scans every provider-visible relative path and every mirror file byte. The protected value, original binary, inline image data, and `.arcelle` state are absent.
+
+Focused verification after the fix:
+
+- `securityReview.test.ts`
+- `cloudMirror.test.ts`
+- `controller.test.ts`
+- 23 tests passed.
+
 ## Important Open Risks
 
-### 1. Protected values in file and folder names — High
-
-The cloud mirror preserves relative paths. Binary companion files also include the original path in their text. Content redaction does not redact path components.
-
-Example: a file named `Contracts/Ben Reich.pdf` can expose `Ben Reich` even when the PDF text is fully redacted.
-
-Required release action:
-
-- Create opaque or redacted cloud path names.
-- Keep the reverse path map only in trusted Arcelle memory or encrypted state.
-- Validate names on write-back in the same way as content placeholders.
-- Add an acceptance test that scans provider-visible paths and file bytes for every protected value.
-
-Do not enable `cloud_redacted_mirror` for sensitive rooms until this is fixed or the release owner records a clear risk acceptance.
-
-### 2. Unsanitized provider failure text — High
+### 1. Unsanitized provider failure text — High
 
 Codex app-server standard error and raw exception messages can become `run_failed` event text. The legacy CLI also forwards standard error on a failed exit. A provider or tool can include file content, credentials, absolute paths, or protected values in that text.
 
@@ -79,7 +78,7 @@ Required release action:
 - Never persist provider standard error by default.
 - Add tests with fake API keys, room content, passwords, and protected values in provider errors.
 
-### 3. Symlink check/use race — Medium
+### 2. Symlink check/use race — Medium
 
 Arcelle checks path segments with `lstat` and then performs the filesystem action. Another local process with access to the room can replace a checked directory with a symlink between those steps. Native direct mode reduces this risk by refusing exposed symlinks before launch, but normal managed operations still use a check-then-use design.
 
@@ -89,7 +88,7 @@ Recommended fix:
 - Reject a workspace root that is itself a symlink in the managed Workspace Service, not only in native direct mode.
 - Revalidate parent identity after atomic rename.
 
-### 4. Cancellation has no forced-kill escalation — Medium
+### 3. Cancellation has no forced-kill escalation — Medium
 
 Native cancellation sends `SIGTERM` to the provider process group. The normal test proves a cooperative shell and its grandchild exit. A hostile or stuck process can ignore `SIGTERM`. Controller shutdown has a timeout, but it does not prove the process is gone before cleanup continues.
 
@@ -99,7 +98,7 @@ Recommended fix:
 - Confirm exit before releasing the write lease or deleting the runtime.
 - Add a test with a child that traps and ignores `SIGTERM`.
 
-### 5. Provider executable and network trust — Medium
+### 4. Provider executable and network trust — Medium
 
 The macOS Seatbelt profile protects local file locations. It does not provide a strict network allowlist. Provider-level settings disable model shell/web tools where required, but the installed Codex or Claude executable must still be trusted because the executable itself can use its cloud connection.
 
@@ -109,7 +108,7 @@ Recommended fix:
 - Pin or verify supported executable versions.
 - Add an application-level outbound destination policy if strict provider endpoint control is required.
 
-### 6. Crash residue window — Low
+### 5. Crash residue window — Low
 
 Runtime folders use mode `0700`; mirror files and Claude MCP configuration use mode `0600`. Normal completion removes them and the next application start removes abandoned folders. A hard crash can leave private runtime state on disk until that cleanup runs.
 
@@ -150,4 +149,4 @@ Result: 43 tests passed. Five third-party SWIG deprecation warnings were reporte
 
 ## Release Decision
 
-This review closes the audit work, not the release gate. General Availability should remain disabled until the two High risks are fixed or explicitly accepted, the focused tests are rerun, and the full release suite passes.
+This review closes the audit work, not the release gate. General Availability should remain disabled until the remaining High risk is fixed or explicitly accepted, the focused tests are rerun, and the full release suite passes.
