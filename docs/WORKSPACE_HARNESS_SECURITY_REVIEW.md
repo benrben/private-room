@@ -136,7 +136,7 @@ npx vitest run electron/main/harness/securityReview.test.ts electron/main/harnes
 
 Result at review time: 5 test files passed, 42 tests passed. A concurrent harness test was then added to the same focused set; the post-commit harness rerun passed 26 tests across the three harness test files.
 
-`npm run typecheck` was also run. It was blocked by an unrelated, concurrent type error in `harness/controller.ts` around the optional `baseDispatcher` type. This security-review change does not edit that implementation file.
+`npm run typecheck` also passed after the concurrent harness integration work settled.
 
 The cancellation and authentication evidence is covered by:
 
