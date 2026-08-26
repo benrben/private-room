@@ -9,6 +9,7 @@ import {
   inspectSealedPackage,
 } from "./sealedPackage.js";
 import { WorkspaceService } from "./workspaceService.js";
+import type { WorkspaceOperationProgressEvent } from "../../shared/workspaceProgress.js";
 
 const roots: string[] = [];
 
@@ -29,6 +30,7 @@ describe("sealed workspace packages", () => {
     const created = createWorkspaceRoom(sourceRoot, roomPassword, "Source Room");
     const workspace = new WorkspaceService(created.db, sourceRoot);
     const sealedPath = path.join(root, "Backup.arcelle");
+    const createProgress: WorkspaceOperationProgressEvent[] = [];
     let snapshotId: string;
     try {
       const file = await workspace.importFile(sourceFile, "Research/notes.txt");
@@ -40,11 +42,20 @@ describe("sealed workspace packages", () => {
         roomPassword,
         sealedPath,
         packagePassword,
+        "backup",
+        { operationId: "seal-1", progress: (event) => createProgress.push(event) },
       );
       expect(info).toMatchObject({ version: 2, purpose: "backup", fileCount: 1, objectCount: 1 });
     } finally {
       created.db.close();
     }
+    expect(createProgress.filter((event) => event.phase === "copying-files").map((event) => event.completed))
+      .toEqual([0, 1]);
+    expect(createProgress.filter((event) => event.phase === "copying-history").map((event) => event.completed))
+      .toEqual([0, 1]);
+    expect(createProgress.at(-1)).toMatchObject({
+      operationId: "seal-1", operation: "sealed-package-create", phase: "completed",
+    });
 
     expect(inspectSealedPackage(sealedPath, packagePassword)).toMatchObject({
       version: 2,
@@ -55,13 +66,22 @@ describe("sealed workspace packages", () => {
     expect((await readFile(sealedPath)).includes(Buffer.from("current normal bytes"))).toBe(false);
 
     const importedRoot = path.join(root, "Imported Room");
+    const importProgress: WorkspaceOperationProgressEvent[] = [];
     const imported = await importSealedPackage(
       sealedPath,
       packagePassword,
       importedRoot,
       importedPassword,
+      { operationId: "import-1", progress: (event) => importProgress.push(event) },
     );
     expect(imported).toMatchObject({ fileCount: 1, objectCount: 1 });
+    expect(importProgress.filter((event) => event.phase === "copying-files").map((event) => event.completed))
+      .toEqual([0, 1]);
+    expect(importProgress.filter((event) => event.phase === "copying-history").map((event) => event.completed))
+      .toEqual([0, 1]);
+    expect(importProgress.at(-1)).toMatchObject({
+      operationId: "import-1", operation: "sealed-package-import", phase: "completed",
+    });
     expect(await readFile(path.join(importedRoot, "Research/notes.txt"), "utf8"))
       .toBe("current normal bytes");
 

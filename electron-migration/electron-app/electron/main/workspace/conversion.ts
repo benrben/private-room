@@ -25,6 +25,10 @@ import {
   WORKSPACE_FORMAT_VERSION,
 } from "./roomLayout.js";
 import { pathKey, PRIVATE_DIR } from "./pathSafety.js";
+import {
+  WorkspaceOperationReporter,
+  type WorkspaceOperationProgressOptions,
+} from "./operationProgress.js";
 import type { WorkspaceMarker } from "./types.js";
 
 const SOURCE_HASH_META = "workspace_conversion_source_sha256";
@@ -55,7 +59,7 @@ export interface WorkspaceConversionReport {
   resumed: boolean;
 }
 
-export interface WorkspaceConversionHooks {
+export interface WorkspaceConversionHooks extends WorkspaceOperationProgressOptions {
   /** Test seam used to prove resume after a committed per-file export. */
   afterFile?: (fileId: string) => void | Promise<void>;
 }
@@ -216,6 +220,7 @@ async function exportPendingFiles(
   db: Database.Database,
   tempRoot: string,
   hooks: WorkspaceConversionHooks,
+  progress: WorkspaceOperationReporter,
 ): Promise<number> {
   const pending = db.prepare(
     `SELECT id, relative_path FROM files
@@ -224,6 +229,7 @@ async function exportPendingFiles(
      ORDER BY rowid`,
   ).all() as Array<{ id: string; relative_path: string }>;
   let converted = 0;
+  progress.emit("copying-files", 0, pending.length, "files");
   for (const row of pending) {
     const destination = path.join(tempRoot, ...row.relative_path.split("/"));
     if (existsSync(destination)) {
@@ -248,6 +254,7 @@ async function exportPendingFiles(
       row.id,
     );
     converted += 1;
+    progress.emit("copying-files", converted, pending.length, "files");
     await hooks.afterFile?.(row.id);
   }
   return converted;
@@ -280,12 +287,14 @@ async function validateWorkspaceCopy(db: Database.Database, tempRoot: string): P
  * Convert a closed legacy room into a normal-file workspace. The source is
  * verified read-only and is never migrated, rekeyed, or replaced.
  */
-export async function convertLegacyRoomToWorkspace(
+async function convertLegacyRoomToWorkspaceCore(
   sourcePath: string,
   password: string,
   destinationPath: string,
-  hooks: WorkspaceConversionHooks = {},
+  hooks: WorkspaceConversionHooks,
+  progress: WorkspaceOperationReporter,
 ): Promise<WorkspaceConversionReport> {
+  progress.emit("scanning", 0, null);
   const source = path.resolve(sourcePath);
   const destination = path.resolve(destinationPath);
   if (source === destination) throw new Error("Choose a different destination folder for the workspace.");
@@ -331,10 +340,14 @@ export async function convertLegacyRoomToWorkspace(
     }
 
     let report = loadReport(db);
+    progress.emit("planning", getMeta(db, PHASE_META) === null ? 0 : 1, 1);
     if (getMeta(db, PHASE_META) === null) report = planPaths(db);
+    progress.emit("planning", 1, 1);
     setMeta(db, PHASE_META, "exporting");
-    await exportPendingFiles(db, tempRoot, hooks);
+    await exportPendingFiles(db, tempRoot, hooks, progress);
+    progress.emit("validating", 0, 1);
     const convertedFiles = await validateWorkspaceCopy(db, tempRoot);
+    progress.emit("validating", 1, 1);
     setMeta(db, PHASE_META, "validated");
     vacuum(db);
     setMeta(db, PHASE_META, "complete");
@@ -353,8 +366,10 @@ export async function convertLegacyRoomToWorkspace(
     if (await sha256File(source) !== sourceHash) {
       throw new Error("The legacy source changed during conversion. The workspace was not published.");
     }
+    progress.emit("publishing", 0, 1);
     await rename(tempRoot, destination);
     await syncDirectory(path.dirname(destination));
+    progress.emit("publishing", 1, 1);
     return {
       sourcePath: source,
       destinationPath: destination,
@@ -366,6 +381,34 @@ export async function convertLegacyRoomToWorkspace(
     };
   } catch (error) {
     try { db.close(); } catch { /* keep the resumable temp workspace */ }
+    throw error;
+  }
+}
+
+export async function convertLegacyRoomToWorkspace(
+  sourcePath: string,
+  password: string,
+  destinationPath: string,
+  hooks: WorkspaceConversionHooks = {},
+): Promise<WorkspaceConversionReport> {
+  const progress = new WorkspaceOperationReporter(
+    "legacy-conversion",
+    hooks.progress,
+    hooks.operationId,
+  );
+  progress.start();
+  try {
+    const report = await convertLegacyRoomToWorkspaceCore(
+      sourcePath,
+      password,
+      destinationPath,
+      hooks,
+      progress,
+    );
+    progress.complete();
+    return report;
+  } catch (error) {
+    progress.fail();
     throw error;
   }
 }

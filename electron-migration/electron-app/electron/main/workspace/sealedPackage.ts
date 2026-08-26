@@ -16,6 +16,10 @@ import {
   WORKSPACE_FORMAT_VERSION,
 } from "./roomLayout.js";
 import { normalizeRelativePath, pathKey, PRIVATE_DIR, resolveWorkspacePath } from "./pathSafety.js";
+import {
+  WorkspaceOperationReporter,
+  type WorkspaceOperationProgressOptions,
+} from "./operationProgress.js";
 import type { ManifestEntry, WorkspaceMarker } from "./types.js";
 import { WorkspaceService } from "./workspaceService.js";
 
@@ -38,9 +42,14 @@ export interface SealedImportResult {
   objectCount: number;
 }
 
-export interface SealedImportOptions {
+export interface SealedImportOptions extends WorkspaceOperationProgressOptions {
   /** Checkpoint restore keeps the logical room identity stored in the package. */
   preserveRoomIdentity?: boolean;
+}
+
+export interface SealedCreateOptions extends WorkspaceOperationProgressOptions {
+  /** Checkpoints share the packager but keep a distinct UI operation kind. */
+  operation?: "sealed-package-create" | "workspace-checkpoint";
 }
 
 interface SealedFileRow {
@@ -232,13 +241,14 @@ function verifySealedDatabase(db: Database.Database): SealedPackageInfo {
 }
 
 /** Create one verified SQLCipher file containing current files and private history. */
-export async function createSealedPackage(
+async function createSealedPackageCore(
   workspace: WorkspaceService,
   roomId: string,
   currentPassword: string,
   destinationPath: string,
-  exportPassword = currentPassword,
-  purpose = "backup",
+  exportPassword: string,
+  purpose: string,
+  progress: WorkspaceOperationReporter,
 ): Promise<SealedPackageInfo> {
   const destination = path.resolve(destinationPath);
   const root = path.resolve(workspace.rootPath);
@@ -249,6 +259,7 @@ export async function createSealedPackage(
   if (await lstat(destination).then(() => true, () => false)) {
     throw new Error("A file already exists at the sealed package destination.");
   }
+  progress.emit("scanning", 0, null);
   await workspace.reconcile();
   const before = await scanWorkspaceManifest(root);
   const fileRows = workspace.db.prepare(
@@ -273,6 +284,8 @@ export async function createSealedPackage(
     const insertFileChunk = packageDb.prepare(
       "INSERT INTO sealed_file_chunks(file_id, seq, bytes) VALUES (?, ?, ?)",
     );
+    let completedFiles = 0;
+    progress.emit("copying-files", completedFiles, fileRows.length, "files");
     for (const row of fileRows) {
       const absolute = resolveWorkspacePath(root, row.relative_path);
       const packed = await addStreamChunks(createReadStream(absolute), insertFileChunk, row.id);
@@ -280,6 +293,8 @@ export async function createSealedPackage(
         throw new Error(`The workspace changed while sealing ${row.relative_path}.`);
       }
       insertFile.run(row.id, row.relative_path, packed.sizeBytes, packed.sha256);
+      completedFiles += 1;
+      progress.emit("copying-files", completedFiles, fileRows.length, "files");
     }
 
     const objectRows = workspace.db.prepare(
@@ -291,6 +306,8 @@ export async function createSealedPackage(
     const insertObjectChunk = packageDb.prepare(
       "INSERT INTO sealed_object_chunks(object_id, seq, bytes) VALUES (?, ?, ?)",
     );
+    let completedObjects = 0;
+    progress.emit("copying-history", completedObjects, objectRows.length, "objects");
     for (const row of objectRows) {
       if (!/^objects\/[0-9a-f-]+\.aobj$/i.test(row.relative_object_path)) {
         throw new Error("The workspace object store contains an unsafe path.");
@@ -298,7 +315,10 @@ export async function createSealedPackage(
       const objectPath = path.join(workspace.privateRoot, ...row.relative_object_path.split("/"));
       const packed = await addStreamChunks(createReadStream(objectPath), insertObjectChunk, row.id);
       insertObject.run(row.id, row.relative_object_path, packed.sizeBytes, packed.sha256);
+      completedObjects += 1;
+      progress.emit("copying-history", completedObjects, objectRows.length, "objects");
     }
+    progress.emit("validating", 0, 1);
     const after = await scanWorkspaceManifest(root);
     if (!mapsEqual(before, after)) throw new Error("The workspace changed while the sealed package was being made.");
     const createdAt = new Date().toISOString();
@@ -315,12 +335,48 @@ export async function createSealedPackage(
     const verified = openRoomReadonly(tempPath, exportPassword);
     const info = verifySealedDatabase(verified);
     verified.close();
+    progress.emit("validating", 1, 1);
+    progress.emit("publishing", 0, 1);
     await rename(tempPath, destination);
     await syncDirectory(path.dirname(destination));
+    progress.emit("publishing", 1, 1);
     return info;
   } catch (error) {
     try { packageDb?.close(); } catch { /* best effort */ }
     await rm(tempPath, { force: true });
+    throw error;
+  }
+}
+
+export async function createSealedPackage(
+  workspace: WorkspaceService,
+  roomId: string,
+  currentPassword: string,
+  destinationPath: string,
+  exportPassword = currentPassword,
+  purpose = "backup",
+  options: SealedCreateOptions = {},
+): Promise<SealedPackageInfo> {
+  const progress = new WorkspaceOperationReporter(
+    options.operation ?? "sealed-package-create",
+    options.progress,
+    options.operationId,
+  );
+  progress.start();
+  try {
+    const result = await createSealedPackageCore(
+      workspace,
+      roomId,
+      currentPassword,
+      destinationPath,
+      exportPassword,
+      purpose,
+      progress,
+    );
+    progress.complete();
+    return result;
+  } catch (error) {
+    progress.fail();
     throw error;
   }
 }
@@ -357,18 +413,20 @@ async function restoreChunksToFile(
 }
 
 /** Import a sealed package into a new normal-file workspace. */
-export async function importSealedPackage(
+async function importSealedPackageCore(
   packagePath: string,
   packagePassword: string,
   destinationPath: string,
-  workspacePassword = packagePassword,
-  options: SealedImportOptions = {},
+  workspacePassword: string,
+  options: SealedImportOptions,
+  progress: WorkspaceOperationReporter,
 ): Promise<SealedImportResult> {
   const source = path.resolve(packagePath);
   const destination = path.resolve(destinationPath);
   if (await lstat(destination).then(() => true, () => false)) {
     throw new Error("A file or folder already exists at the workspace destination.");
   }
+  progress.emit("scanning", 0, null);
   const sourceDb = openRoomReadonly(source, packagePassword);
   let sourceInfo: SealedPackageInfo;
   try { sourceInfo = verifySealedDatabase(sourceDb); } finally { sourceDb.close(); }
@@ -384,6 +442,8 @@ export async function importSealedPackage(
     migrate(db);
     const files = db.prepare("SELECT file_id, relative_path, size_bytes, sha256 FROM sealed_files ORDER BY relative_path")
       .all() as SealedFileRow[];
+    let completedFiles = 0;
+    progress.emit("copying-files", completedFiles, files.length, "files");
     for (const file of files) {
       const relativePath = normalizeRelativePath(file.relative_path);
       const destinationFile = resolveWorkspacePath(tempRoot, relativePath);
@@ -401,10 +461,14 @@ export async function importSealedPackage(
         file.size_bytes, Number(fileStat.mtimeNs),
         `${fileStat.dev}:${fileStat.ino}:${fileStat.birthtimeNs}`, file.file_id,
       );
+      completedFiles += 1;
+      progress.emit("copying-files", completedFiles, files.length, "files");
     }
     const objects = db.prepare(
       "SELECT object_id, relative_object_path, size_bytes, sha256 FROM sealed_objects ORDER BY object_id",
     ).all() as SealedObjectRow[];
+    let completedObjects = 0;
+    progress.emit("copying-history", completedObjects, objects.length, "objects");
     for (const object of objects) {
       if (!/^objects\/[0-9a-f-]+\.aobj$/i.test(object.relative_object_path)) {
         throw new Error("The sealed package contains an unsafe object path.");
@@ -414,7 +478,10 @@ export async function importSealedPackage(
         db, object.object_id, "sealed_object_chunks", "object_id", objectPath,
         object.size_bytes, object.sha256,
       );
+      completedObjects += 1;
+      progress.emit("copying-history", completedObjects, objects.length, "objects");
     }
+    progress.emit("validating", 0, 1);
     const manifest = await scanWorkspaceManifest(tempRoot);
     if (manifest.size !== files.length) throw new Error("The imported workspace file count is incorrect.");
     for (const file of files) {
@@ -423,6 +490,7 @@ export async function importSealedPackage(
         throw new Error(`The imported workspace failed validation for ${file.relative_path}.`);
       }
     }
+    progress.emit("validating", 1, 1);
     db.exec(
       `DROP TABLE sealed_file_chunks;
        DROP TABLE sealed_files;
@@ -449,8 +517,10 @@ export async function importSealedPackage(
     });
     db.close();
     db = null;
+    progress.emit("publishing", 0, 1);
     await rename(tempRoot, destination);
     await syncDirectory(path.dirname(destination));
+    progress.emit("publishing", 1, 1);
     return {
       destinationPath: destination,
       roomId,
@@ -460,6 +530,36 @@ export async function importSealedPackage(
   } catch (error) {
     try { db?.close(); } catch { /* best effort */ }
     await rm(tempRoot, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+export async function importSealedPackage(
+  packagePath: string,
+  packagePassword: string,
+  destinationPath: string,
+  workspacePassword = packagePassword,
+  options: SealedImportOptions = {},
+): Promise<SealedImportResult> {
+  const progress = new WorkspaceOperationReporter(
+    "sealed-package-import",
+    options.progress,
+    options.operationId,
+  );
+  progress.start();
+  try {
+    const result = await importSealedPackageCore(
+      packagePath,
+      packagePassword,
+      destinationPath,
+      workspacePassword,
+      options,
+      progress,
+    );
+    progress.complete();
+    return result;
+  } catch (error) {
+    progress.fail();
     throw error;
   }
 }

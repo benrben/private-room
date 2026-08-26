@@ -9,6 +9,7 @@ import { createRoom, openRoomReadonly } from "../db-host/open.js";
 import { sha256File } from "./hash.js";
 import { openWorkspaceRoom } from "./roomLayout.js";
 import { convertLegacyRoomToWorkspace } from "./conversion.js";
+import type { WorkspaceOperationProgressEvent } from "../../shared/workspaceProgress.js";
 
 const roots: string[] = [];
 
@@ -47,11 +48,21 @@ describe("legacy workspace conversion", () => {
     legacy.close();
     const sourceHashBefore = await sha256File(sourcePath);
 
-    const report = await convertLegacyRoomToWorkspace(sourcePath, password, destinationPath);
+    const progress: WorkspaceOperationProgressEvent[] = [];
+    const report = await convertLegacyRoomToWorkspace(sourcePath, password, destinationPath, {
+      operationId: "convert-1",
+      progress: (event) => progress.push(event),
+    });
 
     expect(report.convertedFiles).toBe(2);
     expect(report.renamed).toHaveLength(2);
     expect(report.skipped).toEqual([]);
+    expect(progress[0]).toMatchObject({
+      operationId: "convert-1", operation: "legacy-conversion", phase: "preparing", status: "started",
+    });
+    expect(progress.filter((event) => event.phase === "copying-files").map((event) => event.completed))
+      .toEqual([0, 1, 2]);
+    expect(progress.at(-1)).toMatchObject({ phase: "completed", status: "completed" });
     expect(await sha256File(sourcePath)).toBe(sourceHashBefore);
     expect(await readFile(path.join(destinationPath, "Research", "notes_.txt"), "utf8"))
       .toBe("first bytes");
@@ -109,13 +120,19 @@ describe("legacy workspace conversion", () => {
     legacy.close();
     const sourceHash = await sha256File(sourcePath);
     let exported = 0;
+    const progress: WorkspaceOperationProgressEvent[] = [];
 
     await expect(convertLegacyRoomToWorkspace(sourcePath, password, destinationPath, {
+      operationId: "convert-failed",
+      progress: (event) => progress.push(event),
       afterFile: () => {
         exported += 1;
         if (exported === 1) throw new Error("simulated interruption");
       },
     })).rejects.toThrow(/simulated interruption/);
+    expect(progress.at(-1)).toMatchObject({
+      operationId: "convert-failed", operation: "legacy-conversion", phase: "failed", status: "failed",
+    });
 
     const report = await convertLegacyRoomToWorkspace(sourcePath, password, destinationPath);
     expect(report.resumed).toBe(true);
