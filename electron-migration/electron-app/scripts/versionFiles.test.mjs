@@ -123,8 +123,8 @@ describe("checkVersionFiles — live repo", () => {
 
   it("keeps every Electron-era version file in agreement", async () => {
     const result = await checkVersionFiles({ repoRoot });
-    expect(result.version).toBe("0.26.4");
+    expect(result.version).toBe("0.26.5");
     expect(result.ok).toBe(true);
-    expect(result.checks.every((check) => check.found === "0.26.4")).toBe(true);
+    expect(result.checks.every((check) => check.found === "0.26.5")).toBe(true);
   });
 });
