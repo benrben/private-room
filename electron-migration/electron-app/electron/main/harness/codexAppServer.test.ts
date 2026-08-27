@@ -317,6 +317,7 @@ exit 2`);
 
     const threadStart = requests.find((message) => message.method === "thread/start");
     expect(threadStart?.params).toMatchObject({
+      model: "test-model",
       approvalPolicy: "on-request",
       sandbox: threadSandbox,
       developerInstructions: expect.stringContaining("Follow the room policy."),
@@ -330,6 +331,32 @@ exit 2`);
       input: [{ type: "text", text: "Review notes.md." }],
     });
     expect(JSON.stringify((turnStart?.params as Record<string, unknown>).input)).not.toContain("Follow the room policy.");
+  });
+
+  it("omits Arcelle's default model alias so Codex uses its configured model", async () => {
+    const fixture = await codexHomeFixture();
+    const requests: Array<Record<string, unknown>> = [];
+    const runtime = new CodexAppServerRuntime(
+      "codex",
+      (() => completingTurnChild(requests)) as never,
+      100,
+      fixture.sourceHome,
+    );
+    const run = await runtime.startTurn({
+      runId: "run-default-model",
+      roomId: "room-1",
+      provider: "codex",
+      model: "default",
+      workspacePath: fixture.workspacePath,
+      runtimePath: fixture.runtimePath,
+      privacyMode: "cloud-direct",
+      writeEnabled: false,
+      exposureVerified: true,
+    }, { text: "Review notes.md." });
+    for await (const _event of run.events) { /* wait for the complete protocol */ }
+
+    const threadStart = requests.find((message) => message.method === "thread/start");
+    expect(threadStart?.params).not.toHaveProperty("model");
   });
 
   it("updates developer instructions when resuming a thread", async () => {

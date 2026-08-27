@@ -59,6 +59,7 @@ describe("Claude native Room MCP wiring", () => {
       };
     };
     expect(request.options.strictMcpConfig).toBe(true);
+    expect(request.options.model).toBe("sonnet");
     expect(request.options.pathToClaudeCodeExecutable).toBe("claude");
     expect(request.options.mcpServers).toEqual({
       room: {
@@ -73,6 +74,37 @@ describe("Claude native Room MCP wiring", () => {
     expect(request.options.systemPrompt.append).toContain("Follow room policy.");
     expect(request.options.systemPrompt.append).toContain(exposure.instructions);
     expect(stop).toHaveBeenCalledTimes(1);
+  });
+
+  it("omits Arcelle's default model alias so Claude uses its configured model", async () => {
+    queryMock.mockReturnValueOnce({
+      async *[Symbol.asyncIterator]() {
+        yield {
+          type: "result",
+          subtype: "success",
+          is_error: false,
+          usage: { input_tokens: 1, output_tokens: 1 },
+          total_cost_usd: 0,
+        };
+      },
+      close: vi.fn(),
+    });
+    const runtime = new ClaudeAgentSdkRuntime();
+    const run = await runtime.startTurn({
+      runId: "run-default-model",
+      roomId: "room-1",
+      provider: "claude",
+      model: "default",
+      privacyMode: "cloud-direct",
+      workspacePath: "/tmp/Arcelle Room",
+      runtimePath: "/tmp/Arcelle Runtime/run-default-model",
+      writeEnabled: false,
+      exposureVerified: true,
+    }, { text: "Review notes.md." });
+    for await (const _event of run.events) { /* drain */ }
+
+    const request = queryMock.mock.calls.at(-1)?.[0] as { options: { model?: string } };
+    expect(request.options.model).toBeUndefined();
   });
 
   it("canonicalizes aliased workspace paths and reports native tool failures", async () => {

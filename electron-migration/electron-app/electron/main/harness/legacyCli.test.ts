@@ -118,6 +118,7 @@ describe("RestrictedLegacyCliRuntime", () => {
       expect(sandbox!.writeEnabled).toBe(false);
       expect(args).toContain("read-only");
       expect(args).toContain("shell_tool");
+      expect(args.slice(args.indexOf("--model"), args.indexOf("--model") + 2)).toEqual(["--model", "gpt-test"]);
       expect(args.join(" ")).toContain("mcp_servers.room.url");
       const bearerToken = sandbox!.env?.ARCELLE_ROOM_MCP_TOKEN;
       expect(bearerToken).toMatch(/^[0-9a-f-]{36}$/i);
@@ -128,6 +129,41 @@ describe("RestrictedLegacyCliRuntime", () => {
       f.created.db.close();
     }
   });
+
+  it.each(["codex", "claude"] as const)(
+    "omits the default model alias for the restricted %s fallback",
+    async (provider) => {
+      const f = await fixture();
+      let args: string[] = [];
+      try {
+        const runtime = new RestrictedLegacyCliRuntime(provider, f.state, {
+          executable: `/fake/${provider}`,
+          available: () => true,
+          spawn: (_options, captured) => {
+            args = captured;
+            return fakeChild(provider === "codex"
+              ? codexAnswer("done")
+              : `${JSON.stringify({ type: "result", subtype: "success", result: "done" })}\n`);
+          },
+        });
+        const run = await runtime.startTurn({
+          runId: `run-default-${provider}`,
+          roomId: createdRoomId(f.created.descriptor.roomId),
+          provider,
+          model: " Default ",
+          workspacePath: f.roomPath,
+          runtimePath: path.join(f.root, `runtime-default-${provider}`),
+          privacyMode: "cloud-direct",
+          writeEnabled: false,
+          exposureVerified: true,
+        }, { text: "work" });
+        for await (const _event of run.events) { /* drain */ }
+        expect(args).not.toContain("--model");
+      } finally {
+        f.created.db.close();
+      }
+    },
+  );
 
   it("never forwards raw CLI stderr into normalized failure events", async () => {
     const f = await fixture();

@@ -29,7 +29,7 @@ import {
   type RunChangeSummary,
 } from "./runProtection.js";
 import { nativeWorkspaceSandboxSupported, verifyNativeHarnessExecutable } from "./seatbelt.js";
-import { nativeCliExecutable } from "./nativeCli.js";
+import { nativeCliExecutable, nativeHarnessModel } from "./nativeCli.js";
 import { createNativeRoomMcpFactory } from "./nativeRoomMcp.js";
 import type {
   ApprovalDecision,
@@ -297,6 +297,12 @@ export class HarnessController {
   async start(request: HarnessStartRequest): Promise<string> {
     if (!this.flag("unified_harness")) throw new Error("The unified harness feature is disabled.");
     const native = request.provider === "codex" || request.provider === "claude";
+    const selectedModel = native
+      ? nativeHarnessModel(request.model) ?? ""
+      : request.model.trim();
+    if (!native && (selectedModel === "" || selectedModel.toLowerCase() === "default")) {
+      throw new Error(`Choose a specific model for the ${request.provider} harness.`);
+    }
     const providerFlag = request.provider === "codex"
       ? "codex_app_server"
       : request.provider === "claude"
@@ -312,13 +318,13 @@ export class HarnessController {
     if (request.provider === "ollama-local" && request.privacyMode !== "local") {
       throw new Error("Local Ollama uses local privacy mode.");
     }
-    if (request.provider === "ollama-local" && !runsOnThisMac(request.model)) {
+    if (request.provider === "ollama-local" && !runsOnThisMac(selectedModel)) {
       throw new Error("Choose a model that runs on this Mac for the local Ollama harness.");
     }
     if ((request.provider === "ollama-cloud" || request.provider === "openrouter") && request.privacyMode === "local") {
       throw new Error("This cloud provider requires cloud-direct or cloud-redacted privacy mode.");
     }
-    if (request.provider === "ollama-cloud" && runsOnThisMac(request.model)) {
+    if (request.provider === "ollama-cloud" && runsOnThisMac(selectedModel)) {
       throw new Error("Choose an Ollama cloud model for the Ollama cloud harness.");
     }
     const room = this.state.room;
@@ -367,6 +373,7 @@ export class HarnessController {
     try {
       const started = await orchestrator.start({
         ...request,
+        model: selectedModel,
         runId,
         roomId: room.descriptor.roomId,
         workspacePath,

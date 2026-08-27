@@ -4,7 +4,7 @@ import { lstat, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/
 import path from "node:path";
 import { AsyncEventQueue } from "./eventQueue.js";
 import { safeProviderFailure } from "./failureSafety.js";
-import { nativeCliExecutable } from "./nativeCli.js";
+import { nativeCliExecutable, nativeHarnessModel } from "./nativeCli.js";
 import { codexAgentInstructions, loadAgentManifest, type SharedAgentDefinition } from "./agentManifest.js";
 import { parseClaudeJsonResult, parseCodexJsonStream } from "../externalAdvisor.js";
 import { McpBridge, type ToolCallResult, type ToolDispatcher, type ToolScope, type ToolSpec } from "../mcpBridge.js";
@@ -464,9 +464,10 @@ export class RestrictedLegacyCliRuntime implements HarnessRuntime {
     await writeFile(configPath, JSON.stringify({ mcpServers: { room: { type: "http", url: bridge.url, headers: { Authorization: `Bearer ${token}` } } } }), { mode: 0o600 });
     const prompt = [context.systemPrompt, codexAgentInstructions(), input.text].filter(Boolean).join("\n\n");
     const env = { ...process.env, ARCELLE_ROOM_MCP_TOKEN: token };
+    const selectedModel = nativeHarnessModel(context.model);
     const args = this.provider === "claude"
-      ? ["-p", "--output-format", "json", "--mcp-config", configPath, "--strict-mcp-config", "--tools", "", "--allowedTools", "mcp__room__*", ...(context.model ? ["--model", context.model] : [])]
-      : ["exec", "--json", "--ignore-user-config", "--ephemeral", "--skip-git-repo-check", "--sandbox", "read-only", "-c", "approval_policy=\"never\"", "--disable", "shell_tool", "--disable", "unified_exec", "-c", "web_search=\"disabled\"", "-c", `mcp_servers.room.url=\"${bridge.url}\"`, "-c", "mcp_servers.room.bearer_token_env_var=\"ARCELLE_ROOM_MCP_TOKEN\"", ...(context.model ? ["--model", context.model] : []), "-"];
+      ? ["-p", "--output-format", "json", "--mcp-config", configPath, "--strict-mcp-config", "--tools", "", "--allowedTools", "mcp__room__*", ...(selectedModel ? ["--model", selectedModel] : [])]
+      : ["exec", "--json", "--ignore-user-config", "--ephemeral", "--skip-git-repo-check", "--sandbox", "read-only", "-c", "approval_policy=\"never\"", "--disable", "shell_tool", "--disable", "unified_exec", "-c", "web_search=\"disabled\"", "-c", `mcp_servers.room.url=\"${bridge.url}\"`, "-c", "mcp_servers.room.bearer_token_env_var=\"ARCELLE_ROOM_MCP_TOKEN\"", ...(selectedModel ? ["--model", selectedModel] : []), "-"];
     let child: ChildProcessWithoutNullStreams;
     try {
       child = this.spawn({

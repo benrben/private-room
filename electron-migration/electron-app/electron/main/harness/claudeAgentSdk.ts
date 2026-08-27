@@ -14,7 +14,7 @@ import {
 import { AsyncEventQueue } from "./eventQueue.js";
 import { claudeAgentDefinitions } from "./agentManifest.js";
 import { safeProviderFailure } from "./failureSafety.js";
-import { nativeCliExecutable } from "./nativeCli.js";
+import { nativeCliExecutable, nativeHarnessModel } from "./nativeCli.js";
 import type { NativeRoomMcpExposure, NativeRoomMcpFactory } from "./nativeRoomMcp.js";
 import {
   spawnWithNativeWorkspaceSandbox,
@@ -273,7 +273,7 @@ export class ClaudeAgentSdkRuntime implements HarnessRuntime {
         // packaged app starts the same verified binary as the sandbox test.
         pathToClaudeCodeExecutable: this.executable,
         cwd: workspacePath,
-        model: context.model || undefined,
+        model: nativeHarnessModel(context.model),
         systemPrompt: context.systemPrompt === undefined
           ? roomMcp === undefined
             ? { type: "preset", preset: "claude_code" }

@@ -8,7 +8,7 @@ import { AsyncEventQueue } from "./eventQueue.js";
 import { codexAgentInstructions } from "./agentManifest.js";
 import { inspectCodexSchemaDirectory, type CodexSchemaCompatibility } from "./codexSchema.js";
 import { safeProviderFailure } from "./failureSafety.js";
-import { nativeCliExecutable } from "./nativeCli.js";
+import { nativeCliExecutable, nativeHarnessModel } from "./nativeCli.js";
 import {
   NATIVE_ROOM_MCP_SERVER,
   NATIVE_ROOM_MCP_TOKEN_ENV,
@@ -531,7 +531,7 @@ export class CodexAppServerRuntime implements HarnessRuntime {
           .join("\n\n");
         const threadResponse = input.threadId === undefined
           ? await request("thread/start", {
-              model: context.model || undefined,
+              model: nativeHarnessModel(context.model),
               cwd: context.workspacePath,
               developerInstructions,
               config: roomMcp === undefined ? undefined : codexRoomMcpConfiguration(roomMcp),

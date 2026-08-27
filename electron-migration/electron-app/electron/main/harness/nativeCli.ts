@@ -4,6 +4,17 @@ import path from "node:path";
 
 export type NativeCliProvider = "codex" | "claude";
 
+/**
+ * Convert Arcelle's user-facing native-model alias into the optional model
+ * value expected by Codex and Claude. Omitting the model lets each installed
+ * harness use its own configured default; forwarding the literal word
+ * `default` makes both CLIs look for a model with that name.
+ */
+export function nativeHarnessModel(model: string): string | undefined {
+  const selected = model.trim();
+  return selected === "" || selected.toLowerCase() === "default" ? undefined : selected;
+}
+
 function executable(candidate: string): string | null {
   try {
     accessSync(candidate, constants.X_OK);

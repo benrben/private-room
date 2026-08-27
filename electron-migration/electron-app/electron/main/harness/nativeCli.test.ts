@@ -2,7 +2,7 @@ import { chmod, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { nativeCliExecutable } from "./nativeCli.js";
+import { nativeCliExecutable, nativeHarnessModel } from "./nativeCli.js";
 
 const roots: string[] = [];
 
@@ -29,5 +29,16 @@ describe("nativeCliExecutable", () => {
       PATH: "/usr/bin:/bin",
       ARCELLE_CLAUDE_PATH: "/managed/claude",
     }, "/unused")).toBe("/managed/claude");
+  });
+});
+
+describe("nativeHarnessModel", () => {
+  it.each(["", "   ", "default", "DEFAULT", " Default "])(
+    "uses the installed harness default for %j",
+    (model) => expect(nativeHarnessModel(model)).toBeUndefined(),
+  );
+
+  it("trims and preserves an explicit native model", () => {
+    expect(nativeHarnessModel("  gpt-5.6-sol  ")).toBe("gpt-5.6-sol");
   });
 });

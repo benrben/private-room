@@ -72,6 +72,22 @@ class LegacyBlobCreatingRuntime implements HarnessRuntime {
   }
 }
 
+class CapturingRuntime implements HarnessRuntime {
+  readonly name = "legacy-cli" as const;
+  context: HarnessContext | null = null;
+  starts = 0;
+  async available(): Promise<boolean> { return true; }
+  async startTurn(context: HarnessContext): Promise<HarnessRun> {
+    this.context = context;
+    this.starts += 1;
+    async function* events() {
+      yield { type: "run_started", runId: context.runId, harness: "legacy-cli" } as const;
+      yield { type: "run_completed", runId: context.runId, status: "completed" } as const;
+    }
+    return { events: events(), cancel: async () => undefined, approve: async () => undefined };
+  }
+}
+
 async function fixture() {
   const root = await mkdtemp(path.join(os.tmpdir(), "arcelle-harness-controller-"));
   roots.push(root);
@@ -94,6 +110,62 @@ async function fixture() {
 }
 
 describe("HarnessController", () => {
+  it.each(["codex", "claude"] as const)(
+    "uses the installed %s default when the UI sends its default alias",
+    async (provider) => {
+      const f = await fixture();
+      let completed!: () => void;
+      const terminal = new Promise<void>((resolve) => { completed = resolve; });
+      try {
+        const runtime = new CapturingRuntime();
+        const controller = new HarnessController(f.state, f.root, (event, payload) => {
+          if (event === "harness-event" && (payload as { type?: string }).type === "run_completed") completed();
+        }, {
+          runtimes: { [provider]: runtime },
+          flag: () => true,
+          outsideWorkspaceIsolation: true,
+          verifyExposure: async () => true,
+        });
+        await controller.start({
+          provider,
+          model: " Default ",
+          privacyMode: "cloud-direct",
+          writeEnabled: false,
+          text: "review",
+        });
+        await terminal;
+        expect(runtime.context?.model).toBe("");
+      } finally {
+        f.created.db.close();
+      }
+    },
+  );
+
+  it.each(["ollama-local", "ollama-cloud", "openrouter"] as const)(
+    "requires a specific model for the %s Deep Harness",
+    async (provider) => {
+      const f = await fixture();
+      try {
+        const runtime = new CapturingRuntime();
+        const controller = new HarnessController(f.state, f.root, () => undefined, {
+          runtimes: { [provider]: runtime },
+          flag: () => true,
+          outsideWorkspaceIsolation: false,
+        });
+        await expect(controller.start({
+          provider,
+          model: " default ",
+          privacyMode: provider === "ollama-local" ? "local" : "cloud-direct",
+          writeEnabled: false,
+          text: "review",
+        })).rejects.toThrow(`Choose a specific model for the ${provider} harness.`);
+        expect(runtime.starts).toBe(0);
+      } finally {
+        f.created.db.close();
+      }
+    },
+  );
+
   it("rebinds history to the new SQLCipher connection after reopening the same room", async () => {
     const f = await fixture();
     let activeDb = f.created.db;
