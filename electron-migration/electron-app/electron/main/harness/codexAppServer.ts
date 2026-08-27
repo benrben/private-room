@@ -411,27 +411,32 @@ export class CodexAppServerRuntime implements HarnessRuntime {
           capabilities: { experimentalApi: false },
         });
         send({ method: "initialized", params: {} });
+        // Codex app-server has a dedicated developer-instruction channel on
+        // thread creation/resume. Keep Arcelle policy out of the user turn so
+        // the model cannot confuse trusted harness policy with task content.
+        const developerInstructions = [context.systemPrompt, codexAgentInstructions()]
+          .filter((part): part is string => typeof part === "string" && part.length > 0)
+          .join("\n\n");
         const threadResponse = input.threadId === undefined
           ? await request("thread/start", {
               model: context.model || undefined,
               cwd: context.workspacePath,
+              developerInstructions,
               approvalPolicy: "on-request",
               sandbox: context.writeEnabled ? "workspace-write" : "read-only",
               ephemeral: true,
             })
-          : await request("thread/resume", { threadId: input.threadId, cwd: context.workspacePath });
+          : await request("thread/resume", {
+              threadId: input.threadId,
+              cwd: context.workspacePath,
+              developerInstructions,
+            });
         threadId = nestedString(threadResponse, "thread", "id");
         if (threadId === null) throw new Error("Codex did not return a thread id.");
         events.push({ type: "agent_started", runId: context.runId, agentId: "coordinator", label: "Codex" });
-        const generatedInstructions = codexAgentInstructions();
-        const prompt = [
-          context.systemPrompt,
-          generatedInstructions,
-          `User task:\n${input.text}`,
-        ].filter((part): part is string => typeof part === "string" && part.length > 0).join("\n\n");
         const turnResponse = await request("turn/start", {
           threadId,
-          input: [{ type: "text", text: prompt }],
+          input: [{ type: "text", text: input.text }],
           cwd: context.workspacePath,
           approvalPolicy: "on-request",
           sandboxPolicy: context.writeEnabled

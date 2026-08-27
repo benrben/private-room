@@ -102,7 +102,7 @@ function completingTurnChild(
       if (id === undefined) continue;
       if (message.method === "initialize") {
         queueMicrotask(() => stdout.write(`${JSON.stringify({ id, result: { userAgent: "fake" } })}\n`));
-      } else if (message.method === "thread/start") {
+      } else if (message.method === "thread/start" || message.method === "thread/resume") {
         queueMicrotask(() => stdout.write(`${JSON.stringify({ id, result: { thread: { id: "thread-1" } } })}\n`));
       } else if (message.method === "turn/start") {
         queueMicrotask(() => {
@@ -258,6 +258,7 @@ exit 2`);
       privacyMode: "cloud-direct",
       writeEnabled,
       exposureVerified: true,
+      systemPrompt: "Follow the room policy.",
     }, { text: "Review notes.md." });
     for await (const _event of run.events) { /* wait for the complete protocol */ }
 
@@ -265,11 +266,50 @@ exit 2`);
     expect(threadStart?.params).toMatchObject({
       approvalPolicy: "on-request",
       sandbox: threadSandbox,
+      developerInstructions: expect.stringContaining("Follow the room policy."),
     });
+    expect((threadStart?.params as Record<string, unknown>).developerInstructions)
+      .toEqual(expect.stringContaining("Arcelle specialist catalog"));
     const turnStart = requests.find((message) => message.method === "turn/start");
     expect(turnStart?.params).toMatchObject({
       approvalPolicy: "on-request",
       sandboxPolicy: turnSandbox,
+      input: [{ type: "text", text: "Review notes.md." }],
+    });
+    expect(JSON.stringify((turnStart?.params as Record<string, unknown>).input)).not.toContain("Follow the room policy.");
+  });
+
+  it("updates developer instructions when resuming a thread", async () => {
+    const fixture = await codexHomeFixture();
+    const requests: Array<Record<string, unknown>> = [];
+    const runtime = new CodexAppServerRuntime(
+      "codex",
+      (() => completingTurnChild(requests)) as never,
+      100,
+      fixture.sourceHome,
+    );
+    const run = await runtime.startTurn({
+      runId: "run-resume",
+      roomId: "room-1",
+      provider: "codex",
+      model: "test-model",
+      workspacePath: fixture.workspacePath,
+      runtimePath: fixture.runtimePath,
+      privacyMode: "cloud-direct",
+      writeEnabled: false,
+      exposureVerified: true,
+      systemPrompt: "Current room policy.",
+    }, { text: "Continue the review.", threadId: "thread-existing" });
+    for await (const _event of run.events) { /* wait for the complete protocol */ }
+
+    const threadResume = requests.find((message) => message.method === "thread/resume");
+    expect(threadResume?.params).toMatchObject({
+      threadId: "thread-existing",
+      developerInstructions: expect.stringContaining("Current room policy."),
+    });
+    const turnStart = requests.find((message) => message.method === "turn/start");
+    expect(turnStart?.params).toMatchObject({
+      input: [{ type: "text", text: "Continue the review." }],
     });
   });
 
