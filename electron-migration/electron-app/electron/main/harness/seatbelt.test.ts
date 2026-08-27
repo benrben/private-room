@@ -1,4 +1,5 @@
 import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { existsSync, lstatSync, readdirSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
@@ -13,6 +14,26 @@ import {
 } from "./seatbelt.js";
 
 const roots: string[] = [];
+const loginKeychainPath = path.join(os.homedir(), "Library", "Keychains", "login.keychain-db");
+const keychainDirectory = path.dirname(loginKeychainPath);
+
+function existingKeychainSibling(kind: "file" | "directory"): string | null {
+  try {
+    for (const name of readdirSync(keychainDirectory)) {
+      if (name === path.basename(loginKeychainPath)) continue;
+      const candidate = path.join(keychainDirectory, name);
+      const info = lstatSync(candidate);
+      if (kind === "file" ? info.isFile() : info.isDirectory()) return candidate;
+    }
+  } catch {
+    // Some test hosts do not have a user keychain directory. The live tests
+    // below are conditional on the exact paths that are present.
+  }
+  return null;
+}
+
+const siblingKeychainFile = existingKeychainSibling("file");
+const siblingKeychainDirectory = existingKeychainSibling("directory");
 
 afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
@@ -67,6 +88,97 @@ describe("native workspace Seatbelt", () => {
       writeEnabled: false,
     })).toBe(true);
   });
+
+  it.runIf(existsSync(loginKeychainPath))("exposes only Claude's login keychain as a read-only literal", async () => {
+    const f = await fixture();
+    const profile = nativeWorkspaceSeatbeltProfile({
+      workspacePath: f.workspacePath,
+      runtimePath: f.runtimePath,
+      executable: "/bin/sh",
+      provider: "claude",
+      writeEnabled: true,
+    });
+    const keychainLiteral = `(literal "${loginKeychainPath}")`;
+    const keychainSubpath = `(subpath "${keychainDirectory}")`;
+    const readRule = profile.split("\n").find((line) => line.startsWith("(allow file-read*") && line.includes(keychainLiteral));
+    const writeRules = profile.split("\n").filter((line) => line.startsWith("(allow file-write*"));
+
+    expect(readRule).toContain(keychainLiteral);
+    expect(readRule).not.toContain(keychainSubpath);
+    expect(writeRules.every((line) => !line.includes(loginKeychainPath) && !line.includes(keychainDirectory))).toBe(true);
+    expect(profile).toContain(`(deny file-read* file-write* (subpath "${path.join(await realpath(f.workspacePath), ".arcelle")}"))`);
+  });
+
+  it.runIf(nativeWorkspaceSandboxSupported() && existsSync(loginKeychainPath))(
+    "lets Claude read login.keychain-db but denies opening it for write and still hides .arcelle",
+    async () => {
+      const f = await fixture();
+      const privateCanary = path.join(f.workspacePath, ".arcelle", "private.txt");
+      await writeFile(privateCanary, "private", "utf8");
+      const profile = nativeWorkspaceSeatbeltProfile({
+        workspacePath: f.workspacePath,
+        runtimePath: f.runtimePath,
+        executable: "/bin/sh",
+        provider: "claude",
+        writeEnabled: true,
+      });
+      const result = spawnSync(
+        "/usr/bin/sandbox-exec",
+        [
+          "-p",
+          profile,
+          "/bin/sh",
+          "-c",
+          'cat "$1" >/dev/null && ! ( exec 3>> "$1" ) 2>/dev/null && ! cat "$2" >/dev/null 2>&1',
+          "arcelle",
+          loginKeychainPath,
+          privateCanary,
+        ],
+        { encoding: "utf8", timeout: 5_000 },
+      );
+      expect(result.status).toBe(0);
+    },
+  );
+
+  it.runIf(nativeWorkspaceSandboxSupported() && siblingKeychainFile !== null)(
+    "denies Claude read access to a sibling keychain file",
+    async () => {
+      const f = await fixture();
+      const profile = nativeWorkspaceSeatbeltProfile({
+        workspacePath: f.workspacePath,
+        runtimePath: f.runtimePath,
+        executable: "/bin/sh",
+        provider: "claude",
+        writeEnabled: false,
+      });
+      const result = spawnSync(
+        "/usr/bin/sandbox-exec",
+        ["-p", profile, "/bin/sh", "-c", '! cat "$1" >/dev/null 2>&1', "arcelle", siblingKeychainFile!],
+        { encoding: "utf8", timeout: 5_000 },
+      );
+      expect(result.status).toBe(0);
+    },
+  );
+
+  it.runIf(nativeWorkspaceSandboxSupported() && siblingKeychainDirectory !== null)(
+    "denies Claude directory reads for a sibling keychain directory",
+    async () => {
+      const f = await fixture();
+      const profile = nativeWorkspaceSeatbeltProfile({
+        workspacePath: f.workspacePath,
+        runtimePath: f.runtimePath,
+        executable: "/bin/sh",
+        provider: "claude",
+        writeEnabled: false,
+      });
+      const result = spawnSync(
+        "/usr/bin/sandbox-exec",
+        ["-p", profile, "/bin/sh", "-c", '! /bin/ls "$1" >/dev/null 2>&1', "arcelle", siblingKeychainDirectory!],
+        { encoding: "utf8", timeout: 5_000 },
+      );
+      expect(result.status).toBe(0);
+    },
+  );
 
   it.runIf(nativeWorkspaceSandboxSupported())("allows /var symlink traversal without exposing its file data", async () => {
     const f = await fixture();

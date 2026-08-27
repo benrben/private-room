@@ -66,7 +66,12 @@ export function nativeWorkspaceSeatbeltProfile(options: NativeWorkspaceSandbox):
     : [path.dirname(executable)];
   const providerLiterals = options.provider === "codex"
     ? [path.join(home, ".codex", "auth.json"), path.join(home, ".codex", "config.toml")]
-    : [];
+    // Claude Code stores its first-party session in the login keychain. The
+    // executable reports "not logged in" when seatbelt cannot read the
+    // keychain database, even though Security.framework owns the secret
+    // lookup. Expose only that encrypted database as a read-only literal;
+    // sibling keychains and every keychain write remain denied.
+    : [path.join(home, "Library", "Keychains", "login.keychain-db")];
   return [
     "(version 1)",
     "(allow default)",
