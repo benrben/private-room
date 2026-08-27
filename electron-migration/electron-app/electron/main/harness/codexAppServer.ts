@@ -8,6 +8,7 @@ import { AsyncEventQueue } from "./eventQueue.js";
 import { codexAgentInstructions } from "./agentManifest.js";
 import { inspectCodexSchemaDirectory, type CodexSchemaCompatibility } from "./codexSchema.js";
 import { safeProviderFailure } from "./failureSafety.js";
+import { nativeCliExecutable } from "./nativeCli.js";
 import {
   spawnWithNativeWorkspaceSandbox,
   terminateNativeProcessTree,
@@ -120,7 +121,7 @@ export class CodexAppServerRuntime implements HarnessRuntime {
   readonly name = "codex-app-server" as const;
   private compatibility: CodexSchemaCompatibility | null = null;
   constructor(
-    private readonly executable = process.env.ARCELLE_CODEX_PATH ?? "codex",
+    private readonly executable = nativeCliExecutable("codex"),
     private readonly sandboxSpawn: SandboxSpawn = spawnWithNativeWorkspaceSandbox,
     private readonly startupProbeTimeoutMs = 5_000,
     private readonly codexHomeSource = sourceCodexHome(),

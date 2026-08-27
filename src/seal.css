@@ -263,11 +263,9 @@
   }
 }
 
-/* The slow-lock note. The seal is silent by design; this only appears once the
-   ritual is over and the room is STILL closing (stopping recordings, waiting on
-   jobs, compacting the file), which is exactly when a dark still screen starts
-   reading as a hung app. It fades in on its own so it never competes with the
-   keyhole animation. */
+/* Lock progress is visible from the first frame. Closing may stop recordings,
+   wait on jobs, or compact the room; an immediate status keeps the covered
+   workspace from reading as a frozen, stale screen. */
 /* Sans, not the hand: this is an explanation of what the app is doing, and
    handwriting is reserved for annotations. --muted is 7.9:1 on the dark sheet
    and 5.0:1 on ivory, both against the veil's own --bg. */
@@ -285,8 +283,7 @@
   font-size: var(--fs-meta);
   line-height: var(--lh-body);
   color: var(--muted);
-  opacity: 0;
-  animation: seal-note-in var(--dur-slow) var(--seal-ease) forwards;
+  opacity: 1;
 }
 /* The one piece of looping motion in the product, and it earns it: it is the
    only thing distinguishing a room that is still closing from a frozen app.
@@ -301,11 +298,6 @@
   border-top-color: var(--accent);
   animation: seal-note-spin 0.9s linear infinite;
 }
-@keyframes seal-note-in {
-  to {
-    opacity: 1;
-  }
-}
 @keyframes seal-note-spin {
   to {
     transform: rotate(360deg);
@@ -314,7 +306,6 @@
 @media (prefers-reduced-motion: reduce) {
   .seal-note {
     opacity: 1;
-    animation: none;
   }
   /* No rotation, so the pen's quarter-arc would just be a mark stuck at
      twelve o'clock; the ring goes back to being a plain drawn circle. */

@@ -4,6 +4,7 @@ import { lstat, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/
 import path from "node:path";
 import { AsyncEventQueue } from "./eventQueue.js";
 import { safeProviderFailure } from "./failureSafety.js";
+import { nativeCliExecutable } from "./nativeCli.js";
 import { codexAgentInstructions, loadAgentManifest, type SharedAgentDefinition } from "./agentManifest.js";
 import { parseClaudeJsonResult, parseCodexJsonStream } from "../externalAdvisor.js";
 import { McpBridge, type ToolCallResult, type ToolDispatcher, type ToolScope, type ToolSpec } from "../mcpBridge.js";
@@ -237,9 +238,7 @@ export class RestrictedLegacyCliRuntime implements HarnessRuntime {
     options: LegacyCliRuntimeOptions = {},
   ) {
     this.options = options;
-    this.executable = options.executable ?? (provider === "codex"
-      ? process.env.ARCELLE_CODEX_PATH ?? "codex"
-      : process.env.ARCELLE_CLAUDE_PATH ?? "claude");
+    this.executable = options.executable ?? nativeCliExecutable(provider);
     this.spawn = options.spawn ?? spawnWithNativeWorkspaceSandbox;
     this.availableProbe = options.available ?? (() => spawnSync(this.executable, ["--version"], { stdio: "ignore", timeout: 5_000 }).status === 0);
     this.writeGate = options.writeGate ?? new AsyncWriteGate();

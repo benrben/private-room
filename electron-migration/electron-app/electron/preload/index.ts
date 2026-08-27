@@ -103,7 +103,6 @@
  * make this file unimportable from a test at all.
  */
 
-import { createRequire } from "node:module";
 import type { IpcRenderer } from "electron";
 import { isKnownCommandChannel, isKnownEventChannel } from "../shared/channelAllowlist.js";
 import type {
@@ -370,8 +369,12 @@ export function installArcelleBridge(
 // during this module's own synchronous evaluation, which is when Electron
 // expects it, not after an awaited step.
 if (typeof process !== "undefined" && process.versions?.electron !== undefined) {
-  const nodeRequire = createRequire(import.meta.url);
-  const electron = nodeRequire("electron") as {
+  // The production preload is bundled as one CommonJS file. Electron's
+  // sandboxed preload loader intentionally exposes only its restricted
+  // `require`, which includes the renderer-safe `electron` APIs below. Keeping
+  // this inside the Electron guard leaves the source module importable by
+  // ordinary Node/Vitest without trying to load Electron at module startup.
+  const electron = require("electron") as {
     contextBridge: ContextBridgeLike;
     ipcRenderer: IpcRendererLike;
     webUtils: { getPathForFile(file: unknown): string };

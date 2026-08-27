@@ -9,16 +9,18 @@
 // frozen app. Once the ritual is over and the close is still going, say so.
 export function SealLockingOverlay({ slow = false }: { slow?: boolean }) {
   return (
-    <div className="seal-locking-overlay" aria-hidden={!slow}>
-      {slow && (
-        <div className="seal-note" role="status">
-          <span className="seal-note-spinner" aria-hidden="true" />
-          <span>
+    <div className="seal-locking-overlay">
+      <div className={`seal-note${slow ? " is-slow" : ""}`} role="status" aria-live="polite">
+        <span className="seal-note-spinner" aria-hidden="true" />
+        <span>
+          {slow ? (
+            <>
             Sealing this room — stopping recordings, letting jobs finish and
             tidying the file. Large rooms can take a little while.
-          </span>
-        </div>
-      )}
+            </>
+          ) : "Locking this room…"}
+        </span>
+      </div>
     </div>
   );
 }

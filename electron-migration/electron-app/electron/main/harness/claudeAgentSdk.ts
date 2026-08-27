@@ -12,6 +12,7 @@ import {
 import { AsyncEventQueue } from "./eventQueue.js";
 import { claudeAgentDefinitions } from "./agentManifest.js";
 import { safeProviderFailure } from "./failureSafety.js";
+import { nativeCliExecutable } from "./nativeCli.js";
 import {
   spawnWithNativeWorkspaceSandbox,
   terminateNativeProcessTree,
@@ -63,7 +64,11 @@ interface PendingApproval {
 export class ClaudeAgentSdkRuntime implements HarnessRuntime {
   readonly name = "claude-agent-sdk" as const;
 
-  private readonly executable = process.env.ARCELLE_CLAUDE_PATH ?? "claude";
+  private readonly executable: string;
+
+  constructor(executable = nativeCliExecutable("claude")) {
+    this.executable = executable;
+  }
 
   async available(): Promise<boolean> {
     const result = spawnSync(this.executable, ["--version"], {

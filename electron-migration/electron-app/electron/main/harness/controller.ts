@@ -29,6 +29,7 @@ import {
   type RunChangeSummary,
 } from "./runProtection.js";
 import { nativeWorkspaceSandboxSupported, verifyNativeHarnessExecutable } from "./seatbelt.js";
+import { nativeCliExecutable } from "./nativeCli.js";
 import type {
   ApprovalDecision,
   HarnessEvent,
@@ -145,9 +146,7 @@ export class HarnessController {
         runtimePath,
         provider,
         writeEnabled,
-        executable: provider === "codex"
-          ? process.env.ARCELLE_CODEX_PATH ?? "codex"
-          : process.env.ARCELLE_CLAUDE_PATH ?? "claude",
+        executable: nativeCliExecutable(provider),
       }, provider === "codex" ? ["app-server", "--help"] : ["--version"]);
     });
     this.isolationProven = options.outsideWorkspaceIsolation ?? nativeWorkspaceSandboxSupported();
