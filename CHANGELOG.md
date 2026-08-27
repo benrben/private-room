@@ -3,6 +3,17 @@
 All notable, user-facing changes to Arcelle. Versions follow
 [semver](https://semver.org); dates are the GitHub release dates.
 
+## 0.26.5 — 2026-08-27
+
+Claude can now use its native Read, Write and Edit tools in every workspace,
+including temporary and synced locations whose macOS path has both `/var` and
+`/private/var` forms. Valid room files are no longer incorrectly treated as
+outside the room, so Claude can edit, create, rename and organize real files.
+
+Claude tool events now always finish with a success or safe failure result.
+Permission denials, failed writes and incomplete write tools can no longer be
+reported as a clean completed run, while provider diagnostics remain private.
+
 ## 0.26.4 — 2026-08-27
 
 Agent-created documents in workspace rooms are now guaranteed to become real
