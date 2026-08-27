@@ -1,6 +1,6 @@
 import type Database from "better-sqlite3-multiple-ciphers";
 import type { Readable } from "node:stream";
-import { clearChunks, insertChunks } from "../db-host/files.js";
+import { clearChunks, DERIVED_PREVIEW_DESTINATION, insertChunks } from "../db-host/files.js";
 import { extractDocumentStream, type StreamExtractionResult } from "../documentExtraction.js";
 import type { WorkspaceService } from "./workspaceService.js";
 
@@ -96,6 +96,7 @@ export class WorkspaceIndexService {
     const candidates = this.workspace.db.prepare(
       `SELECT id, name, content_sha256 FROM files
        WHERE storage_kind = 'workspace' AND trashed_at IS NULL
+         AND origin_destination <> '${DERIVED_PREVIEW_DESTINATION}'
          AND index_state IN ('pending', 'stale', 'failed')
          AND content_sha256 IS NOT NULL
        ORDER BY last_seen_at, created_at`,

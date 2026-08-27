@@ -2,7 +2,8 @@ import { useEffect, useRef, useState } from "react";
 import { listen } from "../platform";
 import { api, ImageBox, recommendedModels } from "../api";
 import { BOX_COLORS, ocrBody } from "./util";
-import { fileUrl } from "./useFileBytes";
+import { fileUrl, useFileBytes } from "./useFileBytes";
+import { useDecodedRaster, type RasterFormat } from "./useDecodedRaster";
 
 interface Props {
   fileId: string;
@@ -27,7 +28,17 @@ export default function ImageView({ fileId, name, mime, mediaToken, dataB64, tex
   // The old data URL was 4/3 the size of the picture and had to cross IPC as
   // one string, which is why anything over 50 MB lost the image viewer
   // entirely and opened as its OCR text. A 60 MB TIFF scan is just a picture.
-  const src = dataB64 ? `data:${mime};base64,${dataB64}` : fileUrl(mediaToken);
+  const extension = name.split(".").pop()?.toLocaleLowerCase() ?? "";
+  const rasterFormat: RasterFormat | null = extension === "psd"
+    ? "psd"
+    : extension === "tif" || extension === "tiff"
+      ? "tiff"
+      : extension === "jxl" ? "jxl" : null;
+  const specialBytes = useFileBytes(rasterFormat ? mediaToken : null, rasterFormat ? dataB64 : null);
+  const decoded = useDecodedRaster(rasterFormat, specialBytes.bytes);
+  const src = rasterFormat
+    ? decoded.url
+    : dataB64 ? `data:${mime};base64,${dataB64}` : fileUrl(mediaToken);
   const imgRef = useRef<HTMLImageElement>(null);
   const [query, setQuery] = useState("");
   const [boxes, setBoxes] = useState<ImageBox[]>([]);
@@ -88,8 +99,9 @@ export default function ImageView({ fileId, name, mime, mediaToken, dataB64, tex
   const [pullDone, setPullDone] = useState(false);
 
   useEffect(() => {
-    setImgDead(!src);
-  }, [src]);
+    if (rasterFormat) setImgDead(Boolean(specialBytes.error || decoded.error));
+    else setImgDead(!src);
+  }, [decoded.error, rasterFormat, specialBytes.error, src]);
 
   // ---- decide whether to offer the vision helper (doesn't block the bar) ----
   // ASK THE BACKEND, don't re-derive. This used to scan the local Ollama list
@@ -237,13 +249,16 @@ export default function ImageView({ fileId, name, mime, mediaToken, dataB64, tex
     }
   }
 
+  if (rasterFormat && (specialBytes.loading || decoded.loading)) {
+    return <div className="empty-hint">Drawing {extension.toUpperCase()} preview…</div>;
+  }
+
   if (imgDead) {
     // Every other viewer names a decode failure plainly; this one used to leave
     // a broken-image icon and a working "ask AI to mark it" bar over nothing.
     return (
       <div className="empty-hint">
-        This picture couldn’t be shown — the file appears to be empty, damaged,
-        or in a format this Mac can’t decode. The original is still stored in
+        This picture couldn’t be shown{specialBytes.error || decoded.error ? ` — ${specialBytes.error || decoded.error}` : " — the file appears to be empty, damaged, or in a format this Mac can’t decode"}. The original is still stored in
         the room: export it from the toolbar above to inspect it, or import the
         picture again to replace it.
       </div>

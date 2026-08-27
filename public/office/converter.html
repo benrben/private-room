@@ -1,0 +1,51 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Arcelle office converter</title>
+<canvas id="qtcanvas" hidden></canvas>
+<script type="module">
+  import { ZetaHelperMain } from "./zetajs/zetaHelper.js";
+  const artifactBase = new URLSearchParams(location.search).get("artifacts");
+  const helper = new ZetaHelperMain("./office_thread.js", {
+    threadJsType: "module",
+    wasmPkg: `url:${artifactBase}`,
+    blockPageScroll: false,
+  });
+  window.officeReady = false;
+  let pending = null;
+  window.convertOfficeFile = (name, b64) => new Promise((resolve, reject) => {
+    if (!window.officeReady || pending) return reject(new Error("The converter is busy."));
+    const bytes = Uint8Array.from(atob(b64), (character) => character.charCodeAt(0));
+    const extension = name.includes(".") ? name.slice(name.lastIndexOf(".")) : ".bin";
+    const from = `/tmp/arcelle-input${extension}`;
+    const to = "/tmp/arcelle-output.pdf";
+    FS.writeFile(from, bytes);
+    pending = { resolve, reject, from, to };
+    helper.thrPort.postMessage({ cmd: "convert", name, from, to });
+  });
+  helper.start(() => {
+    helper.thrPort.onmessage = (event) => {
+      const message = event.data;
+      if (message.cmd === "start") {
+        window.officeReady = true;
+        return;
+      }
+      const current = pending;
+      if (!current) return;
+      pending = null;
+      try { FS.unlink(current.from); } catch {}
+      if (message.cmd === "failed") {
+        current.reject(new Error(message.error || "Office conversion failed."));
+        return;
+      }
+      try {
+        const bytes = FS.readFile(current.to);
+        FS.unlink(current.to);
+        let binary = "";
+        for (const byte of bytes) binary += String.fromCharCode(byte);
+        current.resolve(btoa(binary));
+      } catch (reason) {
+        current.reject(reason);
+      }
+    };
+  });
+</script>

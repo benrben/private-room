@@ -1161,6 +1161,22 @@ pass on a cloud engine does not prove the local tier serves the box.
 
 **Known gap, not a defect of this feature:** §32/§32b are the Sketch page's own section. The **Create** page (v0.20.0) still has no section in this list — it was shipped without one. That is an outstanding debt to close, not a template to copy.
 
+## 33. File preview overhaul (0.26.6)
+
+- [ ] `.toml`, `.go`, `.java` and every shared text extension open in an editable text/code viewer
+- [ ] `.txt` opens as prose; `.ipynb` opens as a notebook; modern `.ai` opens as PDF
+- [ ] `.mkv`, `.flac`, `.ogg`, `.opus` and `.avif` use their media/image viewers
+- [ ] RAW camera files open the largest valid embedded JPEG while Export keeps the original RAW bytes
+- [ ] PSD, TIFF and JPEG XL decode off the renderer main thread; corrupt files show an honest failure
+- [ ] Pages, Keynote and Numbers use a stored embedded PDF/JPEG preview when present
+- [ ] Unknown binary formats create one stored Quick Look PNG at import and reuse it after restart
+- [ ] Derived previews are normal files, hidden from Library/search, capped at 100 MB, and cascade through Trash/Restore
+- [ ] Enabling office conversion asks once before the ~53 MB download, verifies hashes, and works offline afterward
+- [ ] Declining office conversion preserves the existing text preview and does not download anything
+- [ ] MOBI/AZW3/FB2/CBZ paginate; 7z/RAR/TAR/GZ list entries; MSG shows headers, body and attachment names
+- [ ] Password-protected/corrupt archives stop with an honest message, never a permanent spinner
+- [ ] Reopening any original with a stored preview still exports the original bytes
+
 ---
 
 ## Meta: coverage rules for the UA agent

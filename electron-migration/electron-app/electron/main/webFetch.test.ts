@@ -73,6 +73,7 @@ import {
   fetchPage,
   fetchPreview,
   fetchReadable,
+  guessDownloadMime,
   guardedGet,
   htmlTitle,
   MAX_FETCH_BYTES,
@@ -84,6 +85,28 @@ import {
   youtubeTranscript,
   youtubeVideoId,
 } from "./webFetch.js";
+
+describe("download MIME routing", () => {
+  it.each([
+    ["clip.mov", "video/quicktime"],
+    ["clip.webm", "video/webm"],
+    ["clip.mkv", "video/x-matroska"],
+    ["sound.mp3", "audio/mpeg"],
+    ["sound.wav", "audio/wav"],
+    ["sound.m4a", "audio/mp4"],
+    ["sound.flac", "audio/flac"],
+    ["sound.ogg", "audio/ogg"],
+    ["sound.opus", "audio/ogg"],
+    ["photo.avif", "image/avif"],
+  ] as const)("maps %s to %s", (name, expected) => {
+    expect(guessDownloadMime(name)).toBe(expected);
+  });
+
+  it("routes TIFF to the image surface after the worker decoder ships", () => {
+    expect(guessDownloadMime("scan.tiff")).toBe("image/tiff");
+    expect(guessDownloadMime("scan.tif")).toBe("image/tiff");
+  });
+});
 
 let server: http.Server | undefined;
 let tlsServer: tls.Server | undefined;

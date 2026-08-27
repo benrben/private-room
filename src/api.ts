@@ -131,6 +131,10 @@ import type {
   HarnessHistoryRun,
   WorkspaceOperationProgressEvent,
 } from "./apiTypes";
+import {
+  fileExtensionLabel,
+  isTextExtension,
+} from "../electron-migration/electron-app/electron/shared/fileExtensions";
 
 export interface RoomStorageUsage {
   kind: "legacy" | "workspace";
@@ -1733,28 +1737,8 @@ export function fileKindLabel(f: FileMeta): string {
   if (m.startsWith("image/")) return "image";
   if (m === "application/pdf") return "PDF";
   const lower = f.name.toLowerCase();
-  if (lower.endsWith(".md") || lower.endsWith(".markdown")) return "note";
-  // .xls / .ods / .tsv were missing here, so a legacy workbook listed as
-  // "File" right beside an .xlsx listed as "Sheet".
-  if ([".csv", ".tsv", ".xlsx", ".xls", ".ods"].some((e) => lower.endsWith(e))) {
-    return "sheet";
-  }
-  if (lower.endsWith(".py") || lower.endsWith(".js")) return "script";
-  if (lower.endsWith(".docx") || lower.endsWith(".doc")) return "document";
-  if (lower.endsWith(".html") || lower.endsWith(".htm")) return "HTML";
-  // The formats that gained real viewers: a deck listed as "File" next to a
-  // PDF listed as "PDF" reads as "we don't handle this one".
-  if (lower.endsWith(".pptx") || lower.endsWith(".ppt")) return "presentation";
-  if (lower.endsWith(".epub")) return "book";
-  if (lower.endsWith(".zip")) return "archive";
-  if (lower.endsWith(".ipynb")) return "notebook";
-  if (lower.endsWith(".eml")) return "message";
-  if (lower.endsWith(".srt") || lower.endsWith(".vtt")) return "subtitles";
-  if (lower.endsWith(".svg")) return "drawing";
-  if (lower.endsWith(".json") || lower.endsWith(".jsonl")) return "data";
-  if (lower.endsWith(".log")) return "log";
-  if (lower.endsWith(".txt")) return "text";
-  return "file";
+  const ext = lower.split(".").pop() ?? "";
+  return fileExtensionLabel(ext) ?? "file";
 }
 
 export function fileKind(f: FileMeta): FileKind {
@@ -1763,16 +1747,16 @@ export function fileKind(f: FileMeta): FileKind {
   if (isRecordingFile(f)) return "recording";
   if (f.source === "generated") return "generated";
   const ext = f.name.split(".").pop()?.toLowerCase() ?? "";
-  if (ext === "pdf") return "pdf";
+  if (["pdf", "ai"].includes(ext)) return "pdf";
   if (["doc", "docx"].includes(ext)) return "docx";
   if (["xls", "xlsx", "ods", "csv", "tsv"].includes(ext)) return "sheet";
   if (["md", "markdown"].includes(ext)) return "markdown";
-  if (["txt", "log", "eml", "srt", "vtt"].includes(ext)) return "text";
+  if (isTextExtension(ext) || ["eml", "msg", "srt", "vtt"].includes(ext)) return "text";
   if (["html", "htm", "svg"].includes(ext)) return "web";
   // Decks, books and notebooks now have real viewers, so they get the
   // document glyph rather than the blank "unknown file" one. There is no
   // dedicated icon for each; a document mark is closer than nothing, and the
   // ROW's label (fileKindLabel) names the format exactly.
-  if (["pptx", "ppt", "epub", "ipynb"].includes(ext)) return "docx";
+  if (["pptx", "ppt", "odp", "epub", "mobi", "azw", "azw3", "fb2", "cbz", "ipynb"].includes(ext)) return "docx";
   return "file";
 }

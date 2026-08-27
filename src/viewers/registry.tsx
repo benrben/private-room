@@ -257,14 +257,14 @@ export const FORMATS: Record<ViewerKind, FormatEntry> = {
     label: "book",
     edit: copyIfText,
     render: ({ content: c, lazy }) => (
-      <lazy.BookView mediaToken={c.mediaToken} dataB64={c.dataB64} />
+      <lazy.BookView name={c.name} mediaToken={c.mediaToken} dataB64={c.dataB64} />
     ),
   },
   archive: {
     label: "archive",
     edit: notEditable,
     render: ({ content: c, lazy }) => (
-      <lazy.ArchiveView mediaToken={c.mediaToken} dataB64={c.dataB64} />
+      <lazy.ArchiveView name={c.name} mediaToken={c.mediaToken} dataB64={c.dataB64} />
     ),
   },
 
@@ -322,7 +322,14 @@ export const FORMATS: Record<ViewerKind, FormatEntry> = {
   email: {
     label: "message",
     edit: notEditable,
-    render: ({ content: c }) => <EmailView text={c.text ?? ""} />,
+    render: ({ content: c }) => (
+      <EmailView
+        text={c.text ?? ""}
+        name={c.name}
+        mediaToken={c.mediaToken}
+        dataB64={c.dataB64}
+      />
+    ),
   },
   prose: {
     label: "text",

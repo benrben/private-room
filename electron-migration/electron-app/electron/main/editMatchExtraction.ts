@@ -25,21 +25,15 @@
 
 // ------------------------------------------------------------ extension registry
 
-/** Ported verbatim from `extraction::TEXT_EXTENSIONS` (order is not
- * significant — only membership is ever tested — but kept in the Rust
- * source's own order for easy side-by-side diffing). */
-const TEXT_EXTENSIONS: ReadonlySet<string> = new Set([
-  "txt", "md", "markdown", "json", "jsonl", "ndjson", "csv", "tsv", "log", "xml", "yml",
-  "yaml", "toml", "ini", "rs", "py", "js", "jsx", "ts", "tsx", "java", "c", "h", "cpp", "hpp",
-  "cs", "go", "rb", "php", "swift", "kt", "sh", "zsh", "bash", "sql", "r", "m", "scala", "lua",
-  "pl", "css", "scss", "less", "vue", "svelte", "tex", "org", "rst", "diff", "patch",
-  "dockerfile", "graphql", "gql", "proto", "properties", "env", "gitignore", "cfg", "conf",
-]);
+import {
+  isTextExtension as isSharedTextExtension,
+  sharedTextExtensions,
+} from "../shared/fileExtensions.js";
 
 /** The text extensions, for anything that wants the whole registry. Ported
  * from `extraction::text_extensions`. */
 export function textExtensions(): readonly string[] {
-  return [...TEXT_EXTENSIONS];
+  return sharedTextExtensions();
 }
 
 /**
@@ -67,7 +61,7 @@ export function isImage(mime: string): boolean {
 
 /** Ported from `extraction::is_text_extension`. */
 export function isTextExtension(ext: string): boolean {
-  return TEXT_EXTENSIONS.has(ext);
+  return isSharedTextExtension(ext);
 }
 
 // ------------------------------------------------------------------- fold table

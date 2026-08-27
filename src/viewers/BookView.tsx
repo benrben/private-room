@@ -6,6 +6,7 @@ import { findEntry } from "./zipdoc";
 import { frameIsDark, useFrameTheme } from "./frameTheme";
 import { textOf } from "./htmlText";
 import { useFileBytes } from "./useFileBytes";
+import FoliateBookView from "./FoliateBookView";
 import "./book.css";
 
 const FONT_STEPS = [0.85, 1, 1.15, 1.3, 1.5];
@@ -28,7 +29,7 @@ const FONT_STEPS = [0.85, 1, 1.15, 1.3, 1.5];
  * advisories — not a dependency to add to an app whose whole point is opening
  * untrusted files safely.
  */
-export default function BookView({
+function EpubBookView({
   mediaToken,
   dataB64,
 }: {
@@ -299,4 +300,25 @@ export default function BookView({
       </div>
     </div>
   );
+}
+
+export default function BookView({
+  name = "book.epub",
+  mediaToken,
+  dataB64,
+}: {
+  name?: string;
+  mediaToken?: string | null;
+  dataB64?: string | null;
+}) {
+  const alternative = !name.toLocaleLowerCase().endsWith(".epub");
+  const { bytes, error, loading } = useFileBytes(
+    alternative ? mediaToken : null,
+    alternative ? dataB64 : null,
+  );
+  if (!alternative) return <EpubBookView mediaToken={mediaToken} dataB64={dataB64} />;
+  if (loading) return <div className="empty-hint">Opening book…</div>;
+  if (error) return <div className="empty-hint">{error}</div>;
+  if (!bytes) return <div className="empty-hint">Reading book…</div>;
+  return <FoliateBookView name={name} bytes={bytes} />;
 }

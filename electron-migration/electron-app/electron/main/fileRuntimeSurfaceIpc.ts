@@ -18,6 +18,15 @@ import {
   insertFileFromUrl,
   setFileExtractedText,
 } from "./db-host/files.js";
+import { resolveDerivedPreview, snapshotUnknownFormat, storeDerivedPreview } from "./derivedPreview.js";
+import { extractRawPreview } from "./rawPreview.js";
+import { extractIWorkPreview } from "./iWorkPreview.js";
+import {
+  installOfficeArtifacts,
+  OfficeConverter,
+  officeConvertible,
+  verifyOfficeArtifacts,
+} from "./officeConvert.js";
 import { extractDocumentText } from "./documentExtraction.js";
 import { guessDownloadMime, fetchReadable } from "./webFetch.js";
 import { SCRATCH_PAD_NAME } from "./docsHtml.js";
@@ -39,6 +48,7 @@ import { searchWeb } from "./webSearch.js";
 import { isOcrCandidate, OCR_TEXT_PREFIX, recognize, recognizeViaSidecar } from "./ocrTools.js";
 import { getRecMeta } from "./db-host/recordings.js";
 import { logDir } from "./obs.js";
+import { isCodeTextExtension } from "../shared/fileExtensions.js";
 
 export interface FileRuntimeHost {
   openPath(target: string): Promise<void>;
@@ -75,29 +85,51 @@ function ext(name: string): string {
   return i > 0 ? name.slice(i + 1).toLowerCase() : "";
 }
 
-function viewerKind(name: string, mime: string): ViewerKind {
+export function viewerKind(name: string, mime: string): ViewerKind {
   const e = ext(name);
-  if (mime.startsWith("image/")) return e === "svg" ? "svg" : "image";
+  // Extension-specific formats must win over broad MIME families. Illustrator
+  // files are commonly labelled PostScript or generic binary even when their
+  // modern payload is PDF-compatible, while SVG has its own safe text viewer.
+  if (e === "ai" || e === "pdf") return "pdf";
+  if (e === "svg") return "svg";
+  if (mime.startsWith("image/")) return "image";
   if (mime.startsWith("audio/")) return "audio";
   if (mime.startsWith("video/")) return "video";
-  if (e === "pdf") return "pdf";
   if (e === "docx") return "docx";
   if (e === "doc") return "worddoc";
   if (["xlsx", "xls", "ods"].includes(e)) return "sheet";
   if (["csv", "tsv"].includes(e)) return "csv";
   if (["pptx", "ppt", "odp"].includes(e)) return "slides";
-  if (["epub", "mobi"].includes(e)) return "book";
+  if (["epub", "mobi", "azw", "azw3", "fb2", "cbz"].includes(e)) return "book";
   if (["zip", "tar", "gz", "7z", "rar"].includes(e)) return "archive";
   if (["md", "markdown"].includes(e)) return "markdown";
   if (["html", "htm"].includes(e)) return "html";
   if (e === "sketch") return "sketch";
+  if (e === "ipynb") return "notebook";
   if (e === "json") return "json";
   if (["srt", "vtt"].includes(e)) return "subtitle";
   if (["eml", "msg"].includes(e)) return "email";
-  if (["py", "js", "ts", "tsx", "jsx", "rs", "sh", "css", "xml", "yaml", "yml"].includes(e)) return "code";
+  if (e === "txt") return "prose";
   if (["log"].includes(e)) return "log";
+  if (isCodeTextExtension(e)) return "code";
   if (mime.startsWith("text/")) return "text";
   return "binary";
+}
+
+const RAW_TEXT_VIEWER_KINDS: ReadonlySet<ViewerKind> = new Set([
+  "markdown", "html", "json", "subtitle", "prose", "log", "code", "text", "sketch", "notebook",
+]);
+
+const EDITABLE_VIEWER_KINDS: ReadonlySet<ViewerKind> = new Set([
+  "markdown", "html", "json", "subtitle", "prose", "log", "code", "text", "csv", "notebook",
+]);
+
+export function viewerKindIsEditable(kind: ViewerKind): boolean {
+  return EDITABLE_VIEWER_KINDS.has(kind);
+}
+
+export function viewerKindReadsRawText(kind: ViewerKind): boolean {
+  return RAW_TEXT_VIEWER_KINDS.has(kind);
 }
 
 function jsonOrNull<T>(raw: string | null): T | null {
@@ -120,7 +152,7 @@ export function registerFileRuntimeSurfaceIpc(
   ipcMain: Pick<IpcMain, "handle">,
   state: RoomManagerState,
   deps: RoomManagerDeps,
-  _userDataDir: string,
+  userDataDir: string,
   emit: EventSender,
   host: FileRuntimeHost,
 ): FileRuntimeStores {
@@ -162,6 +194,69 @@ export function registerFileRuntimeSurfaceIpc(
     stores.mediaStreams.map.clear();
     stores.fileContents.clear();
   };
+  const officeArtifactDir = path.join(userDataDir, "office-converter-v1");
+  let officeConverter: OfficeConverter | null = null;
+  let officeConsentAsked = false;
+  const officePdf = async (name: string, bytes: Uint8Array): Promise<Buffer | null> => {
+    if (!officeConvertible(name)) return null;
+    if (!await verifyOfficeArtifacts(officeArtifactDir)) {
+      if (officeConsentAsked) return null;
+      officeConsentAsked = true;
+      const { dialog } = await import("electron");
+      const answer = await dialog.showMessageBox({
+        type: "info",
+        buttons: ["Enable previews", "Not now"],
+        defaultId: 0,
+        cancelId: 1,
+        title: "Enable office document previews?",
+        message: "Arcelle can download the open-source ZetaOffice converter.",
+        detail: "This is a one-time download of about 53 MB. It is integrity-checked, then conversions work offline. Your documents are not uploaded.",
+      });
+      if (answer.response !== 0) return null;
+      await installOfficeArtifacts(officeArtifactDir);
+    }
+    officeConverter ??= new OfficeConverter(officeArtifactDir);
+    return officeConverter.convert(name, bytes).catch(() => null);
+  };
+
+  const deriveImportedPreview = async (
+    open: ReturnType<typeof room>,
+    fileId: string,
+    name: string,
+    mime: string,
+    bytes: Buffer,
+    extracted: string | null,
+  ): Promise<void> => {
+    const extension = ext(name);
+    const converted = await officePdf(name, bytes);
+    if (converted !== null) {
+      await storeDerivedPreview({ db: open.conn, path: open.path }, fileId, converted, "application/pdf", "pdf");
+      return;
+    }
+    const rawExtensions = new Set(["3fr", "arw", "cr2", "cr3", "dng", "erf", "kdc", "mos", "mrw", "nef", "nrw", "orf", "pef", "raf", "raw", "rw2", "sr2", "srf", "x3f"]);
+    if (rawExtensions.has(extension)) {
+      const preview = extractRawPreview(bytes);
+      if (preview !== null) {
+        await storeDerivedPreview({ db: open.conn, path: open.path }, fileId, preview.bytes, "image/jpeg", "jpg");
+        return;
+      }
+    }
+    const iWork = ["pages", "key", "numbers"].includes(extension);
+    if (iWork) {
+      const preview = extractIWorkPreview(bytes);
+      if (preview !== null) {
+        await storeDerivedPreview(
+          { db: open.conn, path: open.path }, fileId, preview.bytes, preview.mimeType, preview.extension,
+        );
+        return;
+      }
+    }
+    const invalidIllustratorPdf = extension === "ai" && !bytes.subarray(0, 8).toString("ascii").startsWith("%PDF-");
+    const needsNativeFallback = iWork || ["heic", "heif"].includes(extension);
+    if ((viewerKind(name, mime) === "binary" && !extracted?.trim()) || invalidIllustratorPdf || needsNativeFallback) {
+      await snapshotUnknownFormat({ db: open.conn, path: open.path }, fileId);
+    }
+  };
 
   ipcMain.handle("import_files", async (_e: IpcMainInvokeEvent, raw: unknown) => {
     const paths = rec(raw).paths;
@@ -172,6 +267,7 @@ export function registerFileRuntimeSurfaceIpc(
         const name = availableName(open.conn, path.basename(filePath));
         const mime = guessDownloadMime(name);
         let meta: ReturnType<typeof insertFile>;
+        let importedBytes: Buffer | null = null;
         if (open.workspace !== undefined && (mime.startsWith("audio/") || mime.startsWith("video/"))) {
           // Media has no document text to extract and is not an OCR candidate.
           // Import it directly as a stream instead of allocating the entire
@@ -184,6 +280,7 @@ export function registerFileRuntimeSurfaceIpc(
           });
         } else {
           const bytes = await fs.promises.readFile(filePath);
+          importedBytes = bytes;
           const extracted = await extractDocumentText(name, bytes);
           meta = open.workspace === undefined
             ? insertFile(open.conn, name, mime, bytes, extracted, "import")
@@ -196,6 +293,10 @@ export function registerFileRuntimeSurfaceIpc(
           if (!extracted || extracted.trim() === "") startOcr(open.path, meta.id, name, mime, bytes);
         }
         report.imported.push(meta);
+        if (importedBytes !== null) {
+          const extracted = open.conn.prepare("SELECT extracted_text FROM files WHERE id = ?").get(meta.id) as { extracted_text: string | null };
+          await deriveImportedPreview(open, meta.id, name, mime, importedBytes, extracted.extracted_text).catch(() => undefined);
+        }
       } catch (error) {
         report.errors.push(`${path.basename(filePath)}: ${error instanceof Error ? error.message : String(error)}`);
       }
@@ -207,7 +308,7 @@ export function registerFileRuntimeSurfaceIpc(
     return report;
   });
 
-  ipcMain.handle("get_file_content", (_e: IpcMainInvokeEvent, raw: unknown): FileContent | Promise<FileContent> => {
+  ipcMain.handle("get_file_content", async (_e: IpcMainInvokeEvent, raw: unknown): Promise<FileContent> => {
     const id = String(rec(raw).id ?? "");
     const cached = stores.fileContents.get(id);
     if (cached?.mediaToken && stores.mediaStreams.map.has(cached.mediaToken)) {
@@ -215,6 +316,20 @@ export function registerFileRuntimeSurfaceIpc(
     }
     if (cached) stores.fileContents.delete(id);
     const open = room();
+    const derived = await resolveDerivedPreview({ db: open.conn, path: open.path }, id);
+    if (derived !== null) {
+      const content = buildFileContent(
+        open.conn,
+        stores,
+        derived.preview.id,
+        derived.preview.name,
+        derived.preview.mimeType,
+        derived.bytes,
+        null,
+      );
+      content.name = derived.originalName;
+      return content;
+    }
     if (open.workspace !== undefined) {
       let row = open.conn.prepare(
         "SELECT name, mime_type, extracted_text, size_bytes, storage_kind FROM files WHERE id = ? AND trashed_at IS NULL",
@@ -234,8 +349,7 @@ export function registerFileRuntimeSurfaceIpc(
         // only the drawing's searchable labels). Treating it as a byte viewer
         // made converted sketches open on those labels, so the canvas reported
         // malformed JSON and could neither draw nor save.
-        const byteViewer = !["markdown", "html", "json", "subtitle", "prose", "log", "code", "text", "sketch"]
-          .includes(kind);
+        const byteViewer = !viewerKindReadsRawText(kind);
         if (byteViewer) {
           // The legacy database may carry MIME labels such as `audio/m4a` or
           // `audio/mp4a-latm`. Chromium does not accept those labels for the
@@ -310,7 +424,7 @@ export function registerFileRuntimeSurfaceIpc(
     const kind: ViewerKind = getRecMeta(db, id) !== null
       ? "recording"
       : viewerKind(name, mime);
-    const byteViewer = !["markdown", "html", "json", "subtitle", "prose", "log", "code", "text", "sketch"].includes(kind);
+    const byteViewer = !viewerKindReadsRawText(kind);
     const stagedMime = kind === "audio" || kind === "recording" || kind === "video"
       ? playableMediaMime(mime, ext(name), kind === "video")
       : mime;
@@ -318,11 +432,11 @@ export function registerFileRuntimeSurfaceIpc(
       kind,
       name,
       mime,
-      editable: ["markdown", "html", "json", "subtitle", "prose", "log", "code", "text", "csv"].includes(kind),
+      editable: viewerKindIsEditable(kind),
       // `extracted` is deliberately just labels for a sketch, so search can
       // find a diagram without indexing coordinates and JSON keys. The canvas
       // must instead receive the exact normal-file document.
-      text: kind === "sketch"
+      text: kind === "sketch" || kind === "notebook"
         ? (bytes === null ? null : bytes.toString("utf8"))
         : extracted ?? (bytes && mime.startsWith("text/") ? bytes.toString("utf8") : null),
       dataB64: null,

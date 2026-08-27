@@ -12,10 +12,12 @@ anything shared or saved from iCloud) writes a full PDF rendering of the
 document into the same zip, and that is ordinary text via
 `arcelle_sidecar.docs.pdf.extract_pdf`.
 
-The preview entry is matched by SUFFIX rather than by an exact path: it sits
-at `QuickLook/Preview.pdf` in a flat bundle and at
-`<name>/QuickLook/Preview.pdf` in a package bundle, and the two spellings are
-the same file. `to_ascii_lowercase()` in the Rust source folds only ASCII
+The preferred preview entry is matched by SUFFIX rather than by an exact path:
+it sits at `QuickLook/Preview.pdf` in a flat bundle and at
+`<name>/QuickLook/Preview.pdf` in a package bundle. Modern Keynote bundles may
+instead carry a root `preview.jpg`; matching it keeps the sidecar and Electron
+preview paths consistent, although JPEG previews contain no extractable text.
+`to_ascii_lowercase()` in the Rust source folds only ASCII
 `A`-`Z` (not Python's Unicode-aware `str.lower()`, which can change a
 string's length for characters like Turkish `Ä°`) -- `_ascii_lower` below
 mirrors that exactly, matching the same choice already made in the sibling
@@ -61,13 +63,22 @@ def _ascii_lower(s: str) -> str:
 
 
 def iwork_preview_entry(names: list[str]) -> str | None:
-    """The first entry (in listed/archive order) whose lowercased name ends
-    in `quicklook/preview.pdf` -- matches both a flat bundle's
-    `QuickLook/Preview.pdf` and a package bundle's
-    `<name>/QuickLook/Preview.pdf`. `None` if no entry qualifies.
+    """The preferred safe preview entry. A full PDF wins over a JPEG because
+    PDF text can be extracted. `preview.jpg` is accepted only at archive root
+    or one package-folder deep. `None` if no entry qualifies.
     """
-    for name in names:
+    safe_names = [
+        name
+        for name in names
+        if name and "\x00" not in name and "\\" not in name
+        and not name.startswith("/") and ".." not in name.split("/")
+    ]
+    for name in safe_names:
         if _ascii_lower(name).endswith("quicklook/preview.pdf"):
+            return name
+    for name in safe_names:
+        parts = [part for part in _ascii_lower(name).split("/") if part]
+        if len(parts) <= 2 and parts[-1:] == ["preview.jpg"]:
             return name
     return None
 
@@ -78,11 +89,15 @@ def extract_iwork(data: bytes) -> str | None:
     whole point -- or when the preview entry can't be read at all (not a
     zip, entry missing, encrypted/unsupported compression, over the
     decompression-bomb ceiling either by declared or by actual size), or
-    when `extract_pdf` itself returns `None` for the recovered bytes.
+    when `extract_pdf` itself returns `None` for the recovered bytes. A JPEG
+    preview is deliberately returned as `None`: it improves visual previewing
+    in Electron but contains no document text for this extractor.
     """
     names = zip_entry_names(data)
     entry = iwork_preview_entry(names)
     if entry is None:
+        return None
+    if _ascii_lower(entry).endswith(".jpg"):
         return None
 
     try:

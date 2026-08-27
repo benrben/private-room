@@ -84,6 +84,21 @@ def test_empty_name_list_returns_none() -> None:
     assert iwork.iwork_preview_entry([]) is None
 
 
+def test_finds_modern_root_and_package_preview_jpg() -> None:
+    assert iwork.iwork_preview_entry(["preview.jpg"]) == "preview.jpg"
+    assert iwork.iwork_preview_entry(["Deck.key/Preview.JPG"]) == "Deck.key/Preview.JPG"
+
+
+def test_pdf_is_preferred_over_jpg_regardless_of_archive_order() -> None:
+    names = ["preview.jpg", "QuickLook/Preview.pdf"]
+    assert iwork.iwork_preview_entry(names) == "QuickLook/Preview.pdf"
+
+
+def test_unsafe_or_unrelated_nested_jpg_is_not_a_preview() -> None:
+    names = ["Assets/Thumbnails/preview.jpg", "../preview.jpg", "/preview.jpg"]
+    assert iwork.iwork_preview_entry(names) is None
+
+
 # --------------------------------------------------------------- extract_iwork
 
 
@@ -119,6 +134,12 @@ def test_bundle_without_quicklook_preview_returns_none() -> None:
             "Metadata/BuildVersionHistory.plist": b"<plist/>",
         }
     )
+    assert iwork.extract_iwork(data) is None
+
+
+def test_jpg_preview_has_no_text_but_is_handled_consistently() -> None:
+    data = _zip_bytes({"preview.jpg": b"\xff\xd8synthetic\xff\xd9"})
+    assert iwork.iwork_preview_entry(["preview.jpg"]) == "preview.jpg"
     assert iwork.extract_iwork(data) is None
 
 

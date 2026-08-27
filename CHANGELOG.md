@@ -3,6 +3,21 @@
 All notable, user-facing changes to Arcelle. Versions follow
 [semver](https://semver.org); dates are the GitHub release dates.
 
+## 0.26.6 — 2026-08-27
+
+Arcelle now previews substantially more real-world files inside the app. Text
+and code routing is consistent; RAW and iWork imports create reusable stored
+previews; PSD, TIFF and JPEG XL decode in a worker; MOBI, AZW3, FB2, CBZ, 7z,
+RAR, TAR, GZIP and Outlook MSG have dedicated readers.
+
+Unknown binary formats receive a one-time stored macOS snapshot. Derived
+previews remain hidden from Library and search, follow their original through
+Trash and Restore, and never replace the original during export.
+
+The optional ZetaOffice converter creates real PDF previews for older office
+formats. Its open-source runtime downloads only after explicit consent, is
+SHA-256 verified, and converts locally and offline after installation.
+
 ## 0.26.5 — 2026-08-27
 
 Claude can now use its native Read, Write and Edit tools in every workspace,

@@ -441,14 +441,14 @@ describe("registerAllIpc — one shared room across module boundaries", () => {
       "import",
     ).id;
 
-    const first = handlers.get("get_file_content")!(fakeEvent, { id }) as FileContent;
-    const second = handlers.get("get_file_content")!(fakeEvent, { id }) as FileContent;
+    const first = await handlers.get("get_file_content")!(fakeEvent, { id }) as FileContent;
+    const second = await handlers.get("get_file_content")!(fakeEvent, { id }) as FileContent;
     expect(first.mediaToken).toBeTruthy();
     expect(second.mediaToken).toBe(first.mediaToken);
     expect(runtimeStores.mediaStreams.next).toBe(1);
 
     invalidateFileContentCacheForEvent(runtimeStores, "file-updated");
-    const afterChange = handlers.get("get_file_content")!(fakeEvent, { id }) as FileContent;
+    const afterChange = await handlers.get("get_file_content")!(fakeEvent, { id }) as FileContent;
     expect(afterChange.mediaToken).not.toBe(first.mediaToken);
     expect(runtimeStores.mediaStreams.next).toBe(2);
   });
@@ -470,7 +470,7 @@ describe("registerAllIpc — one shared room across module boundaries", () => {
     );
     setRecMeta(state.room!.conn, file.id, "{}");
 
-    const content = handlers.get("get_file_content")!(fakeEvent, { id: file.id }) as FileContent;
+    const content = await handlers.get("get_file_content")!(fakeEvent, { id: file.id }) as FileContent;
     expect(content.kind).toBe("recording");
     expect(content.mediaToken).toBeTruthy();
   });

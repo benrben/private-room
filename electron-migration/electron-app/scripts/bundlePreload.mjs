@@ -8,9 +8,11 @@
  */
 import { build } from "esbuild";
 
+const outfile = process.env.ARCELLE_PRELOAD_OUTFILE || "dist_package/electron/preload/index.cjs";
+
 await build({
   entryPoints: ["electron/preload/index.ts"],
-  outfile: "dist_package/electron/preload/index.cjs",
+  outfile,
   bundle: true,
   platform: "node",
   format: "cjs",
@@ -20,4 +22,4 @@ await build({
   logLevel: "warning",
 });
 
-process.stdout.write("Bundled sandboxed preload into dist_package/electron/preload/index.cjs.\n");
+process.stdout.write(`Bundled sandboxed preload into ${outfile}.\n`);

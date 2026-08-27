@@ -92,9 +92,11 @@ function Branch({ node, depth }: { node: Node; depth: number }) {
  * archive finds the archive.
  */
 export default function ArchiveView({
+  name,
   mediaToken,
   dataB64,
 }: {
+  name?: string;
   mediaToken?: string | null;
   dataB64?: string | null;
 }) {
@@ -107,6 +109,44 @@ export default function ArchiveView({
     let alive = true;
     setError("");
     setEntries(null);
+    const extension = name?.toLocaleLowerCase() ?? "";
+    if (!extension.endsWith(".zip")) {
+      let reader: { close(): Promise<void> } | null = null;
+      void (async () => {
+        try {
+          const { Archive } = await import("libarchive.js");
+          Archive.init({ workerUrl: new URL("./libarchive/worker-bundle.js", window.location.href).toString() });
+          const archive = await Archive.open(new File([bytes], name || "archive"));
+          reader = archive;
+          if (await archive.hasEncryptedData()) {
+            throw new Error("This archive is password-protected. Arcelle does not ask for archive passwords.");
+          }
+          const files = await archive.getFilesArray() as Array<{
+            file?: { name?: string; size?: number };
+            path?: string;
+          }>;
+          const listed = files
+            .map(({ file, path: folder }) => ({
+              path: `${folder ?? ""}${file?.name ?? ""}`.replace(/^\/+/, ""),
+              size: Number(file?.size ?? 0),
+            }))
+            .filter((entry) => entry.path && !entry.path.endsWith("/"));
+          if (alive) setEntries(listed);
+        } catch (reason) {
+          if (alive) {
+            setError(reason instanceof Error && reason.message.startsWith("This archive")
+              ? reason.message
+              : `This archive could not be read: ${reason instanceof Error ? reason.message : String(reason)}`);
+          }
+        } finally {
+          if (reader) await reader.close().catch(() => {});
+        }
+      })();
+      return () => {
+        alive = false;
+        if (reader) void reader.close().catch(() => {});
+      };
+    }
     // The filter runs once per central-directory record and reports the name
     // and the unpacked size before anything is inflated. Returning false for
     // every entry means a multi-gigabyte archive is listed without a single
@@ -134,7 +174,7 @@ export default function ArchiveView({
     return () => {
       alive = false;
     };
-  }, [bytes]);
+  }, [bytes, name]);
 
   const tree = useMemo(() => (entries ? buildTree(entries) : null), [entries]);
   const total = useMemo(

@@ -12,7 +12,7 @@ import {
   emptyTrash,
   getFileMeta,
   inTransaction,
-  listFiles,
+  listLibraryFiles,
   listTrashedFiles,
   renameFile,
   restoreFile,
@@ -20,6 +20,10 @@ import {
   trashFile,
   updateFileContent,
 } from "./db-host/files.js";
+import {
+  restoreFileWithDerivedPreviews,
+  trashFileWithDerivedPreviews,
+} from "./derivedPreview.js";
 import { moveFileToFolder } from "./db-host/folders.js";
 import { snapshotFileVersion } from "./db-host/versions.js";
 import { saveGeneratedFile } from "./turnEngine.js";
@@ -94,7 +98,7 @@ export function registerFileSurfaceIpc(
     return report;
   };
 
-  ipcMain.handle("list_files", () => listFiles(room().conn));
+  ipcMain.handle("list_files", () => listLibraryFiles(room().conn));
   ipcMain.handle("list_trashed_files", () => listTrashedFiles(room().conn));
   ipcMain.handle("rename_file", (_event: IpcMainInvokeEvent, raw: unknown) => {
     const a = args(raw);
@@ -117,7 +121,7 @@ export function registerFileSurfaceIpc(
     const open = room();
     const id = String(args(raw).id ?? "");
     if (open.workspace !== undefined) {
-      return open.workspace.trash(id).then(() => { changed(); });
+      return trashFileWithDerivedPreviews({ db: open.conn, path: open.path }, id).then(() => { changed(); });
     }
     trashFile(open.conn, id, { kind: "user" });
     changed();
@@ -126,7 +130,7 @@ export function registerFileSurfaceIpc(
     const id = String(args(raw).id ?? "");
     const open = room();
     if (open.workspace !== undefined) {
-      return open.workspace.restore(id).then(() => {
+      return restoreFileWithDerivedPreviews({ db: open.conn, path: open.path }, id).then(() => {
         const result = getFileMeta(open.conn, id);
         changed();
         return result;
@@ -217,14 +221,14 @@ export function registerFileSurfaceIpc(
     const ids = stringIds(args(raw).ids);
     return changedIf(open.workspace === undefined
       ? batch(state, ids, (id) => trashFile(open.conn, id, { kind: "user" }))
-      : await batchAsync(state, ids, (id) => open.workspace!.trash(id)));
+      : await batchAsync(state, ids, (id) => trashFileWithDerivedPreviews({ db: open.conn, path: open.path }, id)));
   });
   ipcMain.handle("restore_files", async (_event: IpcMainInvokeEvent, raw: unknown) => {
     const open = room();
     const ids = stringIds(args(raw).ids);
     return changedIf(open.workspace === undefined
       ? batch(state, ids, (id) => restoreFile(open.conn, id))
-      : await batchAsync(state, ids, (id) => open.workspace!.restore(id)));
+      : await batchAsync(state, ids, (id) => restoreFileWithDerivedPreviews({ db: open.conn, path: open.path }, id)));
   });
   ipcMain.handle("move_files_to_folder", async (_event: IpcMainInvokeEvent, raw: unknown) => {
     const a = args(raw);

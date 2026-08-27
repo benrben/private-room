@@ -213,6 +213,14 @@ beforeAll(() => {
   // when this hook already competes with the rest of the suite for CPU.
   const tscBin = path.join(projectRoot, "node_modules", ".bin", "tsc");
   execFileSync(tscBin, ["-p", "tsconfig.build.json"], { cwd: projectRoot, stdio: "pipe" });
+  execFileSync(process.execPath, [path.join(projectRoot, "scripts", "bundlePreload.mjs")], {
+    cwd: projectRoot,
+    env: {
+      ...process.env,
+      ARCELLE_PRELOAD_OUTFILE: path.join(distDir, "electron", "preload", "index.cjs"),
+    },
+    stdio: "pipe",
+  });
   // The non-`.ts` assets the compiled main process loads — see RUNTIME_ASSETS.
   for (const rel of RUNTIME_ASSETS) {
     cpSync(path.join(projectRoot, ...rel), path.join(distDir, ...rel));

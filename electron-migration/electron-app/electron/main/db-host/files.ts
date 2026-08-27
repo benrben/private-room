@@ -18,8 +18,8 @@
  * matching the Rust mappers' `r.get(i)` order column-for-column so the SQL
  * stays a character-for-character copy of the Rust SQL; a reused Rust `?1`
  * becomes a `?` repeated in the params array. Raw `db.prepare` appears in
- * exactly one place — {@link emptyTrash}, whose RETURN VALUE is the affected
- * row count, which no `util.ts` helper hands back.
+ * exactly one place — {@link emptyTrash}, whose bulk delete has no equivalent
+ * in the single-row utility helpers.
  *
  * `searchTerms`/`likeAllClause`/`likeEscape` come from `messages.ts` rather
  * than being re-spelled: {@link filesNameLike} and `messagesLike` are two
@@ -96,6 +96,13 @@ const NOT_TRASHED = "f.trashed_at IS NULL";
  * database, but is not currently in the room. User-facing inventories must
  * therefore hide it just as they hide trash. Blob rooms are unchanged. */
 const LIVE_FILE = `${NOT_TRASHED} AND NOT (f.storage_kind = 'workspace' AND f.index_state = 'offline')`;
+
+/** Derived files used only to draw an original in the viewer.  This uses the
+ * existing destination column instead of adding another schema field.  Other
+ * `derived_from` files (translations, reports, transcripts) remain ordinary
+ * user-visible files. */
+export const DERIVED_PREVIEW_DESTINATION = "preview";
+const NOT_DERIVED_PREVIEW = `f.origin_destination <> '${DERIVED_PREVIEW_DESTINATION}'`;
 
 /** Mirrors the Rust `FileMeta` struct (`commands.rs`, `#[serde(rename_all =
  * "camelCase")]`), which is field-for-field the `FileMeta` in
@@ -630,6 +637,30 @@ export function listFiles(db: Database.Database): FileMeta[] {
   );
 }
 
+/** Files Home's Library may show.  Internal inventories deliberately keep
+ * using {@link listFiles}; a stored renderer preview is a room implementation
+ * detail, not a second document row. */
+export function listLibraryFiles(db: Database.Database): FileMeta[] {
+  return queryRows(
+    db,
+    `SELECT ${FILE_META_COLS} FROM files f
+     WHERE ${LIVE_FILE} AND ${NOT_DERIVED_PREVIEW} AND f.library_visibility = 'linked'
+     ORDER BY f.created_at DESC, f.rowid DESC`,
+    [],
+    fileMetaRow
+  );
+}
+
+export function libraryFileCount(db: Database.Database): number {
+  return queryOne(
+    db,
+    `SELECT count(*) FROM files f
+     WHERE ${LIVE_FILE} AND ${NOT_DERIVED_PREVIEW} AND f.library_visibility = 'linked'`,
+    [],
+    (r) => r[0] as number
+  );
+}
+
 /**
  * How many files are in this room — the ONE definition of THAT question
  * (`roomCounts`/RoomInfo, the front page's file count).
@@ -797,6 +828,85 @@ export function setDerivedFrom(db: Database.Database, id: string, sourceFileId: 
     return;
   }
   executeOne(db, "UPDATE files SET derived_from = ? WHERE id = ?", [sourceFileId, id]);
+}
+
+export interface DerivedPreviewRef {
+  id: string;
+  sourceFileId: string;
+  name: string;
+  mimeType: string;
+  sizeBytes: number;
+  storageKind: "blob" | "workspace";
+  relativePath: string | null;
+}
+
+function derivedPreviewRow(r: Row): DerivedPreviewRef {
+  return {
+    id: r[0] as string,
+    sourceFileId: r[1] as string,
+    name: r[2] as string,
+    mimeType: (r[3] as string | null) ?? "application/octet-stream",
+    sizeBytes: r[4] as number,
+    storageKind: r[5] === "workspace" ? "workspace" : "blob",
+    relativePath: r[6] as string | null,
+  };
+}
+
+/** Mark an already-created file as the hidden renderer preview for an
+ * original. This is intentionally separate from generic `setDerivedFrom` so
+ * generated reports and translations are never hidden or lifecycle-cascaded. */
+export function markDerivedPreview(
+  db: Database.Database,
+  id: string,
+  sourceFileId: string,
+): void {
+  if (id === sourceFileId) throw new Error("A file cannot preview itself.");
+  inTransaction(db, () => {
+    executeExisting(
+      db,
+      `UPDATE files SET derived_from = ?, origin_destination = ?, library_visibility = 'sectionOnly',
+          folder_id = (SELECT folder_id FROM files src WHERE src.id = ?),
+          extracted_text = NULL, ai_summary = NULL, index_state = 'unsupported', index_error = NULL
+       WHERE id = ? AND trashed_at IS NULL
+         AND EXISTS (
+           SELECT 1 FROM files src WHERE src.id = ? AND src.trashed_at IS NULL
+             AND src.origin_destination <> ?
+         )`,
+      [sourceFileId, DERIVED_PREVIEW_DESTINATION, sourceFileId, id, sourceFileId, DERIVED_PREVIEW_DESTINATION],
+      "The original or preview file is not in this room."
+    );
+    // Preview pixels are never a second search result for the same document.
+    clearChunks(db, id);
+  });
+}
+
+/** Every live preview for one original, newest first.  Multiple rows are
+ * tolerated so regeneration can publish a replacement before removing the
+ * stale one. */
+export function derivedPreviews(
+  db: Database.Database,
+  sourceFileId: string,
+  includeTrashed = false,
+): DerivedPreviewRef[] {
+  return queryRows(
+    db,
+    `SELECT id, derived_from, name, mime_type, size_bytes, storage_kind, relative_path
+     FROM files
+     WHERE derived_from = ? AND origin_destination = ?
+       ${includeTrashed ? "" : "AND trashed_at IS NULL"}
+     ORDER BY created_at DESC, rowid DESC`,
+    [sourceFileId, DERIVED_PREVIEW_DESTINATION],
+    derivedPreviewRow
+  );
+}
+
+/** The current preview used to open an original, or null when none has been
+ * generated. */
+export function getDerivedPreview(
+  db: Database.Database,
+  sourceFileId: string,
+): DerivedPreviewRef | null {
+  return derivedPreviews(db, sourceFileId)[0] ?? null;
 }
 
 /** Room map: every recorded (source file, derived file) pair. Both ends are
@@ -1177,6 +1287,31 @@ export function trashFile(db: Database.Database, id: string, actor: TrashActor):
       [id]
     );
     executeOne(db, "DELETE FROM chunks WHERE file_id = ?", [id]);
+    // Renderer previews are hidden implementation files. They follow their
+    // original into trash in the same transaction and never appear as a
+    // second user action. Generic derived artifacts are intentionally not
+    // included.
+    executeOne(
+      db,
+      `UPDATE files SET trashed_at = (SELECT trashed_at FROM files WHERE id = ?),
+          trashed_by = ?, trashed_by_id = ?
+       WHERE derived_from = ? AND origin_destination = ? AND trashed_at IS NULL`,
+      [id, kind, actorId, id, DERIVED_PREVIEW_DESTINATION]
+    );
+    executeOne(
+      db,
+      `INSERT INTO trashed_chunks(id, file_id, seq, text, embedding)
+       SELECT c.id, c.file_id, c.seq, c.text, c.embedding
+       FROM chunks c JOIN files p ON p.id = c.file_id
+       WHERE p.derived_from = ? AND p.origin_destination = ?`,
+      [id, DERIVED_PREVIEW_DESTINATION]
+    );
+    executeOne(
+      db,
+      `DELETE FROM chunks WHERE file_id IN
+       (SELECT id FROM files WHERE derived_from = ? AND origin_destination = ?)`,
+      [id, DERIVED_PREVIEW_DESTINATION]
+    );
   });
 }
 
@@ -1206,6 +1341,26 @@ export function restoreFile(db: Database.Database, id: string): void {
       [id]
     );
     executeOne(db, "DELETE FROM trashed_chunks WHERE file_id = ?", [id]);
+    executeOne(
+      db,
+      `UPDATE files SET trashed_at = NULL, trashed_by = NULL, trashed_by_id = NULL
+       WHERE derived_from = ? AND origin_destination = ? AND trashed_at IS NOT NULL`,
+      [id, DERIVED_PREVIEW_DESTINATION]
+    );
+    executeOne(
+      db,
+      `INSERT INTO chunks(id, file_id, seq, text, embedding)
+       SELECT c.id, c.file_id, c.seq, c.text, c.embedding
+       FROM trashed_chunks c JOIN files p ON p.id = c.file_id
+       WHERE p.derived_from = ? AND p.origin_destination = ?`,
+      [id, DERIVED_PREVIEW_DESTINATION]
+    );
+    executeOne(
+      db,
+      `DELETE FROM trashed_chunks WHERE file_id IN
+       (SELECT id FROM files WHERE derived_from = ? AND origin_destination = ?)`,
+      [id, DERIVED_PREVIEW_DESTINATION]
+    );
   });
 }
 
@@ -1216,7 +1371,7 @@ export function listTrashedFiles(db: Database.Database): TrashedFile[] {
     db,
     `SELECT id, name, coalesce(mime_type,''), size_bytes,
             trashed_at, coalesce(trashed_by,'unknown'), trashed_by_id, folder_id
-     FROM files WHERE trashed_at IS NOT NULL
+     FROM files WHERE trashed_at IS NOT NULL AND origin_destination <> '${DERIVED_PREVIEW_DESTINATION}'
      ORDER BY trashed_at DESC, rowid DESC`,
     [],
     (r) => ({
@@ -1240,7 +1395,7 @@ export function listTrashedFiles(db: Database.Database): TrashedFile[] {
 export function trashedFileCount(db: Database.Database): number {
   return queryOne(
     db,
-    "SELECT count(*) FROM files WHERE trashed_at IS NOT NULL",
+    `SELECT count(*) FROM files WHERE trashed_at IS NOT NULL AND origin_destination <> '${DERIVED_PREVIEW_DESTINATION}'`,
     [],
     (r) => r[0] as number
   );
@@ -1259,17 +1414,34 @@ export function trashedFileCount(db: Database.Database): number {
  * rather than as a successful delete.
  */
 export function deleteFile(db: Database.Database, id: string): void {
-  executeExisting(db, "DELETE FROM files WHERE id = ?", [id], "That file is not in this room.");
+  inTransaction(db, () => {
+    executeOne(
+      db,
+      "DELETE FROM files WHERE derived_from = ? AND origin_destination = ?",
+      [id, DERIVED_PREVIEW_DESTINATION]
+    );
+    executeExisting(db, "DELETE FROM files WHERE id = ?", [id], "That file is not in this room.");
+  });
 }
 
 /** Permanently destroy everything in the trash. Returns how many files were
  * destroyed — the caller reports THAT number, so an empty trash reads as
  * "nothing to empty" instead of a cheerful "trash emptied".
  *
- * The one raw `db.prepare` in this file: the return value IS the affected-row
- * count, and no `util.ts` helper hands that back. */
+ * Hidden renderer previews are deleted too, but do not inflate the user-facing
+ * count returned to the caller. */
 export function emptyTrash(db: Database.Database): number {
-  return db.prepare("DELETE FROM files WHERE trashed_at IS NOT NULL").run().changes;
+  return inTransaction(db, () => {
+    const visible = queryOne(
+      db,
+      `SELECT count(*) FROM files
+       WHERE trashed_at IS NOT NULL AND origin_destination <> '${DERIVED_PREVIEW_DESTINATION}'`,
+      [],
+      (r) => r[0] as number
+    );
+    db.prepare("DELETE FROM files WHERE trashed_at IS NOT NULL").run();
+    return visible;
+  });
 }
 
 /**
@@ -1310,6 +1482,7 @@ export function filesMissingText(
     `SELECT id, name, coalesce(mime_type,''), original_bytes FROM files
      WHERE trashed_at IS NULL
        AND (extracted_text IS NULL OR trim(extracted_text) = '')
+       AND origin_destination <> '${DERIVED_PREVIEW_DESTINATION}'
        AND original_bytes IS NOT NULL`,
     [],
     (r) => [
@@ -1341,7 +1514,8 @@ export function filesWithBytes(
   return queryRows(
     db,
     `SELECT id, name, coalesce(mime_type,''), original_bytes FROM files
-     WHERE trashed_at IS NULL AND original_bytes IS NOT NULL`,
+     WHERE trashed_at IS NULL AND origin_destination <> '${DERIVED_PREVIEW_DESTINATION}'
+       AND original_bytes IS NOT NULL`,
     [],
     (r) => [
       r[0] as string,

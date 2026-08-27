@@ -1,5 +1,7 @@
-import { useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { parseEml, ParsedEmail } from "./eml";
+import { parseMsg } from "./msg";
+import { useFileBytes } from "./useFileBytes";
 import "./email.css";
 
 /**
@@ -10,8 +12,42 @@ import "./email.css";
  * the same shape as the Rust reader that feeds search (`extraction/data.rs`),
  * so what the screen shows and what the model reads agree.
  */
-export default function EmailView({ text }: { text: string }) {
-  const mail: ParsedEmail = useMemo(() => parseEml(text), [text]);
+export default function EmailView({
+  text,
+  name,
+  mediaToken,
+  dataB64,
+}: {
+  text: string;
+  name?: string;
+  mediaToken?: string | null;
+  dataB64?: string | null;
+}) {
+  const isMsg = name?.toLocaleLowerCase().endsWith(".msg") ?? false;
+  const { bytes, error: readError, loading } = useFileBytes(
+    isMsg ? mediaToken : null,
+    isMsg ? dataB64 : null,
+  );
+  const eml = useMemo(() => parseEml(text), [text]);
+  const [msg, setMsg] = useState<ParsedEmail | null>(null);
+  const [msgError, setMsgError] = useState("");
+
+  useEffect(() => {
+    if (!isMsg || !bytes) return;
+    try {
+      setMsg(parseMsg(bytes));
+      setMsgError("");
+    } catch (error) {
+      setMsg(null);
+      setMsgError(`This Outlook message could not be read: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }, [bytes, isMsg]);
+
+  if (isMsg && loading) return <div className="empty-hint">Opening message…</div>;
+  if (isMsg && readError) return <div className="empty-hint">{readError}</div>;
+  if (isMsg && msgError) return <div className="empty-hint">{msgError}</div>;
+  if (isMsg && !msg) return <div className="empty-hint">Reading Outlook message…</div>;
+  const mail = isMsg ? msg! : eml;
 
   return (
     <div className="eml-view">

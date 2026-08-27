@@ -7,6 +7,11 @@ export default defineConfig(async () => ({
   // Electron loads the packaged renderer from a file inside app.asar.  Every
   // emitted asset therefore uses a relative URL rather than a web-root URL.
   base: "./",
+  worker: {
+    // PSD/TIFF/JXL decoders are lazy ESM chunks inside a dedicated worker.
+    // Rollup's IIFE worker default cannot represent that code-split graph.
+    format: "es" as const,
+  },
 
   // Keep the renderer server stable for Electron main's ARCELLE_RENDERER_URL.
   clearScreen: false,
