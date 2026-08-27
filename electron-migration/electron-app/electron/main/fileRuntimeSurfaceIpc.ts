@@ -216,55 +216,77 @@ export function registerFileRuntimeSurfaceIpc(
     if (cached) stores.fileContents.delete(id);
     const open = room();
     if (open.workspace !== undefined) {
-      const row = open.conn.prepare(
-        "SELECT name, mime_type, extracted_text, size_bytes FROM files WHERE id = ? AND trashed_at IS NULL",
+      let row = open.conn.prepare(
+        "SELECT name, mime_type, extracted_text, size_bytes, storage_kind FROM files WHERE id = ? AND trashed_at IS NULL",
       ).get(id) as {
         name: string;
         mime_type: string | null;
         extracted_text: string | null;
         size_bytes: number;
+        storage_kind: string | null;
       } | undefined;
       if (row === undefined) throw new Error("File not found.");
-      const mime = row.mime_type ?? "application/octet-stream";
-      const kind = getRecMeta(open.conn, id) !== null ? "recording" : viewerKind(row.name, mime);
-      // A sketch is JSON edited by its own canvas. It needs the real document
-      // text, not a roommedia token and not `extracted_text` (which contains
-      // only the drawing's searchable labels). Treating it as a byte viewer
-      // made converted sketches open on those labels, so the canvas reported
-      // malformed JSON and could neither draw nor save.
-      const byteViewer = !["markdown", "html", "json", "subtitle", "prose", "log", "code", "text", "sketch"]
-        .includes(kind);
-      if (byteViewer) {
-        // The legacy database may carry MIME labels such as `audio/m4a` or
-        // `audio/mp4a-latm`. Chromium does not accept those labels for the
-        // AAC-in-MP4 bytes it can otherwise play. Conversion deliberately
-        // preserves that metadata, so normalize the response type when the
-        // normal workspace file is staged, not only when a new file is
-        // imported. This also gives old octet-stream media a playable type
-        // from its extension.
-        const streamMime = kind === "audio" || kind === "recording" || kind === "video"
-          ? playableMediaMime(mime, ext(row.name), kind === "video")
-          : mime;
-        const token = stageMediaStream(
-          stores.mediaStreams,
-          row.size_bytes,
-          streamMime,
-          async () => open.workspace!.readStream(id),
-          async (start, end) => open.workspace!.readStream(id, { start, end }),
-        );
-        return buildFileContent(
-          open.conn,
-          stores,
-          id,
-          row.name,
-          row.mime_type,
-          null,
-          row.extracted_text,
-          token,
-        );
+      const finish = (current: NonNullable<typeof row>): FileContent | Promise<FileContent> => {
+        const mime = current.mime_type ?? "application/octet-stream";
+        const kind = getRecMeta(open.conn, id) !== null ? "recording" : viewerKind(current.name, mime);
+        // A sketch is JSON edited by its own canvas. It needs the real document
+        // text, not a roommedia token and not `extracted_text` (which contains
+        // only the drawing's searchable labels). Treating it as a byte viewer
+        // made converted sketches open on those labels, so the canvas reported
+        // malformed JSON and could neither draw nor save.
+        const byteViewer = !["markdown", "html", "json", "subtitle", "prose", "log", "code", "text", "sketch"]
+          .includes(kind);
+        if (byteViewer) {
+          // The legacy database may carry MIME labels such as `audio/m4a` or
+          // `audio/mp4a-latm`. Chromium does not accept those labels for the
+          // AAC-in-MP4 bytes it can otherwise play. Conversion deliberately
+          // preserves that metadata, so normalize the response type when the
+          // normal workspace file is staged, not only when a new file is
+          // imported. This also gives old octet-stream media a playable type
+          // from its extension.
+          const streamMime = kind === "audio" || kind === "recording" || kind === "video"
+            ? playableMediaMime(mime, ext(current.name), kind === "video")
+            : mime;
+          const token = stageMediaStream(
+            stores.mediaStreams,
+            current.size_bytes,
+            streamMime,
+            async () => open.workspace!.readStream(id),
+            async (start, end) => open.workspace!.readStream(id, { start, end }),
+          );
+          return buildFileContent(
+            open.conn,
+            stores,
+            id,
+            current.name,
+            current.mime_type,
+            null,
+            current.extracted_text,
+            token,
+          );
+        }
+        return readAll(open.workspace!.readStream(id)).then((bytes) =>
+          buildFileContent(open.conn, stores, id, current.name, current.mime_type, bytes, current.extracted_text));
+      };
+      if (row.storage_kind === "workspace") return finish(row);
+      // A second Arcelle process may open the room read-only while the writer
+      // lease is held elsewhere. Opening a legacy DB-only row must not mutate
+      // that room just to display it. Serve its encrypted DB bytes for this
+      // session; the writable owner (or the next writable open) will perform
+      // the one-time materialization into a normal workspace file.
+      if (open.readOnly === true) {
+        const [name, mime0, bytes, extracted] = getFileFull(open.conn, id);
+        return buildFileContent(open.conn, stores, id, name, mime0, bytes, extracted);
       }
-      return readAll(open.workspace.readStream(id)).then((bytes) =>
-        buildFileContent(open.conn, stores, id, row.name, row.mime_type, bytes, row.extracted_text));
+      return open.workspace.materializeLiveBlobFile(id).then(() => {
+        const repaired = open.conn.prepare(
+          "SELECT name, mime_type, extracted_text, size_bytes, storage_kind FROM files WHERE id = ? AND trashed_at IS NULL",
+        ).get(id) as typeof row;
+        if (repaired === undefined || repaired.storage_kind !== "workspace") {
+          throw new Error("That file could not be restored to the workspace.");
+        }
+        return finish(repaired);
+      });
     }
     const [name, mime0, bytes, extracted] = getFileFull(open.conn, id);
     return buildFileContent(open.conn, stores, id, name, mime0, bytes, extracted);

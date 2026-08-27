@@ -1932,7 +1932,10 @@ export async function recTranslate(
   const stem = trimEndMatches(name, ".wav");
   const content = buildTranslatedDocument(stem, lang, translated, untranslated);
   const open = ctx.deps.currentRoom();
-  const file = open?.db === db && open.workspace !== undefined
+  if (open?.db !== db) {
+    throw new Error("The room was closed or changed before the translated file could be saved.");
+  }
+  const file = open.workspace !== undefined
     ? await open.workspace.createFile(
         `${stem} — ${lang}.md`,
         Readable.from([Buffer.from(content, "utf8")]),

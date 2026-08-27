@@ -1,3 +1,4 @@
+import { createHash, randomUUID } from "node:crypto";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -58,6 +59,125 @@ function ipcHandlers(): {
 const event = {} as IpcMainInvokeEvent;
 
 describe("workspace content cutover", () => {
+  it("repairs and opens a database-only agent artifact as a real workspace file", async () => {
+    const { root, state, db } = await fixture();
+    const { ipc, handlers } = ipcHandlers();
+    registerFileRuntimeSurfaceIpc(
+      ipc,
+      state,
+      { userDataDir: temporary!, spawnRoomServerIfEnabled: () => {} },
+      temporary!,
+      () => {},
+      { openPath: async () => {} },
+    );
+    const ghost = {
+      id: "legacy-agent-artifact",
+      name: "Uncle Bob Martin on Software Fundamentals in the Age of AI.md",
+    };
+    db.prepare(
+      `INSERT INTO files(id, name, mime_type, size_bytes, source, original_bytes, extracted_text, storage_kind)
+       VALUES (?, ?, 'text/markdown', ?, 'generated', ?, ?, 'blob')`,
+    ).run(
+      ghost.id,
+      ghost.name,
+      Buffer.byteLength("# Recovered agent output\n"),
+      Buffer.from("# Recovered agent output\n"),
+      "# Recovered agent output\n",
+    );
+
+    try {
+      const content = await handlers.get("get_file_content")!(event, { id: ghost.id }) as {
+        kind: string;
+        text: string | null;
+      };
+      expect(content).toMatchObject({ kind: "markdown", text: "# Recovered agent output\n" });
+      expect(await readFile(path.join(root, ghost.name), "utf8"))
+        .toBe("# Recovered agent output\n");
+      expect(db.prepare(
+        "SELECT storage_kind, original_bytes, relative_path FROM files WHERE id = ?",
+      ).get(ghost.id)).toEqual({
+        storage_kind: "workspace",
+        original_bytes: null,
+        relative_path: ghost.name,
+      });
+    } finally {
+      db.close();
+    }
+  });
+
+  it("adopts an interrupted blob repair at its original path and stable id", async () => {
+    const { root, db, workspace } = await fixture();
+    const id = "interrupted-agent-artifact";
+    const name = "Recovered report.md";
+    const bytes = Buffer.from("# Survived the crash\n");
+    const hash = createHash("sha256").update(bytes).digest("hex");
+    db.prepare(
+      `INSERT INTO files(id, name, mime_type, size_bytes, source, original_bytes, storage_kind)
+       VALUES (?, ?, 'text/markdown', ?, 'generated', ?, 'blob')`,
+    ).run(id, name, bytes.length, bytes);
+    await writeFile(path.join(root, name), bytes);
+    const operationId = randomUUID();
+    db.prepare(
+      `INSERT INTO fs_operations(
+         operation_id, operation_type, phase, file_id, new_path, new_hash
+       ) VALUES (?, 'repair_live_blob', 'filesystem_committed', ?, ?, ?)`,
+    ).run(operationId, id, name, hash);
+
+    try {
+      expect(workspace.recoverIncompleteOperations()).toBe(1);
+      await expect(workspace.materializeLiveBlobFile(id)).resolves.toBe(true);
+      expect(await readFile(path.join(root, name), "utf8")).toBe(bytes.toString("utf8"));
+      await expect(readFile(path.join(root, "Recovered report (2).md"))).rejects.toMatchObject({ code: "ENOENT" });
+      expect(db.prepare(
+        "SELECT storage_kind, original_bytes, relative_path FROM files WHERE id = ?",
+      ).get(id)).toEqual({ storage_kind: "workspace", original_bytes: null, relative_path: name });
+      expect(db.prepare(
+        "SELECT phase FROM fs_operations WHERE operation_id = ?",
+      ).get(operationId)).toEqual({ phase: "completed" });
+    } finally {
+      db.close();
+    }
+  });
+
+  it("gives concurrent same-name ghost repairs distinct normal files", async () => {
+    const { root, db, workspace } = await fixture();
+    const insert = db.prepare(
+      `INSERT INTO files(id, name, mime_type, size_bytes, source, original_bytes, storage_kind)
+       VALUES (?, 'Agent report.md', 'text/markdown', ?, 'generated', ?, 'blob')`,
+    );
+    const first = Buffer.from("first agent output\n");
+    const second = Buffer.from("second agent output\n");
+    insert.run("ghost-one", first.length, first);
+    insert.run("ghost-two", second.length, second);
+
+    try {
+      await Promise.all([
+        workspace.materializeLiveBlobFile("ghost-one"),
+        workspace.materializeLiveBlobFile("ghost-two"),
+      ]);
+      const rows = db.prepare(
+        `SELECT id, relative_path, storage_kind, original_bytes FROM files
+         WHERE id IN ('ghost-one', 'ghost-two') ORDER BY id`,
+      ).all() as Array<{
+        id: string;
+        relative_path: string;
+        storage_kind: string;
+        original_bytes: Buffer | null;
+      }>;
+      expect(rows.map((row) => row.relative_path).sort()).toEqual([
+        "Agent report (2).md",
+        "Agent report.md",
+      ]);
+      expect(rows.every((row) => row.storage_kind === "workspace" && row.original_bytes === null)).toBe(true);
+      for (const row of rows) {
+        const expected = row.id === "ghost-one" ? first : second;
+        expect(await readFile(path.join(root, row.relative_path))).toEqual(expected);
+      }
+    } finally {
+      db.close();
+    }
+  });
+
   it("opens a converted sketch from its normal JSON file, not its search labels", async () => {
     const { state, db, workspace } = await fixture();
     const { ipc, handlers } = ipcHandlers();

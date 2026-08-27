@@ -67,6 +67,10 @@ export class RunProtection {
     reporter: WorkspaceOperationReporter | null,
   ): Promise<void> {
     reporter?.emit("scanning", 0, null);
+    // A workspace opened from an older build may still contain a live blob
+    // row. Move it to the normal filesystem before the rollback baseline is
+    // captured, so every write-enabled run starts from one storage invariant.
+    await this.workspace.materializeLiveBlobFiles();
     await this.workspace.reconcile();
     this.workspace.db.prepare(
       `INSERT INTO agent_runs(
@@ -175,6 +179,10 @@ export class RunProtection {
     if (run?.write_enabled !== 1 || run.baseline_completed !== 1) {
       return { changedPaths: [], changedFiles: [], count: 0 };
     }
+    // A provider can reach older Arcelle-special tools in fallback modes.
+    // Heal any DB-only output before the terminal reconciliation/event so the
+    // run cannot report a file that is absent from the normal room folder.
+    await this.workspace.materializeLiveBlobFiles();
     await this.workspace.reconcile();
     // A terminal harness event is not final until changed normal files have a
     // hash-matched extraction/search state. Failed extraction is recorded per

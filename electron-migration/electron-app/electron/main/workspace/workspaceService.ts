@@ -1,7 +1,7 @@
 import type Database from "better-sqlite3-multiple-ciphers";
 import { createHash, randomUUID } from "node:crypto";
 import { createReadStream, createWriteStream, lstatSync } from "node:fs";
-import { chmod, lstat, mkdir, open, readdir, rename, rm, rmdir } from "node:fs/promises";
+import { chmod, link, lstat, mkdir, open, readdir, rename, rm, rmdir } from "node:fs/promises";
 import path from "node:path";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -127,6 +127,17 @@ async function assertDestinationAbsent(destination: string): Promise<void> {
   throw new Error("A file already exists at that destination.");
 }
 
+function safeRecoveredComponent(raw: string, fallback: string): string {
+  let value = path.basename(raw).normalize("NFC")
+    .replace(/[\u0000-\u001f<>:"/\\|?*]/g, "_")
+    .replace(/[. ]+$/g, "")
+    .trim();
+  if (value === "" || value === "." || value === "..") value = fallback;
+  if (value.toLocaleLowerCase("en-US") === ".arcelle") value = `${value}_file`;
+  value = [...value].slice(0, 180).join("").replace(/[. ]+$/g, "");
+  return value === "" ? fallback : value;
+}
+
 export class WorkspaceService {
   readonly objects: ContentObjectStore;
   private reconcileRunning: Promise<{ added: number; changed: number; missing: number; renamed: number }> | null = null;
@@ -182,6 +193,225 @@ export class WorkspaceService {
       throw new ContentConflictError(expectedHash, actual);
     }
     return actual;
+  }
+
+  /**
+   * Repair a live legacy/blob row that was accidentally created after a room
+   * became a workspace. The stable file id and all private metadata stay on
+   * the original row; only its current bytes move to the normal filesystem.
+   */
+  materializeLiveBlobFile(fileId: string): Promise<boolean> {
+    // Path allocation and publication are room-wide. Serializing by file id
+    // would let two old rows with the same name both select the same unused
+    // destination before either one commits its path_key.
+    return serializeFileWrite(
+      this.rootPath,
+      "__arcelle_live_blob_repair__",
+      () => this.materializeLiveBlobFileSerialized(fileId),
+    );
+  }
+
+  private async materializeLiveBlobFileSerialized(fileId: string): Promise<boolean> {
+    const row = this.db.prepare(
+      `SELECT f.id, f.name, f.storage_kind, length(f.original_bytes) AS byte_length,
+              fo.name AS folder_name
+       FROM files f LEFT JOIN folders fo ON fo.id = f.folder_id
+       WHERE f.id = ? AND f.trashed_at IS NULL`,
+    ).get(fileId) as {
+      id: string;
+      name: string;
+      storage_kind: string | null;
+      byte_length: number | null;
+      folder_name: string | null;
+    } | undefined;
+    if (row === undefined) throw new Error("That file is no longer in this room.");
+    if (row.storage_kind === "workspace") return false;
+    if (row.byte_length === null) {
+      throw new Error("This database-only file has no recoverable current bytes.");
+    }
+
+    const commitMaterializedRow = (
+      operationId: string,
+      relativePath: string,
+      contentHash: string,
+      fileStat: Awaited<ReturnType<typeof lstat>> & { mtimeNs: bigint; dev: bigint; ino: bigint; birthtimeNs: bigint },
+    ): void => {
+      this.db.transaction(() => {
+        const updated = this.db.prepare(
+          `UPDATE files SET name = ?, storage_kind = 'workspace', original_bytes = NULL,
+             relative_path = ?, path_key = ?, content_sha256 = ?, size_bytes = ?,
+             mtime_ns = ?, fs_identity = ?, index_state = CASE
+               WHEN extracted_text IS NULL THEN 'pending' ELSE 'ready' END,
+             index_error = NULL, last_seen_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+           WHERE id = ? AND trashed_at IS NULL
+             AND (storage_kind IS NULL OR storage_kind <> 'workspace')`,
+        ).run(
+          path.posix.basename(relativePath),
+          relativePath,
+          pathKey(relativePath),
+          contentHash,
+          row.byte_length,
+          Number(fileStat.mtimeNs),
+          `${fileStat.dev}:${fileStat.ino}:${fileStat.birthtimeNs}`,
+          fileId,
+        );
+        if (updated.changes !== 1) {
+          throw new Error("The database-only file changed while it was being restored.");
+        }
+        this.updateOperation(operationId, "database_committed", contentHash);
+      })();
+    };
+
+    // A crash can happen after the atomic filesystem publication but before
+    // the stable file row is committed. The journal contains the intended
+    // path and content hash before publication, so a later open can safely
+    // adopt exactly those bytes instead of creating "name (2)" with a new id.
+    const interrupted = this.db.prepare(
+      `SELECT operation_id, new_path, new_hash
+       FROM fs_operations
+       WHERE operation_type = 'repair_live_blob' AND file_id = ?
+         AND phase <> 'completed' AND new_path IS NOT NULL AND new_hash IS NOT NULL
+       ORDER BY created_at DESC, rowid DESC LIMIT 1`,
+    ).get(fileId) as {
+      operation_id: string;
+      new_path: string;
+      new_hash: string;
+    } | undefined;
+    if (interrupted !== undefined) {
+      try {
+        const interruptedPath = normalizeRelativePath(interrupted.new_path);
+        const destination = resolveWorkspacePath(this.rootPath, interruptedPath);
+        await assertNoSymlinkSegments(this.rootPath, interruptedPath, false);
+        const fileStat = await lstat(destination, { bigint: true });
+        if (fileStat.isFile()
+          && Number(fileStat.size) === row.byte_length
+          && await sha256(destination) === interrupted.new_hash) {
+          commitMaterializedRow(interrupted.operation_id, interruptedPath, interrupted.new_hash, fileStat);
+          this.updateOperation(interrupted.operation_id, "completed", interrupted.new_hash);
+          return true;
+        }
+        this.updateOperation(
+          interrupted.operation_id,
+          "failed",
+          undefined,
+          "Interrupted repair destination changed; preserved it and selected a new path.",
+        );
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+          this.updateOperation(
+            interrupted.operation_id,
+            "failed",
+            undefined,
+            "Interrupted repair destination could not be safely adopted; preserved it and selected a new path.",
+          );
+        }
+      }
+    }
+
+    const fileName = safeRecoveredComponent(row.name, `File-${row.id.slice(0, 8)}`);
+    const folder = row.folder_name === null
+      ? null
+      : safeRecoveredComponent(row.folder_name, "Recovered");
+    const desired = folder === null ? fileName : `${folder}/${fileName}`;
+    const extension = path.posix.extname(desired);
+    const stem = desired.slice(0, desired.length - extension.length);
+    const manifest = await scanWorkspaceManifest(this.rootPath);
+    const used = new Set(manifest.keys());
+    for (const item of this.db.prepare(
+      `SELECT path_key FROM files
+       WHERE storage_kind = 'workspace' AND trashed_at IS NULL AND path_key IS NOT NULL`,
+    ).all() as Array<{ path_key: string }>) used.add(item.path_key);
+    let relativePath = "";
+    for (let number = 1; number <= 10_000; number += 1) {
+      const candidate = number === 1 ? desired : `${stem} (${number})${extension}`;
+      if (!used.has(pathKey(candidate))) {
+        relativePath = normalizeRelativePath(candidate);
+        break;
+      }
+    }
+    if (relativePath === "") throw new Error(`Could not create a unique workspace path for ${row.name}.`);
+
+    const destination = resolveWorkspacePath(this.rootPath, relativePath);
+    await assertNoSymlinkSegments(this.rootPath, relativePath, true);
+    await mkdir(path.dirname(destination), { recursive: true });
+    await assertNoSymlinkSegments(this.rootPath, relativePath, true);
+    await assertDestinationAbsent(destination);
+    const operationId = this.prepareOperation("repair_live_blob", fileId, null, relativePath, null, null);
+    const tempPath = path.join(
+      path.dirname(destination),
+      `.${path.basename(destination)}.arcelle-${randomUUID()}.tmp`,
+    );
+    const digest = createHash("sha256");
+    const observe = new Transform({
+      transform(chunk: Buffer, _encoding, callback) {
+        digest.update(chunk);
+        callback(null, chunk);
+      },
+    });
+    const readChunk = this.db.prepare(
+      "SELECT substr(original_bytes, ?, ?) AS chunk FROM files WHERE id = ?",
+    );
+    const chunks = async function* (): AsyncGenerator<Buffer> {
+      const chunkBytes = 1024 * 1024;
+      for (let offset = 0; offset < row.byte_length!; offset += chunkBytes) {
+        const found = readChunk.get(
+          offset + 1,
+          Math.min(chunkBytes, row.byte_length! - offset),
+          fileId,
+        ) as { chunk: Buffer | null } | undefined;
+        if (found?.chunk === null || found?.chunk === undefined) {
+          throw new Error("The database-only file bytes disappeared during recovery.");
+        }
+        yield found.chunk;
+      }
+    };
+    let filesystemCommitted = false;
+    let databaseCommitted = false;
+    let contentHash: string | null = null;
+    try {
+      await pipeline(Readable.from(chunks()), observe, createWriteStream(tempPath, { flags: "wx", mode: 0o600 }));
+      const handle = await open(tempPath, "r+");
+      try { await handle.sync(); } finally { await handle.close(); }
+      contentHash = digest.digest("hex");
+      // Store the verification hash before publishing. A hard-link is an
+      // atomic no-replace publication on the same filesystem, unlike rename()
+      // which can silently overwrite a file created after our absence check.
+      this.updateOperation(operationId, "prepared", contentHash);
+      await link(tempPath, destination);
+      filesystemCommitted = true;
+      await rm(tempPath, { force: true });
+      await syncDirectory(path.dirname(destination));
+      const fileStat = await lstat(destination, { bigint: true });
+      this.updateOperation(operationId, "filesystem_committed", contentHash);
+      commitMaterializedRow(operationId, relativePath, contentHash, fileStat);
+      databaseCommitted = true;
+      this.updateOperation(operationId, "completed", contentHash);
+      return true;
+    } catch (error) {
+      await rm(tempPath, { force: true });
+      if (filesystemCommitted && !databaseCommitted && contentHash !== null) {
+        try {
+          if (await sha256(destination) === contentHash) await rm(destination, { force: true });
+        } catch { /* preserve any missing or externally changed destination */ }
+      }
+      this.updateOperation(operationId, "failed", undefined, error instanceof Error ? error.message : String(error));
+      throw error;
+    }
+  }
+
+  async materializeLiveBlobFiles(): Promise<number> {
+    const rows = this.db.prepare(
+      `SELECT id FROM files
+       WHERE trashed_at IS NULL
+         AND (storage_kind IS NULL OR storage_kind <> 'workspace')
+         AND original_bytes IS NOT NULL
+       ORDER BY rowid`,
+    ).all() as Array<{ id: string }>;
+    let repaired = 0;
+    for (const row of rows) {
+      if (await this.materializeLiveBlobFile(row.id)) repaired += 1;
+    }
+    return repaired;
   }
 
   /** Inspect a normal workspace directory without exposing an absolute path. */

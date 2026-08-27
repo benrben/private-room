@@ -379,9 +379,11 @@ function emitSafely(send: EventSender, event: string, payload: unknown): void {
  * Files list to reload and the viewer to open it. Ported verbatim; see this
  * module's own doc for why it is duplicated here rather than imported.
  */
-function saveAndOpen(rooms: RoomSource, send: EventSender, art: Artifact): Written {
+async function saveAndOpen(rooms: RoomSource, send: EventSender, art: Artifact): Promise<Written> {
   const room = requireRoom(rooms);
-  const written = art.commit(room.db);
+  const written = room.workspace === undefined
+    ? art.commit(room.db)
+    : await art.commitToWorkspace(room.workspace);
   emitSafely(send, "room-files-changed", undefined);
   emitSafely(send, "agent-open-file", { id: written.meta.id });
   return written;
@@ -678,7 +680,7 @@ export async function aiAction(
     // `.fromFiles(refs)`/`.cancelWith(cancel)` — Rust's own `Artifact::new(..)
     // .by(spec.title)` calls neither (the cancel flag was already checked
     // immediately above via `guardCommit`).
-    const written = saveAndOpen(
+    const written = await saveAndOpen(
       deps.rooms,
       deps.send,
       Artifact.new(name, "text/markdown", content).by(spec.title)

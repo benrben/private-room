@@ -216,10 +216,17 @@ export class Artifact {
         id = existing.id;
         versioned = true;
       } else if (existing !== undefined) {
-        // Compatibility for an old blob row that still exists in a legacy
-        // room opened through this API.
-        const [meta, wasVersioned] = commitStaged(db, staged.id);
-        return { meta, versioned: wasVersioned };
+        // Heal output left by an older/missed writer, then version the stable
+        // id through the normal workspace path. Never fall back to committing
+        // current bytes into SQLCipher for a workspace room.
+        await workspace.materializeLiveBlobFile(existing.id);
+        const current = db.prepare("SELECT content_sha256 FROM files WHERE id = ?")
+          .get(existing.id) as { content_sha256: string | null };
+        await workspace.snapshotVersion(existing.id, "AI regenerated");
+        await workspace.writeAtomic(existing.id, Readable.from([bytes]), current.content_sha256 ?? undefined);
+        setFileExtractedText(db, existing.id, text);
+        id = existing.id;
+        versioned = true;
       } else {
         const free = availableName(db, staged.name);
         const entry = await workspace.createFile(free, Readable.from([bytes]), "generated");

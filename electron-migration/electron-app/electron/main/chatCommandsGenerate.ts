@@ -1244,12 +1244,14 @@ export async function cmdMinutes(ctx: CmdCtx): Promise<CommandResult> {
   const body = renderMinutesHtml(parsed, title);
   const doc = htmlDocument(title, body);
   const name = htmlNoteName(title);
-  const written = Artifact.note(name, doc)
+  const artifact = Artifact.note(name, doc)
     .by("#minutes")
     .duringRun(ctx.turn.runId)
     .fromFiles(ctx.refs)
-    .cancelWith(ctx.cancel)
-    .commit(room.db);
+    .cancelWith(ctx.cancel);
+  const written = room.workspace === undefined
+    ? artifact.commit(room.db)
+    : await artifact.commitToWorkspace(room.workspace);
   emitSafely(ctx.emit, "room-files-changed", undefined);
   emitSafely(ctx.emit, "agent-open-file", { id: written.meta.id });
   const items = parsed.timeline.length;
@@ -1318,13 +1320,15 @@ export async function cmdSketch(ctx: CmdCtx): Promise<CommandResult> {
   const doc = layoutGraph(nodes, edges);
 
   const name = `${title}.sketch`;
-  const written = Artifact.note(name, doc.toJson())
+  const artifact = Artifact.note(name, doc.toJson())
     .indexedAs(doc.extractedText())
     .by("#sketch")
     .duringRun(ctx.turn.runId)
     .fromFiles(ctx.refs)
-    .cancelWith(ctx.cancel)
-    .commit(room.db);
+    .cancelWith(ctx.cancel);
+  const written = room.workspace === undefined
+    ? artifact.commit(room.db)
+    : await artifact.commitToWorkspace(room.workspace);
   emitSafely(ctx.emit, "room-files-changed", undefined);
   emitSafely(ctx.emit, "agent-open-file", { id: written.meta.id });
 
@@ -1351,8 +1355,11 @@ export async function cmdToSheet(ctx: CmdCtx): Promise<CommandResult> {
     throw new Error("No table found in a recent answer to convert.");
   }
   const csv = serializeDelim(rows, ",");
-  const db = requireRoom(ctx.rooms).db;
-  const written = Artifact.note("table.csv", csv).by("#to-sheet").duringRun(ctx.turn.runId).commit(db);
+  const room = requireRoom(ctx.rooms);
+  const artifact = Artifact.note("table.csv", csv).by("#to-sheet").duringRun(ctx.turn.runId);
+  const written = room.workspace === undefined
+    ? artifact.commit(room.db)
+    : await artifact.commitToWorkspace(room.workspace);
   emitSafely(ctx.emit, "room-files-changed", undefined);
   emitSafely(ctx.emit, "agent-open-file", { id: written.meta.id });
   return commandResult(
@@ -1474,11 +1481,13 @@ export async function cmdTranslate(ctx: CmdCtx): Promise<CommandResult> {
   // parts already translated (the partial note above says so), so the write
   // is the honest record of what was done, not work that should be thrown
   // away.
-  const written = Artifact.note(fname, out)
+  const artifact = Artifact.note(fname, out)
     .by("#translate")
     .duringRun(ctx.turn.runId)
-    .fromFiles(ctx.refs)
-    .commit(room.db);
+    .fromFiles(ctx.refs);
+  const written = room.workspace === undefined
+    ? artifact.commit(room.db)
+    : await artifact.commitToWorkspace(room.workspace);
   emitSafely(ctx.emit, "room-files-changed", undefined);
   emitSafely(ctx.emit, "agent-open-file", { id: written.meta.id });
   return commandResult(`Translated **${name}** into ${lang} → **${written.meta.name}**.`, [written.meta.name]);

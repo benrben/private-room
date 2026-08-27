@@ -912,7 +912,14 @@ function startWorkspaceRuntime(
     polling,
   });
   room.workspaceWatcher = watcher;
-  void reconcileIfCurrent()
+  const repairLegacyLiveFiles = room.readOnly === true
+    ? Promise.resolve()
+    : workspace.materializeLiveBlobFiles().then((repaired) => {
+        if (repaired > 0) {
+          try { deps?.emit?.("room-files-changed", undefined); } catch { /* closed renderer */ }
+        }
+      });
+  void repairLegacyLiveFiles.then(reconcileIfCurrent)
     .then(() => room.workspaceRuntimeClosed === true ? undefined : watcher.start())
     .catch((error) => {
       console.error(`workspace watcher could not start: ${error instanceof Error ? error.message : String(error)}`);

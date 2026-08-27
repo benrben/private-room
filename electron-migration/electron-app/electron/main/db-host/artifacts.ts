@@ -58,6 +58,7 @@ import {
   getFileMeta,
   inTransaction,
   insertFile,
+  isWorkspaceDatabase,
   updateFileContent,
   type FileMeta,
 } from "./files.js";
@@ -289,6 +290,9 @@ interface StagedRow {
  * row still there for the sweep — never a file half-way between two versions.
  */
 export function commitStaged(db: Database.Database, stagingId: string): [FileMeta, boolean] {
+  if (isWorkspaceDatabase(db)) {
+    throw new Error("Workspace artifacts must be committed through commitToWorkspace.");
+  }
   const staged = queryOpt(
     db,
     "SELECT name, mime, bytes, text, provenance FROM staged_artifacts WHERE id = ?",

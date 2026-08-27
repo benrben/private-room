@@ -493,6 +493,15 @@ export function searchKey(query: string): string {
 export const LINKED = "linked";
 export const SECTION_ONLY = "sectionOnly";
 
+/** True when current file bytes belong on the normal filesystem, never in
+ * `files.original_bytes`. Legacy-only writers use this as a fail-closed guard
+ * so a missed hybrid call site cannot create an unopenable ghost row. */
+export function isWorkspaceDatabase(db: Database.Database): boolean {
+  return db.prepare(
+    "SELECT 1 FROM meta WHERE key = 'room_kind' AND value = 'workspace-folder'",
+  ).get() !== undefined;
+}
+
 /** The destinations {@link markSectionOnly} is called from today. NOT the
  * parameter's type — see that function's own comment for why the signature
  * stays as wide as Rust's while the LOG value is whitelisted. */
@@ -522,6 +531,9 @@ export function insertFileFromUrl(
   source: string,
   originUrl: string | null
 ): FileMeta {
+  if (isWorkspaceDatabase(db)) {
+    throw new Error("Workspace rooms must create current files through WorkspaceService.");
+  }
   const id = randomUUID();
   inTransaction(db, () => {
     executeOne(
@@ -1066,6 +1078,9 @@ export function updateFileContent(
   bytes: Uint8Array,
   text: string | null
 ): void {
+  if (isWorkspaceDatabase(db)) {
+    throw new Error("Workspace files must update current bytes through WorkspaceService.");
+  }
   inTransaction(db, () => {
     // ADD-17: content changed, so the cached one-liner is stale — clear it so
     // the next "Summarize room" run re-summarizes this file.

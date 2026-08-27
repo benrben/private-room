@@ -2,6 +2,7 @@ import { existsSync } from "node:fs";
 import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import type Database from "better-sqlite3-multiple-ciphers";
 import { afterEach, describe, expect, it } from "vitest";
 import { Redactor, type PrivacyRule } from "../privacyRedact.js";
 import { createRoomManagerState } from "../roomManager.js";
@@ -41,6 +42,28 @@ class MassEditingRuntime implements HarnessRuntime {
     for (let index = 0; index < 21; index += 1) {
       await writeFile(path.join(context.workspacePath, `bulk-${index}.txt`), `change ${index}`, "utf8");
     }
+    async function* events() {
+      yield { type: "run_started", runId: context.runId, harness: "legacy-cli" } as const;
+      yield { type: "run_completed", runId: context.runId, status: "completed" } as const;
+    }
+    return { events: events(), cancel: async () => undefined, approve: async () => undefined };
+  }
+}
+
+class LegacyBlobCreatingRuntime implements HarnessRuntime {
+  readonly name = "legacy-cli" as const;
+  constructor(private readonly db: Database.Database) {}
+  async available(): Promise<boolean> { return true; }
+  async startTurn(context: HarnessContext): Promise<HarnessRun> {
+    this.db.prepare(
+      `INSERT INTO files(id, name, mime_type, size_bytes, source, original_bytes, extracted_text, storage_kind)
+       VALUES (?, 'Agent report.md', 'text/markdown', ?, 'generated', ?, ?, 'blob')`,
+    ).run(
+      `legacy-agent-${context.runId}`,
+      Buffer.byteLength("# Agent report\n"),
+      Buffer.from("# Agent report\n"),
+      "# Agent report\n",
+    );
     async function* events() {
       yield { type: "run_started", runId: context.runId, harness: "legacy-cli" } as const;
       yield { type: "run_completed", runId: context.runId, status: "completed" } as const;
@@ -173,6 +196,49 @@ describe("HarnessController", () => {
       expect(emittedNames.indexOf("file-updated")).toBeLessThan(
         emittedNames.lastIndexOf("harness-event"),
       );
+    } finally {
+      f.created.db.close();
+    }
+  });
+
+  it("materializes a legacy agent blob before reporting the run complete", async () => {
+    const f = await fixture();
+    let complete!: () => void;
+    const completed = new Promise<void>((resolve) => { complete = resolve; });
+    try {
+      const runtime = new LegacyBlobCreatingRuntime(f.created.db);
+      const controller = new HarnessController(f.state, f.root, (event, payload) => {
+        const item = payload as { type?: string };
+        if (event === "harness-event" && item.type === "run_completed") complete();
+      }, {
+        runtimes: {
+          codex: runtime,
+          claude: runtime,
+          "ollama-local": runtime,
+          "ollama-cloud": runtime,
+          openrouter: runtime,
+        },
+        flag: () => true,
+        outsideWorkspaceIsolation: false,
+      });
+      await controller.start({
+        provider: "ollama-local",
+        model: "qwen3:14b",
+        privacyMode: "local",
+        writeEnabled: true,
+        text: "create a report",
+      });
+      await completed;
+      expect(await readFile(path.join(f.roomPath, "Agent report.md"), "utf8"))
+        .toBe("# Agent report\n");
+      expect(f.created.db.prepare(
+        `SELECT storage_kind, original_bytes, relative_path FROM files
+         WHERE name = 'Agent report.md' AND trashed_at IS NULL`,
+      ).get()).toEqual({
+        storage_kind: "workspace",
+        original_bytes: null,
+        relative_path: "Agent report.md",
+      });
     } finally {
       f.created.db.close();
     }
