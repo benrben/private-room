@@ -3,6 +3,28 @@
 All notable, user-facing changes to Arcelle. Versions follow
 [semver](https://semver.org); dates are the GitHub release dates.
 
+## 0.26.2 — 2026-08-27
+
+Agents can now create, edit, rename, move, organize and recoverably delete
+normal workspace files across Codex, Claude, local and cloud Ollama,
+OpenRouter, and the regular Assistant chat. Codex Room tools no longer cancel
+before execution, Claude uses its native Agent SDK file tools, and restricted
+fallback specialists safely share their parent's completed rollback baseline.
+
+Cloud Privacy keeps original content out of the runtime mirror while still
+allowing metadata-only organization of PDFs, recordings, images, Sketch files
+and spreadsheets. Redacted filenames remain redacted inside the mirror and are
+restored only inside trusted local file operations.
+
+Every existing-file Assistant edit now saves encrypted prior bytes before the
+atomic write. Native write runs retain full baseline review and one-click
+rollback, all mutation tools share one write serializer, `.arcelle` remains
+blocked, and leased duplicate rooms report their read-only state honestly.
+
+Provider credentials are cached per process after the first successful or
+denied Keychain lookup, stopping repeated macOS password prompts during the
+same Arcelle session.
+
 ## 0.26.1 — 2026-08-27
 
 Claude's native Agent SDK harness can now use an existing Claude login inside
