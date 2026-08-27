@@ -69,4 +69,15 @@ test("the image row of the format registry hands the text to ImageView", () => {
   assert.match(view, /text\?:\s*string \| null;/, "ImageView has no prop for the text");
   assert.match(view, /ocrBody\(text\)/, "ImageView does not derive the shown text");
   assert.match(view, /className="img-ocr"/, "ImageView renders no panel for the text");
+  assert.match(
+    view,
+    /const accessibleName = name\.trim\(\) \|\| "Image preview";/,
+    "ImageView has no stable accessible name when a file name is blank",
+  );
+  assert.match(view, /alt=\{accessibleName\}/, "the picture has no alternative text");
+  assert.match(
+    view,
+    /aria-label=\{accessibleName\}/,
+    "the picture is unnamed in Electron's accessibility tree",
+  );
 });

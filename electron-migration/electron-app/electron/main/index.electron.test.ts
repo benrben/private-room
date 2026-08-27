@@ -358,6 +358,25 @@ describe("real Electron boot (index.ts, compiled + launched for real)", () => {
     expect(info).toBeNull();
   });
 
+  it("a file-origin viewer can fetch roommedia through the real custom protocol", async () => {
+    const result = await window.evaluate(async () => {
+      try {
+        // A missing token is intentional: it exercises scheme registration,
+        // CORS, Fetch support and the real protocol handler without opening a
+        // SQLCipher room (which this test process cannot do across the native
+        // ABI boundary documented above). Before `corsEnabled`, Chromium
+        // rejected this at Fetch with the same `TypeError: Failed to fetch`
+        // shown by the XLSX and PDF viewers. A working transport reaches our
+        // handler and receives its precise 404 response instead.
+        const response = await fetch("roommedia://localhost/not-staged");
+        return { status: response.status, body: await response.text() };
+      } catch (error) {
+        return { status: -1, body: String(error) };
+      }
+    });
+    expect(result).toEqual({ status: 404, body: "media not staged" });
+  });
+
   it("a real IPC round trip: a room-scoped command's real refusal reaches the renderer's catch block", async () => {
     const message = await window.evaluate(async () => {
       const api = (window as unknown as { arcelle: RendererArcelle }).arcelle;

@@ -21,6 +21,7 @@ const MAX_ZOOM = 4;
 const ZOOM_STEP = 0.25;
 
 export default function ImageView({ fileId, name, mime, mediaToken, dataB64, text }: Props) {
+  const accessibleName = name.trim() || "Image preview";
   const ocrText = ocrBody(text);
   // Streamed over the room's own URI scheme rather than inlined as base64.
   // The old data URL was 4/3 the size of the picture and had to cross IPC as
@@ -430,7 +431,8 @@ export default function ImageView({ fileId, name, mime, mediaToken, dataB64, tex
         <img
           ref={imgRef}
           src={src ?? ""}
-          alt={name}
+          alt={accessibleName}
+          aria-label={accessibleName}
           onLoad={(e) => setNatW(e.currentTarget.naturalWidth)}
           onError={() => setImgDead(true)}
         />

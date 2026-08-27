@@ -30,6 +30,7 @@ import {
   displaysToGeometryScreens,
   formatReadyMarker,
   grantDisplayMediaRequest,
+  PRIVILEGED_SCHEMES,
   preloadPath,
   READY_MARKER_PREFIX,
   type BootstrapElectron,
@@ -43,6 +44,19 @@ import type { CheckpointList } from "./roomCheckpoints.js";
 import type { Message } from "./db-host/messages.js";
 
 const tmpDirs: string[] = [];
+
+describe("room viewer protocols", () => {
+  it("lets file-origin viewers fetch streamed room bytes through CORS", () => {
+    const roomMedia = PRIVILEGED_SCHEMES.find((entry) => entry.scheme === "roommedia");
+    expect(roomMedia?.privileges).toMatchObject({
+      standard: true,
+      secure: true,
+      supportFetchAPI: true,
+      corsEnabled: true,
+      stream: true,
+    });
+  });
+});
 
 afterEach(() => {
   while (tmpDirs.length > 0) {
@@ -363,7 +377,7 @@ describe("displaysToGeometryScreens", () => {
 
 describe("preloadPath", () => {
   it("resolves the preload as a SIBLING of the compiled main directory", () => {
-    expect(preloadPath("/x/dist/electron/main")).toBe("/x/dist/electron/preload/index.js");
+    expect(preloadPath("/x/dist/electron/main")).toBe("/x/dist/electron/preload/index.cjs");
   });
 });
 
@@ -412,11 +426,11 @@ describe("bootstrap", () => {
       };
     };
     expect(opts.show).toBe(false);
-    expect(opts.webPreferences.preload.endsWith(path.join("preload", "index.js"))).toBe(true);
-    // D10's two real requirements, asserted rather than assumed.
+    expect(opts.webPreferences.preload.endsWith(path.join("preload", "index.cjs"))).toBe(true);
+    // All three renderer boundaries are asserted rather than assumed.
     expect(opts.webPreferences.contextIsolation).toBe(true);
     expect(opts.webPreferences.nodeIntegration).toBe(false);
-    expect(opts.webPreferences.sandbox).toBe(false);
+    expect(opts.webPreferences.sandbox).toBe(true);
 
     // never shown by default (module doc step 9)
     expect(win.shown).toBe(false);

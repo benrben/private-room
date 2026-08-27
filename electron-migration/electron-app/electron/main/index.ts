@@ -261,26 +261,13 @@
  * reached. Wiring the browser lane is that batch's work, not this one's.
  *
  * ============================================================================
- * SANDBOX: `sandbox: false`, tested rather than assumed
+ * SANDBOX: sandboxed renderer + one bundled CommonJS preload
  * ============================================================================
- * D10 requires `contextIsolation: true` and no `nodeIntegration` in the page —
- * both set below. `sandbox` is a THIRD, separate knob: it additionally forces
- * the PRELOAD SCRIPT through Electron's sandboxed preload loader, which does
- * not understand ES module `import`/`export` syntax regardless of this
- * package's `"type": "module"`. Found empirically, on the real binary, by both
- * merge candidates independently: `Unable to load preload script …
- * SyntaxError: Cannot use import statement outside a module`, thrown from
- * `node:electron/js2c/sandbox_bundle`'s `runPreloadScript`; renaming the
- * compiled output to `.mjs` changed nothing.
- *
- * `false` here does NOT reopen the isolated-world boundary D10 cares about — a
- * sandboxed and a non-sandboxed preload are equally unable to hand the
- * renderer raw Node access once `contextIsolation: true` + `nodeIntegration:
- * false` are set; `sandbox` only restricts what the preload script ITSELF may
- * do, which this preload never needs. Restoring `sandbox: true` means compiling
- * this one preload entry to CommonJS specifically — a genuinely separate build
- * step for exactly one file, real scoped follow-up work for whoever next
- * touches preload packaging, not a config flag.
+ * Electron does not support ESM imports in a sandboxed preload. The production
+ * build therefore bundles the preload and its allowlists into ONE CommonJS
+ * file (`index.cjs`). This keeps `sandbox`, `contextIsolation`, and the absence
+ * of renderer Node integration enabled together. The preload receives only
+ * Electron's restricted sandbox `require` and exposes the narrow Arcelle bridge.
  *
  * ============================================================================
  * WHY "PURE PIECES" + A GUARDED TAIL
@@ -304,6 +291,7 @@ import { fileURLToPath } from "node:url";
 import type {
   App,
   BrowserWindow as BrowserWindowType,
+  CustomScheme,
   DisplayMediaRequestHandlerHandlerRequest,
   IpcMain,
   Menu as ElectronMenuType,
@@ -340,11 +328,10 @@ const DEFAULT_HEIGHT = 780;
 const BOOT_STUB_FILE = "bootStub.html";
 
 /** The compiled preload script this window loads. `tsc` mirrors the source
- * tree under `outDir`, so `electron/preload/index.ts`'s compiled output sits at
- * `<outDir>/electron/preload/index.js` — a SIBLING of `<outDir>/electron/main`
- * (this file's own compiled directory), not nested under it. */
+ * tree under `outDir`; `scripts/bundlePreload.mjs` then emits the one-file
+ * sandboxed CommonJS entry beside that tree. */
 export function preloadPath(distDir: string): string {
-  return path.join(distDir, "..", "preload", "index.js");
+  return path.join(distDir, "..", "preload", "index.cjs");
 }
 
 /** Convert Electron's `screen.getAllDisplays()` into `windowGeometry.ts`'s
@@ -370,6 +357,38 @@ export interface ReadyMarker {
  * stdout for — a plain, stable string rather than JSON-parsing arbitrary log
  * noise around it. */
 export const READY_MARKER_PREFIX = "ARCELLE_MAIN_READY ";
+
+/** Schemes that must be registered before Electron becomes ready.
+ *
+ * `supportFetchAPI` alone only teaches Chromium that a custom scheme can be
+ * fetched. The renderer is loaded from `file://`, so reading a staged room
+ * file is also a cross-origin request. `corsEnabled` makes Chromium evaluate
+ * the `Access-Control-Allow-Origin` header emitted by `mediaTools.ts`; without
+ * it `<img>`/`<audio>` resource loads happened to work while JavaScript
+ * `fetch()` (used by the PDF, workbook, document and archive viewers) failed
+ * before the protocol response reached the viewer.
+ */
+export const PRIVILEGED_SCHEMES: CustomScheme[] = [
+  {
+    scheme: "roomdoc",
+    privileges: {
+      standard: true,
+      secure: true,
+      supportFetchAPI: true,
+      corsEnabled: true,
+    },
+  },
+  {
+    scheme: "roommedia",
+    privileges: {
+      standard: true,
+      secure: true,
+      supportFetchAPI: true,
+      corsEnabled: true,
+      stream: true,
+    },
+  },
+];
 
 /** Render {@link ReadyMarker} as the exact line printed to stdout. Exported so
  * a test constructs the same string it expects to find, rather than
@@ -667,11 +686,10 @@ export async function bootstrap(opts: BootstrapOptions): Promise<BootstrapResult
     minHeight: MIN_H,
     webPreferences: {
       preload: preloadPath(distDir),
-      // D10: isolated world, contextBridge only, no direct nodeIntegration.
-      // `sandbox: false` is deliberate — see the module doc's SANDBOX section.
+      // Sandboxed isolated world, contextBridge only, no direct Node access.
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: false,
+      sandbox: true,
     },
   });
   mainWindowRef = win;
@@ -824,10 +842,7 @@ if (
   process.type === "browser"
 ) {
   const electronModule = await import("electron");
-  electronModule.protocol.registerSchemesAsPrivileged([
-    { scheme: "roomdoc", privileges: { standard: true, secure: true, supportFetchAPI: true } },
-    { scheme: "roommedia", privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true } },
-  ]);
+  electronModule.protocol.registerSchemesAsPrivileged(PRIVILEGED_SCHEMES);
   void bootstrap({
     electron: {
       app: electronModule.app,

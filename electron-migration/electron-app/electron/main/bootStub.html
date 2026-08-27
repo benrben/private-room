@@ -3,7 +3,10 @@
   <head>
     <meta charset="utf-8" />
     <title>Arcelle — boot stub</title>
-    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; style-src 'unsafe-inline'; connect-src roommedia:"
+    />
     <style>
       body {
         font: 14px -apple-system, system-ui, sans-serif;
@@ -25,7 +28,9 @@
       driven from OUTSIDE the page (index.electron.test.ts evaluates JS in this
       page's own context over CDP), so nothing here needs to run on its own —
       and a stub page that executes no script of its own is one fewer thing to
-      keep honest.
+      keep honest. The single `connect-src` exception lets that external proof
+      exercise Arcelle's private roommedia protocol; it does not grant network
+      access and the handler never leaves this process.
     -->
     <h1>Arcelle</h1>
     <p>Electron main process booted. This is the migration boot stub, not the app UI.</p>
