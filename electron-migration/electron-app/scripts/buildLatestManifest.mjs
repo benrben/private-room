@@ -24,6 +24,27 @@
  */
 
 import { isValidRfc3339 } from "../electron/main/updater/updateManifest.js";
+import { decodeOuterBase64, parseSignatureFile } from "../electron/main/updater/minisignVerify.js";
+
+/** Decode and validate the one-line `.sig` written by `tauri signer sign`.
+ *
+ * The Tauri CLI writes manifest-ready outer base64. The standalone minisign
+ * CLI writes the inner four-line document. The JSON builder continues to take
+ * that inner document, so this boundary converts Tauri output exactly once and
+ * prevents a release from silently publishing a double-encoded signature.
+ */
+export function decodeTauriSignatureFile(text) {
+  if (typeof text !== "string" || !text.trim()) {
+    throw new Error("decodeTauriSignatureFile: signature file is empty");
+  }
+  const decoded = decodeOuterBase64(
+    text.trim(),
+    "malformed_signature",
+    "Tauri signature file",
+  );
+  parseSignatureFile(decoded);
+  return decoded;
+}
 
 /** `date -u +%Y-%m-%dT%H:%M:%SZ` equivalent -- always a real calendar
  * instant (it comes from `Date.now()`, not string-built), so this can never
@@ -85,7 +106,9 @@ export function buildLatestManifestJson({
   return `${JSON.stringify(manifest, null, 2)}\n`;
 }
 
-// CLI: node buildLatestManifest.mjs --version 0.26.0 --notes "..." --sig-file path/to/Arcelle.app.tar.gz.sig --out path/to/latest.json [--repo owner/name] [--tag vX.Y.Z] [--pub-date RFC3339]
+// CLI accepts exactly one signature form:
+//   --tauri-sig-file: one-line outer base64 from `tauri signer sign` (release)
+//   --sig-file: raw four-line minisign document (tool/test compatibility)
 if (import.meta.url === `file://${process.argv[1]}`) {
   const { readFile, writeFile } = await import("node:fs/promises");
   const args = process.argv.slice(2);
@@ -94,16 +117,19 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     const key = args[i]?.replace(/^--/, "");
     flags[key] = args[i + 1];
   }
-  const required = ["version", "notes", "sig-file", "out"];
+  const required = ["version", "notes", "out"];
   const missing = required.filter((k) => flags[k] === undefined);
-  if (missing.length > 0) {
+  const signatureFlags = ["sig-file", "tauri-sig-file"].filter((k) => flags[k] !== undefined);
+  if (missing.length > 0 || signatureFlags.length !== 1) {
     console.error(
-      `usage: node buildLatestManifest.mjs --version X.Y.Z --notes "..." --sig-file path.sig --out path/latest.json [--repo owner/name] [--tag vX.Y.Z] [--pub-date RFC3339]\n` +
-        `missing: ${missing.join(", ")}`,
+      `usage: node buildLatestManifest.mjs --version X.Y.Z --notes "..." (--tauri-sig-file path.sig | --sig-file raw.sig) --out path/latest.json [--repo owner/name] [--tag vX.Y.Z] [--pub-date RFC3339]\n` +
+        `missing: ${missing.join(", ") || "none"}; signature inputs supplied: ${signatureFlags.length}`,
     );
     process.exit(2);
   }
-  const signatureFileText = await readFile(flags["sig-file"], "utf8");
+  const signatureFileText = flags["tauri-sig-file"] !== undefined
+    ? decodeTauriSignatureFile(await readFile(flags["tauri-sig-file"], "utf8"))
+    : await readFile(flags["sig-file"], "utf8");
   const json = buildLatestManifestJson({
     version: flags.version,
     notes: flags.notes,

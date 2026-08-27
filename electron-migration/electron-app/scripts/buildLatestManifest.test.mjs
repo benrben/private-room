@@ -20,7 +20,11 @@
  */
 import { createHash, generateKeyPairSync, sign as cryptoSign } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { buildLatestManifestJson, rfc3339Now } from "./buildLatestManifest.mjs";
+import {
+  buildLatestManifestJson,
+  decodeTauriSignatureFile,
+  rfc3339Now,
+} from "./buildLatestManifest.mjs";
 import { isUpdateAvailable, parseUpdateManifest, selectPlatformEntry } from "../electron/main/updater/updateManifest.js";
 import { verifyManifestSignature } from "../electron/main/updater/minisignVerify.js";
 
@@ -46,6 +50,15 @@ function throwawayKey(keyIdHex = "aabbccddeeff0011") {
 }
 
 describe("buildLatestManifestJson — round trip through the real client code", () => {
+  it("decodes Tauri CLI's one-line .sig exactly once before manifest encoding", () => {
+    const key = throwawayKey();
+    const raw = key.signPayload(Buffer.from("payload"), "timestamp:1787000000\tfile:Arcelle.app.tar.gz");
+    const tauriSigFile = Buffer.from(raw, "utf8").toString("base64");
+    expect(decodeTauriSignatureFile(tauriSigFile)).toBe(raw);
+    expect(() => decodeTauriSignatureFile(raw)).toThrow(/base64|signature/i);
+    expect(() => decodeTauriSignatureFile("")).toThrow(/empty/);
+  });
+
   it("produces a manifest the real parser + real signature verifier both accept, with the plain darwin-aarch64 key winning selectPlatformEntry", () => {
     const key = throwawayKey();
     const payload = Buffer.from("pretend this is Arcelle.app.tar.gz's real bytes", "utf8");
