@@ -117,7 +117,10 @@ async function startWireCompatServer(extraEnv: Record<string, string> = {}): Pro
   delete env.ARCELLE_SIDECAR_TOKEN;
   Object.assign(env, extraEnv);
 
-  const proc: ChildProcess = spawn("uv", ["run", "python", LAUNCHER_RELATIVE], {
+  // A clean checkout does not yet have pytest in the sidecar environment.
+  // The launcher imports the shared pytest-backed test doubles, so explicitly
+  // request the optional dev dependencies instead of relying on a warm venv.
+  const proc: ChildProcess = spawn("uv", ["run", "--extra", "dev", "python", LAUNCHER_RELATIVE], {
     cwd: SIDECAR_DIR,
     env,
     stdio: ["ignore", "pipe", "pipe"],
