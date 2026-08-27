@@ -64,7 +64,6 @@ function privateOrOutside(root: string, candidate: string): boolean {
 
 function mutatingTool(toolName: string): boolean {
   return WRITE_TOOLS.has(toolName)
-    || toolName === "Bash"
     || /(?:^|__)(?:workspace_(?:write|edit|move|rename|delete)|trash_files|organize_files|save_generated_file)$/i.test(toolName);
 }
 
