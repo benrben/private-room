@@ -138,6 +138,9 @@ export function nativeWorkspaceSeatbeltProfile(options: NativeWorkspaceSandbox):
     // lookup. Expose only that encrypted database as a read-only literal;
     // sibling keychains and every keychain write remain denied.
     : [path.join(home, "Library", "Keychains", "login.keychain-db")];
+  const providerState = options.provider === "claude"
+    ? [path.join(home, ".claude", "session-env"), path.join(home, ".claude", "shell-snapshots")]
+    : [];
   return [
     "(version 1)",
     "(allow default)",
@@ -146,15 +149,19 @@ export function nativeWorkspaceSeatbeltProfile(options: NativeWorkspaceSandbox):
       "/tmp", "/var", "/Network", "/home", "/cores",
     ])})`,
     `(allow file-read-metadata ${literalClauses(ancestorPaths([
-      workspace, runtime, executable, ...providerRead, ...providerLiterals,
+      workspace, runtime, executable, ...providerRead, ...providerLiterals, ...providerState,
     ]))})`,
     // macOS hostname resolution traverses the public /var symlink before it
     // reaches /private/var. Metadata for the symlink itself is enough; file
     // data and every write below /var remain covered by the broad deny above.
     `(allow file-read-metadata (literal "/var"))`,
     `(allow file-read* ${clauses(["/Library/Apple", "/private/etc", "/private/var/db", "/dev"])})`,
-    `(allow file-read* ${clauses([workspace, runtime, ...providerRead])} ${literalClauses(providerLiterals)})`,
+    `(allow file-read* ${clauses([workspace, runtime, ...providerRead, ...providerState])} ${literalClauses(providerLiterals)})`,
     `(allow file-write* (subpath ${quoteSeatbelt(runtime)}))`,
+    // Claude prepares Bash commands through these two internal state folders
+    // before its own nested, fail-closed command sandbox starts. The nested
+    // sandbox still grants the agent command only the verified workspace.
+    providerState.length > 0 ? `(allow file-write* ${clauses(providerState)})` : "",
     options.writeEnabled ? `(allow file-write* (subpath ${quoteSeatbelt(workspace)}))` : "",
     `(deny file-read* file-write* (subpath ${quoteSeatbelt(path.join(workspace, ".arcelle"))}))`,
   ].filter((line) => line.length > 0).join("\n");

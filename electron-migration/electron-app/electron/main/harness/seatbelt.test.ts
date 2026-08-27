@@ -102,10 +102,14 @@ describe("native workspace Seatbelt", () => {
     const keychainSubpath = `(subpath "${keychainDirectory}")`;
     const readRule = profile.split("\n").find((line) => line.startsWith("(allow file-read*") && line.includes(keychainLiteral));
     const writeRules = profile.split("\n").filter((line) => line.startsWith("(allow file-write*"));
+    const claudeSessionEnv = path.join(os.homedir(), ".claude", "session-env");
+    const claudeShellSnapshots = path.join(os.homedir(), ".claude", "shell-snapshots");
 
     expect(readRule).toContain(keychainLiteral);
     expect(readRule).not.toContain(keychainSubpath);
     expect(writeRules.every((line) => !line.includes(loginKeychainPath) && !line.includes(keychainDirectory))).toBe(true);
+    expect(writeRules).toContain(`(allow file-write* (subpath "${claudeSessionEnv}") (subpath "${claudeShellSnapshots}"))`);
+    expect(writeRules.every((line) => !line.includes(path.join(os.homedir(), ".claude", "history.jsonl")))).toBe(true);
     expect(profile).toContain(`(deny file-read* file-write* (subpath "${path.join(await realpath(f.workspacePath), ".arcelle")}"))`);
   });
 
