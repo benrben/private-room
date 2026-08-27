@@ -55,6 +55,7 @@ describe("Claude native Room MCP wiring", () => {
         mcpServers: Record<string, unknown>;
         sandbox: { network: { allowedDomains: string[] } };
         systemPrompt: { append?: string };
+        disallowedTools: string[];
         tools: unknown;
       };
     };
@@ -70,10 +71,54 @@ describe("Claude native Room MCP wiring", () => {
       },
     });
     expect(request.options.tools).toEqual({ type: "preset", preset: "claude_code" });
+    expect(request.options.disallowedTools).toContain("Bash");
     expect(request.options.sandbox.network.allowedDomains).toEqual(["127.0.0.1"]);
     expect(request.options.systemPrompt.append).toContain("Follow room policy.");
     expect(request.options.systemPrompt.append).toContain(exposure.instructions);
+    expect(request.options.systemPrompt.append).toContain("Use native Read, Write, Edit, Glob, Grep, and NotebookEdit");
+    expect(request.options.systemPrompt.append).toContain("move, rename, or delete");
+    expect(request.options.systemPrompt.append).toContain("Arcelle Room MCP tools");
     expect(stop).toHaveBeenCalledTimes(1);
+  });
+
+  it("disables nested-sandbox Bash without disabling Claude's native file tools", async () => {
+    queryMock.mockReturnValueOnce({
+      async *[Symbol.asyncIterator]() {
+        yield {
+          type: "result",
+          subtype: "success",
+          is_error: false,
+          usage: { input_tokens: 1, output_tokens: 1 },
+          total_cost_usd: 0,
+        };
+      },
+      close: vi.fn(),
+    });
+    const runtime = new ClaudeAgentSdkRuntime();
+    const run = await runtime.startTurn({
+      runId: "run-no-bash",
+      roomId: "room-1",
+      provider: "claude",
+      model: "sonnet",
+      privacyMode: "cloud-direct",
+      workspacePath: "/tmp/Arcelle Room",
+      runtimePath: "/tmp/Arcelle Runtime/run-no-bash",
+      writeEnabled: true,
+      exposureVerified: true,
+    }, { text: "Edit and organize the notes." });
+    for await (const _event of run.events) { /* drain */ }
+
+    const request = queryMock.mock.calls.at(-1)?.[0] as {
+      options: {
+        disallowedTools: string[];
+        tools: unknown;
+        systemPrompt: { append: string };
+      };
+    };
+    expect(request.options.disallowedTools).toEqual(["Bash", "WebFetch", "WebSearch"]);
+    expect(request.options.tools).toEqual({ type: "preset", preset: "claude_code" });
+    expect(request.options.systemPrompt.append).toMatch(/move, rename, or delete[\s\S]*Arcelle Room MCP tools/);
+    expect(request.options.systemPrompt.append).toContain("Bash is unavailable in this runtime.");
   });
 
   it("omits Arcelle's default model alias so Claude uses its configured model", async () => {

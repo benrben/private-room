@@ -37,6 +37,10 @@ const SAFE_TOOL_DENIAL = "Claude tool was denied by the Arcelle permission polic
 const SAFE_TOOL_INCOMPLETE = "Claude tool ended without a completion result.";
 const NETWORK_COMMAND = /(^|[;&|()\s])(curl|wget|nc|ncat|ssh|scp|sftp|ftp|telnet)\b/i;
 const EXECUTABLE_CHANGE = /(^|[;&|()\s])chmod\s+(?:-[^\s]+\s+)*[^\n]*(?:\+x|[157][0-7]{2})/i;
+const WORKSPACE_TOOL_GUIDANCE =
+  "Use native Read, Write, Edit, Glob, Grep, and NotebookEdit for normal room files. " +
+  "For move, rename, or delete operations, you must use the Arcelle Room MCP tools because Claude has no native tool for those operations. " +
+  "Bash is unavailable in this runtime.";
 
 function within(root: string, candidate: string): boolean {
   const absolute = path.resolve(root, candidate);
@@ -262,6 +266,11 @@ export class ClaudeAgentSdkRuntime implements HarnessRuntime {
 
     let sdkQuery: ReturnType<typeof query>;
     try {
+      const systemAppend = [
+        context.systemPrompt,
+        WORKSPACE_TOOL_GUIDANCE,
+        roomMcp?.instructions,
+      ].filter((value): value is string => typeof value === "string" && value.length > 0).join("\n\n");
       sdkQuery = query({
         prompt: input.text,
         options: {
@@ -274,22 +283,17 @@ export class ClaudeAgentSdkRuntime implements HarnessRuntime {
         pathToClaudeCodeExecutable: this.executable,
         cwd: workspacePath,
         model: nativeHarnessModel(context.model),
-        systemPrompt: context.systemPrompt === undefined
-          ? roomMcp === undefined
-            ? { type: "preset", preset: "claude_code" }
-            : { type: "preset", preset: "claude_code", append: roomMcp.instructions }
-          : {
-              type: "preset",
-              preset: "claude_code",
-              append: [context.systemPrompt, roomMcp?.instructions].filter(Boolean).join("\n\n"),
-            },
+        systemPrompt: { type: "preset", preset: "claude_code", append: systemAppend },
         tools: { type: "preset", preset: "claude_code" },
         agents: claudeAgentDefinitions(),
         mcpServers: roomMcp === undefined ? undefined : {
           room: claudeRoomMcpConfiguration(roomMcp),
         },
         strictMcpConfig: roomMcp !== undefined,
-        disallowedTools: ["WebFetch", "WebSearch"],
+        // Claude Code's Bash tool starts its own macOS sandbox. Arcelle has
+        // already placed the CLI inside a stricter Seatbelt profile, and the
+        // nested sandbox is not compatible with that verified exposure.
+        disallowedTools: ["Bash", "WebFetch", "WebSearch"],
         permissionMode: "default",
         sandbox: {
           enabled: true,

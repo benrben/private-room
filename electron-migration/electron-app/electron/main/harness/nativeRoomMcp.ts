@@ -159,10 +159,14 @@ export function createNativeRoomMcpFactory(
       url: bridge.url,
       token,
       instructions: [
-        "Arcelle exposes a trusted MCP server named room for this run.",
-        "Use native file tools for ordinary reads and edits inside the exposed workspace.",
-        "Use only tools actually listed by the room server for Arcelle operations; never invent MCP tool names.",
-        "For file organization, rename, move, and trash operations, prefer the registered room tools so Arcelle can preserve metadata and recovery behavior.",
+        "Arcelle provides a trusted MCP server named room for this run.",
+        "Work only with normal files inside the exposed workspace.",
+        "The private .arcelle folder is always blocked. Never try to read, list, change, move, or delete .arcelle.",
+        "Use the provider's native file tools first when they support the task: Read, Write, Edit, Glob, Grep, NotebookEdit, or the native shell.",
+        "Do not use an Arcelle MCP tool for a normal file action that a native tool can complete.",
+        "When this run allows file changes, Claude has no native rename, move, or delete tool. This is an exception to the native-shell-first rule: Claude must use workspace_rename to rename, workspace_move to move, and workspace_delete to delete a normal file. workspace_delete moves the file to Arcelle Trash, so it can be restored.",
+        "In a Cloud Privacy mirror, an exact workspace organization tool may be hidden. Use the Arcelle rename, move, or trash tool that the room server lists.",
+        "Use only tool names listed by the room server. Never invent an MCP tool name.",
       ].join(" "),
       stop: async () => {
         if (stopped) return;

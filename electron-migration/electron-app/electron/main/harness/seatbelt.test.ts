@@ -67,6 +67,18 @@ describe("native workspace Seatbelt", () => {
     expect(profile).toContain(`(deny file-read* file-write* (subpath "${path.join(canonicalWorkspace, ".arcelle")}"))`);
   });
 
+  it("does not grant Claude writable state outside the run runtime and workspace", async () => {
+    const f = await fixture();
+    const profile = nativeWorkspaceSeatbeltProfile({
+      ...f,
+      executable: "/bin/sh",
+      provider: "claude",
+      writeEnabled: true,
+    });
+    const writeRules = profile.split("\n").filter((line) => line.startsWith("(allow file-write*"));
+    expect(writeRules.every((line) => !line.includes(path.join(os.homedir(), ".claude")))).toBe(true);
+  });
+
   it.runIf(nativeWorkspaceSandboxSupported())("proves read/write isolation for a write run", async () => {
     const f = await fixture();
     expect(verifyNativeWorkspaceSandbox({
@@ -102,14 +114,10 @@ describe("native workspace Seatbelt", () => {
     const keychainSubpath = `(subpath "${keychainDirectory}")`;
     const readRule = profile.split("\n").find((line) => line.startsWith("(allow file-read*") && line.includes(keychainLiteral));
     const writeRules = profile.split("\n").filter((line) => line.startsWith("(allow file-write*"));
-    const claudeSessionEnv = path.join(os.homedir(), ".claude", "session-env");
-    const claudeShellSnapshots = path.join(os.homedir(), ".claude", "shell-snapshots");
 
     expect(readRule).toContain(keychainLiteral);
     expect(readRule).not.toContain(keychainSubpath);
     expect(writeRules.every((line) => !line.includes(loginKeychainPath) && !line.includes(keychainDirectory))).toBe(true);
-    expect(writeRules).toContain(`(allow file-write* (subpath "${claudeSessionEnv}") (subpath "${claudeShellSnapshots}"))`);
-    expect(writeRules.every((line) => !line.includes(path.join(os.homedir(), ".claude", "history.jsonl")))).toBe(true);
     expect(profile).toContain(`(deny file-read* file-write* (subpath "${path.join(await realpath(f.workspacePath), ".arcelle")}"))`);
   });
 

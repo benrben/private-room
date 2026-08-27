@@ -206,6 +206,56 @@ describe("native Room MCP exposure", () => {
     await expect(factory(context(root))).rejects.toThrow(/baseline is complete/i);
   });
 
+  it.each(["codex", "claude"] as const)(
+    "teaches %s to use native file tools without exposing private state",
+    async (provider) => {
+      const root = await mkdtemp(path.join(os.tmpdir(), `arcelle-native-mcp-${provider}-policy-`));
+      roots.push(root);
+      const factory = createNativeRoomMcpFactory(
+        stateWith(root, { baseline_completed: 1, status: "running", write_enabled: 0 }),
+        () => dispatcher(),
+      );
+      const exposure = await factory(context(root, { provider, writeEnabled: false }));
+      try {
+        expect(exposure.instructions).toContain("Work only with normal files inside the exposed workspace.");
+        expect(exposure.instructions).toContain("The private .arcelle folder is always blocked.");
+        expect(exposure.instructions).toContain("Never try to read, list, change, move, or delete .arcelle.");
+        expect(exposure.instructions).toContain(
+          "Read, Write, Edit, Glob, Grep, NotebookEdit, or the native shell",
+        );
+        expect(exposure.instructions).toContain("native file tools first");
+        expect(exposure.instructions).toContain(
+          "Do not use an Arcelle MCP tool for a normal file action that a native tool can complete.",
+        );
+      } finally {
+        await exposure.stop();
+      }
+    }
+  );
+
+  it("teaches Claude to use recoverable Arcelle tools for rename, move, and delete", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "arcelle-native-mcp-claude-policy-"));
+    roots.push(root);
+    const factory = createNativeRoomMcpFactory(
+      stateWith(root, { baseline_completed: 1, status: "running", write_enabled: 0 }),
+      () => dispatcher(),
+    );
+    const exposure = await factory(context(root, { provider: "claude", writeEnabled: false }));
+    try {
+      expect(exposure.instructions).toContain("Claude has no native rename, move, or delete tool.");
+      expect(exposure.instructions).toContain("exception to the native-shell-first rule");
+      expect(exposure.instructions).toContain("workspace_rename to rename");
+      expect(exposure.instructions).toContain("workspace_move to move");
+      expect(exposure.instructions).toContain("workspace_delete to delete a normal file");
+      expect(exposure.instructions).toContain("moves the file to Arcelle Trash, so it can be restored");
+      expect(exposure.instructions).toContain(
+        "Use the Arcelle rename, move, or trash tool that the room server lists.",
+      );
+    } finally {
+      await exposure.stop();
+    }
+  });
+
   it("binds Cloud Privacy file operations to the redacted mirror backend", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "arcelle-native-mcp-mirror-"));
     roots.push(root);
