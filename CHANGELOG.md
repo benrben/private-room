@@ -3,6 +3,66 @@
 All notable, user-facing changes to Arcelle. Versions follow
 [semver](https://semver.org); dates are the GitHub release dates.
 
+## 0.26.0 — 2026-08-27
+
+Arcelle's rooms are now real folders, and every supported model can work through
+one safe agent system. This release also completes the move from Tauri to
+Electron and closes the bugs found during a full installed-app review.
+
+### Your current documents are normal files
+
+New rooms are ordinary folders that still work when Arcelle is closed. The
+documents you see in Finder are the source of truth; Arcelle keeps chats,
+memory, search, metadata, agent history and recovery versions encrypted inside
+the hidden `.arcelle` folder. Locking a room protects that private state but
+does not pretend that the normal files disappear.
+
+Existing `.arcelle` and `.roomai` rooms still open unchanged. Conversion is an
+explicit, resumable copy: Arcelle writes every live document into a new folder,
+checks its hash, preserves the original room as a rollback copy and reports any
+filename collision it had to resolve. Files changed in Finder are reconciled
+back into the Library, with safer rename matching, synced-folder polling and a
+manual rescan when a watcher needs help.
+
+Checkpoints, sealed `.arcelle` backups, trash recovery and agent rollback now
+store encrypted immutable history objects without hiding the live files. Large
+media reads stream from disk, and incomplete filesystem operations recover
+cleanly after a crash.
+
+### One harness for Codex, Claude, Ollama and OpenRouter
+
+Codex uses its structured app-server interface, Claude uses the Agent SDK, and
+Ollama local, Ollama cloud and OpenRouter use Arcelle's Deep Harness. They feed
+the same run timeline, approvals, cancellation, usage, specialist delegation
+and file-change review. Restricted fallbacks remain available when a native
+harness cannot prove its sandbox.
+
+Write-enabled runs take an encrypted baseline before an agent starts. Arcelle
+finds changes independently of provider hooks, shows created, edited, moved and
+deleted files, and can restore the exact baseline without overwriting a file
+that changed again later. Real Ollama and Codex runs were tested against files
+converted from a legacy room, including byte-exact rollback.
+
+Cloud Privacy uses a temporary redacted mirror instead of the real workspace.
+The mirror contains no database, `.arcelle` directory, original binary files or
+placeholder reverse map, and is removed after success, failure, cancellation or
+crash recovery.
+
+### The Electron app is now the shipping app
+
+The macOS host, encrypted SQLCipher database, recording bridge, browser,
+workflows, studios, scripts, updater and file viewers have completed their
+Electron cutover. The renderer now runs sandboxed, privileged paths stay in the
+trusted main process, and provider errors are contained without leaking room
+content into logs.
+
+The installed-app review fixed the failures it found: PDFs and spreadsheets can
+be fetched by their viewers, converted sketches load and save safely, converted
+recordings draw a real waveform and play, external file changes refresh open
+views, exact filenames constrain agent retrieval, follow-up turns use the
+current question, and test reviews no longer touch saved provider credentials
+or summon repeated Keychain prompts.
+
 ## 0.25.0 — 2026-08-22
 
 YouTube downloads had quietly died, twice over. This release brings them back
