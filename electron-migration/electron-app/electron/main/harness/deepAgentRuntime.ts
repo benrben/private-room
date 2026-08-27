@@ -177,6 +177,10 @@ export class DeepAgentRuntime implements HarnessRuntime {
             model: context.model,
             question: input.text,
             harness: "deep",
+            // Agent file work must be repeatable. Leaving this unset delegates
+            // to the model's Modelfile (qwen3.5:4b-mlx defaults to 1), which can
+            // randomly answer without making the required workspace tool call.
+            temperature: 0,
             messages: context.systemPrompt ? [{ role: "system", content: context.systemPrompt }] : [],
             ollamaBaseUrl,
             mcp: {

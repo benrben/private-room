@@ -49,6 +49,7 @@ describe("DeepAgentRuntime", () => {
     expect(request).toMatchObject({
       harness: "deep",
       model: "qwen3:14b",
+      temperature: 0,
       runId: "run-1",
       ollamaBaseUrl: "http://127.0.0.1:11434",
       provider: null,

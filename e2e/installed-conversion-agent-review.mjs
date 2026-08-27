@@ -122,9 +122,17 @@ try {
   );
   const events = await window.evaluate(() => globalThis.__conversionAgentEvents);
   const approvalErrors = await window.evaluate(() => globalThis.__conversionAgentApprovalErrors);
+  const runEvents = events.filter((event) => event.runId === started.runId);
+  log(`normalized events: ${runEvents.map((event) => {
+    if (event.type === "tool_started" || event.type === "tool_completed") {
+      return `${event.type}:${event.tool || "unknown"}`;
+    }
+    if (event.type === "run_completed") return `${event.type}:${event.status}`;
+    return event.type;
+  }).join(", ")}`);
   assert.deepEqual(approvalErrors, []);
-  const terminal = events.findLast(
-    (event) => event.runId === started.runId && (event.type === "run_completed" || event.type === "run_failed"),
+  const terminal = runEvents.findLast(
+    (event) => event.type === "run_completed" || event.type === "run_failed",
   );
   assert.equal(terminal?.type, "run_completed", JSON.stringify(terminal));
   assert.match(
