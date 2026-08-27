@@ -913,6 +913,34 @@ describe("runPrivacyScan", () => {
     db.close();
   });
 
+  it("resolves an uninstalled default tag once and scans every file with the installed local build", async () => {
+    const db = freshRoomDb();
+    const fixture = makeRoomFixture({ db, path: "room-a" });
+    const deps = policyDeps(fixture);
+    setPrivacyRoom(deps, "on");
+    addFile(db, "a.txt", "Ben Reich");
+    addFile(db, "b.txt", "Dana Levi");
+    const resolved: string[] = [];
+    const calledModels: string[] = [];
+
+    const end = await runPrivacyScan(scanDeps(fixture, {
+      resolveGuardModel: async (preferred) => {
+        resolved.push(preferred);
+        return "qwen3.5:4b-mlx";
+      },
+      privacyScanCall: async (body) => {
+        calledModels.push(String(body.model));
+        return { entities: [], complete: true };
+      },
+    }));
+
+    expect(end.error).toBeNull();
+    expect(resolved).toEqual([DEFAULT_MODEL]);
+    expect(calledModels).toEqual(["qwen3.5:4b-mlx", "qwen3.5:4b-mlx"]);
+    expect(privacyStatus(deps).pendingFiles).toBe(0);
+    db.close();
+  });
+
   it("a finding under the character floor is skipped, not filed as protected", async () => {
     const db = freshRoomDb();
     const fixture = makeRoomFixture({ db, path: "room-a" });

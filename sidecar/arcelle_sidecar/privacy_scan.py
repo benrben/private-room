@@ -236,6 +236,16 @@ async def scan_text(
         except asyncio.CancelledError:
             # The client hung up (``until_hangup``). Not our failure to absorb.
             raise
+        except llm.LlmError as exc:
+            # A missing model or unreachable daemon is not one bad document
+            # chunk. Swallowing either made the host try every file, report
+            # "20 incomplete files", and hide the actionable engine error.
+            # Let the route preserve its MODEL_MISSING / OLLAMA_DOWN contract.
+            if exc.code in {"MODEL_MISSING", "OLLAMA_DOWN"}:
+                raise
+            failed += 1
+            log.warning("privacy scan: chunk failed, continuing")
+            continue
         except Exception:  # noqa: BLE001 - any engine failure is one bad chunk
             failed += 1
             log.warning("privacy scan: chunk failed, continuing")

@@ -283,6 +283,7 @@ export function filesNeedingPrivacyScan(
     `SELECT f.id, f.name, f.extracted_text, s.rules_sha256, s.text_sha256 FROM files f
      LEFT JOIN privacy_scans s ON s.file_id = f.id
      WHERE f.trashed_at IS NULL
+       AND NOT (f.storage_kind = 'workspace' AND f.index_state = 'offline')
        AND f.extracted_text IS NOT NULL AND length(f.extracted_text) > 0
      ORDER BY f.created_at ASC, f.rowid ASC`,
     [],

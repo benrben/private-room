@@ -16,6 +16,7 @@ import { cancelAsk, listSpecialists } from "./specialists.js";
 import { listChatCommands } from "./chatCommands.js";
 import { listModels, resolvedBaseUrl } from "./engineRouting.js";
 import { bestDefault } from "./turnContext.js";
+import { bestLocalDefault } from "./ollamaModels.js";
 import { declaredFor, engineCapabilities, enginePreflight, engineSupportMatrix } from "./capabilities.js";
 import { roomToolNamesWith, WEB_LANES_ALL } from "./bridgeDispatcher.js";
 import { webAccessEnabled } from "./browser/webAccess.js";
@@ -75,6 +76,10 @@ export function registerCoreSurfaceIpc(
     roomEpoch: () => state.roomEpoch,
     emit: { emit: (payload) => emit("privacy-scan", payload) },
     privacyScanCall: (body) => sidecarValue("/privacy_scan", body) as Promise<{ entities?: Array<{ text?: string; category?: string }>; complete?: boolean }>,
+    resolveGuardModel: async (preferred) => {
+      const installed = await listModels();
+      return installed.includes(preferred) ? preferred : bestLocalDefault(installed);
+    },
     isChatBusy: () => state.cancel.cancels.size > 0,
   };
   // Room-open schedules its automatic scan through RoomManagerDeps. Keep the

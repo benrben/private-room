@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import type { Readable } from "node:stream";
+import { Readable } from "node:stream";
 import { afterEach, describe, expect, it } from "vitest";
 import { createWorkspaceRoom } from "./roomLayout.js";
 import { WorkspaceIndexService } from "./indexing.js";
@@ -25,6 +25,45 @@ function digest(bytes: Buffer): string {
 }
 
 describe("WorkspaceIndexService", () => {
+  it("runs another pass when reconciliation adds a file during extraction", async () => {
+    const parent = await mkdtemp(path.join(os.tmpdir(), "arcelle-index-rerun-"));
+    roots.push(parent);
+    const root = path.join(parent, "Room");
+    const { db } = createWorkspaceRoom(root, "correct horse battery staple", "Room");
+    try {
+      const workspace = new WorkspaceService(db, root);
+      await workspace.createFile("first.txt", Readable.from(["first"]), "external");
+      let releaseFirst!: () => void;
+      const firstBlocked = new Promise<void>((resolve) => { releaseFirst = resolve; });
+      let firstStarted!: () => void;
+      const started = new Promise<void>((resolve) => { firstStarted = resolve; });
+      const indexer = new WorkspaceIndexService(workspace, async (name, stream) => {
+        const bytes = await collect(stream);
+        if (name === "first.txt") {
+          firstStarted();
+          await firstBlocked;
+        }
+        return { text: bytes.toString("utf8"), sha256: digest(bytes), sizeBytes: bytes.length };
+      });
+
+      const firstPass = indexer.indexPending();
+      await started;
+      await workspace.createFile("second.txt", Readable.from(["second"]), "external");
+      const requestedWhileRunning = indexer.indexPending();
+      releaseFirst();
+      await Promise.all([firstPass, requestedWhileRunning]);
+
+      expect(db.prepare(
+        "SELECT name, index_state, extracted_text FROM files ORDER BY name",
+      ).all()).toEqual([
+        { name: "first.txt", index_state: "ready", extracted_text: "first" },
+        { name: "second.txt", index_state: "ready", extracted_text: "second" },
+      ]);
+    } finally {
+      db.close();
+    }
+  });
+
   it("replaces stale extracted text and chunks from the current normal file", async () => {
     const parent = await mkdtemp(path.join(os.tmpdir(), "arcelle-index-"));
     roots.push(parent);

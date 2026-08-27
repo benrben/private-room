@@ -1023,6 +1023,10 @@ export interface PrivacyScanDeps extends PolicyDeps {
    * `Err(_)` transient-failure branch.
    */
   privacyScanCall: (body: Record<string, unknown>) => Promise<SidecarPrivacyScanResult>;
+  /** Resolve the preferred local guard to an installed tag. This matters for
+   * builds such as `qwen3.5:4b-mlx`: asking Ollama for the unsuffixed default
+   * makes every file look like a transient incomplete scan. */
+  resolveGuardModel?: (preferred: string) => Promise<string>;
   /** `!state.cancels.lock().unwrap().is_empty()` — is an interactive ask
    * running right now? */
   isChatBusy: () => boolean;
@@ -1226,6 +1230,7 @@ async function scanPasses(scan: PrivacyScanDeps): Promise<ScanEnd> {
   // new run.
   const failed = new Set<string>();
   let failedGeneration = scanGeneration;
+  let resolvedGuardModel: string | null = null;
 
   for (;;) {
     const generation = scanGeneration;
@@ -1263,7 +1268,18 @@ async function scanPasses(scan: PrivacyScanDeps): Promise<ScanEnd> {
     } catch {
       known = [];
     }
-    const guardModel = policyCell?.guardModel ?? DEFAULT_MODEL;
+    const preferredGuardModel = policyCell?.guardModel ?? DEFAULT_MODEL;
+    let guardModel: string = resolvedGuardModel ?? preferredGuardModel;
+    if (resolvedGuardModel === null && scan.resolveGuardModel !== undefined) {
+      try {
+        guardModel = await scan.resolveGuardModel(preferredGuardModel);
+      } catch {
+        // Keep the preferred model. The sidecar then returns the precise
+        // daemon/model error instead of turning model discovery into a false
+        // claim that there is nothing left to scan.
+      }
+    }
+    resolvedGuardModel = guardModel;
 
     if (work.length === 0) {
       return scanFinished(null);

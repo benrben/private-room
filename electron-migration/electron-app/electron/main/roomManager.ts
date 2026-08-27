@@ -850,7 +850,11 @@ function attachStorageRuntime(
   }
 }
 
-function startWorkspaceRuntime(state: RoomManagerState, room: Room): void {
+function startWorkspaceRuntime(
+  state: RoomManagerState,
+  room: Room,
+  deps?: Pick<RoomManagerDeps, "emit" | "privacyScan">,
+): void {
   const workspace = room.workspace;
   const rootPath = room.descriptor?.rootPath;
   if (workspace === undefined || rootPath === null || rootPath === undefined) return;
@@ -868,10 +872,13 @@ function startWorkspaceRuntime(state: RoomManagerState, room: Room): void {
   const reconcileIfCurrent = async (): Promise<void> => {
     if (state.room !== room) return;
     try {
-      await workspace.reconcile();
+      const changes = await workspace.reconcile();
       if (state.room === room && room.workspaceRuntimeClosed !== true) {
-        void indexer.indexPending()
-          .catch((error) => console.error(`workspace indexing failed: ${error instanceof Error ? error.message : String(error)}`));
+        await indexer.indexPending();
+        if (deps?.privacyScan !== undefined) schedulePrivacyScan(deps.privacyScan);
+        if (changes.added > 0 || changes.changed > 0 || changes.missing > 0 || changes.renamed > 0) {
+          try { deps?.emit?.("room-files-changed", undefined); } catch { /* closed renderer */ }
+        }
       }
       room.workspaceWatcherHealth = {
         state: "healthy",
@@ -923,12 +930,18 @@ export function workspaceWatcherStatus(state: RoomManagerState): WorkspaceWatche
   };
 }
 
-export async function rescanWorkspaceRoom(state: RoomManagerState): Promise<WorkspaceWatcherHealth> {
+export async function rescanWorkspaceRoom(
+  state: RoomManagerState,
+  deps?: Pick<RoomManagerDeps, "emit" | "privacyScan">,
+): Promise<WorkspaceWatcherHealth> {
   const room = state.room;
   if (room?.workspace === undefined) throw new Error("A workspace room is not open.");
   if (room.readOnly === true) throw new Error("This workspace is read-only because another Arcelle process owns the writer lease.");
   try {
     await room.workspace.reconcile();
+    await room.workspaceIndexer?.indexPending();
+    if (deps?.privacyScan !== undefined) schedulePrivacyScan(deps.privacyScan);
+    try { deps?.emit?.("room-files-changed", undefined); } catch { /* closed renderer */ }
     room.workspaceWatcherHealth = {
       state: "healthy",
       lastReconciledAt: new Date().toISOString(),
@@ -950,6 +963,7 @@ export async function rescanWorkspaceRoom(state: RoomManagerState): Promise<Work
 export async function setWorkspaceWatcherPolling(
   state: RoomManagerState,
   enabled: boolean,
+  deps?: Pick<RoomManagerDeps, "emit" | "privacyScan">,
 ): Promise<WorkspaceWatcherHealth> {
   const room = state.room;
   if (room?.workspace === undefined) throw new Error("A workspace room is not open.");
@@ -959,7 +973,7 @@ export async function setWorkspaceWatcherPolling(
   room.workspaceWatcher = undefined;
   if (oldWatcher !== undefined) await oldWatcher.close();
   if (state.room !== room) throw new Error("The room was closed while its watcher restarted.");
-  startWorkspaceRuntime(state, room);
+  startWorkspaceRuntime(state, room, deps);
   return workspaceWatcherStatus(state)!;
 }
 
@@ -1084,7 +1098,7 @@ export function createRoom(
   }
   pushRecent(deps.userDataDir, room.name, room.path);
   state.room = room;
-  startWorkspaceRuntime(state, room);
+  startWorkspaceRuntime(state, room, deps);
   // ADD-30: a job left 'running' belongs to a process that's gone — mark it
   // 'paused' so the UI offers Resume rather than a phantom active job.
   quiesceStaleJobs(room.conn);
@@ -1174,7 +1188,7 @@ export function openRoomImpl(
   pushRecent(deps.userDataDir, room.name, room.path);
   state.room = room;
   if (!readOnly) {
-    startWorkspaceRuntime(state, room);
+    startWorkspaceRuntime(state, room, deps);
     quiesceStaleJobs(room.conn);
   }
 
@@ -1265,7 +1279,7 @@ export function registerWorkspaceCopy(
     room.readOnly = false;
     room.duplicateRoomIdentity = false;
     attachStorageRuntime(room, registered.descriptor, lease);
-    startWorkspaceRuntime(state, room);
+    startWorkspaceRuntime(state, room, deps);
     quiesceStaleJobs(room.conn);
     runCreateOpenSpawns(deps, room);
     pushRecent(deps.userDataDir, room.name, room.path);
@@ -1485,7 +1499,7 @@ export function renameRoom(
         room.workspaceLease.lockPath = path.join(newPath, ".arcelle", "room.lock");
       }
       room.workspaceRuntimeClosed = false;
-      startWorkspaceRuntime(state, room);
+      startWorkspaceRuntime(state, room, deps);
 
       // Keychain accounts are keyed by the room path. Copy the credential to
       // the new account before deleting the old one, so a failed Keychain

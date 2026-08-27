@@ -28,6 +28,14 @@ async function hashFile(filePath: string): Promise<string> {
   return hash.digest("hex");
 }
 
+/** Arcelle writes normal files through a hidden sibling and then renames it.
+ * Watcher hints already ignore these names, but a full manifest scan can run
+ * while the sibling exists. The scan is the source of truth, so it must apply
+ * the same exclusion or it can permanently adopt a short-lived partial file. */
+export function isArcelleAtomicTemporaryName(name: string): boolean {
+  return /^\..+\.arcelle-[0-9a-f-]+\.tmp$/i.test(name);
+}
+
 export async function scanWorkspaceManifest(
   rootPath: string,
   options: ManifestScanOptions = {},
@@ -39,6 +47,7 @@ export async function scanWorkspaceManifest(
     const dir = await opendir(absoluteDir);
     for await (const item of dir) {
       if (prefix === "" && item.name.toLocaleLowerCase("en-US") === PRIVATE_DIR) continue;
+      if (isArcelleAtomicTemporaryName(item.name)) continue;
       const relativePath = prefix === "" ? item.name : `${prefix}/${item.name}`;
       const absolutePath = path.join(absoluteDir, item.name);
       const fileStat = await lstat(absolutePath, { bigint: true });

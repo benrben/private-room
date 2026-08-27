@@ -169,10 +169,10 @@ export function registerRoomManagerIpc(
     return roomStorageUsage(state.room);
   });
   handle("workspace_watcher_status", () => workspaceWatcherStatus(state));
-  handle("rescan_workspace_room", () => rescanWorkspaceRoom(state));
+  handle("rescan_workspace_room", () => rescanWorkspaceRoom(state, deps));
   handle(
     "set_workspace_watcher_polling",
-    (args: { enabled: boolean }) => setWorkspaceWatcherPolling(state, args.enabled),
+    (args: { enabled: boolean }) => setWorkspaceWatcherPolling(state, args.enabled, deps),
   );
   handle("rename_room", (args: { name: string }): RoomInfo => renameRoom(state, deps, args.name));
   handle("register_workspace_copy", (): RoomInfo => registerWorkspaceCopy(state, deps));

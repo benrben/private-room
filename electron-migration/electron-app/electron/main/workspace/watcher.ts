@@ -1,5 +1,6 @@
 import chokidar, { type FSWatcher } from "chokidar";
 import path from "node:path";
+import { isArcelleAtomicTemporaryName } from "./manifest.js";
 import { PRIVATE_DIR } from "./pathSafety.js";
 
 export type WorkspaceChangeKind = "add" | "change" | "unlink" | "addDir" | "unlinkDir" | "error";
@@ -20,7 +21,7 @@ export interface WorkspaceWatcherOptions {
 function isPrivateOrTemporary(rootPath: string, candidate: string): boolean {
   const relative = path.relative(rootPath, candidate).replace(/\\/g, "/");
   if (relative === PRIVATE_DIR || relative.startsWith(`${PRIVATE_DIR}/`)) return true;
-  return /(^|\/)\.[^/]+\.arcelle-[0-9a-f-]+\.tmp$/i.test(relative);
+  return relative.split("/").some(isArcelleAtomicTemporaryName);
 }
 
 /** Low-latency hints plus periodic full reconciliation as the source of truth. */

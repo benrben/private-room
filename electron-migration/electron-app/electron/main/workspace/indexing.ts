@@ -47,6 +47,7 @@ function candidateStillCurrent(
  */
 export class WorkspaceIndexService {
   private running: Promise<WorkspaceIndexResult> | null = null;
+  private rerunRequested = false;
   private closed = false;
 
   constructor(
@@ -56,9 +57,33 @@ export class WorkspaceIndexService {
 
   indexPending(): Promise<WorkspaceIndexResult> {
     if (this.closed) return Promise.resolve({ ready: 0, unsupported: 0, failed: 0, staleDiscarded: 0 });
-    if (this.running !== null) return this.running;
-    this.running = this.run().finally(() => { this.running = null; });
+    if (this.running !== null) {
+      // A reconcile can discover more files while a previous extraction is
+      // awaiting the sidecar. Returning that old pass without remembering the
+      // request leaves the new rows pending until an unrelated later event.
+      this.rerunRequested = true;
+      return this.running;
+    }
+    this.running = this.runUntilSettled().finally(() => { this.running = null; });
     return this.running;
+  }
+
+  private async runUntilSettled(): Promise<WorkspaceIndexResult> {
+    const total: WorkspaceIndexResult = {
+      ready: 0,
+      unsupported: 0,
+      failed: 0,
+      staleDiscarded: 0,
+    };
+    do {
+      this.rerunRequested = false;
+      const pass = await this.run();
+      total.ready += pass.ready;
+      total.unsupported += pass.unsupported;
+      total.failed += pass.failed;
+      total.staleDiscarded += pass.staleDiscarded;
+    } while (!this.closed && this.rerunRequested);
+    return total;
   }
 
   private async run(): Promise<WorkspaceIndexResult> {

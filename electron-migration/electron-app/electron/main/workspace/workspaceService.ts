@@ -129,6 +129,8 @@ async function assertDestinationAbsent(destination: string): Promise<void> {
 
 export class WorkspaceService {
   readonly objects: ContentObjectStore;
+  private reconcileRunning: Promise<{ added: number; changed: number; missing: number; renamed: number }> | null = null;
+  private reconcileAgain = false;
 
   constructor(
     readonly db: Database.Database,
@@ -736,7 +738,30 @@ export class WorkspaceService {
     }
   }
 
-  async reconcile(): Promise<{ added: number; changed: number; missing: number; renamed: number }> {
+  reconcile(): Promise<{ added: number; changed: number; missing: number; renamed: number }> {
+    if (this.reconcileRunning !== null) {
+      // Chokidar can emit add/change/rename hints as a burst. The later call is
+      // not redundant: its filesystem view may be newer than the scan already
+      // in flight, so remember it and return only after that final pass.
+      this.reconcileAgain = true;
+      return this.reconcileRunning;
+    }
+    this.reconcileRunning = this.reconcileUntilSettled().finally(() => {
+      this.reconcileRunning = null;
+    });
+    return this.reconcileRunning;
+  }
+
+  private async reconcileUntilSettled(): Promise<{ added: number; changed: number; missing: number; renamed: number }> {
+    let result = { added: 0, changed: 0, missing: 0, renamed: 0 };
+    do {
+      this.reconcileAgain = false;
+      result = await this.reconcileOnce();
+    } while (this.reconcileAgain);
+    return result;
+  }
+
+  private async reconcileOnce(): Promise<{ added: number; changed: number; missing: number; renamed: number }> {
     const rows = this.db.prepare(
       `SELECT id, name, relative_path, path_key, content_sha256, size_bytes, mtime_ns, fs_identity,
               index_state
@@ -805,13 +830,16 @@ export class WorkspaceService {
     }
 
     for (const entry of unmatchedEntries.values()) this.insertManifestEntry(entry);
+    let missing = 0;
     for (const row of unmatchedRows.values()) {
+      if (row.index_state === "offline") continue;
       this.db.transaction(() => {
         clearChunks(this.db, row.id);
         this.db.prepare("UPDATE files SET index_state = 'offline' WHERE id = ?").run(row.id);
       })();
+      missing += 1;
     }
-    return { added: unmatchedEntries.size, changed, missing: unmatchedRows.size, renamed };
+    return { added: unmatchedEntries.size, changed, missing, renamed };
   }
 
   private reconciledIndexState(row: WorkspaceFileRow, sha256: string): string {

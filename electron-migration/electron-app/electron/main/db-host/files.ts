@@ -92,6 +92,10 @@ const FILE_META_COLS =
  * aliased `f` — the shape `FILE_META_COLS` already forces. Queries that don't
  * alias spell the clause out inline. */
 const NOT_TRASHED = "f.trashed_at IS NULL";
+/** A missing normal workspace file keeps its private history/stable id in the
+ * database, but is not currently in the room. User-facing inventories must
+ * therefore hide it just as they hide trash. Blob rooms are unchanged. */
+const LIVE_FILE = `${NOT_TRASHED} AND NOT (f.storage_kind = 'workspace' AND f.index_state = 'offline')`;
 
 /** Mirrors the Rust `FileMeta` struct (`commands.rs`, `#[serde(rename_all =
  * "camelCase")]`), which is field-for-field the `FileMeta` in
@@ -607,7 +611,7 @@ export function fileWithSameBytes(
 export function listFiles(db: Database.Database): FileMeta[] {
   return queryRows(
     db,
-    `SELECT ${FILE_META_COLS} FROM files f WHERE ${NOT_TRASHED}
+    `SELECT ${FILE_META_COLS} FROM files f WHERE ${LIVE_FILE}
      ORDER BY f.created_at DESC, f.rowid DESC`,
     [],
     fileMetaRow
@@ -637,7 +641,7 @@ export function listFiles(db: Database.Database): FileMeta[] {
 export function roomFileCount(db: Database.Database): number {
   return queryOne(
     db,
-    `SELECT count(*) FROM files f WHERE ${NOT_TRASHED}`,
+    `SELECT count(*) FROM files f WHERE ${LIVE_FILE}`,
     [],
     (r) => r[0] as number
   );
@@ -681,7 +685,7 @@ export function listFilesBrief(db: Database.Database): FileBriefRow[] {
             coalesce(f.mime_type,''), f.size_bytes, f.ai_summary,
             f.origin_destination, f.library_visibility
      FROM files f LEFT JOIN folders fo ON fo.id = f.folder_id
-     WHERE f.trashed_at IS NULL
+     WHERE ${LIVE_FILE}
      ORDER BY f.created_at`,
     [],
     (r): FileBriefRow => [
@@ -718,7 +722,7 @@ export function listFileInventory(
     `SELECT CASE WHEN fo.name IS NOT NULL THEN fo.name || '/' || f.name ELSE f.name END,
             coalesce(f.mime_type, ''), f.ai_summary
      FROM files f LEFT JOIN folders fo ON fo.id = f.folder_id
-     WHERE f.trashed_at IS NULL
+     WHERE ${LIVE_FILE}
      ORDER BY f.created_at DESC, f.rowid DESC LIMIT 101`,
     [],
     (r) => [r[0] as string, r[1] as string, r[2] as string | null]
@@ -874,7 +878,7 @@ export function filesMissingSummary(
 export function fileByExactName(db: Database.Database, name: string): FileMeta | null {
   const rows = queryRows(
     db,
-    `SELECT ${FILE_META_COLS} FROM files f WHERE f.name = ? AND ${NOT_TRASHED}
+    `SELECT ${FILE_META_COLS} FROM files f WHERE f.name = ? AND ${LIVE_FILE}
      ORDER BY f.created_at DESC, f.rowid DESC LIMIT 1`,
     [name],
     fileMetaRow
@@ -957,7 +961,7 @@ export function availableName(db: Database.Database, name: string): string {
 export function getFileMeta(db: Database.Database, id: string): FileMeta {
   return queryOne(
     db,
-    `SELECT ${FILE_META_COLS} FROM files f WHERE f.id = ? AND ${NOT_TRASHED}`,
+    `SELECT ${FILE_META_COLS} FROM files f WHERE f.id = ? AND ${LIVE_FILE}`,
     [id],
     fileMetaRow
   );

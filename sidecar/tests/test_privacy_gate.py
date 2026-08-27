@@ -371,6 +371,25 @@ async def test_scan_keeps_what_it_found_when_a_chunk_fails(monkeypatch) -> None:
     assert scan.complete is False
 
 
+@pytest.mark.parametrize("code", ["MODEL_MISSING", "OLLAMA_DOWN"])
+async def test_scan_propagates_structural_engine_errors(monkeypatch, code) -> None:
+    """A missing model/dead daemon applies to the whole run, not one file.
+
+    Swallowing it once per chunk made the host retry every room file and report
+    only a misleading count of incomplete documents.
+    """
+
+    async def unavailable_generate(model, messages, base_url, **kwargs):
+        raise llm.LlmError(code, "engine unavailable")
+
+    monkeypatch.setattr(privacy_scan.llm, "generate", unavailable_generate)
+    with pytest.raises(llm.LlmError) as caught:
+        await privacy_scan.scan_text(
+            "Ben Reich", model="qwen3.5:4b", base_url="http://127.0.0.1:11434"
+        )
+    assert caught.value.code == code
+
+
 async def test_scan_reports_itself_incomplete_when_capped(monkeypatch) -> None:
     """MAX_FINDINGS stops the pass mid-document. The host used to mark the file
     fully scanned anyway, so everything past the cap went to the cloud as-is."""

@@ -4,6 +4,8 @@ import path from "node:path";
 import { Readable } from "node:stream";
 import { afterEach, describe, expect, it } from "vitest";
 import { listFileVersions, setVersionPinned } from "../db-host/fileVersionsList.js";
+import { listFiles, roomFileCount } from "../db-host/files.js";
+import { filesNeedingPrivacyScan } from "../db-host/privacy.js";
 import { scanWorkspaceManifest } from "./manifest.js";
 import {
   acquireWorkspaceLease,
@@ -57,6 +59,44 @@ describe("workspace path safety", () => {
 });
 
 describe("workspace room storage", () => {
+  it("projects exactly the current regular files and never adopts atomic temporary siblings", async () => {
+    const parent = await temporaryRoot();
+    const workspaceRoot = path.join(parent, "Reconcile Room");
+    const { db } = createWorkspaceRoom(
+      workspaceRoot,
+      "correct horse battery staple",
+      "Reconcile Room",
+    );
+    const workspace = new WorkspaceService(db, workspaceRoot);
+    try {
+      await writeFile(path.join(workspaceRoot, "kept.txt"), "kept", "utf8");
+      await writeFile(path.join(workspaceRoot, "gone.txt"), "gone", "utf8");
+      await writeFile(
+        path.join(workspaceRoot, ".audio.wav.arcelle-12345678-1234-1234-1234-123456789abc.tmp"),
+        "partial",
+        "utf8",
+      );
+      expect(await workspace.reconcile()).toMatchObject({ added: 2 });
+      expect(listFiles(db).map((file) => file.name).sort()).toEqual(["gone.txt", "kept.txt"]);
+
+      const gone = db.prepare("SELECT id FROM files WHERE name = 'gone.txt'").get() as { id: string };
+      db.prepare("UPDATE files SET extracted_text = 'private person Ben Reich' WHERE id = ?")
+        .run(gone.id);
+      await rm(path.join(workspaceRoot, "gone.txt"));
+      expect(await workspace.reconcile()).toMatchObject({ missing: 1 });
+      expect(await workspace.reconcile(), "an already-missing row is not reported as a new change")
+        .toMatchObject({ missing: 0 });
+
+      expect(listFiles(db).map((file) => file.name)).toEqual(["kept.txt"]);
+      expect(roomFileCount(db)).toBe(1);
+      expect(filesNeedingPrivacyScan(db, "rules")).toEqual([]);
+      expect(db.prepare("SELECT index_state FROM files WHERE id = ?").get(gone.id))
+        .toEqual({ index_state: "offline" });
+    } finally {
+      db.close();
+    }
+  });
+
   it("serializes same-file writes across service instances before checking the expected hash", async () => {
     const parent = await temporaryRoot();
     const workspaceRoot = path.join(parent, "Concurrent Write Room");
