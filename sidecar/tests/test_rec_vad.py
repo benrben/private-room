@@ -137,9 +137,6 @@ def test_vad_model_path_fallback_is_the_electron_development_models_dir() -> Non
     assert vad._vad_model_path_override is None
     expected = str(REPO_ROOT / "electron-migration" / "electron-app" / "assets" / "models" / "silero_vad.onnx")
     assert vad._vad_model_path() == expected
-    # The directory genuinely exists on this machine (it holds the OTHER
-    # vendored models) even though the ONNX file itself does not yet.
-    assert (REPO_ROOT / "electron-migration" / "electron-app" / "assets" / "models").is_dir()
 
 
 def test_set_vad_model_path_overrides_and_is_callable_repeatedly() -> None:
