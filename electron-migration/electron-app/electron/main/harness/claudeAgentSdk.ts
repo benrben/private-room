@@ -1,9 +1,11 @@
 import { spawnSync } from "node:child_process";
+import { realpathSync } from "node:fs";
 import path from "node:path";
 import {
   query,
   type CanUseTool,
   type HookCallback,
+  type PostToolUseFailureHookInput,
   type PreToolUseHookInput,
   type SDKMessage,
   type SpawnOptions,
@@ -30,6 +32,9 @@ import type {
 
 const FILE_TOOLS = new Set(["Read", "Write", "Edit", "Glob", "Grep", "NotebookEdit"]);
 const WRITE_TOOLS = new Set(["Write", "Edit", "NotebookEdit"]);
+const SAFE_TOOL_FAILURE = "Claude tool failed. Provider diagnostics were omitted to protect room data.";
+const SAFE_TOOL_DENIAL = "Claude tool was denied by the Arcelle permission policy.";
+const SAFE_TOOL_INCOMPLETE = "Claude tool ended without a completion result.";
 const NETWORK_COMMAND = /(^|[;&|()\s])(curl|wget|nc|ncat|ssh|scp|sftp|ftp|telnet)\b/i;
 const EXECUTABLE_CHANGE = /(^|[;&|()\s])chmod\s+(?:-[^\s]+\s+)*[^\n]*(?:\+x|[157][0-7]{2})/i;
 
@@ -37,6 +42,11 @@ function within(root: string, candidate: string): boolean {
   const absolute = path.resolve(root, candidate);
   const relative = path.relative(path.resolve(root), absolute);
   return relative !== "" && !relative.startsWith("..") && !path.isAbsolute(relative);
+}
+
+function canonicalPath(candidate: string): string {
+  try { return realpathSync(candidate); }
+  catch { return path.resolve(candidate); }
 }
 
 function requestedPath(input: Record<string, unknown>): string | null {
@@ -50,6 +60,12 @@ function privateOrOutside(root: string, candidate: string): boolean {
   const absolute = path.resolve(root, candidate);
   const privateRoot = path.join(path.resolve(root), ".arcelle");
   return absolute === privateRoot || absolute.startsWith(`${privateRoot}${path.sep}`) || !within(root, absolute);
+}
+
+function mutatingTool(toolName: string): boolean {
+  return WRITE_TOOLS.has(toolName)
+    || toolName === "Bash"
+    || /(?:^|__)(?:workspace_(?:write|edit|move|rename|delete)|trash_files|organize_files|save_generated_file)$/i.test(toolName);
 }
 
 function streamText(message: SDKMessage): string | null {
@@ -97,11 +113,32 @@ export class ClaudeAgentSdkRuntime implements HarnessRuntime {
       throw new Error("Claude native harness refused an unverified workspace exposure.");
     }
     const events = new AsyncEventQueue<HarnessEvent>();
+    // macOS exposes /var as a symlink to /private/var. Claude resolves its cwd
+    // before producing native Read/Write inputs, so every containment check and
+    // both sandbox layers must use the same physical workspace path.
+    const workspacePath = canonicalPath(context.workspacePath);
     const abortController = new AbortController();
     const pending = new Map<string, PendingApproval>();
     const spawned = new Set<SpawnedProcess>();
     const subagents = new Map<string, string>();
+    const startedTools = new Map<string, string>();
+    const settledTools = new Set<string>();
+    let hadMutatingToolFailure = false;
     const roomMcp = await this.roomMcpFactory?.(context);
+
+    const startTool = (toolId: string, tool: string): void => {
+      if (settledTools.has(toolId) || startedTools.has(toolId)) return;
+      startedTools.set(toolId, tool);
+      events.push({ type: "tool_started", runId: context.runId, tool, toolId });
+    };
+    const settleTool = (toolId: string, tool: string, error?: string): void => {
+      if (settledTools.has(toolId)) return;
+      startTool(toolId, tool);
+      settledTools.add(toolId);
+      startedTools.delete(toolId);
+      if (error !== undefined && mutatingTool(tool)) hadMutatingToolFailure = true;
+      events.push({ type: "tool_completed", runId: context.runId, tool, toolId, error });
+    };
 
     const canUseTool: CanUseTool = async (toolName, toolInput, options) => {
       const requestId = options.requestId || options.toolUseID;
@@ -130,7 +167,7 @@ export class ClaudeAgentSdkRuntime implements HarnessRuntime {
       const pre = hookInput as PreToolUseHookInput;
       const toolInput = (pre.tool_input ?? {}) as Record<string, unknown>;
       const candidate = requestedPath(toolInput);
-      if (candidate !== null && privateOrOutside(context.workspacePath, candidate)) {
+      if (candidate !== null && privateOrOutside(workspacePath, candidate)) {
         return {
           hookSpecificOutput: {
             hookEventName: "PreToolUse",
@@ -189,25 +226,27 @@ export class ClaudeAgentSdkRuntime implements HarnessRuntime {
     };
 
     const postTool: HookCallback = async (hookInput, toolUseId) => {
-      const inputRecord = hookInput as unknown as { tool_name?: string };
-      events.push({
-        type: "tool_completed",
-        runId: context.runId,
-        tool: inputRecord.tool_name ?? "tool",
-        toolId: toolUseId,
-      });
-      const subagent = toolUseId === undefined ? undefined : subagents.get(toolUseId);
+      const inputRecord = hookInput as unknown as { tool_name?: string; tool_use_id?: string };
+      const settledId = toolUseId ?? inputRecord.tool_use_id;
+      if (settledId !== undefined) settleTool(settledId, inputRecord.tool_name ?? "tool");
+      const subagent = settledId === undefined ? undefined : subagents.get(settledId);
       if (subagent !== undefined) {
         events.push({ type: "agent_completed", runId: context.runId, agentId: subagent });
-        if (toolUseId !== undefined) subagents.delete(toolUseId);
+        subagents.delete(settledId!);
       }
+      return {};
+    };
+
+    const postToolFailure: HookCallback = async (hookInput, toolUseId) => {
+      const failure = hookInput as PostToolUseFailureHookInput;
+      settleTool(toolUseId ?? failure.tool_use_id, failure.tool_name, SAFE_TOOL_FAILURE);
       return {};
     };
 
     const spawnSandboxed = (options: SpawnOptions): SpawnedProcess => {
       const child = spawnWithNativeWorkspaceSandbox(
         {
-          workspacePath: context.workspacePath,
+          workspacePath,
           runtimePath: context.runtimePath,
           executable: options.command,
           provider: "claude",
@@ -234,7 +273,7 @@ export class ClaudeAgentSdkRuntime implements HarnessRuntime {
         // capability-probed (normally the installed Claude Code CLI), so the
         // packaged app starts the same verified binary as the sandbox test.
         pathToClaudeCodeExecutable: this.executable,
-        cwd: context.workspacePath,
+        cwd: workspacePath,
         model: context.model || undefined,
         systemPrompt: context.systemPrompt === undefined
           ? roomMcp === undefined
@@ -260,10 +299,10 @@ export class ClaudeAgentSdkRuntime implements HarnessRuntime {
           allowUnsandboxedCommands: false,
           filesystem: {
             allowManagedReadPathsOnly: true,
-            allowRead: [context.workspacePath],
-            allowWrite: context.writeEnabled ? [context.workspacePath] : [],
-            denyRead: [path.join(context.workspacePath, ".arcelle")],
-            denyWrite: [path.join(context.workspacePath, ".arcelle")],
+            allowRead: [workspacePath],
+            allowWrite: context.writeEnabled ? [workspacePath] : [],
+            denyRead: [path.join(workspacePath, ".arcelle")],
+            denyWrite: [path.join(workspacePath, ".arcelle")],
           },
           network: {
             strictAllowlist: true,
@@ -283,6 +322,7 @@ export class ClaudeAgentSdkRuntime implements HarnessRuntime {
         hooks: {
           PreToolUse: [{ hooks: [preTool] }],
           PostToolUse: [{ hooks: [postTool] }],
+          PostToolUseFailure: [{ hooks: [postToolFailure] }],
         },
         spawnClaudeCodeProcess: spawnSandboxed,
         },
@@ -294,6 +334,8 @@ export class ClaudeAgentSdkRuntime implements HarnessRuntime {
 
     void (async () => {
       events.push({ type: "run_started", runId: context.runId, harness: this.name });
+      let receivedResult = false;
+      let providerSucceeded = false;
       try {
         for await (const message of sdkQuery) {
           const delta = streamText(message);
@@ -322,16 +364,16 @@ export class ClaudeAgentSdkRuntime implements HarnessRuntime {
                   subagents.set(block.id, agentId);
                   events.push({ type: "agent_started", runId: context.runId, agentId, label: agentId });
                 }
-                events.push({
-                  type: "tool_started",
-                  runId: context.runId,
-                  tool: block.name,
-                  toolId: block.id,
-                });
+                startTool(block.id, block.name);
               }
             }
           }
           if (message.type === "result") {
+            receivedResult = true;
+            providerSucceeded = message.subtype === "success" && !message.is_error;
+            for (const denial of message.permission_denials ?? []) {
+              settleTool(denial.tool_use_id, denial.tool_name, SAFE_TOOL_DENIAL);
+            }
             const usage = message.subtype === "success" ? message.usage : undefined;
             events.push({
               type: "usage_updated",
@@ -340,13 +382,16 @@ export class ClaudeAgentSdkRuntime implements HarnessRuntime {
               outputTokens: usage?.output_tokens,
               costUsd: message.total_cost_usd,
             });
-            if (message.subtype !== "success" || message.is_error) {
-              events.push({ type: "run_failed", runId: context.runId, error: "Claude Agent SDK run failed." });
-            } else {
-              events.push({ type: "agent_completed", runId: context.runId, agentId: "coordinator" });
-              events.push({ type: "run_completed", runId: context.runId, status: "completed" });
-            }
           }
+        }
+        for (const [toolId, tool] of startedTools) {
+          settleTool(toolId, tool, SAFE_TOOL_INCOMPLETE);
+        }
+        if (!receivedResult || !providerSucceeded || hadMutatingToolFailure) {
+          events.push({ type: "run_failed", runId: context.runId, error: "Claude Agent SDK run failed." });
+        } else {
+          events.push({ type: "agent_completed", runId: context.runId, agentId: "coordinator" });
+          events.push({ type: "run_completed", runId: context.runId, status: "completed" });
         }
       } catch (error) {
         events.push({ type: "run_failed", runId: context.runId, error: safeProviderFailure("claude") });

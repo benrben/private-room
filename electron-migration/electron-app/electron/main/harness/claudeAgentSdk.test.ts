@@ -1,4 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import type { NativeRoomMcpExposure } from "./nativeRoomMcp.js";
 
 const queryMock = vi.hoisted(() => vi.fn());
@@ -70,5 +73,92 @@ describe("Claude native Room MCP wiring", () => {
     expect(request.options.systemPrompt.append).toContain("Follow room policy.");
     expect(request.options.systemPrompt.append).toContain(exposure.instructions);
     expect(stop).toHaveBeenCalledTimes(1);
+  });
+
+  it("canonicalizes aliased workspace paths and reports native tool failures", async () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), "arcelle-claude-alias-"));
+    const physical = path.join(root, "physical-room");
+    const alias = path.join(root, "room-alias");
+    mkdirSync(physical);
+    symlinkSync(physical, alias, "dir");
+    let releaseResult!: () => void;
+    const resultGate = new Promise<void>((resolve) => { releaseResult = resolve; });
+    const sdkQuery = {
+      async *[Symbol.asyncIterator]() {
+        await resultGate;
+        yield {
+          type: "result",
+          subtype: "success",
+          is_error: false,
+          usage: { input_tokens: 1, output_tokens: 1 },
+          total_cost_usd: 0,
+        };
+      },
+      close: vi.fn(),
+    };
+    queryMock.mockReturnValueOnce(sdkQuery);
+
+    try {
+      const runtime = new ClaudeAgentSdkRuntime("claude");
+      const run = await runtime.startTurn({
+        runId: "run-alias",
+        roomId: "room-alias",
+        provider: "claude",
+        model: "sonnet",
+        privacyMode: "cloud-direct",
+        workspacePath: alias,
+        runtimePath: path.join(root, "runtime"),
+        writeEnabled: true,
+        exposureVerified: true,
+      }, { text: "Edit notes.txt." });
+      const request = queryMock.mock.calls.at(-1)?.[0] as {
+        options: {
+          cwd: string;
+          sandbox: { filesystem: { allowRead: string[]; allowWrite: string[] } };
+          hooks: Record<string, Array<{ hooks: Array<(...args: unknown[]) => Promise<unknown>> }>>;
+        };
+      };
+      const canonical = realpathSync(physical);
+      expect(request.options.cwd).toBe(canonical);
+      expect(request.options.sandbox.filesystem.allowRead).toEqual([canonical]);
+      expect(request.options.sandbox.filesystem.allowWrite).toEqual([canonical]);
+
+      const preTool = request.options.hooks["PreToolUse"]![0]!.hooks[0]!;
+      await expect(preTool({
+        hook_event_name: "PreToolUse",
+        tool_name: "Write",
+        tool_input: { file_path: path.join(canonical, "notes.txt") },
+        tool_use_id: "write-1",
+      })).resolves.toMatchObject({
+        hookSpecificOutput: { permissionDecision: "allow" },
+      });
+
+      const failedTool = request.options.hooks["PostToolUseFailure"]![0]!.hooks[0]!;
+      await failedTool({
+        hook_event_name: "PostToolUseFailure",
+        tool_name: "Write",
+        tool_input: { file_path: path.join(canonical, "notes.txt") },
+        tool_use_id: "write-1",
+        error: `Sensitive diagnostic for ${canonical}`,
+      }, "write-1");
+      releaseResult();
+      const events = [];
+      for await (const event of run.events) events.push(event);
+      expect(events).toContainEqual({
+        type: "tool_completed",
+        runId: "run-alias",
+        tool: "Write",
+        toolId: "write-1",
+        error: "Claude tool failed. Provider diagnostics were omitted to protect room data.",
+      });
+      expect(events.filter((event) => event.type === "tool_started" && event.toolId === "write-1")).toHaveLength(1);
+      expect(events.filter((event) => event.type === "tool_completed" && event.toolId === "write-1")).toHaveLength(1);
+      expect(events.some((event) => event.type === "run_failed")).toBe(true);
+      expect(events.some((event) => event.type === "run_completed")).toBe(false);
+      expect(JSON.stringify(events)).not.toContain(canonical);
+    } finally {
+      releaseResult();
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
