@@ -3,6 +3,23 @@
 All notable, user-facing changes to Arcelle. Versions follow
 [semver](https://semver.org); dates are the GitHub release dates.
 
+## 0.26.4 — 2026-08-27
+
+Agent-created documents in workspace rooms are now guaranteed to become real
+normal files. Arcelle repairs database-only output left by older or fallback
+writers while preserving its stable file ID, metadata and extracted text, so
+the item appears in Finder and opens normally instead of reporting that it is
+not in the room.
+
+Legacy blob creation and byte-update paths now fail closed inside workspace
+rooms. Codex, Claude, Ollama and OpenRouter runs also repair any older mixed
+output before reporting completion, and long recording translations no longer
+write into a room that was closed or changed while the model was running.
+
+The workspace forms of AI Actions, meeting minutes, Sketch generation, table
+conversion and translation now always publish through the normal-file content
+store.
+
 ## 0.26.3 — 2026-08-27
 
 Codex app-server and Claude Agent SDK direct runs now use their own native file
