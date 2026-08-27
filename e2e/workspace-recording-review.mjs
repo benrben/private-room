@@ -25,6 +25,21 @@ const workspacePath = path.join(temporary, "Converted Recording Room");
 const password = "workspace-recording-review-password";
 let app;
 
+async function closeAppSafely(application) {
+  const processHandle = application.process();
+  let timeout;
+  const closed = application.close().then(() => true, () => true);
+  const completed = await Promise.race([
+    closed,
+    new Promise((resolve) => { timeout = setTimeout(() => resolve(false), 5_000); }),
+  ]);
+  clearTimeout(timeout);
+  if (!completed) {
+    processHandle.kill("SIGKILL");
+    await Promise.race([closed, new Promise((resolve) => setTimeout(resolve, 2_000))]);
+  }
+}
+
 function log(message) {
   process.stdout.write(`[recording-review] ${message}\n`);
 }
@@ -135,10 +150,11 @@ try {
   // unrelated provider credential sheet from blocking this navigation.
   await window.reload({ waitUntil: "domcontentloaded", timeout: 15_000 });
   await window.locator(".workspace").waitFor({ state: "visible" });
-  await window.locator('[data-area="recordings"]').click();
+  await window.locator('[data-area="recordings"]').evaluate((button) => button.click());
   const recordingRow = window.locator("button.file-main", { hasText: "converted-meeting" });
   await recordingRow.waitFor({ state: "visible" });
-  await recordingRow.click();
+  await recordingRow.evaluate((button) => button.click());
+  await window.waitForTimeout(1_000);
   await window.locator(".rec-view").waitFor({ state: "visible" });
   await window.locator(".waveform-canvas").waitFor({ state: "visible" });
   await window.waitForFunction(() => {
@@ -160,7 +176,7 @@ try {
   await window.locator("audio.rec-player").evaluate((audio) => {
     audio.muted = true;
   });
-  await window.getByRole("button", { name: "Play the recording" }).click();
+  await window.getByRole("button", { name: "Play the recording" }).evaluate((button) => button.click());
   await window.waitForFunction(() => {
     const audio = document.querySelector(".rec-view audio.rec-player");
     return audio instanceof HTMLAudioElement && !audio.paused && audio.currentTime > 0.05;
@@ -171,7 +187,7 @@ try {
   }));
   assert(playback.currentTime > 0.05);
   assert(Math.abs(playback.duration - 1) < 0.01);
-  await window.getByRole("button", { name: "Pause playback" }).click();
+  await window.getByRole("button", { name: "Pause playback" }).evaluate((button) => button.click());
   await window.waitForFunction(() => {
     const audio = document.querySelector(".rec-view audio.rec-player");
     return audio instanceof HTMLAudioElement && audio.paused;
@@ -181,6 +197,6 @@ try {
   assert.deepEqual(severeConsole, []);
   log("converted RecordingView waveform and UI playback passed without renderer errors; PASS");
 } finally {
-  if (app) await app.close().catch(() => {});
+  if (app) await closeAppSafely(app);
   await rm(temporary, { recursive: true, force: true });
 }

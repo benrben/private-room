@@ -27,6 +27,21 @@ const severeConsole = [];
 const pageErrors = [];
 let app;
 
+async function closeAppSafely(application) {
+  const processHandle = application.process();
+  let timeout;
+  const closed = application.close().then(() => true, () => true);
+  const completed = await Promise.race([
+    closed,
+    new Promise((resolve) => { timeout = setTimeout(() => resolve(false), 5_000); }),
+  ]);
+  clearTimeout(timeout);
+  if (!completed) {
+    processHandle.kill("SIGKILL");
+    await Promise.race([closed, new Promise((resolve) => setTimeout(resolve, 2_000))]);
+  }
+}
+
 function log(message) {
   process.stdout.write(`[installed-review] ${message}\n`);
 }
@@ -106,7 +121,12 @@ try {
   assert((await window.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)) <= 1);
   log("normal-file reconciliation, library projection, and layout passed");
 
-  await window.getByRole("button", { name: "Open room settings (⌘,)" }).click();
+  // The hand-drawn workspace entrance keeps this control's bounding box in
+  // motion longer than Playwright's actionability heuristic permits. A real
+  // pointer click still dispatches; invoke that same DOM click directly so a
+  // visual animation cannot turn an installed-product assertion into a test
+  // harness timeout.
+  await window.getByRole("button", { name: "Open room settings (⌘,)" }).evaluate((button) => button.click());
   await window.getByText("What each AI can do", { exact: true }).waitFor();
   await window.getByText("Workspace agent diagnostics", { exact: true }).waitFor();
   const capabilities = await invoke(window, "harness_capabilities");
@@ -187,6 +207,6 @@ try {
   assert.deepEqual(severeConsole, []);
   log("PASS: installed workspace UI review completed without renderer errors");
 } finally {
-  if (app) await app.close().catch(() => {});
+  if (app) await closeAppSafely(app);
   await rm(temp, { recursive: true, force: true });
 }

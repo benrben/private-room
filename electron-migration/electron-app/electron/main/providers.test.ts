@@ -27,6 +27,7 @@ import {
   clearKeyRejected,
   connectAiProvider,
   deleteKey,
+  defaultProviderDeps,
   disconnectAiProvider,
   ensureProviderCatalog,
   injectProviderRuntime,
@@ -83,6 +84,20 @@ function forbiddenDeps(overrides: Partial<ProviderDeps> = {}): ProviderDeps {
     ...overrides,
   };
 }
+
+it("installed E2E reviews isolate provider credentials from the login Keychain", () => {
+  const previous = process.env.ARCELLE_E2E;
+  process.env.ARCELLE_E2E = "1";
+  try {
+    defaultProviderDeps.storeKey("review-provider", "temporary-review-key");
+    expect(defaultProviderDeps.readKey("review-provider")).toBe("temporary-review-key");
+    defaultProviderDeps.deleteKey("review-provider");
+    expect(() => defaultProviderDeps.readKey("review-provider")).toThrow(/No API key is saved/);
+  } finally {
+    if (previous === undefined) delete process.env.ARCELLE_E2E;
+    else process.env.ARCELLE_E2E = previous;
+  }
+});
 
 // ===========================================================================
 // Ported Rust fixtures

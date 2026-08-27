@@ -260,6 +260,12 @@ export function catalogRetryDue(msSinceLastAttempt: number | null): boolean {
 // `await`, so they are serialized onto one queue and each re-checks the
 // guards after acquiring it — exactly as the Rust does.
 let fetchLockChain: Promise<void> = Promise.resolve();
+// Installed-product reviews must never touch the user's login Keychain. The
+// Electron data directory is not a Keychain namespace, so a temporary
+// ARCELLE_USER_DATA_DIR alone does not isolate credentials. Keep E2E provider
+// secrets process-local; production continues to use the real generic-password
+// item below.
+const e2eProviderKeys = new Map<string, string>();
 
 async function withFetchLock<T>(fn: () => Promise<T>): Promise<T> {
   const previous = fetchLockChain;
@@ -287,6 +293,7 @@ export function resetProviderStateForTests(): void {
   catalogLoaded = false;
   catalogAttemptedAtMs = null;
   fetchLockChain = Promise.resolve();
+  e2eProviderKeys.clear();
 }
 
 // ────────────────────────────────────────────── macOS Keychain (plain item)
@@ -568,9 +575,28 @@ export function deleteKey(provider: string, service: string = KEYCHAIN_SERVICE):
 /** The real default {@link ProviderDeps}: the actual macOS Keychain and the
  * actual network. */
 export const defaultProviderDeps: ProviderDeps = {
-  readKey: (provider) => readKey(provider),
-  storeKey: (provider, key) => storeKey(provider, key),
-  deleteKey: (provider) => deleteKey(provider),
+  readKey: (provider) => {
+    if (process.env.ARCELLE_E2E === "1") {
+      const key = e2eProviderKeys.get(provider);
+      if (key === undefined) throw new Error(`No API key is saved for ${provider}. [code ${ERR_SEC_ITEM_NOT_FOUND}]`);
+      return key;
+    }
+    return readKey(provider);
+  },
+  storeKey: (provider, key) => {
+    if (process.env.ARCELLE_E2E === "1") {
+      e2eProviderKeys.set(provider, key);
+      return;
+    }
+    storeKey(provider, key);
+  },
+  deleteKey: (provider) => {
+    if (process.env.ARCELLE_E2E === "1") {
+      e2eProviderKeys.delete(provider);
+      return;
+    }
+    deleteKey(provider);
+  },
   fetchJson: realFetchJson,
 };
 
