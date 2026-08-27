@@ -23,8 +23,17 @@
  *    counts as valid.
  */
 
-import { isValidRfc3339 } from "../electron/main/updater/updateManifest.js";
-import { decodeOuterBase64, parseSignatureFile } from "../electron/main/updater/minisignVerify.js";
+// Vitest resolves the source-side `.js` specifiers to their TypeScript files.
+// The standalone release CLI runs under plain Node after `build:main`, so it
+// must load the emitted JavaScript instead. Keeping the choice here means the
+// pure helpers remain unit-testable while the publishing path never depends on
+// a test runner's TypeScript resolver.
+const invokedAsCli = import.meta.url === `file://${process.argv[1]}`;
+const updaterModuleBase = invokedAsCli
+  ? "../dist_package/electron/main/updater"
+  : "../electron/main/updater";
+const { isValidRfc3339 } = await import(`${updaterModuleBase}/updateManifest.js`);
+const { decodeOuterBase64, parseSignatureFile } = await import(`${updaterModuleBase}/minisignVerify.js`);
 
 /** Decode and validate the one-line `.sig` written by `tauri signer sign`.
  *
@@ -109,7 +118,7 @@ export function buildLatestManifestJson({
 // CLI accepts exactly one signature form:
 //   --tauri-sig-file: one-line outer base64 from `tauri signer sign` (release)
 //   --sig-file: raw four-line minisign document (tool/test compatibility)
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (invokedAsCli) {
   const { readFile, writeFile } = await import("node:fs/promises");
   const args = process.argv.slice(2);
   const flags = {};

@@ -19,6 +19,11 @@
  * reaching into another file's test-only internals).
  */
 import { createHash, generateKeyPairSync, sign as cryptoSign } from "node:crypto";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { spawnSync } from "node:child_process";
 import { describe, expect, it } from "vitest";
 import {
   buildLatestManifestJson,
@@ -50,6 +55,43 @@ function throwawayKey(keyIdHex = "aabbccddeeff0011") {
 }
 
 describe("buildLatestManifestJson — round trip through the real client code", () => {
+  const compiledUpdater = fileURLToPath(
+    new URL("../dist_package/electron/main/updater/updateManifest.js", import.meta.url),
+  );
+
+  it.runIf(existsSync(compiledUpdater))(
+    "runs the standalone Node CLI against the emitted updater modules",
+    () => {
+      const dir = mkdtempSync(join(tmpdir(), "arcelle-manifest-cli-"));
+      try {
+        const key = throwawayKey();
+        const raw = key.signPayload(Buffer.from("payload"), "timestamp:1787000000\tfile:Arcelle.app.tar.gz");
+        const sig = join(dir, "payload.sig");
+        const out = join(dir, "latest.json");
+        writeFileSync(sig, Buffer.from(raw, "utf8").toString("base64"), "utf8");
+        const script = fileURLToPath(new URL("./buildLatestManifest.mjs", import.meta.url));
+        const result = spawnSync(
+          process.execPath,
+          [
+            script,
+            "--version", "0.26.0",
+            "--notes", "CLI smoke",
+            "--tauri-sig-file", sig,
+            "--out", out,
+            "--pub-date", "2026-08-27T12:00:00Z",
+          ],
+          { encoding: "utf8" },
+        );
+        expect(result.status, result.stderr).toBe(0);
+        const manifest = JSON.parse(readFileSync(out, "utf8"));
+        expect(manifest.version).toBe("0.26.0");
+        expect(manifest.platforms["darwin-aarch64"].signature).toBeTruthy();
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
+
   it("decodes Tauri CLI's one-line .sig exactly once before manifest encoding", () => {
     const key = throwawayKey();
     const raw = key.signPayload(Buffer.from("payload"), "timestamp:1787000000\tfile:Arcelle.app.tar.gz");
