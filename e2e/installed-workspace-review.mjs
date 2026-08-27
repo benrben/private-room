@@ -188,6 +188,9 @@ try {
   await window.getByRole("tab", { name: "Activity" }).click();
   await window.getByRole("region", { name: "Workspace agents" }).waitFor();
   await window.getByText("Workspace agent", { exact: true }).waitFor();
+  const fileChanges = window.getByRole("checkbox", { name: "Allow file changes" });
+  assert.equal(await fileChanges.isChecked(), true);
+  await window.getByRole("button", { name: "Run with file access" }).waitFor();
   await shot(window, "06-agent-activity");
 
   await window.getByRole("button", { name: "Lock", exact: true }).click();

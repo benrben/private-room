@@ -45,6 +45,72 @@ function executablePath(command: string, env: NodeJS.ProcessEnv): string | null 
   try { return realpathSync(candidate); } catch { return null; }
 }
 
+// Native CLIs need the ordinary macOS user identity to resolve first-party
+// Keychain sessions, plus a small set of non-secret process settings for
+// shells and locale handling. Do not inherit the complete Electron process
+// environment: it can contain unrelated provider keys or application secrets.
+const SAFE_AMBIENT_ENV_KEYS = [
+  "HOME",
+  "USER",
+  "LOGNAME",
+  "PATH",
+  "SHELL",
+  "LANG",
+  "LC_ALL",
+  "LC_CTYPE",
+  "TERM",
+  "__CF_USER_TEXT_ENCODING",
+] as const;
+
+const SAFE_EXPLICIT_ENV_KEYS = new Set<string>([
+  ...SAFE_AMBIENT_ENV_KEYS,
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "NO_PROXY",
+  "http_proxy",
+  "https_proxy",
+  "no_proxy",
+  "SSL_CERT_FILE",
+  "SSL_CERT_DIR",
+  "ARCELLE_ROOM_MCP_TOKEN",
+]);
+
+function providerEnvironmentKey(provider: NativeWorkspaceSandbox["provider"], key: string): boolean {
+  if (SAFE_EXPLICIT_ENV_KEYS.has(key)) return true;
+  return provider === "claude"
+    ? key.startsWith("CLAUDE_") || key.startsWith("ANTHROPIC_")
+    : key.startsWith("CODEX_") || key.startsWith("OPENAI_");
+}
+
+function nativeSandboxEnvironment(
+  provider: NativeWorkspaceSandbox["provider"],
+  runtimePath: string,
+  ...explicitSources: Array<NodeJS.ProcessEnv | undefined>
+): NodeJS.ProcessEnv {
+  const username = os.userInfo().username;
+  const env: NodeJS.ProcessEnv = {
+    HOME: os.homedir(),
+    USER: username,
+    LOGNAME: username,
+    PATH: process.env.PATH ?? "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    SHELL: process.env.SHELL ?? "/bin/zsh",
+  };
+  for (const key of SAFE_AMBIENT_ENV_KEYS) {
+    const value = process.env[key];
+    if (value !== undefined) env[key] = value;
+  }
+  for (const source of explicitSources) {
+    if (source === undefined) continue;
+    for (const [key, value] of Object.entries(source)) {
+      if (providerEnvironmentKey(provider, key) && value !== undefined) env[key] = value;
+    }
+  }
+  env.TMPDIR = runtimePath;
+  env.CLAUDE_TMPDIR = runtimePath;
+  env.CLAUDE_CODE_TMPDIR = runtimePath;
+  return env;
+}
+
 export interface NativeWorkspaceSandbox {
   workspacePath: string;
   runtimePath: string;
@@ -146,7 +212,7 @@ export function verifyNativeWorkspaceSandbox(options: NativeWorkspaceSandbox): b
         encoding: "utf8",
         timeout: 5_000,
         cwd: workspace,
-        env: { ...options.env, TMPDIR: canonicalRuntime, CLAUDE_TMPDIR: canonicalRuntime, CLAUDE_CODE_TMPDIR: canonicalRuntime },
+        env: nativeSandboxEnvironment(options.provider, canonicalRuntime, options.env),
       },
     );
     return result.status === 0;
@@ -174,7 +240,7 @@ export function verifyNativeHarnessExecutable(
     ["-p", nativeWorkspaceSeatbeltProfile(options), executable, ...args],
     {
       cwd: canonical(options.workspacePath),
-      env: { ...options.env, TMPDIR: runtime, CLAUDE_TMPDIR: runtime, CLAUDE_CODE_TMPDIR: runtime },
+      env: nativeSandboxEnvironment(options.provider, runtime, options.env),
       stdio: "ignore",
       timeout: 5_000,
     },
@@ -198,7 +264,7 @@ export function spawnWithNativeWorkspaceSandbox(
     ["-p", nativeWorkspaceSeatbeltProfile(options), executable, ...args],
     {
       cwd: spawnOptions.cwd,
-      env: { ...spawnOptions.env, TMPDIR: runtime, CLAUDE_TMPDIR: runtime, CLAUDE_CODE_TMPDIR: runtime },
+      env: nativeSandboxEnvironment(options.provider, runtime, options.env, spawnOptions.env),
       signal: spawnOptions.signal,
       // Give every native harness its own process group. Codex and Claude can
       // create helper processes, so killing only sandbox-exec can otherwise

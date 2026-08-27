@@ -248,7 +248,7 @@ describe("workspace content cutover", () => {
   });
 
   it("keeps workspace MCP writes searchable and uses optimistic trash", async () => {
-    const { root, state, db } = await fixture();
+    const { root, state, db, workspace } = await fixture();
     const bridge = createWorkspaceMcpBridge(state, true);
 
     try {
@@ -261,13 +261,35 @@ describe("workspace content cutover", () => {
       expect(row.original_bytes).toBeNull();
       expect(row.extracted_text).toBe("alpha beta");
 
+      expect(await bridge.call("write", {
+        path: "/notes/today.md",
+        content: "alpha delta",
+      })).toEqual({ path: "/notes/today.md" });
       expect(await bridge.call("edit", {
         path: "/notes/today.md",
-        old_string: "beta",
+        old_string: "delta",
         new_string: "gamma",
       })).toMatchObject({ occurrences: 1 });
       expect(await bridge.call("grep", { path: "/notes", pattern: "gamma" }))
         .toMatchObject({ matches: [{ path: "/notes/today.md", line: 1, text: "alpha gamma" }] });
+
+      const versions = db.prepare(
+        `SELECT v.id, v.cause, length(v.bytes) AS inline_bytes, r.object_id
+         FROM file_versions v
+         JOIN content_object_refs r
+           ON r.owner_type = 'file_version' AND r.owner_id = v.id AND r.role = 'content'
+         WHERE v.file_id = ? ORDER BY v.rowid`,
+      ).all(row.id) as Array<{ id: string; cause: string; inline_bytes: number; object_id: string }>;
+      expect(versions.map(({ cause, inline_bytes }) => ({ cause, inline_bytes }))).toEqual([
+        { cause: "Agent workspace rewrite", inline_bytes: 0 },
+        { cause: "Agent workspace edit", inline_bytes: 0 },
+      ]);
+      expect(versions.every((version) => typeof version.object_id === "string" && version.object_id.length > 0)).toBe(true);
+      expect((await workspace.versionSnapshot(versions[0]!.id)).bytes.toString("utf8")).toBe("alpha beta");
+      expect((await workspace.versionSnapshot(versions[1]!.id)).bytes.toString("utf8")).toBe("alpha delta");
+      await workspace.restoreVersion(versions[0]!.id);
+      expect(await readFile(path.join(root, "notes/today.md"), "utf8")).toBe("alpha beta");
+
       expect((await bridge.call("delete", { path: "/notes/today.md" })).error).toBeUndefined();
       await expect(readFile(path.join(root, "notes/today.md"))).rejects.toThrow();
     } finally {
@@ -276,23 +298,81 @@ describe("workspace content cutover", () => {
   });
 
   it("maps standard Room MCP file mutations onto normal workspace files", async () => {
-    const { root, state, db } = await fixture();
+    const { root, state, db, workspace } = await fixture();
     const bridge = createWorkspaceMcpBridge(state, true);
 
     try {
       expect(await bridge.call("standard_create", { name: "Draft.md", content: "first" }))
         .toMatchObject({ created: true, path: "/Draft.md" });
+      expect(await bridge.call("standard_write", { name: "Draft.md", content: "second" }))
+        .toMatchObject({ path: "/Draft.md" });
       expect(await bridge.call("standard_edit", {
         name: "draft",
-        old_text: "first",
-        new_text: "second",
+        old_text: "second",
+        new_text: "third",
       })).toMatchObject({ path: "/Draft.md", occurrences: 1 });
+      const file = db.prepare("SELECT id FROM files WHERE relative_path = 'Draft.md'").get() as { id: string };
+      const versions = db.prepare(
+        `SELECT v.id, v.cause, length(v.bytes) AS inline_bytes, r.object_id
+         FROM file_versions v
+         JOIN content_object_refs r
+           ON r.owner_type = 'file_version' AND r.owner_id = v.id AND r.role = 'content'
+         WHERE v.file_id = ? ORDER BY v.rowid`,
+      ).all(file.id) as Array<{ id: string; cause: string; inline_bytes: number; object_id: string }>;
+      expect(versions.map(({ cause, inline_bytes }) => ({ cause, inline_bytes }))).toEqual([
+        { cause: "AI rewrite", inline_bytes: 0 },
+        { cause: "AI edit", inline_bytes: 0 },
+      ]);
+      expect(versions.every((version) => typeof version.object_id === "string" && version.object_id.length > 0)).toBe(true);
+      expect((await workspace.versionSnapshot(versions[0]!.id)).bytes.toString("utf8")).toBe("first");
+      expect((await workspace.versionSnapshot(versions[1]!.id)).bytes.toString("utf8")).toBe("second");
+      await workspace.restoreVersion(versions[0]!.id);
       expect(await bridge.call("standard_rename", { name: "Draft.md", new_name: "Final" }))
         .toMatchObject({ path: "/Final.md" });
-      expect(await readFile(path.join(root, "Final.md"), "utf8")).toBe("second");
+      expect(await readFile(path.join(root, "Final.md"), "utf8")).toBe("first");
       expect(await bridge.call("standard_trash", { names: ["Final"] }))
         .toMatchObject({ trashed: ["/Final.md"] });
       await expect(readFile(path.join(root, "Final.md"))).rejects.toThrow();
+    } finally {
+      db.close();
+    }
+  });
+
+  it("moves and renames binary workspace files without text conversion", async () => {
+    const { root, state, db, workspace } = await fixture();
+    const bridge = createWorkspaceMcpBridge(state, true);
+    const bytes = Buffer.from([0x00, 0xff, 0x41, 0x52, 0x43, 0x45, 0x4c, 0x4c, 0x45]);
+
+    try {
+      await workspace.createFile("Uploads/source.pdf", Readable.from([bytes]), "agent");
+      expect(await bridge.call("move", {
+        source_path: "/Uploads/source.pdf",
+        destination_path: "/Filed/source.pdf",
+      })).toEqual({ old_path: "/Uploads/source.pdf", path: "/Filed/source.pdf" });
+      expect(await bridge.call("rename", {
+        source_path: "/Filed/source.pdf",
+        new_name: "signed.pdf",
+      })).toEqual({ old_path: "/Filed/source.pdf", path: "/Filed/signed.pdf" });
+      expect(await readFile(path.join(root, "Filed/signed.pdf"))).toEqual(bytes);
+      await expect(readFile(path.join(root, "Uploads/source.pdf"))).rejects.toThrow();
+    } finally {
+      db.close();
+    }
+  });
+
+  it("rejects move and rename through a read-only workspace bridge", async () => {
+    const { state, db, workspace } = await fixture();
+    const bridge = createWorkspaceMcpBridge(state, false);
+    try {
+      await workspace.createFile("source.pdf", Readable.from([Buffer.from([0xff])]), "agent");
+      expect(await bridge.call("move", {
+        source_path: "/source.pdf",
+        destination_path: "/Filed/source.pdf",
+      })).toEqual({ error: "This workspace bridge is read-only." });
+      expect(await bridge.call("rename", {
+        source_path: "/source.pdf",
+        new_name: "renamed.pdf",
+      })).toEqual({ error: "This workspace bridge is read-only." });
     } finally {
       db.close();
     }

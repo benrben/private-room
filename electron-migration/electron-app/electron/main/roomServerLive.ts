@@ -216,6 +216,16 @@ export function roomServerDispatcherFactory(
   lanes: WebLanes,
   runOptions?: {
     workspace?: RoomToolDispatcherOptions["workspace"];
+    /**
+     * Give this one short-lived bridge controlled write access to a normal
+     * workspace room. The persistent Leash bridge deliberately omits this:
+     * it has no owning chat turn or harness rollback boundary.
+     *
+     * The request is always clamped by the room's writer lease. A caller
+     * cannot turn a read-only duplicate/process view into a writer merely by
+     * setting this flag.
+     */
+    workspaceWriteEnabled?: boolean;
     privacyBypass?: boolean;
   },
 ) => ToolDispatcher {
@@ -237,13 +247,17 @@ export function roomServerDispatcherFactory(
       activePolicy: realActivePolicy,
       webThrottle: createWebThrottle(),
       execDeps: liveExecToolDeps(state, emit, services === undefined ? {} : { services }),
-      // The persistent bridge is read-only. A write-enabled per-run bridge is
-      // created only after HarnessOrchestrator completes rollback baselines.
+      // The persistent bridge is read-only. Short-lived chat turns may opt in
+      // to controlled WorkspaceService writes; native harnesses instead pass
+      // their own baseline-protected workspace bridge above.
       workspace: runOptions.workspace !== undefined
         ? runOptions.workspace
         : state.room?.workspace === undefined
           ? null
-          : createWorkspaceMcpBridge(state, false),
+          : createWorkspaceMcpBridge(
+              state,
+              runOptions.workspaceWriteEnabled === true && state.room.readOnly !== true,
+            ),
     };
     return withCatalogTelemetry(
       new RoomToolDispatcher(liveLanesDispatcherOptions(base, readLiveLanes)),

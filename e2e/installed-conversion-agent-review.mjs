@@ -2,7 +2,7 @@
 
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -32,6 +32,16 @@ const temporary = await mkdtemp(path.join(os.tmpdir(), "arcelle-installed-conver
 const sourcePath = path.join(temporary, "Legacy Agent Review.roomai");
 const workspacePath = path.join(temporary, "Converted Agent Review");
 let app;
+
+async function missing(candidate) {
+  try {
+    await stat(candidate);
+    return false;
+  } catch (error) {
+    if (error?.code === "ENOENT") return true;
+    throw error;
+  }
+}
 
 function log(message) {
   process.stdout.write(`[conversion-agent-review] ${message}\n`);
@@ -64,11 +74,16 @@ try {
     name: "Legacy Agent Review",
     format: "sealed-db",
   });
-  const legacyFile = await invoke(window, "save_generated_file", {
-    name: "notes.txt",
-    content: "Converted baseline.\n",
-  });
-  assert.equal(typeof legacyFile.id, "string");
+  const fixtures = [
+    ["notes.txt", "Converted baseline.\n"],
+    ["rename-me.txt", "Rename baseline.\n"],
+    ["move-me.txt", "Move baseline.\n"],
+    ["delete-me.txt", "Delete baseline.\n"],
+  ];
+  for (const [name, content] of fixtures) {
+    const legacyFile = await invoke(window, "save_generated_file", { name, content });
+    assert.equal(typeof legacyFile.id, "string");
+  }
   await invoke(window, "close_room");
 
   const conversion = await invoke(window, "convert_legacy_room", {
@@ -76,9 +91,11 @@ try {
     password,
     destinationPath: workspacePath,
   });
-  assert.equal(conversion.convertedFiles, 1);
+  assert.equal(conversion.convertedFiles, fixtures.length);
   await stat(path.join(workspacePath, ".arcelle", "room.db"));
   assert.equal(await readFile(path.join(workspacePath, "notes.txt"), "utf8"), "Converted baseline.\n");
+  const privateCanaryPath = path.join(workspacePath, ".arcelle", "agent-private-canary.txt");
+  await writeFile(privateCanaryPath, "PRIVATE CANARY\n", { mode: 0o600 });
   await invoke(window, "open_room", { path: workspacePath, password });
   log("legacy room converted and opened as a normal-files workspace");
 
@@ -103,47 +120,99 @@ try {
       }
     });
   });
-  const started = await invoke(window, "harness_start", {
-    provider,
-    ...(model ? { model } : {}),
-    privacyMode,
-    writeEnabled: true,
-    text:
-      "Use your workspace file tools. Read notes.txt, then append the exact line " +
-      "REAL AGENT EDIT CONFIRMED. Do not change any other file.",
-  });
-  assert.equal(typeof started.runId, "string");
-  await window.waitForFunction(
-    (runId) => globalThis.__conversionAgentEvents.some(
-      (event) => event.runId === runId && (event.type === "run_completed" || event.type === "run_failed"),
-    ),
-    started.runId,
-    { timeout: 10 * 60_000 },
+  const runAgent = async (text) => {
+    const started = await invoke(window, "harness_start", {
+      provider,
+      ...(model ? { model } : {}),
+      privacyMode,
+      writeEnabled: true,
+      text,
+    });
+    assert.equal(typeof started.runId, "string");
+    await window.waitForFunction(
+      (runId) => globalThis.__conversionAgentEvents.some(
+        (event) => event.runId === runId && (event.type === "run_completed" || event.type === "run_failed"),
+      ),
+      started.runId,
+      { timeout: 10 * 60_000 },
+    );
+    const events = await window.evaluate(() => globalThis.__conversionAgentEvents);
+    const runEvents = events.filter((event) => event.runId === started.runId);
+    log(`normalized events: ${runEvents.map((event) => {
+      if (event.type === "tool_started" || event.type === "tool_completed") {
+        return `${event.type}:${event.tool || "unknown"}${event.error ? `:${event.error}` : ""}`;
+      }
+      if (event.type === "run_completed") return `${event.type}:${event.status}`;
+      return event.type;
+    }).join(", ")}`);
+    const terminal = runEvents.findLast(
+      (event) => event.type === "run_completed" || event.type === "run_failed",
+    );
+    assert.equal(terminal?.type, "run_completed", JSON.stringify(terminal));
+    return started;
+  };
+
+  // Keep deletion in a dedicated real-agent turn. Small local models and
+  // native agents otherwise sometimes decide that four completed operations
+  // are enough and merely describe the fifth. This directly proves that the
+  // provider can discover and execute the recoverable delete tool.
+  const deleteTool = provider === "ollama-local"
+    ? { name: "workspace_delete", arguments: { path: "delete-me.txt" } }
+    : { name: "mcp__room__trash_files", arguments: { names: ["delete-me.txt"] } };
+  const deleteRun = await runAgent(
+    `Call the registered tool ${deleteTool.name} exactly once with JSON ${JSON.stringify(deleteTool.arguments)}. ` +
+      "This must move delete-me.txt to recoverable Arcelle Trash. Do not move, rename, recreate, or only describe the file. Do not change any other file.",
   );
-  const events = await window.evaluate(() => globalThis.__conversionAgentEvents);
+  assert.equal(await missing(path.join(workspacePath, "delete-me.txt")), true);
+
+  const operationRun = await runAgent(
+    "Use your own workspace file tools and complete every operation below. " +
+      "(1) Append the exact line REAL AGENT EDIT CONFIRMED. to notes.txt. " +
+      "(2) Create Organized/new-file.txt containing exactly NEW FILE CONFIRMED. followed by a newline. " +
+      "(3) Rename rename-me.txt to Organized/renamed.txt without changing its bytes. " +
+      "(4) Move move-me.txt to Archive/move-me.txt without changing its bytes. " +
+      "Do not change any other file. Complete the file operations; do not only describe them.",
+  );
   const approvalErrors = await window.evaluate(() => globalThis.__conversionAgentApprovalErrors);
-  const runEvents = events.filter((event) => event.runId === started.runId);
-  log(`normalized events: ${runEvents.map((event) => {
-    if (event.type === "tool_started" || event.type === "tool_completed") {
-      return `${event.type}:${event.tool || "unknown"}`;
-    }
-    if (event.type === "run_completed") return `${event.type}:${event.status}`;
-    return event.type;
-  }).join(", ")}`);
   assert.deepEqual(approvalErrors, []);
-  const terminal = runEvents.findLast(
-    (event) => event.type === "run_completed" || event.type === "run_failed",
-  );
-  assert.equal(terminal?.type, "run_completed", JSON.stringify(terminal));
   assert.match(
     await readFile(path.join(workspacePath, "notes.txt"), "utf8"),
     /REAL AGENT EDIT CONFIRMED/,
   );
-  log(`real ${provider} agent edited the converted normal file${model ? ` with ${model}` : ""}`);
+  assert.equal(await readFile(path.join(workspacePath, "Organized", "new-file.txt"), "utf8"), "NEW FILE CONFIRMED.\n");
+  assert.equal(await readFile(path.join(workspacePath, "Organized", "renamed.txt"), "utf8"), "Rename baseline.\n");
+  assert.equal(await readFile(path.join(workspacePath, "Archive", "move-me.txt"), "utf8"), "Move baseline.\n");
+  assert.equal(await missing(path.join(workspacePath, "rename-me.txt")), true);
+  assert.equal(await missing(path.join(workspacePath, "move-me.txt")), true);
+  assert.equal(await readFile(privateCanaryPath, "utf8"), "PRIVATE CANARY\n");
+  const history = await invoke(window, "harness_list_runs");
+  const durableOperation = history.find((run) => run.runId === operationRun.runId);
+  const durableDelete = history.find((run) => run.runId === deleteRun.runId);
+  assert.equal(durableOperation?.writeEnabled, true);
+  assert.equal(durableOperation?.baselineCompleted, true);
+  assert.equal(durableDelete?.writeEnabled, true);
+  assert.equal(durableDelete?.baselineCompleted, true);
+  const changeKinds = new Set([
+    ...(durableOperation?.changes.map((change) => change.change) ?? []),
+    ...(durableDelete?.changes.map((change) => change.change) ?? []),
+  ]);
+  for (const expected of ["created", "modified", "moved", "deleted"]) {
+    assert.equal(changeKinds.has(expected), true, JSON.stringify({ durableOperation, durableDelete }));
+  }
+  log(`real ${provider} agent edited, created, renamed, moved, and deleted normal files${model ? ` with ${model}` : ""}`);
 
-  const rolledBack = await invoke(window, "harness_rollback", { runId: started.runId });
-  assert.deepEqual(rolledBack.conflicts, []);
+  const operationRollback = await invoke(window, "harness_rollback", { runId: operationRun.runId });
+  assert.deepEqual(operationRollback.conflicts, []);
+  const deleteRollback = await invoke(window, "harness_rollback", { runId: deleteRun.runId });
+  assert.deepEqual(deleteRollback.conflicts, []);
   assert.equal(await readFile(path.join(workspacePath, "notes.txt"), "utf8"), "Converted baseline.\n");
+  assert.equal(await readFile(path.join(workspacePath, "rename-me.txt"), "utf8"), "Rename baseline.\n");
+  assert.equal(await readFile(path.join(workspacePath, "move-me.txt"), "utf8"), "Move baseline.\n");
+  assert.equal(await readFile(path.join(workspacePath, "delete-me.txt"), "utf8"), "Delete baseline.\n");
+  assert.equal(await missing(path.join(workspacePath, "Organized", "new-file.txt")), true);
+  assert.equal(await missing(path.join(workspacePath, "Organized", "renamed.txt")), true);
+  assert.equal(await missing(path.join(workspacePath, "Archive", "move-me.txt")), true);
+  assert.equal(await readFile(privateCanaryPath, "utf8"), "PRIVATE CANARY\n");
   assert.deepEqual(pageErrors, []);
   log("rollback restored the converted file exactly; PASS");
 } finally {

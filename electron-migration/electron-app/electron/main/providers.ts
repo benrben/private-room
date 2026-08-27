@@ -266,6 +266,30 @@ let fetchLockChain: Promise<void> = Promise.resolve();
 // secrets process-local; production continues to use the real generic-password
 // item below.
 const e2eProviderKeys = new Map<string, string>();
+const providerKeySessionCache = new Map<string, { key?: string; error?: string }>();
+
+/**
+ * Read one provider credential at most once per application process.
+ *
+ * Ad-hoc signed development/release builds can trigger a macOS Keychain ACL
+ * sheet. Several capability surfaces ask only whether a provider is connected;
+ * without this session cache they can show the same native sheet repeatedly.
+ * A later explicit store/delete replaces the cached result immediately.
+ */
+export function readProviderKeyOnce(provider: string, reader: (provider: string) => string): string {
+  const cached = providerKeySessionCache.get(provider);
+  if (cached?.key !== undefined) return cached.key;
+  if (cached?.error !== undefined) throw new Error(cached.error);
+  try {
+    const key = reader(provider);
+    providerKeySessionCache.set(provider, { key });
+    return key;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "The provider credential is unavailable.";
+    providerKeySessionCache.set(provider, { error: message });
+    throw new Error(message);
+  }
+}
 
 async function withFetchLock<T>(fn: () => Promise<T>): Promise<T> {
   const previous = fetchLockChain;
@@ -294,6 +318,7 @@ export function resetProviderStateForTests(): void {
   catalogAttemptedAtMs = null;
   fetchLockChain = Promise.resolve();
   e2eProviderKeys.clear();
+  providerKeySessionCache.clear();
 }
 
 // ────────────────────────────────────────────── macOS Keychain (plain item)
@@ -581,7 +606,7 @@ export const defaultProviderDeps: ProviderDeps = {
       if (key === undefined) throw new Error(`No API key is saved for ${provider}. [code ${ERR_SEC_ITEM_NOT_FOUND}]`);
       return key;
     }
-    return readKey(provider);
+    return readProviderKeyOnce(provider, readKey);
   },
   storeKey: (provider, key) => {
     if (process.env.ARCELLE_E2E === "1") {
@@ -589,6 +614,7 @@ export const defaultProviderDeps: ProviderDeps = {
       return;
     }
     storeKey(provider, key);
+    providerKeySessionCache.set(provider, { key });
   },
   deleteKey: (provider) => {
     if (process.env.ARCELLE_E2E === "1") {
@@ -596,6 +622,7 @@ export const defaultProviderDeps: ProviderDeps = {
       return;
     }
     deleteKey(provider);
+    providerKeySessionCache.delete(provider);
   },
   fetchJson: realFetchJson,
 };

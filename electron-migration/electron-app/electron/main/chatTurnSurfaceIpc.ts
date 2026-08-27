@@ -1,7 +1,7 @@
 /** Main chat-turn and context-handoff IPC over a per-turn room MCP bridge. */
 
 import type { IpcMain, IpcMainInvokeEvent } from "electron";
-import type { RoomManagerState } from "./roomManager.js";
+import type { Room, RoomManagerState } from "./roomManager.js";
 import type { EventSender } from "./turn.js";
 import { ask, handoffChat, type AskRequest } from "./turnEngine.js";
 import { liveTurnRoomSource } from "./liveContext.js";
@@ -24,6 +24,26 @@ function object(value: unknown): Record<string, unknown> {
   return typeof value === "object" && value !== null ? value as Record<string, unknown> : {};
 }
 
+/**
+ * A main Assistant turn may mutate normal files only while this process owns
+ * the workspace writer lease. Sealed database rooms have no normal-file
+ * backend, and duplicate/concurrently-open workspace rooms remain read-only.
+ */
+export function chatTurnWorkspaceWriteEnabled(room: Room): boolean {
+  return room.workspace !== undefined && room.readOnly !== true;
+}
+
+/** One source of truth for the per-ask bridge grants derived from user input. */
+export function chatTurnBridgeRunOptions(
+  room: Room,
+  privacyBypass: boolean,
+): { workspaceWriteEnabled: boolean; privacyBypass: boolean } {
+  return {
+    workspaceWriteEnabled: chatTurnWorkspaceWriteEnabled(room),
+    privacyBypass,
+  };
+}
+
 export function registerChatTurnSurfaceIpc(
   ipcMain: Pick<IpcMain, "handle">,
   state: RoomManagerState,
@@ -42,7 +62,17 @@ export function registerChatTurnSurfaceIpc(
       ? { kind: "LocalEngine" as const }
       : { kind: "CloudEngine" as const };
     const online = webAccessEnabled(open.conn);
-    const dispatcher = roomServerDispatcherFactory(state, emit, services)(online, scope, WEB_LANES_ALL);
+    // This bridge exists only for this user-started chat turn. Workspace
+    // writes still go through the path-safe, atomic WorkspaceService and the
+    // factory clamps the grant off when another process owns the room lease.
+    // The same explicit one-turn privacy approval used by ask() must also
+    // reach its file tools; otherwise their results stay redacted mid-turn.
+    const dispatcher = roomServerDispatcherFactory(state, emit, services)(
+      online,
+      scope,
+      WEB_LANES_ALL,
+      chatTurnBridgeRunOptions(open, args.privacyBypass === true),
+    );
     let bridge: RunningBridge | null = null;
     try {
       bridge = await createRoomBridge({ scope, dispatcher });

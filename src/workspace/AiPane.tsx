@@ -810,7 +810,10 @@ function HarnessRunner({ s, runs }: { s: WSState; runs: HarnessUiRun[] }) {
   const [, selectedModel] = splitExternalModel(s.model ?? "");
   const [model, setModel] = useState(selectedModel ?? "default");
   const [prompt, setPrompt] = useState("");
-  const [writeEnabled, setWriteEnabled] = useState(false);
+  // Workspace agents are primarily used to do file work. Start with the
+  // rollback-protected write capability enabled; users can still explicitly
+  // switch a run to read-only before starting it.
+  const [writeEnabled, setWriteEnabled] = useState(true);
   const [starting, setStarting] = useState(false);
   const [rollbackBusy, setRollbackBusy] = useState<string | null>(null);
   const [restoreConflicts, setRestoreConflicts] = useState<Record<string, string[]>>({});
@@ -929,7 +932,7 @@ function HarnessRunner({ s, runs }: { s: WSState; runs: HarnessUiRun[] }) {
           ? "Local Ollama works through Arcelle's controlled file backend. It receives no database keys or unrestricted system paths."
           : s.privacyOn
           ? "Cloud Privacy is on. The agent works in a temporary redacted copy; protected values and original binary files stay on this Mac."
-          : "Cloud Privacy is off. The cloud agent can receive the real room files. Normal workspace files are readable files on disk; the private .arcelle folder stays blocked."}
+          : "Cloud Privacy is off. The cloud agent can receive the real room files. File changes are enabled with an encrypted rollback baseline; the private .arcelle folder stays blocked."}
       </p>
       <div className="harness-compose">
         <div className="harness-options">

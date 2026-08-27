@@ -18,11 +18,50 @@ import {
 } from "./seatbelt.js";
 import type { HarnessContext, HarnessEvent, HarnessInput, HarnessName, HarnessRun, HarnessRuntime } from "./types.js";
 
-const TOOLS: ToolSpec[] = ["list", "read", "write", "edit", "delete", "glob", "grep"].map((operation) => ({
-  name: `workspace_${operation}`,
-  description: `${operation} normal files through Arcelle's restricted workspace service.`,
-  inputSchema: { type: "object", additionalProperties: true },
-}));
+const TOOLS: ToolSpec[] = [
+  ...["list", "read", "write", "edit", "delete", "glob", "grep"].map((operation): ToolSpec => ({
+    name: `workspace_${operation}`,
+    description: `${operation} normal files through Arcelle's restricted workspace service.`,
+    inputSchema: { type: "object", additionalProperties: true },
+  })),
+  {
+    name: "workspace_move",
+    description: "Move or rename exactly one normal file to an exact destination path.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        source_path: { type: "string", minLength: 1, description: "Existing path relative to the exposed workspace root." },
+        destination_path: { type: "string", minLength: 1, description: "Exact destination path, including the file name, relative to the exposed workspace root." },
+      },
+      required: ["source_path", "destination_path"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "workspace_rename",
+    description: "Rename exactly one normal file inside its current folder.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        source_path: { type: "string", minLength: 1, description: "Existing path relative to the exposed workspace root." },
+        new_name: { type: "string", minLength: 1, description: "New base file name only, with no slash or folder path." },
+      },
+      required: ["source_path", "new_name"],
+      additionalProperties: false,
+    },
+  },
+];
+
+const WORKSPACE_MUTATIONS = new Set(["write", "edit", "delete", "move", "rename"]);
+const STANDARD_MUTATION_TOOLS = new Set([
+  "create_file", "write_file", "edit_file", "rename_file", "move_file", "trash_files",
+  "standard_create", "standard_write", "standard_edit",
+  "standard_rename", "standard_move", "standard_trash",
+]);
+
+function isWorkspaceMutation(name: string, operation: string): boolean {
+  return WORKSPACE_MUTATIONS.has(operation) || STANDARD_MUTATION_TOOLS.has(name);
+}
 
 const DELEGATE_TOOL: ToolSpec = {
   name: "arcelle_delegate",
@@ -50,8 +89,65 @@ export class AsyncWriteGate {
 }
 
 export interface WorkspaceCalls {
-  call(operation: string, args: Record<string, unknown>): Promise<Record<string, unknown>>;
+  call(
+    operation: string,
+    args: Record<string, unknown>,
+    redactedMirrorArgs?: Record<string, unknown>,
+  ): Promise<Record<string, unknown>>;
 }
+
+const CLOUD_REAL_METADATA_OPERATIONS = new Set([
+  "standard_rename",
+  "standard_move",
+  "standard_trash",
+]);
+
+export interface CloudPrivacyWorkspaceOptions {
+  /** Deep Agents use these exact tools for metadata-only binary organization. */
+  routeExactMoveRenameToReal?: boolean;
+}
+
+/**
+ * Cloud agents work on redacted mirror bytes. The three standard organization
+ * tools may operate on the real WorkspaceService because they change only a
+ * file's path/trash state and return metadata, never original content.
+ *
+ * The caller must supply a rollback-baseline-gated real backend. Exact
+ * `workspace_*` operations stay on the mirror by default. Deep Agents may opt
+ * exact move/rename into the metadata route for binary organization; their
+ * read/write/edit operations still pass through mirror validation.
+ */
+export function createCloudPrivacyWorkspaceBackend(
+  mirror: WorkspaceCalls,
+  baselineGatedReal: WorkspaceCalls,
+  options: CloudPrivacyWorkspaceOptions = {},
+): WorkspaceCalls {
+  return {
+    async call(operation, args, redactedMirrorArgs = args) {
+      const routeReal = CLOUD_REAL_METADATA_OPERATIONS.has(operation)
+        || (options.routeExactMoveRenameToReal === true && (operation === "move" || operation === "rename"));
+      if (!routeReal) {
+        return mirror.call(operation, redactedMirrorArgs);
+      }
+      const payload = await baselineGatedReal.call(operation, args);
+      if (typeof payload.error === "string") {
+        return { error: safeProviderFailure("provider", "tool") };
+      }
+      if (operation === "standard_trash") {
+        return {
+          trashed: Array.isArray(payload.trashed)
+            ? payload.trashed.filter((value): value is string => typeof value === "string")
+            : [],
+        };
+      }
+      return {
+        ...(typeof payload.old_path === "string" ? { old_path: payload.old_path } : {}),
+        ...(typeof payload.path === "string" ? { path: payload.path } : {}),
+      };
+    },
+  };
+}
+
 function result(payload: Record<string, unknown>): ToolCallResult {
   const isError = typeof payload.error === "string";
   return { isError, content: [{ type: "text", text: JSON.stringify(payload) }] };
@@ -82,13 +178,13 @@ export class WorkspaceDispatcher implements ToolDispatcher {
         try { return await this.base!.callTool(scope, name, args); }
         catch { return result({ error: safeProviderFailure("provider", "tool") }); }
       };
-      return ["write", "edit", "delete"].includes(operation)
+      return isWorkspaceMutation(name, operation)
         ? this.writeGate.run(call)
         : call();
     }
     if (!TOOLS.some((tool) => tool.name === name)) return result({ error: `unknown tool: ${name}` });
     const call = () => this.backend.call(operation, args);
-    return result(["write", "edit", "delete"].includes(operation) ? await this.writeGate.run(call) : await call());
+    return result(isWorkspaceMutation(name, operation) ? await this.writeGate.run(call) : await call());
   }
 }
 
@@ -169,6 +265,42 @@ export function createMirrorWorkspaceBackend(root: string, writeEnabled: boolean
             });
           }
           return { matches };
+        }
+        if (operation === "move" || operation === "rename") {
+          writable();
+          const source = await absolute(args.source_path);
+          const sourceStat = await lstat(source.absolute);
+          if (!sourceStat.isFile()) throw new Error("Workspace move accepts regular files only.");
+
+          let destinationRelative: string;
+          if (operation === "move") {
+            destinationRelative = relativeArg(args.destination_path);
+          } else {
+            const newName = typeof args.new_name === "string" ? args.new_name.trim() : "";
+            if (
+              newName === "" || newName === "." || newName === ".." ||
+              newName.includes("/") || newName.includes("\\") || newName.includes("\0") ||
+              newName.toLocaleLowerCase("en-US") === ".arcelle"
+            ) {
+              throw new Error("The new name must be one safe file name.");
+            }
+            const parent = path.posix.dirname(source.relative);
+            destinationRelative = parent === "." ? newName : path.posix.join(parent, newName);
+          }
+          const destination = await absolute(destinationRelative);
+          const destinationStat = await lstat(destination.absolute).catch((error: NodeJS.ErrnoException) => {
+            if (error.code === "ENOENT") return null;
+            throw error;
+          });
+          if (
+            destinationStat !== null &&
+            (destinationStat.dev !== sourceStat.dev || destinationStat.ino !== sourceStat.ino)
+          ) {
+            throw new Error("A workspace file already exists at the destination.");
+          }
+          await mkdir(path.dirname(destination.absolute), { recursive: true });
+          await rename(source.absolute, destination.absolute);
+          return { old_path: `/${source.relative}`, path: `/${destination.relative}` };
         }
         const requested = await absolute(args.path ?? args.name);
         if (operation === "read") {
@@ -269,9 +401,40 @@ export class RestrictedLegacyCliRuntime implements HarnessRuntime {
     await mkdir(path.join(isolated, ".arcelle"), { recursive: true, mode: 0o700 });
     const realRoot = room.descriptor.rootPath;
     const isRealWorkspace = realRoot !== null && path.resolve(context.workspacePath) === path.resolve(realRoot);
-    const backend = isRealWorkspace
-      ? createWorkspaceMcpBridge(this.state, context.writeEnabled)
-      : createMirrorWorkspaceBackend(context.workspacePath, context.writeEnabled);
+    let backend: WorkspaceCalls;
+    if (isRealWorkspace) {
+      backend = createWorkspaceMcpBridge(this.state, context.writeEnabled);
+    } else {
+      const mirror = createMirrorWorkspaceBackend(context.workspacePath, context.writeEnabled);
+      if (context.privacyMode !== "cloud-redacted") {
+        backend = mirror;
+      } else {
+        if (room.descriptor.roomId !== context.roomId) {
+          throw new Error("The restricted Cloud Privacy bridge requires the matching room.");
+        }
+        if (context.writeEnabled) {
+          const baselineRunId = context.baselineRunId ?? context.runId;
+          const baseline = room.conn.prepare(
+            `SELECT baseline_completed, status, write_enabled
+             FROM agent_runs WHERE run_id = ? AND room_id = ?`,
+          ).get(baselineRunId, context.roomId) as {
+            baseline_completed: number;
+            status: string;
+            write_enabled: number;
+          } | undefined;
+          if (
+            room.readOnly === true || baseline === undefined ||
+            baseline.baseline_completed !== 1 || baseline.status !== "running" || baseline.write_enabled !== 1
+          ) {
+            throw new Error("The Cloud Privacy organization bridge cannot start before its rollback baseline is complete.");
+          }
+        }
+        backend = createCloudPrivacyWorkspaceBackend(
+          mirror,
+          createWorkspaceMcpBridge(this.state, context.writeEnabled),
+        );
+      }
+    }
     const events = new AsyncEventQueue<HarnessEvent>();
     const activeChildren = new Set<HarnessRun>();
     let parentCancelled = false;
@@ -378,6 +541,7 @@ export class RestrictedLegacyCliRuntime implements HarnessRuntime {
     const child = await runtime.startTurn({
       ...parent,
       runId: `${parent.runId}-child-${suffix}`,
+      baselineRunId: parent.baselineRunId ?? parent.runId,
       runtimePath: path.join(parent.runtimePath, "children", suffix),
       writeEnabled: specialist.permission === "write",
       systemPrompt: [

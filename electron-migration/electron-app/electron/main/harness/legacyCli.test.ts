@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import { mkdtemp, rm } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
@@ -8,8 +8,16 @@ import { afterEach, describe, expect, it } from "vitest";
 import { createRoomManagerState } from "../roomManager.js";
 import { createWorkspaceRoom } from "../workspace/roomLayout.js";
 import { WorkspaceService } from "../workspace/workspaceService.js";
+import { RunProtection } from "./runProtection.js";
 import type { NativeWorkspaceSandbox } from "./seatbelt.js";
-import { AsyncWriteGate, RestrictedLegacyCliRuntime, RuntimeWithFallback, WorkspaceDispatcher } from "./legacyCli.js";
+import {
+  AsyncWriteGate,
+  createCloudPrivacyWorkspaceBackend,
+  createMirrorWorkspaceBackend,
+  RestrictedLegacyCliRuntime,
+  RuntimeWithFallback,
+  WorkspaceDispatcher,
+} from "./legacyCli.js";
 import type { ToolDispatcher } from "../mcpBridge.js";
 import type { HarnessContext, HarnessRun, HarnessRuntime } from "./types.js";
 
@@ -152,6 +160,15 @@ describe("RestrictedLegacyCliRuntime", () => {
     const f = await fixture();
     let spawned = 0;
     try {
+      const mirror = path.join(f.root, "redacted-mirror");
+      await mkdir(mirror);
+      const parentContext: HarnessContext = {
+        runId: "parent", roomId: f.created.descriptor.roomId, provider: "codex", model: "gpt-test",
+        workspacePath: mirror, runtimePath: path.join(f.root, "runtime-delegate"), privacyMode: "cloud-redacted",
+        writeEnabled: true, exposureVerified: true,
+      };
+      await new RunProtection(f.state.room!.workspace!, f.created.descriptor.roomId)
+        .createBaseline(parentContext);
       const runtime = new RestrictedLegacyCliRuntime("codex", f.state, {
         executable: "/fake/codex",
         available: () => true,
@@ -174,7 +191,7 @@ describe("RestrictedLegacyCliRuntime", () => {
                   jsonrpc: "2.0",
                   id: 1,
                   method: "tools/call",
-                  params: { name: "arcelle_delegate", arguments: { agent_id: "chat.web", task: "research this" } },
+                  params: { name: "arcelle_delegate", arguments: { agent_id: "files.read", task: "organize this" } },
                 }),
               });
               const body = await response.json() as { result?: { content?: Array<{ text?: string }> } };
@@ -187,18 +204,16 @@ describe("RestrictedLegacyCliRuntime", () => {
           return process.child;
         },
       });
-      const run = await runtime.startTurn({
-        runId: "parent", roomId: f.created.descriptor.roomId, provider: "codex", model: "gpt-test",
-        workspacePath: f.roomPath, runtimePath: path.join(f.root, "runtime-delegate"), privacyMode: "cloud-direct",
-        writeEnabled: true, exposureVerified: true,
-      }, { text: "delegate" });
+      const run = await runtime.startTurn(parentContext, { text: "delegate" });
       const events = [];
       for await (const event of run.events) events.push(event);
       expect(spawned).toBe(2);
-      expect(events).toContainEqual({ type: "agent_started", runId: "parent", agentId: "chat.web", label: "Web agent" });
-      expect(events).toContainEqual({ type: "text_delta", runId: "parent", text: "specialist answer", agentId: "chat.web" });
-      expect(events).toContainEqual({ type: "agent_completed", runId: "parent", agentId: "chat.web" });
+      expect(events).toContainEqual({ type: "agent_started", runId: "parent", agentId: "files.read", label: "File agent" });
+      expect(events).toContainEqual({ type: "text_delta", runId: "parent", text: "specialist answer", agentId: "files.read" });
+      expect(events).toContainEqual({ type: "agent_completed", runId: "parent", agentId: "files.read" });
       expect(events.at(-1)).toEqual({ type: "run_completed", runId: "parent", status: "completed" });
+      expect(f.created.db.prepare("SELECT run_id FROM agent_runs ORDER BY run_id").all())
+        .toEqual([{ run_id: "parent" }]);
     } finally {
       f.created.db.close();
     }
@@ -220,6 +235,243 @@ describe("RestrictedLegacyCliRuntime", () => {
     releaseFirst();
     await Promise.all([first, second]);
     expect(sequence).toEqual(["first-start", "parallel-read", "first-end", "second"]);
+  });
+
+  it("exposes exact move and rename contracts and serializes both mutations", async () => {
+    const sequence: string[] = [];
+    let releaseMove!: () => void;
+    const dispatcher = new WorkspaceDispatcher({
+      call: async (operation) => {
+        sequence.push(`${operation}-start`);
+        if (operation === "move") {
+          await new Promise<void>((resolve) => { releaseMove = resolve; });
+        }
+        sequence.push(`${operation}-end`);
+        return { operation };
+      },
+    }, new AsyncWriteGate());
+    const scope = { kind: "CloudEngine" as const };
+    const specs = dispatcher.listTools(scope);
+    const move = specs.find((tool) => tool.name === "workspace_move")!;
+    const rename = specs.find((tool) => tool.name === "workspace_rename")!;
+    expect(move.inputSchema).toMatchObject({
+      required: ["source_path", "destination_path"],
+      additionalProperties: false,
+    });
+    expect(Object.keys(move.inputSchema.properties as Record<string, unknown>))
+      .toEqual(["source_path", "destination_path"]);
+    expect(rename.inputSchema).toMatchObject({
+      required: ["source_path", "new_name"],
+      additionalProperties: false,
+    });
+    expect(Object.keys(rename.inputSchema.properties as Record<string, unknown>))
+      .toEqual(["source_path", "new_name"]);
+
+    const moving = dispatcher.callTool(scope, "workspace_move", {
+      source_path: "one.txt", destination_path: "Archive/one.txt",
+    });
+    const renaming = dispatcher.callTool(scope, "workspace_rename", {
+      source_path: "two.txt", new_name: "renamed.txt",
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(sequence).toEqual(["move-start"]);
+    releaseMove();
+    await Promise.all([moving, renaming]);
+    expect(sequence).toEqual(["move-start", "move-end", "rename-start", "rename-end"]);
+  });
+
+  it("serializes every standard base-dispatcher file mutation", async () => {
+    const sequence: string[] = [];
+    let releaseFirst!: () => void;
+    const mutationNames = [
+      "create_file", "write_file", "edit_file", "rename_file", "move_file", "trash_files",
+    ];
+    const base: ToolDispatcher = {
+      listTools: () => mutationNames.map((name) => ({ name, inputSchema: { type: "object" } })),
+      callTool: async (_scope, name) => {
+        sequence.push(`${name}-start`);
+        if (name === "create_file") {
+          await new Promise<void>((resolve) => { releaseFirst = resolve; });
+        }
+        sequence.push(`${name}-end`);
+        return { isError: false, content: [{ type: "text", text: name }] };
+      },
+    };
+    const dispatcher = new WorkspaceDispatcher(
+      { call: async () => ({ error: "unused" }) },
+      new AsyncWriteGate(),
+      undefined,
+      base,
+    );
+    const scope = { kind: "CloudEngine" as const };
+    const first = dispatcher.callTool(scope, "create_file", { name: "one.txt" });
+    const rest = mutationNames.slice(1).map((name) => dispatcher.callTool(scope, name, {}));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(sequence).toEqual(["create_file-start"]);
+    releaseFirst();
+    await Promise.all([first, ...rest]);
+    expect(sequence).toEqual(mutationNames.flatMap((name) => [`${name}-start`, `${name}-end`]));
+  });
+
+  it("moves and renames cloud-mirror files without replacing an existing destination", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "arcelle-mirror-backend-"));
+    roots.push(root);
+    await writeFile(path.join(root, "notes.txt"), "private redacted notes", "utf8");
+    await writeFile(path.join(root, "occupied.txt"), "keep me", "utf8");
+    const backend = createMirrorWorkspaceBackend(root, true);
+
+    expect(await backend.call("move", {
+      source_path: "notes.txt", destination_path: "Archive/notes.txt",
+    })).toEqual({ old_path: "/notes.txt", path: "/Archive/notes.txt" });
+    expect(await backend.call("rename", {
+      source_path: "/Archive/notes.txt", new_name: "final.md",
+    })).toEqual({ old_path: "/Archive/notes.txt", path: "/Archive/final.md" });
+    expect(await readFile(path.join(root, "Archive", "final.md"), "utf8"))
+      .toBe("private redacted notes");
+    await expect(lstat(path.join(root, "notes.txt"))).rejects.toThrow();
+
+    const collision = await backend.call("move", {
+      source_path: "Archive/final.md", destination_path: "occupied.txt",
+    });
+    expect(collision.error).toEqual(expect.any(String));
+    expect(await readFile(path.join(root, "Archive", "final.md"), "utf8"))
+      .toBe("private redacted notes");
+    expect(await readFile(path.join(root, "occupied.txt"), "utf8")).toBe("keep me");
+  });
+
+  it("blocks read-only, private, traversal, directory, and symlink mirror moves", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "arcelle-mirror-safety-"));
+    const outside = await mkdtemp(path.join(os.tmpdir(), "arcelle-mirror-outside-"));
+    roots.push(root, outside);
+    await writeFile(path.join(root, "safe.txt"), "safe", "utf8");
+    await mkdir(path.join(root, "folder"));
+    await mkdir(path.join(root, ".arcelle"));
+    await symlink(outside, path.join(root, "escape"));
+    const writable = createMirrorWorkspaceBackend(root, true);
+    const readOnly = createMirrorWorkspaceBackend(root, false);
+
+    for (const response of [
+      await readOnly.call("move", { source_path: "safe.txt", destination_path: "moved.txt" }),
+      await writable.call("move", { source_path: "safe.txt", destination_path: "../outside.txt" }),
+      await writable.call("move", { source_path: "safe.txt", destination_path: ".arcelle/private.txt" }),
+      await writable.call("move", { source_path: "safe.txt", destination_path: "escape/outside.txt" }),
+      await writable.call("move", { source_path: "folder", destination_path: "moved-folder" }),
+      await writable.call("rename", { source_path: "safe.txt", new_name: "../outside.txt" }),
+      await writable.call("rename", { source_path: "safe.txt", new_name: ".arcelle" }),
+    ]) {
+      expect(response.error).toEqual(expect.any(String));
+    }
+    expect(await readFile(path.join(root, "safe.txt"), "utf8")).toBe("safe");
+    await expect(lstat(path.join(outside, "outside.txt"))).rejects.toThrow();
+  });
+
+  it("routes only standard metadata organization to the protected real workspace", async () => {
+    const mirrorCalls: Array<[string, Record<string, unknown>]> = [];
+    const realCalls: Array<[string, Record<string, unknown>]> = [];
+    const mirror = {
+      call: async (operation: string, args: Record<string, unknown>) => {
+        mirrorCalls.push([operation, args]);
+        return { backend: "mirror", content: "redacted only" };
+      },
+    };
+    const real = {
+      call: async (operation: string, args: Record<string, unknown>) => {
+        realCalls.push([operation, args]);
+        if (operation === "standard_trash") {
+          return { trashed: ["/private.pdf"], original_bytes: "must not escape" };
+        }
+        return {
+          old_path: "/private.pdf",
+          path: "/Archive/private.pdf",
+          original_bytes: "must not escape",
+          content: "must not escape",
+        };
+      },
+    };
+    const hybrid = createCloudPrivacyWorkspaceBackend(mirror, real);
+
+    expect(await hybrid.call("standard_rename", { name: "[File A]", new_name: "Final.pdf" }))
+      .toEqual({ old_path: "/private.pdf", path: "/Archive/private.pdf" });
+    expect(await hybrid.call("standard_move", { name: "[File A]", folder: "Archive" }))
+      .toEqual({ old_path: "/private.pdf", path: "/Archive/private.pdf" });
+    expect(await hybrid.call("standard_trash", { names: ["[File A]"] }))
+      .toEqual({ trashed: ["/private.pdf"] });
+
+    for (const operation of [
+      "list", "read", "write", "edit", "delete", "move", "rename",
+      "standard_create", "standard_read", "standard_write", "standard_edit",
+    ]) {
+      expect(await hybrid.call(operation, { path: "redacted.txt" }))
+        .toMatchObject({ backend: "mirror" });
+    }
+    expect(realCalls.map(([operation]) => operation)).toEqual([
+      "standard_rename", "standard_move", "standard_trash",
+    ]);
+    expect(realCalls[0]?.[1]).toEqual({ name: "[File A]", new_name: "Final.pdf" });
+    expect(mirrorCalls.map(([operation]) => operation)).toContain("move");
+    expect(JSON.stringify(await hybrid.call("standard_move", { name: "private.pdf", folder: "Archive" })))
+      .not.toContain("must not escape");
+  });
+
+  it("contains errors returned by the protected real organization backend", async () => {
+    const secret = "binary bytes Ben Reich /Users/benreich/private.pdf";
+    const hybrid = createCloudPrivacyWorkspaceBackend(
+      { call: async () => ({}) },
+      { call: async () => ({ error: secret, content: secret }) },
+    );
+    const response = await hybrid.call("standard_move", { name: "x", folder: "Archive" });
+    expect(response.error).toEqual(expect.any(String));
+    expect(JSON.stringify(response)).not.toContain(secret);
+    expect(JSON.stringify(response)).not.toContain("/Users/benreich");
+  });
+
+  it("keeps redacted filenames on mirror tools while Deep binary move and rename use restored real paths", async () => {
+    const mirrorCalls: Array<[string, Record<string, unknown>]> = [];
+    const realCalls: Array<[string, Record<string, unknown>]> = [];
+    const hybrid = createCloudPrivacyWorkspaceBackend(
+      {
+        call: async (operation, args) => {
+          mirrorCalls.push([operation, args]);
+          return { path: args.path };
+        },
+      },
+      {
+        call: async (operation, args) => {
+          realCalls.push([operation, args]);
+          return { old_path: args.source_path, path: args.destination_path ?? args.new_name };
+        },
+      },
+      { routeExactMoveRenameToReal: true },
+    );
+    const restoredMove = {
+      source_path: "Contracts/Ben Reich.pdf",
+      destination_path: "Archive/Ben Reich.pdf",
+    };
+    const redactedMove = {
+      source_path: "Contracts/[Person A].pdf",
+      destination_path: "Archive/[Person A].pdf",
+    };
+    await hybrid.call("read", { path: "Contracts/Ben Reich.txt" }, { path: "Contracts/[Person A].txt" });
+    await hybrid.call("write", { path: "Contracts/Ben Reich.txt", content: "real" }, {
+      path: "Contracts/[Person A].txt", content: "[Person A]",
+    });
+    await hybrid.call("edit", { path: "Contracts/Ben Reich.txt" }, { path: "Contracts/[Person A].txt" });
+    await hybrid.call("move", restoredMove, redactedMove);
+    await hybrid.call("rename", {
+      source_path: "Archive/Ben Reich.pdf", new_name: "Ben Reich signed.pdf",
+    }, {
+      source_path: "Archive/[Person A].pdf", new_name: "[Person A] signed.pdf",
+    });
+
+    expect(mirrorCalls).toEqual([
+      ["read", { path: "Contracts/[Person A].txt" }],
+      ["write", { path: "Contracts/[Person A].txt", content: "[Person A]" }],
+      ["edit", { path: "Contracts/[Person A].txt" }],
+    ]);
+    expect(realCalls).toEqual([
+      ["move", restoredMove],
+      ["rename", { source_path: "Archive/Ben Reich.pdf", new_name: "Ben Reich signed.pdf" }],
+    ]);
   });
 
   it("merges the full Arcelle MCP catalog into the restricted fallback", async () => {

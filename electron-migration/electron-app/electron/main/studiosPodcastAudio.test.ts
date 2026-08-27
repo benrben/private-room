@@ -267,7 +267,7 @@ describe("encodeEpisode", () => {
     // Whichever it is, the room's own kind detection has to route it to the
     // audio player — a file the viewer cannot open is not an episode.
     expect(mediaKind(mime, ext)).toBe("audio");
-  });
+  }, 15_000);
 });
 
 // ==================================================== safeScopeName

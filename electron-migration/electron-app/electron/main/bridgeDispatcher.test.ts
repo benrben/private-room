@@ -495,6 +495,111 @@ describe("RoomToolDispatcher.listTools", () => {
     expect(result.isError).not.toBe(true);
     expect(calls).toEqual([["standard_create", { name: "notes.md", content: "normal file" }]]);
   });
+
+  it("advertises and routes explicit workspace move and rename tools", async () => {
+    const calls: Array<[string, Record<string, unknown>]> = [];
+    const dispatcher = new RoomToolDispatcher(baseOpts({
+      workspace: {
+        call: async (operation, args) => {
+          calls.push([operation, args]);
+          return { path: args.destination_path ?? "/Archive/final.pdf" };
+        },
+      },
+    }));
+
+    const names = dispatcher.listTools(LOCAL_ENGINE).map((tool) => tool.name);
+    expect(names).toContain("workspace_move");
+    expect(names).toContain("workspace_rename");
+    expect(dispatcher.listTools(CLOUD_ADVISOR_MCP).map((tool) => tool.name))
+      .not.toContain("workspace_move");
+
+    expect((await dispatcher.callTool(LOCAL_ENGINE, "workspace_move", {
+      source_path: "/raw.pdf",
+      destination_path: "/Archive/raw.pdf",
+    })).isError).not.toBe(true);
+    expect((await dispatcher.callTool(LOCAL_ENGINE, "workspace_rename", {
+      source_path: "/Archive/raw.pdf",
+      new_name: "final.pdf",
+    })).isError).not.toBe(true);
+    expect(calls).toEqual([
+      ["move", { source_path: "/raw.pdf", destination_path: "/Archive/raw.pdf" }],
+      ["rename", { source_path: "/Archive/raw.pdf", new_name: "final.pdf" }],
+    ]);
+  });
+
+  it("publishes exact required arguments for every workspace MCP tool", () => {
+    const dispatcher = new RoomToolDispatcher(baseOpts({
+      workspace: { call: async () => ({}) },
+    }));
+    const schemas = new Map(dispatcher.listTools(LOCAL_ENGINE)
+      .filter((tool) => tool.name.startsWith("workspace_"))
+      .map((tool) => [tool.name, tool.inputSchema]));
+    const contract = (name: string): {
+      properties: Record<string, unknown>;
+      required?: string[];
+      additionalProperties?: boolean;
+    } => schemas.get(name) as {
+      properties: Record<string, unknown>;
+      required?: string[];
+      additionalProperties?: boolean;
+    };
+
+    expect([...schemas.keys()].sort()).toEqual([
+      "workspace_delete",
+      "workspace_edit",
+      "workspace_glob",
+      "workspace_grep",
+      "workspace_list",
+      "workspace_move",
+      "workspace_read",
+      "workspace_rename",
+      "workspace_write",
+    ]);
+    expect(contract("workspace_delete").required).toEqual(["path"]);
+    expect(Object.keys(contract("workspace_delete").properties)).toEqual(["path"]);
+    expect(contract("workspace_move").required).toEqual(["source_path", "destination_path"]);
+    expect(Object.keys(contract("workspace_move").properties)).toEqual(["source_path", "destination_path"]);
+    expect(contract("workspace_rename").required).toEqual(["source_path", "new_name"]);
+    expect(Object.keys(contract("workspace_rename").properties)).toEqual(["source_path", "new_name"]);
+    expect(contract("workspace_write").required).toEqual(["path", "content"]);
+    expect(contract("workspace_edit").required).toEqual(["path", "old_string", "new_string"]);
+    expect(contract("workspace_read").required).toEqual(["path"]);
+    expect(contract("workspace_glob").required).toEqual(["pattern"]);
+    expect(contract("workspace_grep").required).toEqual(["pattern"]);
+    expect(contract("workspace_list").required).toBeUndefined();
+    for (const schema of schemas.values()) expect(schema.additionalProperties).toBe(false);
+
+    const deletion = dispatcher.listTools(LOCAL_ENGINE).find((tool) => tool.name === "workspace_delete");
+    expect(deletion?.description).toContain('{"path":"delete-me.txt"}');
+  });
+
+  it("fails closed when batch file tools could bypass a Cloud Privacy mirror", async () => {
+    const calls: Array<[string, Record<string, unknown>]> = [];
+    const policy: RedactionPolicy = {
+      restoreValue: (value) => value,
+      redact: (text) => ({ text, entitiesHidden: 0 }),
+    };
+    const dispatcher = new RoomToolDispatcher(baseOpts({
+      activePolicy: () => policy,
+      workspace: {
+        call: async (operation, args) => {
+          calls.push([operation, args]);
+          return {};
+        },
+      },
+    }));
+
+    for (const [name, args] of [
+      ["organize_files", { files: [{ name: "notes.md", folder: "Archive" }] }],
+      ["merge_files", { names: ["a.md", "b.md"], into: "merged.md" }],
+      ["draw", { name: "plan", script: "rect A 0 0 100 100" }],
+    ] as const) {
+      const result = await dispatcher.callTool(CLOUD_ENGINE, name, args);
+      expect(result.isError, name).toBe(true);
+      expect((result.content[0] as { text: string }).text, name).toContain("cannot run directly");
+    }
+    expect(calls).toEqual([]);
+  });
 });
 
 describe("RoomToolDispatcher.callTool — the advertised-tools-only gate", () => {
@@ -920,6 +1025,29 @@ describe("RoomToolDispatcher.callTool — cloud redaction", () => {
     expect((result.content[0] as { text: string }).text).toBe("[Person A] said hello");
     expect(policy.restoreCalls).toHaveLength(1);
     expect(policy.redactCalls).toEqual(["Ben said hello"]);
+  });
+
+  it("preserves redacted filename arguments separately for a cloud mirror backend", async () => {
+    const policy = fakePolicy();
+    let restoredArgs: Record<string, unknown> | undefined;
+    let redactedMirrorArgs: Record<string, unknown> | undefined;
+    const dispatcher = new RoomToolDispatcher(baseOpts({
+      activePolicy: () => policy,
+      workspace: {
+        call: async (_operation, args, redactedArgs) => {
+          restoredArgs = args;
+          redactedMirrorArgs = redactedArgs;
+          return { path: args.path, content: "Ben's private note" };
+        },
+      },
+    }));
+    const result = await dispatcher.callTool(CLOUD_ENGINE, "workspace_read", {
+      path: "Contracts/[Person A]/notes.txt",
+    });
+
+    expect(restoredArgs).toEqual({ path: "Contracts/Ben/notes.txt" });
+    expect(redactedMirrorArgs).toEqual({ path: "Contracts/[Person A]/notes.txt" });
+    expect((result.content[0] as { text: string }).text).toContain("[Person A]'s private note");
   });
 
   it("drops images entirely under a cloud policy — an image cannot be redacted", async () => {

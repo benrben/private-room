@@ -26,6 +26,8 @@ interface EditableMirrorFile {
   fileId: string;
   relativePath: string;
   mirrorPath: string;
+  mirrorSha256: string;
+  mirrorFsIdentity: string;
   expectedHash: string;
   baselineText: string;
 }
@@ -52,6 +54,13 @@ function redactedRelativePath(
   }
   occupied.add(pathKey(candidate));
   return { relativePath: candidate, entitiesHidden: report.entitiesHidden };
+}
+
+function restoredRelativePath(relativePath: string, redactor: Redactor): string {
+  const normalized = normalizeRelativePath(relativePath);
+  return normalizeRelativePath(normalized.split("/").map((segment) =>
+    safeRedactedPathSegment(redactor.restore(segment))
+  ).join("/"));
 }
 
 export interface CloudMirrorInfo {
@@ -203,11 +212,15 @@ export class CloudRedactedMirror {
         const report = emptyPrivacyReport();
         const redacted = this.policy.redactor.redact(stripEmbeddedImages(decodeTextBytes(bytes)), report);
         entitiesHidden += report.entitiesHidden;
-        await privateWrite(resolveWorkspacePath(this.workspacePath, mirrorPath), redacted);
+        const absoluteMirrorPath = resolveWorkspacePath(this.workspacePath, mirrorPath);
+        await privateWrite(absoluteMirrorPath, redacted);
+        const mirrorStat = await lstat(absoluteMirrorPath, { bigint: true });
         this.editable.set(pathKey(mirrorPath), {
           fileId: row.id,
           relativePath,
           mirrorPath,
+          mirrorSha256: sha256(Buffer.from(redacted, "utf8")),
+          mirrorFsIdentity: `${mirrorStat.dev}:${mirrorStat.ino}:${mirrorStat.birthtimeNs}`,
           expectedHash: row.content_sha256,
           baselineText: redacted,
         });
@@ -244,24 +257,68 @@ export class CloudRedactedMirror {
     const manifest = await scanWorkspaceManifest(this.workspacePath);
     const knownTokens = new Set(this.policy.rules.map(([, placeholder]) => placeholder));
     const labels = placeholderLabels(this.policy.rules);
-    const baselineAll = [...this.editable.values()].map((entry) => entry.baselineText).join("\n");
-    const edited = new Map<string, string>();
+    const baselineAll = [...this.editable.values()]
+      .flatMap((entry) => [entry.baselineText, entry.mirrorPath])
+      .join("\n");
+    const companionPrefix = `${pathKey(this.companionRoot)}/`;
+    const visibleManifest = new Map(
+      [...manifest].filter(([key]) => !key.startsWith(companionPrefix)),
+    );
+    const matched = new Map<string, { entry: EditableMirrorFile; currentPath: string; currentKey: string }>();
+    const claimedCurrentKeys = new Set<string>();
+
+    // Same-path files are unambiguous even when an editor replaced the inode.
     for (const [key, entry] of this.editable) {
-      if (!manifest.has(key)) continue; // Mirror deletion does not delete the real file.
-      edited.set(key, await readFile(resolveWorkspacePath(this.workspacePath, entry.mirrorPath), "utf8"));
+      const current = visibleManifest.get(key);
+      if (current === undefined) continue;
+      matched.set(key, { entry, currentPath: current.relativePath, currentKey: key });
+      claimedCurrentKeys.add(key);
     }
-    const createdPaths = [...manifest.values()]
-      .filter((entry) => !this.editable.has(entry.pathKey) && !entry.relativePath.startsWith(`${this.companionRoot}/`));
+
+    // A rename preserves filesystem identity. Exact redacted bytes are a safe
+    // fallback only when they identify one missing baseline and one new path.
+    // We never guess between identical candidates.
+    for (const [baselineKey, entry] of this.editable) {
+      if (matched.has(baselineKey)) continue;
+      const available = [...visibleManifest.values()].filter((candidate) =>
+        !claimedCurrentKeys.has(candidate.pathKey) && isTextPath(candidate.relativePath),
+      );
+      let candidates = available.filter((candidate) => candidate.fsIdentity === entry.mirrorFsIdentity);
+      if (candidates.length === 0) {
+        candidates = available.filter((candidate) => candidate.sha256 === entry.mirrorSha256);
+      }
+      if (candidates.length !== 1) continue;
+      const candidate = candidates[0]!;
+      matched.set(baselineKey, {
+        entry,
+        currentPath: candidate.relativePath,
+        currentKey: candidate.pathKey,
+      });
+      claimedCurrentKeys.add(candidate.pathKey);
+    }
+
+    const createdPaths = [...visibleManifest.values()]
+      .filter((entry) => !claimedCurrentKeys.has(entry.pathKey));
+    const edited = new Map<string, { text: string; relativePath: string; baseline?: EditableMirrorFile }>();
+    for (const match of matched.values()) {
+      edited.set(match.currentKey, {
+        text: await readFile(resolveWorkspacePath(this.workspacePath, match.currentPath), "utf8"),
+        relativePath: match.currentPath,
+        baseline: match.entry,
+      });
+    }
     for (const entry of createdPaths) {
       if (!isTextPath(entry.relativePath) || entry.sizeBytes > MAX_EDITABLE_TEXT_BYTES) {
         throw new Error(`Cloud write-back only accepts new text files: ${entry.relativePath}`);
       }
-      edited.set(entry.pathKey, await readFile(resolveWorkspacePath(this.workspacePath, entry.relativePath), "utf8"));
+      edited.set(entry.pathKey, {
+        text: await readFile(resolveWorkspacePath(this.workspacePath, entry.relativePath), "utf8"),
+        relativePath: entry.relativePath,
+      });
     }
 
     const editedAll = [
-      ...edited.values(),
-      ...[...manifest.values()].map((entry) => entry.relativePath),
+      ...[...edited.values()].flatMap((entry) => [entry.text, entry.relativePath]),
     ].join("\n");
     const unknown = unknownPlaceholders(editedAll, knownTokens, labels);
     if (unknown.length > 0) {
@@ -276,30 +333,98 @@ export class CloudRedactedMirror {
 
     const updated: string[] = [];
     const created: string[] = [];
-    for (const [key, text] of edited) {
-      const baseline = this.editable.get(key);
-      const restored = this.policy.redactor.restore(text);
+    const moves: Array<{ baseline: EditableMirrorFile; destination: string; text: string }> = [];
+    const writes: Array<{ baseline: EditableMirrorFile; text: string; displayedPath: string }> = [];
+    const additions: Array<{ destination: string; text: string }> = [];
+    const deleted = [...this.editable.entries()]
+      .filter(([key]) => !matched.has(key))
+      .map(([, entry]) => entry);
+
+    // Restore and validate every destination and every protected value before
+    // the first real workspace mutation. This keeps malformed cloud output
+    // from producing a partially applied run.
+    for (const item of edited.values()) {
+      const restored = this.policy.redactor.restore(item.text);
+      const destination = restoredRelativePath(item.relativePath, this.policy.redactor);
+      const baseline = item.baseline;
       if (baseline !== undefined) {
-        if (text === baseline.baselineText) continue;
+        if (destination !== baseline.relativePath) {
+          moves.push({ baseline, destination, text: restored });
+        } else if (item.text !== baseline.baselineText) {
+          writes.push({ baseline, text: restored, displayedPath: baseline.relativePath });
+        }
+      } else {
+        additions.push({ destination, text: restored });
+      }
+    }
+
+    const occupied = new Set((this.workspace.db.prepare(
+      `SELECT path_key FROM files
+       WHERE storage_kind = 'workspace' AND trashed_at IS NULL AND path_key IS NOT NULL`,
+    ).all() as Array<{ path_key: string }>).map((row) => row.path_key));
+    for (const baseline of [...deleted, ...moves.map((move) => move.baseline)]) {
+      occupied.delete(pathKey(baseline.relativePath));
+    }
+    for (const destination of [
+      ...moves.map((move) => move.destination),
+      ...additions.map((addition) => addition.destination),
+    ]) {
+      const key = pathKey(destination);
+      if (occupied.has(key)) {
+        throw new Error(`Cloud write-back destination already exists: ${destination}`);
+      }
+      occupied.add(key);
+    }
+
+    // Apply chains from their free end (B -> C before A -> B). A cycle has
+    // no collision-free order through WorkspaceService and must fail closed.
+    const orderedMoves: typeof moves = [];
+    const pendingMoves = [...moves];
+    while (pendingMoves.length > 0) {
+      const nextIndex = pendingMoves.findIndex((candidate) =>
+        !pendingMoves.some((other) =>
+          other !== candidate && pathKey(other.baseline.relativePath) === pathKey(candidate.destination)
+        )
+      );
+      if (nextIndex === -1) throw new Error("Cloud write-back cannot safely apply a file-move cycle.");
+      orderedMoves.push(pendingMoves.splice(nextIndex, 1)[0]!);
+    }
+
+    for (const baseline of deleted) {
+      await this.workspace.trash(baseline.fileId, baseline.expectedHash);
+    }
+    for (const move of orderedMoves) {
+      await this.workspace.move(move.baseline.fileId, move.destination, move.baseline.expectedHash);
+      if (move.text !== move.baseline.baselineText) {
         await this.workspace.writeAtomic(
-          baseline.fileId,
-          Readable.from([Buffer.from(restored, "utf8")]),
-          baseline.expectedHash,
+          move.baseline.fileId,
+          Readable.from([Buffer.from(move.text, "utf8")]),
+          move.baseline.expectedHash,
         );
         this.workspace.db.prepare(
           `UPDATE files SET extracted_text = ?, provenance = ? WHERE id = ?`,
-        ).run(restored, JSON.stringify({ kind: "cloud-mirror", runId: path.basename(this.runRoot) }), baseline.fileId);
-        updated.push(baseline.relativePath);
-      } else {
-        const entry = manifest.get(key)!;
-        const restoredPath = normalizeRelativePath(this.policy.redactor.restore(entry.relativePath));
-        await this.workspace.createFile(
-          restoredPath,
-          Readable.from([Buffer.from(restored, "utf8")]),
-          "cloud-mirror",
-        );
-        created.push(restoredPath);
+        ).run(move.text, JSON.stringify({ kind: "cloud-mirror", runId: path.basename(this.runRoot) }), move.baseline.fileId);
       }
+      updated.push(move.destination);
+    }
+    for (const write of writes) {
+      await this.workspace.writeAtomic(
+        write.baseline.fileId,
+        Readable.from([Buffer.from(write.text, "utf8")]),
+        write.baseline.expectedHash,
+      );
+      this.workspace.db.prepare(
+        `UPDATE files SET extracted_text = ?, provenance = ? WHERE id = ?`,
+      ).run(write.text, JSON.stringify({ kind: "cloud-mirror", runId: path.basename(this.runRoot) }), write.baseline.fileId);
+      updated.push(write.displayedPath);
+    }
+    for (const addition of additions) {
+      await this.workspace.createFile(
+        addition.destination,
+        Readable.from([Buffer.from(addition.text, "utf8")]),
+        "cloud-mirror",
+      );
+      created.push(addition.destination);
     }
     return { updated, created, requiresReview: [] };
   }

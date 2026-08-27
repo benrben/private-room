@@ -1,4 +1,4 @@
-import { lstat, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, rename, rm, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
@@ -121,6 +121,53 @@ describe("cloud redacted workspace mirror", () => {
       expect(applied.updated).toEqual(["notes.txt"]);
       expect(applied.created).toEqual(["summary.md"]);
       expect(await readFile(path.join(f.roomPath, "summary.md"), "utf8")).toBe("About Ben Reich");
+    } finally {
+      await f.mirror.cleanup();
+      f.created.db.close();
+    }
+  });
+
+  it("applies a mirror move and edit with the stable real file id", async () => {
+    const f = await fixture("run-move");
+    try {
+      await f.mirror.create();
+      await mkdir(path.join(f.mirror.workspacePath, "Archive"));
+      const destination = path.join(f.mirror.workspacePath, "Archive", "archived notes.txt");
+      await rename(path.join(f.mirror.workspacePath, "notes.txt"), destination);
+      await writeFile(destination, "Archived for [Person A]", "utf8");
+
+      expect(await f.mirror.writeBack()).toEqual({
+        updated: ["Archive/archived notes.txt"],
+        created: [],
+        requiresReview: [],
+      });
+      await expect(lstat(path.join(f.roomPath, "notes.txt"))).rejects.toThrow();
+      expect(await readFile(path.join(f.roomPath, "Archive", "archived notes.txt"), "utf8"))
+        .toBe("Archived for Ben Reich");
+      expect(f.created.db.prepare("SELECT relative_path FROM files WHERE id = ?").get(f.text.fileId))
+        .toEqual({ relative_path: "Archive/archived notes.txt" });
+    } finally {
+      await f.mirror.cleanup();
+      f.created.db.close();
+    }
+  });
+
+  it("turns a deleted mirror text file into recoverable Arcelle Trash", async () => {
+    const f = await fixture("run-delete");
+    try {
+      await f.mirror.create();
+      await rm(path.join(f.mirror.workspacePath, "notes.txt"));
+
+      expect(await f.mirror.writeBack()).toEqual({ updated: [], created: [], requiresReview: [] });
+      await expect(lstat(path.join(f.roomPath, "notes.txt"))).rejects.toThrow();
+      const row = f.created.db.prepare(
+        "SELECT relative_path, trashed_at FROM files WHERE id = ?",
+      ).get(f.text.fileId) as { relative_path: string; trashed_at: string | null };
+      expect(row.relative_path).toBe("notes.txt");
+      expect(row.trashed_at).not.toBeNull();
+      expect(f.created.db.prepare(
+        "SELECT 1 FROM content_object_refs WHERE owner_type = 'trash' AND owner_id = ? AND role = 'content'",
+      ).get(f.text.fileId)).toBeDefined();
     } finally {
       await f.mirror.cleanup();
       f.created.db.close();

@@ -115,6 +115,10 @@ export function createWorkspaceMcpBridge(
             next = args.all === true ? current.split(oldText).join(newText) : current.replace(oldText, newText);
           }
           if (args.dry_run === true) return { path: `/${row.relative_path}`, occurrences, dry_run: true };
+          await room().workspace!.snapshotVersion(
+            row.id,
+            operation === "standard_edit" ? "AI edit" : "AI rewrite",
+          );
           await room().workspace!.writeAtomic(
             row.id,
             Readable.from([Buffer.from(next)]),
@@ -200,8 +204,30 @@ export function createWorkspaceMcpBridge(
           };
         }
 
-        if (["write", "edit", "delete"].includes(operation) && !writeEnabled) {
+        if (["write", "edit", "delete", "move", "rename"].includes(operation) && !writeEnabled) {
           return { error: "This workspace bridge is read-only." };
+        }
+
+        if (operation === "move" || operation === "rename") {
+          const source = virtualPath(args.source_path);
+          const row = file(source);
+          let destination: string;
+          if (operation === "move") {
+            destination = virtualPath(args.destination_path);
+          } else {
+            const requested = typeof args.new_name === "string" ? args.new_name.trim() : "";
+            if (
+              requested === "" || requested === "." || requested === ".." ||
+              requested.includes("/") || requested.includes("\\") ||
+              requested.toLocaleLowerCase("en-US") === ".arcelle"
+            ) {
+              return { error: "The new name must be one safe file name." };
+            }
+            const parent = path.posix.dirname(row.relative_path);
+            destination = parent === "." ? requested : path.posix.join(parent, requested);
+          }
+          await room().workspace!.move(row.id, destination, row.content_sha256 ?? undefined);
+          return { old_path: `/${row.relative_path}`, path: `/${destination}` };
         }
 
         if (operation === "write") {
@@ -217,6 +243,7 @@ export function createWorkspaceMcpBridge(
             );
             setFileExtractedText(room().conn, created.fileId, content);
           } else {
+            await room().workspace!.snapshotVersion(row.id, "Agent workspace rewrite");
             await room().workspace!.writeAtomic(
               row.id,
               Readable.from([Buffer.from(content)]),
@@ -239,6 +266,7 @@ export function createWorkspaceMcpBridge(
           if (occurrences === 0) return { error: "The old text was not found." };
           if (occurrences > 1 && args.replace_all !== true) return { error: "The old text is not unique." };
           const next = args.replace_all === true ? current.split(oldText).join(newText) : current.replace(oldText, newText);
+          await room().workspace!.snapshotVersion(row.id, "Agent workspace edit");
           await room().workspace!.writeAtomic(
             row.id,
             Readable.from([Buffer.from(next)]),

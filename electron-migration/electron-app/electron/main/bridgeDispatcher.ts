@@ -884,23 +884,143 @@ export interface RoomToolDispatcherOptions {
   /** Trusted workspace filesystem projection used by Deep Agents. It accepts
    * only virtual room paths and never exposes the SQLCipher key or host path. */
   workspace?: {
-    call(operation: string, args: Record<string, unknown>): Promise<Record<string, unknown>>;
+    call(
+      operation: string,
+      args: Record<string, unknown>,
+      redactedMirrorArgs?: Record<string, unknown>,
+    ): Promise<Record<string, unknown>>;
   } | null;
 }
 
-const WORKSPACE_TOOL_SPECS: ToolSpec[] = ([
-  ["workspace_list", "List normal files and folders in one workspace directory."],
-  ["workspace_read", "Read a line range from a normal text file."],
-  ["workspace_write", "Create or atomically replace a normal text file."],
-  ["workspace_edit", "Replace exact text in a normal text file."],
-  ["workspace_delete", "Move one normal file to Arcelle Trash."],
-  ["workspace_glob", "Find normal workspace files by a glob pattern."],
-  ["workspace_grep", "Search normal workspace text files for literal text."],
-] as const).map(([name, description]) => ({
-  name,
-  description,
-  inputSchema: { type: "object", additionalProperties: true },
-}));
+const WORKSPACE_PATH_DESCRIPTION =
+  "A path relative to the exposed workspace root. A leading slash is accepted. Never use an absolute host path or .arcelle.";
+
+/**
+ * Exact MCP contracts for the normal-file backend. These schemas are model
+ * instructions as well as validation metadata: an open-ended object caused
+ * native agents to guess `name`, `file`, or `files` for destructive calls,
+ * which the backend correctly ignored because it requires `path`.
+ */
+const WORKSPACE_TOOL_SPECS: ToolSpec[] = [
+  {
+    name: "workspace_list",
+    description: "List normal files and folders. Use path to limit the listing to one workspace directory.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: `${WORKSPACE_PATH_DESCRIPTION} Omit it or use / for the workspace root.` },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "workspace_read",
+    description: "Read normal UTF-8 text from exactly one workspace file. This tool does not read binary files.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: { type: "string", minLength: 1, description: WORKSPACE_PATH_DESCRIPTION },
+        offset: { type: "integer", minimum: 0, description: "Zero-based line offset. Defaults to 0." },
+        limit: { type: "integer", minimum: 1, maximum: 2000, description: "Maximum lines to return. Defaults to 2000." },
+      },
+      required: ["path"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "workspace_write",
+    description: "Create or atomically replace one normal UTF-8 text file. Call with exactly path and content.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: { type: "string", minLength: 1, description: WORKSPACE_PATH_DESCRIPTION },
+        content: { type: "string", description: "The complete new UTF-8 file content." },
+      },
+      required: ["path", "content"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "workspace_edit",
+    description: "Replace exact text in one normal UTF-8 text file. The edit fails if old_string is absent or ambiguous unless replace_all is true.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: { type: "string", minLength: 1, description: WORKSPACE_PATH_DESCRIPTION },
+        old_string: { type: "string", minLength: 1, description: "Exact existing text to replace." },
+        new_string: { type: "string", description: "Replacement text." },
+        replace_all: { type: "boolean", description: "Replace every occurrence. Defaults to false." },
+      },
+      required: ["path", "old_string", "new_string"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "workspace_delete",
+    description: "Move exactly one normal file to recoverable Arcelle Trash. Call once per file with {\"path\":\"delete-me.txt\"}.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: { type: "string", minLength: 1, description: WORKSPACE_PATH_DESCRIPTION },
+      },
+      required: ["path"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "workspace_move",
+    description: "Move or rename exactly one normal file, including a binary file, to an exact destination path. Call with source_path and destination_path.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        source_path: { type: "string", minLength: 1, description: `Existing file. ${WORKSPACE_PATH_DESCRIPTION}` },
+        destination_path: { type: "string", minLength: 1, description: `Exact new file path, including its file name. ${WORKSPACE_PATH_DESCRIPTION}` },
+      },
+      required: ["source_path", "destination_path"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "workspace_rename",
+    description: "Rename exactly one normal file, including a binary file, inside its current folder. Call with source_path and the new file name only.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        source_path: { type: "string", minLength: 1, description: `Existing file. ${WORKSPACE_PATH_DESCRIPTION}` },
+        new_name: { type: "string", minLength: 1, description: "The new base file name only, with no slash or folder path." },
+      },
+      required: ["source_path", "new_name"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "workspace_glob",
+    description: "Find normal workspace files whose relative paths match a glob pattern.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        pattern: { type: "string", minLength: 1, description: "Glob such as **/*.md or *.pdf." },
+        path: { type: "string", description: `${WORKSPACE_PATH_DESCRIPTION} Omit it or use / to search the whole workspace.` },
+      },
+      required: ["pattern"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "workspace_grep",
+    description: "Search normal UTF-8 workspace text files for literal text.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        pattern: { type: "string", minLength: 1, description: "Literal text to find." },
+        path: { type: "string", description: `${WORKSPACE_PATH_DESCRIPTION} Omit it or use / to search the whole workspace.` },
+        max_count: { type: "integer", minimum: 1, maximum: 1000, description: "Maximum matching lines to return. Defaults to 1000." },
+      },
+      required: ["pattern"],
+      additionalProperties: false,
+    },
+  },
+];
 
 function workspaceTools(scope: ToolScope, workspace: RoomToolDispatcherOptions["workspace"]): ToolSpec[] {
   if (workspace == null) return [];
@@ -924,6 +1044,33 @@ function standardWorkspaceOperation(name: string): string | null {
       return null;
   }
 }
+
+/**
+ * File-producing or file-reorganising tools whose legacy execTool arms target
+ * the real room. During Cloud Privacy they must never bypass the redacted
+ * workspace backend. The simple create/edit/rename/move/trash tools are not in
+ * this set because standardWorkspaceOperation routes them through that backend.
+ */
+const MIRROR_UNROUTED_WORKSPACE_MUTATIONS = new Set([
+  "organize_files",
+  "merge_files",
+  "set_in_library",
+  "save_link",
+  "download_url",
+  "download_media",
+  "browse_save",
+  "run_script",
+  "run_skill_script",
+  "start_file_pass",
+  "run_workflow",
+  "test_workflow",
+  "studio_flashcards",
+  "studio_mindmap",
+  "generate_podcast_script",
+  "draw",
+  "local_generate",
+  "ui_act",
+]);
 
 /**
  * THE REAL {@link ToolDispatcher}. Ported from `room_mcp.rs`'s `tool_call`
@@ -991,9 +1138,12 @@ export class RoomToolDispatcher implements ToolDispatcher {
     // load-bearing rather than cosmetic.
     opts.markToolRan?.();
 
-    let args = normalizeArguments(rawArgs);
+    const redactedArgs = normalizeArguments(rawArgs);
+    let args = redactedArgs;
     if (cloudPolicy !== null) {
-      const restored = cloudPolicy.restoreValue(args);
+      // Keep an independent redacted filename view for a cloud mirror even if
+      // a custom policy implementation restores objects in place.
+      const restored = cloudPolicy.restoreValue(structuredClone(redactedArgs));
       args = normalizeArguments(restored);
     }
 
@@ -1002,13 +1152,29 @@ export class RoomToolDispatcher implements ToolDispatcher {
       : standardWorkspaceOperation(name);
     if (workspaceOperation !== null && opts.workspace != null) {
       const operation = workspaceOperation;
-      const payload = await opts.workspace.call(operation, args);
+      // Hybrid Cloud Privacy backends need both views: real metadata-only
+      // organization uses restored names, while mirror reads/edits must keep
+      // the redacted filename visible to the cloud agent.
+      const payload = await opts.workspace.call(operation, args, redactedArgs);
       const isError = typeof payload.error === "string" && payload.error.length > 0;
       const text = JSON.stringify(payload);
       if (cloudPolicy !== null) {
         return toolResult(cloudPolicy.redact(text).text, isError, []);
       }
       return toolResult(text, isError, []);
+    }
+
+    if (
+      cloudPolicy !== null
+      && opts.workspace != null
+      && MIRROR_UNROUTED_WORKSPACE_MUTATIONS.has(name)
+    ) {
+      return toolResult(
+        `${name} cannot run directly against the private room during Cloud Privacy. `
+        + "Use the exposed workspace file tools; their mirror changes are validated and applied after the run.",
+        true,
+        [],
+      );
     }
 
     if (name === "consult_advisor") {

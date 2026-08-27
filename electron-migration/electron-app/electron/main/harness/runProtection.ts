@@ -181,7 +181,8 @@ export class RunProtection {
     // file and does not damage or roll back the user's file.
     await this.reindexChanged();
     const baseline = this.workspace.db.prepare(
-      "SELECT file_id, baseline_path, baseline_hash FROM agent_run_files WHERE run_id = ?",
+      `SELECT file_id, baseline_path, baseline_hash FROM agent_run_files
+       WHERE run_id = ? AND baseline_object_id IS NOT NULL`,
     ).all(runId) as Array<{ file_id: string; baseline_path: string | null; baseline_hash: string | null }>;
     const baselineIds = new Set(baseline.map((row) => row.file_id));
     const current = this.workspace.db.prepare(

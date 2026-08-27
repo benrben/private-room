@@ -16,7 +16,7 @@ import { runViaSidecar, type SidecarOutcome } from "../sidecar.js";
 import { AsyncEventQueue } from "./eventQueue.js";
 import { safeProviderFailure } from "./failureSafety.js";
 import { createDeepWorkspaceBridgeGrant } from "./deepWorkspaceBridge.js";
-import { createMirrorWorkspaceBackend } from "./legacyCli.js";
+import { createCloudPrivacyWorkspaceBackend, createMirrorWorkspaceBackend } from "./legacyCli.js";
 import type {
   ApprovalDecision,
   HarnessContext,
@@ -64,6 +64,7 @@ export class DeepAgentRuntime implements HarnessRuntime {
     private readonly services?: LiveAppServices,
     private readonly runSidecar: typeof runViaSidecar = runViaSidecar,
     private readonly mirrorBackend: typeof createMirrorWorkspaceBackend = createMirrorWorkspaceBackend,
+    private readonly cloudPrivacyBackend: typeof createCloudPrivacyWorkspaceBackend = createCloudPrivacyWorkspaceBackend,
   ) {}
 
   available(): Promise<boolean> {
@@ -143,10 +144,17 @@ export class DeepAgentRuntime implements HarnessRuntime {
         // Cloud Privacy supplies a redacted mirror, the MCP backend must point
         // at that mirror too; otherwise a cloud tool can bypass placeholder
         // validation and mutate the real workspace directly.
-        const workspace = realRoot !== null
-          && path.resolve(context.workspacePath) === path.resolve(realRoot)
+        const usesRealWorkspace = realRoot !== null
+          && path.resolve(context.workspacePath) === path.resolve(realRoot);
+        const workspace = usesRealWorkspace
           ? grant.workspace
-          : this.mirrorBackend(context.workspacePath, context.writeEnabled);
+          : context.privacyMode === "cloud-redacted"
+            ? this.cloudPrivacyBackend(
+                this.mirrorBackend(context.workspacePath, context.writeEnabled),
+                grant.workspace,
+                { routeExactMoveRenameToReal: true },
+              )
+            : this.mirrorBackend(context.workspacePath, context.writeEnabled);
         const cloud = context.provider !== "ollama-local";
         const scope = cloud ? { kind: "CloudEngine" as const } : { kind: "LocalEngine" as const };
         const dispatcher = roomServerDispatcherFactory(this.state, this.emit, this.services)(

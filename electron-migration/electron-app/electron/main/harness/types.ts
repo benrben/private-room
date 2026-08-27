@@ -23,6 +23,8 @@ export interface HarnessContext {
   systemPrompt?: string;
   /** Internal fallback recursion guard. Child specialists cannot delegate again. */
   delegationDepth?: number;
+  /** Internal authority inheritance for a delegated child protected by its parent's baseline. */
+  baselineRunId?: string;
 }
 
 export interface HarnessInput {

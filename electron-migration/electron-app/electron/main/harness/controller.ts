@@ -30,6 +30,7 @@ import {
 } from "./runProtection.js";
 import { nativeWorkspaceSandboxSupported, verifyNativeHarnessExecutable } from "./seatbelt.js";
 import { nativeCliExecutable } from "./nativeCli.js";
+import { createNativeRoomMcpFactory } from "./nativeRoomMcp.js";
 import type {
   ApprovalDecision,
   HarnessEvent,
@@ -121,13 +122,25 @@ export class HarnessController {
           privacyBypass: context.privacyMode === "cloud-direct",
         }),
     };
+    const nativeRoomMcp = createNativeRoomMcpFactory(
+      state,
+      (context, workspace) => fallbackDispatcher(
+        false,
+        { kind: "CloudEngine" },
+        WEB_LANES_ALL,
+        {
+          workspace,
+          privacyBypass: context.privacyMode === "cloud-direct",
+        },
+      ),
+    );
     this.runtimes = {
       codex: options.runtimes?.codex ?? new RuntimeWithFallback(
-        new CodexAppServerRuntime(),
+        new CodexAppServerRuntime(undefined, undefined, undefined, undefined, nativeRoomMcp),
         new RestrictedLegacyCliRuntime("codex", state, fallbackOptions),
       ),
       claude: options.runtimes?.claude ?? new RuntimeWithFallback(
-        new ClaudeAgentSdkRuntime(),
+        new ClaudeAgentSdkRuntime(undefined, nativeRoomMcp),
         new RestrictedLegacyCliRuntime("claude", state, fallbackOptions),
       ),
       "ollama-local": options.runtimes?.["ollama-local"] ?? new DeepAgentRuntime(state, emit, options.services),
@@ -209,6 +222,7 @@ export class HarnessController {
         && this.isolationProven
         && installed
         && room?.workspace !== undefined
+        && room.readOnly !== true
         && room.descriptor?.kind === "workspace-folder"
         && room.descriptor.rootPath !== null
       ) {
@@ -228,6 +242,7 @@ export class HarnessController {
       else if (!this.isolationProven) reason = "Outside-workspace process isolation has not passed its security test.";
       else if (!installed) reason = `The ${name} agent runtime is not installed.`;
       else if (room?.descriptor?.kind !== "workspace-folder") reason = "Open a workspace room to run the sandbox capability test.";
+      else if (room.readOnly === true) reason = "This workspace is read-only because another Arcelle process owns the writer lease.";
       else if (!sandboxReady) reason = `The ${name} runtime failed its sandbox capability test.`;
       else if (harness === "legacy-cli") {
         reason = `The native ${name} harness failed its startup test. Arcelle will use the restricted CLI fallback.`;
@@ -243,6 +258,9 @@ export class HarnessController {
       else if (!installed) reason = "The built-in Deep Harness runtime is unavailable.";
       else if (room?.descriptor?.kind !== "workspace-folder" || room.workspace === undefined) {
         reason = "Open a workspace room to use the Deep Harness.";
+      }
+      else if (room.readOnly === true) {
+        reason = "This workspace is read-only because another Arcelle process owns the writer lease.";
       }
       return {
         enabled: reason === null,
@@ -311,8 +329,8 @@ export class HarnessController {
     ) {
       throw new Error("Open a workspace room before starting this harness.");
     }
-    if (room.readOnly === true && request.writeEnabled) {
-      throw new Error("This workspace is read-only because another Arcelle process owns the writer lease.");
+    if (room.readOnly === true) {
+      throw new Error("Agent runs are unavailable because another Arcelle process owns the workspace writer lease.");
     }
     const runId = randomUUID();
     const runRuntimePath = path.join(this.runtimeRoot(), room.descriptor.roomId, runId);

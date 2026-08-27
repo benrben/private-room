@@ -6,7 +6,13 @@ import path from "node:path";
 import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
-import { CodexAppServerRuntime, prepareCodexRuntimeHome } from "./codexAppServer.js";
+import {
+  CodexAppServerRuntime,
+  codexRoomMcpConfiguration,
+  mcpApprovalResult,
+  permissionApprovalResult,
+  prepareCodexRuntimeHome,
+} from "./codexAppServer.js";
 import { inspectCodexSchemaDirectory } from "./codexSchema.js";
 import { nativeWorkspaceSandboxSupported } from "./seatbelt.js";
 
@@ -15,6 +21,53 @@ const installedCodex = spawnSync(process.env.ARCELLE_CODEX_PATH ?? "codex", ["--
 
 afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+});
+
+describe("Codex permission-profile approvals", () => {
+  it("returns the app-server response shape without widening a denied request", () => {
+    const requested = { fileSystem: { write: ["/workspace"] } };
+    expect(permissionApprovalResult(requested, "allow-run")).toEqual({
+      permissions: requested,
+      scope: "session",
+      strictAutoReview: false,
+    });
+    expect(permissionApprovalResult(requested, "deny")).toEqual({
+      permissions: {},
+      scope: "turn",
+      strictAutoReview: false,
+    });
+  });
+});
+
+describe("Codex Room MCP configuration", () => {
+  it("pre-approves the protected per-run Room server so headless calls are dispatched", () => {
+    expect(codexRoomMcpConfiguration({
+      url: "http://127.0.0.1:4321/mcp",
+      token: "secret",
+      instructions: "Use Room tools.",
+      stop: async () => undefined,
+    })).toEqual({
+      mcp_servers: {
+        room: {
+          url: "http://127.0.0.1:4321/mcp",
+          bearer_token_env_var: "ARCELLE_ROOM_MCP_TOKEN",
+          default_tools_approval_mode: "approve",
+        },
+      },
+    });
+  });
+
+  it("maps Room MCP approval decisions to the installed app-server contract", () => {
+    expect(mcpApprovalResult("allow-once", true)).toEqual({ action: "accept", content: null });
+    expect(mcpApprovalResult("allow-run", true)).toEqual({
+      action: "accept",
+      content: null,
+      _meta: { persist: "session" },
+    });
+    expect(mcpApprovalResult("allow-run", false)).toEqual({ action: "accept", content: null });
+    expect(mcpApprovalResult("deny", true)).toEqual({ action: "decline", content: null });
+    expect(mcpApprovalResult("cancel", true)).toEqual({ action: "cancel", content: null });
+  });
 });
 
 async function fakeCodex(body: string): Promise<string> {

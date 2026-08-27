@@ -45,6 +45,7 @@ import {
   providerRuntimeConfig,
   providerRuntimeConfigWire,
   readKey,
+  readProviderKeyOnce,
   resetProviderStateForTests,
   storeKey,
   type HttpJsonResponseLike,
@@ -97,6 +98,28 @@ it("installed E2E reviews isolate provider credentials from the login Keychain",
     if (previous === undefined) delete process.env.ARCELLE_E2E;
     else process.env.ARCELLE_E2E = previous;
   }
+});
+
+it("reads or rejects one provider Keychain item only once per app session", () => {
+  let successfulReads = 0;
+  expect(readProviderKeyOnce("cached-success", () => {
+    successfulReads += 1;
+    return "session-key";
+  })).toBe("session-key");
+  expect(readProviderKeyOnce("cached-success", () => {
+    successfulReads += 1;
+    return "different-key";
+  })).toBe("session-key");
+  expect(successfulReads).toBe(1);
+
+  let deniedReads = 0;
+  const denied = () => readProviderKeyOnce("cached-denial", () => {
+    deniedReads += 1;
+    throw new Error("Keychain access was denied.");
+  });
+  expect(denied).toThrow("Keychain access was denied.");
+  expect(denied).toThrow("Keychain access was denied.");
+  expect(deniedReads).toBe(1);
 });
 
 // ===========================================================================

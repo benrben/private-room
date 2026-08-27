@@ -16,6 +16,74 @@ afterEach(async () => {
 });
 
 describe("RunProtection conflict recovery", () => {
+  it("keeps every change classification stable across repeated capture and finalization", async () => {
+    const parent = await mkdtemp(path.join(os.tmpdir(), "arcelle-run-idempotency-"));
+    roots.push(parent);
+    const workspaceRoot = path.join(parent, "Room");
+    const { db, descriptor } = createWorkspaceRoom(
+      workspaceRoot,
+      "correct horse battery staple",
+      "Room",
+    );
+    const workspace = new WorkspaceService(db, workspaceRoot);
+    try {
+      const modified = await workspace.createFile(
+        "modified.txt", Readable.from(["before modified"]), "import",
+      );
+      const moved = await workspace.createFile(
+        "moved.txt", Readable.from(["before moved"]), "import",
+      );
+      const deleted = await workspace.createFile(
+        "deleted.txt", Readable.from(["before deleted"]), "import",
+      );
+      const context: HarnessContext = {
+        runId: "repeat-capture-run",
+        roomId: descriptor.roomId,
+        provider: "codex",
+        model: "gpt-test",
+        workspacePath: workspaceRoot,
+        runtimePath: path.join(parent, "runtime"),
+        privacyMode: "local",
+        writeEnabled: true,
+        exposureVerified: true,
+      };
+      const protection = new RunProtection(workspace, descriptor.roomId);
+      await protection.createBaseline(context);
+
+      await workspace.writeAtomic(modified.fileId, Readable.from(["after modified"]));
+      await workspace.move(moved.fileId, "Archive/moved.txt");
+      await workspace.trash(deleted.fileId);
+      await workspace.createFile(
+        "created.bin", Readable.from([Buffer.from([0x00, 0xff, 0x41])]), "agent",
+      );
+
+      const expected = [
+        { relativePath: "Archive/moved.txt", change: "moved" },
+        { relativePath: "created.bin", change: "created" },
+        { relativePath: "deleted.txt", change: "deleted" },
+        { relativePath: "modified.txt", change: "modified" },
+      ];
+      const first = await protection.captureFinalState(context.runId);
+      const second = await protection.captureFinalState(context.runId);
+      expect(first.changedFiles.map(({ relativePath, change }) => ({ relativePath, change })))
+        .toEqual(expected);
+      expect(second.changedFiles.map(({ relativePath, change }) => ({ relativePath, change })))
+        .toEqual(expected);
+
+      // finish() captures once more. A later history refresh may also capture
+      // again, so prove both paths leave the durable classifications intact.
+      await protection.finish(context.runId, "completed");
+      const afterFinish = await protection.captureFinalState(context.runId);
+      expect(afterFinish.changedFiles.map(({ relativePath, change }) => ({ relativePath, change })))
+        .toEqual(expected);
+      expect((await protection.listHistory())[0]?.changes.map(
+        ({ relativePath, change }) => ({ relativePath, change }),
+      )).toEqual(expected);
+    } finally {
+      db.close();
+    }
+  });
+
   it("recovers a stale write run into durable history and rolls it back after restart", async () => {
     const parent = await mkdtemp(path.join(os.tmpdir(), "arcelle-run-history-"));
     roots.push(parent);

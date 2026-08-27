@@ -8,6 +8,7 @@ process that can touch live files. LocalShellBackend is intentionally absent.
 from __future__ import annotations
 
 import json
+import posixpath
 import re
 from dataclasses import dataclass
 from typing import Any, Protocol, TypedDict
@@ -26,7 +27,7 @@ from deepagents.backends.protocol import (
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
-from langchain_core.tools import BaseTool
+from langchain_core.tools import BaseTool, StructuredTool
 from langchain_core.utils.function_calling import convert_to_openai_tool
 from langgraph.graph import END, START, StateGraph
 from pydantic import ConfigDict, Field
@@ -347,6 +348,41 @@ class ArcelleWorkspaceBackend(BackendProtocol):
         payload = await self._mutate("delete", {"path": safe})
         return DeleteResult(error=payload.get("error"), path=payload.get("path"))
 
+    async def amove(self, source_path: str, destination_path: str) -> dict[str, Any]:
+        """Move one normal workspace file without reading or rewriting its bytes."""
+        if not self.write_enabled:
+            return {"error": "This run is read-only."}
+        try:
+            source = _safe_virtual_path(source_path)
+            destination = _safe_virtual_path(destination_path)
+        except ValueError as exc:
+            return {"error": str(exc)}
+        return await self._mutate(
+            "move", {"source_path": source, "destination_path": destination}
+        )
+
+    async def arename(self, file_path: str, new_name: str) -> dict[str, Any]:
+        """Rename one normal workspace file in place without touching its bytes."""
+        if not self.write_enabled:
+            return {"error": "This run is read-only."}
+        try:
+            source = _safe_virtual_path(file_path)
+        except ValueError as exc:
+            return {"error": str(exc)}
+        requested = new_name.strip()
+        if (
+            requested in {"", ".", ".."}
+            or "/" in requested
+            or "\\" in requested
+            or requested.casefold() == ".arcelle"
+        ):
+            return {"error": "The new name must be one safe file name."}
+        destination = posixpath.join(posixpath.dirname(source), requested)
+        return await self._mutate(
+            "rename",
+            {"source_path": source, "new_name": requested, "destination_path": destination},
+        )
+
     async def aglob(self, pattern: str, path: str | None = None) -> GlobResult:
         try:
             safe = _safe_virtual_path(path or "/")
@@ -396,6 +432,71 @@ class ArcelleToolBackend:
         if result.is_error:
             raise RuntimeError(result.text)
         return result.text
+
+
+def _workspace_mutation_tools(backend: ArcelleWorkspaceBackend) -> list[BaseTool]:
+    """Tools missing from Deep Agents' text-focused filesystem middleware."""
+
+    async def workspace_delete(file_path: str) -> str:
+        """Move one normal workspace file to recoverable Arcelle Trash.
+
+        Use this tool when the user asks to delete a file. Do not simulate a
+        deletion by renaming or moving the file to another workspace folder.
+        Arcelle permits the operation only after a rollback baseline exists.
+        """
+        result = await backend.adelete(file_path)
+        return json.dumps(
+            {
+                key: value
+                for key, value in {"error": result.error, "path": result.path}.items()
+                if value is not None
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    async def workspace_move(source_path: str, destination_path: str) -> str:
+        """Move or rename a normal workspace file to an exact absolute virtual path.
+
+        This moves the filesystem entry directly, so it also works for PDFs,
+        recordings, images, sketches, spreadsheets, and other binary files.
+        Arcelle permits the operation only after a rollback baseline exists.
+        """
+        return json.dumps(
+            await backend.amove(source_path, destination_path),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    async def workspace_rename(file_path: str, new_name: str) -> str:
+        """Rename a normal workspace file while keeping it in its current folder.
+
+        Give only the new file name, including its extension. Arcelle moves the
+        filesystem entry directly and requires an authorized rollback baseline.
+        """
+        return json.dumps(
+            await backend.arename(file_path, new_name),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    return [
+        StructuredTool.from_function(
+            name="workspace_delete",
+            description=workspace_delete.__doc__ or "Move a workspace file to Arcelle Trash.",
+            coroutine=workspace_delete,
+        ),
+        StructuredTool.from_function(
+            name="workspace_move",
+            description=workspace_move.__doc__ or "Move a workspace file.",
+            coroutine=workspace_move,
+        ),
+        StructuredTool.from_function(
+            name="workspace_rename",
+            description=workspace_rename.__doc__ or "Rename a workspace file.",
+            coroutine=workspace_rename,
+        ),
+    ]
 
 
 class _SubagentState(TypedDict):
@@ -511,6 +612,7 @@ def build_deep_agent(
     ]
     return create_deep_agent(
         model=ArcelleHarnessModelAdapter(inner=deps.chat, cancel=deps.cancel),
+        tools=_workspace_mutation_tools(backend),
         system_prompt=get_agent("chat.answer").prompt,
         backend=backend,
         permissions=permissions,

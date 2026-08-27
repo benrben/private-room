@@ -10,6 +10,12 @@ import { inspectCodexSchemaDirectory, type CodexSchemaCompatibility } from "./co
 import { safeProviderFailure } from "./failureSafety.js";
 import { nativeCliExecutable } from "./nativeCli.js";
 import {
+  NATIVE_ROOM_MCP_SERVER,
+  NATIVE_ROOM_MCP_TOKEN_ENV,
+  type NativeRoomMcpExposure,
+  type NativeRoomMcpFactory,
+} from "./nativeRoomMcp.js";
+import {
   spawnWithNativeWorkspaceSandbox,
   terminateNativeProcessTree,
   type NativeWorkspaceSandbox,
@@ -68,11 +74,12 @@ export async function prepareCodexRuntimeHome(
   return realpath(runtimeHome);
 }
 
-function codexRunEnvironment(codexHome: string): NodeJS.ProcessEnv {
+function codexRunEnvironment(codexHome: string, roomMcp?: NativeRoomMcpExposure): NodeJS.ProcessEnv {
   return {
     ...process.env,
     CODEX_HOME: codexHome,
     CODEX_INTERNAL_ORIGINATOR_OVERRIDE: "arcelle",
+    ...(roomMcp === undefined ? {} : { [NATIVE_ROOM_MCP_TOKEN_ENV]: roomMcp.token }),
   };
 }
 
@@ -101,8 +108,58 @@ function approvalResult(decision: ApprovalDecision): { decision: string } {
   return { decision: "decline" };
 }
 
+export function permissionApprovalResult(
+  requested: Record<string, unknown>,
+  decision: ApprovalDecision,
+): { permissions: Record<string, unknown>; scope: "turn" | "session"; strictAutoReview: boolean } {
+  const allowed = decision === "allow-once" || decision === "allow-run";
+  return {
+    permissions: allowed ? requested : {},
+    scope: decision === "allow-run" ? "session" : "turn",
+    strictAutoReview: false,
+  };
+}
+
+export function mcpApprovalResult(
+  decision: ApprovalDecision,
+  sessionPersistAllowed: boolean,
+): { action: "accept" | "decline" | "cancel"; content: null; _meta?: { persist: "session" } } {
+  if (decision === "cancel") return { action: "cancel", content: null };
+  if (decision === "deny") return { action: "decline", content: null };
+  if (decision === "allow-run" && sessionPersistAllowed) {
+    return { action: "accept", content: null, _meta: { persist: "session" } };
+  }
+  return { action: "accept", content: null };
+}
+
+function advertisesSessionPersistence(meta: Record<string, unknown>): boolean {
+  const persist = meta.persist;
+  return persist === "session" || (Array.isArray(persist) && persist.includes("session"));
+}
+
 function itemType(item: Record<string, unknown>): string {
   return String(item.type ?? "tool").replace(/_([a-z])/g, (_match, letter: string) => letter.toUpperCase());
+}
+
+function itemToolLabel(item: Record<string, unknown>, type: string): string {
+  if (type !== "mcpToolCall") return type;
+  const server = typeof item.server === "string" ? item.server : "mcp";
+  const tool = typeof item.tool === "string" ? item.tool : "tool";
+  return `${server}.${tool}`;
+}
+
+function safeToolError(item: Record<string, unknown>): string | undefined {
+  if (item.status !== "failed" && item.error == null) return undefined;
+  const message = nestedString(item, "error", "message") ?? "";
+  if (/read[- ]?only/i.test(message)) return "The provider treated this tool as read-only.";
+  if (/not found|no file|missing/i.test(message)) return "The requested workspace file was not found.";
+  if (/argument|schema|invalid input/i.test(message)) return "The provider rejected the tool arguments.";
+  if (/permission|approval|denied|declin/i.test(message)) return "The provider denied the tool permission request.";
+  const httpStatus = message.match(/\b(?:HTTP\D*)?(400|401|403|404|409|413|429|500|502|503)\b/i)?.[1];
+  if (httpStatus !== undefined) return `The Room MCP call failed with HTTP ${httpStatus}.`;
+  if (/transport/i.test(message)) return "The provider reported a Room MCP transport failure.";
+  if (/connect|mcp|server|http/i.test(message)) return "The provider could not complete the Room MCP call.";
+  return safeProviderFailure("codex", "tool");
 }
 
 function collabAgentIds(item: Record<string, unknown>): string[] {
@@ -125,6 +182,7 @@ export class CodexAppServerRuntime implements HarnessRuntime {
     private readonly sandboxSpawn: SandboxSpawn = spawnWithNativeWorkspaceSandbox,
     private readonly startupProbeTimeoutMs = 5_000,
     private readonly codexHomeSource = sourceCodexHome(),
+    private readonly roomMcpFactory?: NativeRoomMcpFactory,
   ) {}
 
   async available(): Promise<boolean> {
@@ -162,7 +220,7 @@ export class CodexAppServerRuntime implements HarnessRuntime {
       provider: "codex",
       writeEnabled,
     };
-    let child;
+    let child: ReturnType<SandboxSpawn>;
     try {
       const codexHome = await prepareCodexRuntimeHome(runtimePath, this.codexHomeSource);
       child = this.sandboxSpawn(
@@ -248,23 +306,37 @@ export class CodexAppServerRuntime implements HarnessRuntime {
       throw new Error("Codex native harness refused an unverified workspace exposure.");
     }
     const events = new AsyncEventQueue<HarnessEvent>();
-    const codexHome = await prepareCodexRuntimeHome(context.runtimePath, this.codexHomeSource);
-    const child = this.sandboxSpawn(
-      {
-        workspacePath: context.workspacePath,
-        runtimePath: context.runtimePath,
-        executable: this.executable,
-        provider: "codex",
-        writeEnabled: context.writeEnabled,
-      },
-      ["app-server", "--listen", "stdio://"],
-      { cwd: context.workspacePath, env: codexRunEnvironment(codexHome) },
-    );
+    const roomMcp = await this.roomMcpFactory?.(context);
+    let child;
+    try {
+      const codexHome = await prepareCodexRuntimeHome(context.runtimePath, this.codexHomeSource);
+      const env = codexRunEnvironment(codexHome, roomMcp);
+      child = this.sandboxSpawn(
+        {
+          workspacePath: context.workspacePath,
+          runtimePath: context.runtimePath,
+          executable: this.executable,
+          provider: "codex",
+          writeEnabled: context.writeEnabled,
+          env,
+        },
+        ["app-server", "--listen", "stdio://"],
+        { cwd: context.workspacePath, env },
+      );
+    } catch (error) {
+      await roomMcp?.stop();
+      throw error;
+    }
     const pendingRpc = new Map<number | string, {
       resolve(value: unknown): void;
       reject(error: Error): void;
     }>();
-    const approvalRequests = new Map<string, number | string>();
+    const approvalRequests = new Map<string, {
+      rpcId: number | string;
+      kind: "standard" | "permissions" | "mcp";
+      permissions?: Record<string, unknown>;
+      sessionPersistAllowed?: boolean;
+    }>();
     let nextId = 1;
     let threadId: string | null = null;
     let turnId: string | null = null;
@@ -304,7 +376,7 @@ export class CodexAppServerRuntime implements HarnessRuntime {
           method === "item/fileChange/requestApproval"
         ) {
           const requestId = String(message.id);
-          approvalRequests.set(requestId, message.id);
+          approvalRequests.set(requestId, { rpcId: message.id, kind: "standard" });
           events.push({
             type: "approval_requested",
             runId: context.runId,
@@ -313,6 +385,43 @@ export class CodexAppServerRuntime implements HarnessRuntime {
             detail: nestedString(message.params, "reason") ?? nestedString(message.params, "command") ?? "Codex requests approval.",
           });
           return;
+        }
+        if (method === "item/permissions/requestApproval") {
+          const requestId = String(message.id);
+          const permissions = record(message.params?.permissions);
+          approvalRequests.set(requestId, { rpcId: message.id, kind: "permissions", permissions });
+          events.push({
+            type: "approval_requested",
+            runId: context.runId,
+            requestId,
+            tool: "permissions",
+            detail: nestedString(message.params, "reason") ?? "Codex requests permission for this protected operation.",
+          });
+          return;
+        }
+        if (method === "mcpServer/elicitation/request") {
+          const meta = record(message.params?._meta);
+          const isRoomToolApproval = message.params?.serverName === NATIVE_ROOM_MCP_SERVER
+            && message.params?.mode === "form"
+            && meta.codex_approval_kind === "mcp_tool_call";
+          if (isRoomToolApproval) {
+            const requestId = String(message.id);
+            approvalRequests.set(requestId, {
+              rpcId: message.id,
+              kind: "mcp",
+              sessionPersistAllowed: advertisesSessionPersistence(meta),
+            });
+            events.push({
+              type: "approval_requested",
+              runId: context.runId,
+              requestId,
+              tool: "room_mcp",
+              detail: typeof message.params?.message === "string"
+                ? message.params.message
+                : "Codex requests approval for an Arcelle Room tool.",
+            });
+            return;
+          }
         }
         // Arcelle does not expose generic app-server elicitations yet. Refuse
         // rather than leaving the Codex process blocked forever.
@@ -337,7 +446,7 @@ export class CodexAppServerRuntime implements HarnessRuntime {
           events.push({
             type: "tool_started",
             runId: context.runId,
-            tool: type,
+            tool: itemToolLabel(item, type),
             toolId: typeof item.id === "string" ? item.id : undefined,
           });
         }
@@ -347,9 +456,9 @@ export class CodexAppServerRuntime implements HarnessRuntime {
         events.push({
           type: "tool_completed",
           runId: context.runId,
-          tool: type,
+          tool: itemToolLabel(item, type),
           toolId: typeof item.id === "string" ? item.id : undefined,
-          error: item.status === "failed" ? safeProviderFailure("codex", "tool") : undefined,
+          error: safeToolError(item),
         });
         if (type === "collabToolCall" || type === "collabAgentToolCall") {
           const statuses = collabStatuses(item);
@@ -391,16 +500,19 @@ export class CodexAppServerRuntime implements HarnessRuntime {
     });
 
     child.once("exit", (code) => {
-      for (const pending of pendingRpc.values()) pending.reject(new Error("Codex app-server exited."));
-      pendingRpc.clear();
-      if (!terminal) {
-        events.push({
-          type: "run_failed",
-          runId: context.runId,
-          error: safeProviderFailure("codex", "run", code),
-        });
-      }
-      events.end();
+      void (async () => {
+        for (const pending of pendingRpc.values()) pending.reject(new Error("Codex app-server exited."));
+        pendingRpc.clear();
+        if (!terminal) {
+          events.push({
+            type: "run_failed",
+            runId: context.runId,
+            error: safeProviderFailure("codex", "run", code),
+          });
+        }
+        await roomMcp?.stop();
+        events.end();
+      })();
     });
 
     void (async () => {
@@ -414,7 +526,7 @@ export class CodexAppServerRuntime implements HarnessRuntime {
         // Codex app-server has a dedicated developer-instruction channel on
         // thread creation/resume. Keep Arcelle policy out of the user turn so
         // the model cannot confuse trusted harness policy with task content.
-        const developerInstructions = [context.systemPrompt, codexAgentInstructions()]
+        const developerInstructions = [context.systemPrompt, roomMcp?.instructions, codexAgentInstructions()]
           .filter((part): part is string => typeof part === "string" && part.length > 0)
           .join("\n\n");
         const threadResponse = input.threadId === undefined
@@ -422,6 +534,7 @@ export class CodexAppServerRuntime implements HarnessRuntime {
               model: context.model || undefined,
               cwd: context.workspacePath,
               developerInstructions,
+              config: roomMcp === undefined ? undefined : codexRoomMcpConfiguration(roomMcp),
               approvalPolicy: "on-request",
               sandbox: context.writeEnabled ? "workspace-write" : "read-only",
               ephemeral: true,
@@ -430,6 +543,7 @@ export class CodexAppServerRuntime implements HarnessRuntime {
               threadId: input.threadId,
               cwd: context.workspacePath,
               developerInstructions,
+              config: roomMcp === undefined ? undefined : codexRoomMcpConfiguration(roomMcp),
             });
         threadId = nestedString(threadResponse, "thread", "id");
         if (threadId === null) throw new Error("Codex did not return a thread id.");
@@ -454,6 +568,7 @@ export class CodexAppServerRuntime implements HarnessRuntime {
     return {
       events,
       cancel: async () => {
+        await roomMcp?.stop();
         if (threadId !== null && turnId !== null) {
           try { await request("turn/interrupt", { threadId, turnId }); } catch { terminateNativeProcessTree(child); }
         } else {
@@ -461,11 +576,44 @@ export class CodexAppServerRuntime implements HarnessRuntime {
         }
       },
       approve: async (requestId, decision) => {
-        const rpcId = approvalRequests.get(requestId);
-        if (rpcId === undefined) throw new Error("That approval request is no longer active.");
+        const pending = approvalRequests.get(requestId);
+        if (pending === undefined) throw new Error("That approval request is no longer active.");
         approvalRequests.delete(requestId);
-        respond(rpcId, approvalResult(decision));
+        respond(
+          pending.rpcId,
+          pending.kind === "permissions"
+            ? permissionApprovalResult(pending.permissions ?? {}, decision)
+            : pending.kind === "mcp"
+              ? mcpApprovalResult(decision, pending.sessionPersistAllowed === true)
+              : approvalResult(decision),
+        );
       },
     };
   }
+}
+
+/** App-server thread config keeps the bearer out of JSON-RPC and process args. */
+export function codexRoomMcpConfiguration(exposure: NativeRoomMcpExposure): {
+  mcp_servers: {
+    room: {
+      url: string;
+      bearer_token_env_var: typeof NATIVE_ROOM_MCP_TOKEN_ENV;
+      default_tools_approval_mode: "approve";
+    };
+  };
+} {
+  return {
+    mcp_servers: {
+      room: {
+        url: exposure.url,
+        bearer_token_env_var: NATIVE_ROOM_MCP_TOKEN_ENV,
+        // The app-server otherwise routes every MCP call through its generic
+        // user-input flow. Headless rich clients cannot answer that flow, so
+        // Codex cancels the call before it reaches Arcelle. This server is
+        // per-run, bearer protected, baseline gated, and still confined by
+        // the native workspace sandbox and Arcelle's own tool policies.
+        default_tools_approval_mode: "approve",
+      },
+    },
+  };
 }

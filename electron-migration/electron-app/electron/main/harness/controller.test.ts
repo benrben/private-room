@@ -216,6 +216,40 @@ describe("HarnessController", () => {
     }
   });
 
+  it("reports leased read-only rooms honestly and refuses runs before history writes", async () => {
+    const f = await fixture();
+    try {
+      f.state.room!.readOnly = true;
+      const runtime = new EditingRuntime();
+      const controller = new HarnessController(f.state, f.root, () => undefined, {
+        runtimes: {
+          codex: runtime,
+          claude: runtime,
+          "ollama-local": runtime,
+          "ollama-cloud": runtime,
+          openrouter: runtime,
+        },
+        flag: () => true,
+        outsideWorkspaceIsolation: true,
+        verifyExposure: async () => true,
+      });
+
+      const capabilities = await controller.capabilities();
+      for (const provider of Object.values(capabilities.providers)) {
+        expect(provider).toMatchObject({ enabled: false, reason: expect.stringMatching(/writer lease/i) });
+      }
+      await expect(controller.start({
+        provider: "ollama-local",
+        model: "qwen3:14b",
+        privacyMode: "local",
+        writeEnabled: false,
+        text: "read notes",
+      })).rejects.toThrow(/writer lease/i);
+    } finally {
+      f.created.db.close();
+    }
+  });
+
   it("keeps production native mode disabled until outside-workspace isolation is proven", async () => {
     const f = await fixture();
     try {

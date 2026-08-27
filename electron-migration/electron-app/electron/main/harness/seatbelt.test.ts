@@ -227,6 +227,46 @@ describe("native workspace Seatbelt", () => {
     }, ["-c", "exit 0"])).toBe(true);
   });
 
+  it.runIf(nativeWorkspaceSandboxSupported())(
+    "derives a GUI-safe identity, preserves provider settings, and drops ambient secrets",
+    async () => {
+      const f = await fixture();
+      const ambientSecretKey = "ARCELLE_SANDBOX_AMBIENT_SECRET_CANARY";
+      const previousSecret = process.env[ambientSecretKey];
+      const previousUser = process.env.USER;
+      process.env[ambientSecretKey] = "must-not-be-inherited";
+      delete process.env.USER;
+      try {
+        const child = spawnWithNativeWorkspaceSandbox({
+          workspacePath: f.workspacePath,
+          runtimePath: f.runtimePath,
+          executable: "/bin/sh",
+          provider: "claude",
+          writeEnabled: false,
+        }, [
+          "-c",
+          'test "$USER" = "$1" && test -n "$HOME" && test "$CLAUDE_CODE_ENTRYPOINT" = "sdk-ts" && test -z "$ARCELLE_SANDBOX_AMBIENT_SECRET_CANARY"',
+          "arcelle",
+          os.userInfo().username,
+        ], {
+          cwd: f.workspacePath,
+          // The real Claude SDK sends a copy of the complete process env.
+          env: { ...process.env, CLAUDE_CODE_ENTRYPOINT: "sdk-ts" },
+        });
+        const result = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
+          child.once("error", reject);
+          child.once("exit", (code, signal) => resolve({ code, signal }));
+        });
+        expect(result).toEqual({ code: 0, signal: null });
+      } finally {
+        if (previousSecret === undefined) delete process.env[ambientSecretKey];
+        else process.env[ambientSecretKey] = previousSecret;
+        if (previousUser === undefined) delete process.env.USER;
+        else process.env.USER = previousUser;
+      }
+    },
+  );
+
   it.runIf(process.platform !== "win32")("terminates the native harness process group", async () => {
     const f = await fixture();
     const grandchildPidPath = path.join(f.runtimePath, "grandchild.pid");
@@ -290,7 +330,7 @@ describe("native workspace Seatbelt", () => {
       executable,
       provider,
       writeEnabled: false,
-    }, args, { cwd: f.workspacePath, env: process.env });
+    }, args, { cwd: f.workspacePath });
     await new Promise<void>((resolve, reject) => {
       child.once("spawn", resolve);
       child.once("error", reject);

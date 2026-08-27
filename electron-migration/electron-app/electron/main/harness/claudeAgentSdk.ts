@@ -13,6 +13,7 @@ import { AsyncEventQueue } from "./eventQueue.js";
 import { claudeAgentDefinitions } from "./agentManifest.js";
 import { safeProviderFailure } from "./failureSafety.js";
 import { nativeCliExecutable } from "./nativeCli.js";
+import type { NativeRoomMcpExposure, NativeRoomMcpFactory } from "./nativeRoomMcp.js";
 import {
   spawnWithNativeWorkspaceSandbox,
   terminateNativeProcessTree,
@@ -66,7 +67,10 @@ export class ClaudeAgentSdkRuntime implements HarnessRuntime {
 
   private readonly executable: string;
 
-  constructor(executable = nativeCliExecutable("claude")) {
+  constructor(
+    executable = nativeCliExecutable("claude"),
+    private readonly roomMcpFactory?: NativeRoomMcpFactory,
+  ) {
     this.executable = executable;
   }
 
@@ -97,6 +101,7 @@ export class ClaudeAgentSdkRuntime implements HarnessRuntime {
     const pending = new Map<string, PendingApproval>();
     const spawned = new Set<SpawnedProcess>();
     const subagents = new Map<string, string>();
+    const roomMcp = await this.roomMcpFactory?.(context);
 
     const canUseTool: CanUseTool = async (toolName, toolInput, options) => {
       const requestId = options.requestId || options.toolUseID;
@@ -217,17 +222,35 @@ export class ClaudeAgentSdkRuntime implements HarnessRuntime {
       return child;
     };
 
-    const sdkQuery = query({
-      prompt: input.text,
-      options: {
+    let sdkQuery: ReturnType<typeof query>;
+    try {
+      sdkQuery = query({
+        prompt: input.text,
+        options: {
         abortController,
+        // The SDK resolves its optional CLI relative to sdk.mjs. Inside an
+        // Electron asar that virtual path is readable by Node but cannot be
+        // executed by spawn(2). Use the executable that Arcelle already
+        // capability-probed (normally the installed Claude Code CLI), so the
+        // packaged app starts the same verified binary as the sandbox test.
+        pathToClaudeCodeExecutable: this.executable,
         cwd: context.workspacePath,
         model: context.model || undefined,
         systemPrompt: context.systemPrompt === undefined
-          ? { type: "preset", preset: "claude_code" }
-          : { type: "preset", preset: "claude_code", append: context.systemPrompt },
+          ? roomMcp === undefined
+            ? { type: "preset", preset: "claude_code" }
+            : { type: "preset", preset: "claude_code", append: roomMcp.instructions }
+          : {
+              type: "preset",
+              preset: "claude_code",
+              append: [context.systemPrompt, roomMcp?.instructions].filter(Boolean).join("\n\n"),
+            },
         tools: { type: "preset", preset: "claude_code" },
         agents: claudeAgentDefinitions(),
+        mcpServers: roomMcp === undefined ? undefined : {
+          room: claudeRoomMcpConfiguration(roomMcp),
+        },
+        strictMcpConfig: roomMcp !== undefined,
         disallowedTools: ["WebFetch", "WebSearch"],
         permissionMode: "default",
         sandbox: {
@@ -244,7 +267,10 @@ export class ClaudeAgentSdkRuntime implements HarnessRuntime {
           },
           network: {
             strictAllowlist: true,
-            allowedDomains: [],
+            // The per-run Arcelle MCP bridge is the only network endpoint
+            // exposed to the native Claude process. Seatbelt still blocks
+            // filesystem escape and the bridge requires a fresh bearer token.
+            allowedDomains: roomMcp === undefined ? [] : ["127.0.0.1"],
             allowLocalBinding: false,
             allowAllUnixSockets: false,
           },
@@ -259,8 +285,12 @@ export class ClaudeAgentSdkRuntime implements HarnessRuntime {
           PostToolUse: [{ hooks: [postTool] }],
         },
         spawnClaudeCodeProcess: spawnSandboxed,
-      },
-    });
+        },
+      });
+    } catch (error) {
+      await roomMcp?.stop();
+      throw error;
+    }
 
     void (async () => {
       events.push({ type: "run_started", runId: context.runId, harness: this.name });
@@ -323,6 +353,7 @@ export class ClaudeAgentSdkRuntime implements HarnessRuntime {
       } finally {
         for (const approval of pending.values()) approval.resolve("cancel");
         pending.clear();
+        await roomMcp?.stop();
         events.end();
       }
     })();
@@ -334,6 +365,7 @@ export class ClaudeAgentSdkRuntime implements HarnessRuntime {
         sdkQuery.close();
         for (const child of spawned) terminateNativeProcessTree(child);
         spawned.clear();
+        await roomMcp?.stop();
       },
       approve: async (requestId, decision) => {
         const approval = pending.get(requestId);
@@ -342,4 +374,21 @@ export class ClaudeAgentSdkRuntime implements HarnessRuntime {
       },
     };
   }
+}
+
+/** Serializable SDK config for the one authenticated per-run Room bridge. */
+export function claudeRoomMcpConfiguration(exposure: NativeRoomMcpExposure): {
+  type: "http";
+  url: string;
+  headers: Record<string, string>;
+  alwaysLoad: true;
+} {
+  return {
+    type: "http",
+    url: exposure.url,
+    headers: { Authorization: `Bearer ${exposure.token}` },
+    // The specialist definitions reference exact room tool names. Loading
+    // the catalog before turn one prevents those names from being deferred.
+    alwaysLoad: true,
+  };
 }

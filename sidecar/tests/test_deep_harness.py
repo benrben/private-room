@@ -12,6 +12,7 @@ from arcelle_sidecar.deep_harness import (
     ArcelleWorkspaceBackend,
     SAFE_WORKSPACE_FAILURE,
     _subagent_initial_state,
+    _workspace_mutation_tools,
     is_small_parameter_model,
     select_deep_harness,
 )
@@ -81,7 +82,65 @@ async def test_workspace_backend_suppresses_duplicate_mutations_and_honours_canc
 
     cancel.cancelled = True
     assert (await backend.aread("/other.md")).error == "This run was cancelled."
+    assert (await backend.amove("/notes.md", "/Archive/notes.md"))["error"] == "This run was cancelled."
     assert len(bridge.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_workspace_backend_moves_and_renames_arbitrary_files_without_copying_bytes() -> None:
+    bridge = Bridge()
+    backend = ArcelleWorkspaceBackend(bridge, write_enabled=True)
+
+    moved = await backend.amove("/Recordings/raw.m4a", "/Archive/meeting.m4a")
+    duplicate = await backend.amove("/Recordings/raw.m4a", "/Archive/meeting.m4a")
+    renamed = await backend.arename("/Sketches/idea.sketch.json", "final.sketch.json")
+
+    assert moved == duplicate == {"path": None}
+    assert renamed == {"path": None}
+    assert bridge.calls == [
+        (
+            "move",
+            {
+                "source_path": "/Recordings/raw.m4a",
+                "destination_path": "/Archive/meeting.m4a",
+            },
+        ),
+        (
+            "rename",
+            {
+                "source_path": "/Sketches/idea.sketch.json",
+                "new_name": "final.sketch.json",
+                "destination_path": "/Sketches/final.sketch.json",
+            },
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_workspace_move_tools_require_write_baseline_and_validate_both_paths() -> None:
+    bridge = Bridge()
+    read_only = ArcelleWorkspaceBackend(bridge, write_enabled=False)
+    assert (await read_only.adelete("/a.pdf")).error == "This run is read-only."
+    assert (await read_only.amove("/a.pdf", "/Archive/a.pdf"))["error"] == "This run is read-only."
+    assert (await read_only.arename("/a.pdf", "b.pdf"))["error"] == "This run is read-only."
+
+    writable = ArcelleWorkspaceBackend(bridge, write_enabled=True)
+    assert (await writable.adelete("/.arcelle/a.pdf")).error
+    assert (await writable.amove("/a.pdf", "/.arcelle/a.pdf"))["error"]
+    assert (await writable.amove("/../a.pdf", "/a.pdf"))["error"]
+    assert (await writable.arename("/a.pdf", "../b.pdf"))["error"]
+    assert bridge.calls == []
+
+    tools = {tool.name: tool for tool in _workspace_mutation_tools(writable)}
+    assert set(tools) == {"workspace_delete", "workspace_move", "workspace_rename"}
+    await tools["workspace_delete"].ainvoke({"file_path": "/obsolete.pdf"})
+    await tools["workspace_move"].ainvoke(
+        {"source_path": "/binary.pdf", "destination_path": "/Filed/binary.pdf"}
+    )
+    await tools["workspace_rename"].ainvoke(
+        {"file_path": "/Filed/binary.pdf", "new_name": "signed.pdf"}
+    )
+    assert [operation for operation, _arguments in bridge.calls] == ["delete", "move", "rename"]
 
 
 @pytest.mark.asyncio
@@ -108,6 +167,14 @@ async def test_workspace_backend_never_forwards_raw_bridge_failures(mode: str) -
         assert "Ben Reich" not in result.error
         assert "secret-token" not in result.error
         assert "/Users/benreich" not in result.error
+    for result in [
+        await backend.amove("/notes.md", "/Archive/notes.md"),
+        await backend.arename("/notes.md", "final.md"),
+    ]:
+        assert result["error"] == SAFE_WORKSPACE_FAILURE
+        assert "Ben Reich" not in result["error"]
+        assert "secret-token" not in result["error"]
+        assert "/Users/benreich" not in result["error"]
 
 
 @pytest.mark.asyncio

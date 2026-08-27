@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { RoomManagerState } from "../roomManager.js";
 import type { RunViaSidecarRequest } from "../sidecar.js";
 import { DeepAgentRuntime } from "./deepAgentRuntime.js";
+import type { CloudPrivacyWorkspaceOptions, WorkspaceCalls } from "./legacyCli.js";
 import type { HarnessContext, HarnessEvent } from "./types.js";
 
 function state(): RoomManagerState {
@@ -102,6 +103,52 @@ describe("DeepAgentRuntime", () => {
     for await (const _event of started.events) { /* drain */ }
 
     expect(mirrorFactory).toHaveBeenCalledWith("/private/redacted-mirror", true);
+    expect(request).toMatchObject({ routing: { write: true } });
+  });
+
+  it("keeps workspace operations on the mirror but routes standard binary organization to the protected room", async () => {
+    const mirror = { call: vi.fn(async () => ({ backend: "mirror" })) };
+    const hybrid = { call: vi.fn(async () => ({ backend: "hybrid" })) };
+    const mirrorFactory = vi.fn(() => mirror);
+    let selectedMirror: WorkspaceCalls | null = null;
+    let selectedReal: WorkspaceCalls | null = null;
+    let selectedOptions: CloudPrivacyWorkspaceOptions | null = null;
+    const hybridFactory = vi.fn((
+      mirrorBackend: WorkspaceCalls,
+      realBackend: WorkspaceCalls,
+      options?: CloudPrivacyWorkspaceOptions,
+    ) => {
+      selectedMirror = mirrorBackend;
+      selectedReal = realBackend;
+      selectedOptions = options ?? null;
+      return hybrid;
+    });
+    let request: RunViaSidecarRequest | null = null;
+    const runtime = new DeepAgentRuntime(
+      state(),
+      () => {},
+      undefined,
+      vi.fn(async (req) => {
+        request = req;
+        return { kind: "done" as const, text: "done", usage: null, plan: null };
+      }),
+      mirrorFactory,
+      hybridFactory,
+    );
+    const started = await runtime.startTurn({
+      ...context(true),
+      provider: "ollama-cloud",
+      model: "gpt-oss:120b-cloud",
+      privacyMode: "cloud-redacted",
+      workspacePath: "/private/redacted-mirror",
+    }, { text: "organize the PDF" });
+    for await (const _event of started.events) { /* drain */ }
+
+    expect(mirrorFactory).toHaveBeenCalledWith("/private/redacted-mirror", true);
+    expect(hybridFactory).toHaveBeenCalledTimes(1);
+    expect(selectedMirror).toBe(mirror);
+    expect(selectedReal).toEqual(expect.objectContaining({ call: expect.any(Function) }));
+    expect(selectedOptions).toEqual({ routeExactMoveRenameToReal: true });
     expect(request).toMatchObject({ routing: { write: true } });
   });
 

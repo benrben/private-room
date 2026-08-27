@@ -12,7 +12,7 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -22,6 +22,7 @@ import { setSetting } from "./db-host/settings.js";
 import { clearPolicy, setPolicyRulesForTests } from "./privacy.js";
 import { discoveryFile } from "./moonshotDiscovery.js";
 import { createLiveRoomManagerDeps } from "./ipc/registry.js";
+import { chatTurnBridgeRunOptions, chatTurnWorkspaceWriteEnabled } from "./chatTurnSurfaceIpc.js";
 import {
   closeRoom,
   createRoom,
@@ -32,9 +33,13 @@ import {
 } from "./roomManager.js";
 import {
   createRoomServerDeps,
+  roomServerDispatcherFactory,
   spawnRoomServerIfEnabledCore,
   type SpawnRoomServerResult,
 } from "./roomServerLive.js";
+import { createWorkspaceRoom } from "./workspace/roomLayout.js";
+import { WorkspaceService } from "./workspace/workspaceService.js";
+import { WEB_LANES_ALL } from "./toolSpecs.js";
 
 const PASSWORD = "correct horse battery staple";
 
@@ -78,6 +83,27 @@ function fixtureRoom(dir: string): { state: RoomManagerState; room: Room } {
   const room: Room = { conn, path: roomPath, name: "Leash Room", password: PASSWORD };
   state.room = room;
   return { state, room };
+}
+
+function fixtureWorkspaceRoom(
+  dir: string,
+  readOnly = false,
+): { state: RoomManagerState; room: Room; root: string } {
+  const root = path.join(dir, `workspace-${randomUUID()}`);
+  const created = createWorkspaceRoom(root, PASSWORD, "Workspace Room");
+  strayConns.push(created.db);
+  const state = createRoomManagerState();
+  const room: Room = {
+    conn: created.db,
+    path: root,
+    name: "Workspace Room",
+    password: PASSWORD,
+    descriptor: created.descriptor,
+    workspace: new WorkspaceService(created.db, root),
+    ...(readOnly ? { readOnly: true } : {}),
+  };
+  state.room = room;
+  return { state, room, root };
 }
 
 async function postJson(
@@ -165,6 +191,122 @@ describe("spawnRoomServerIfEnabledCore — disabled / never-double-start", () =>
     expect(state.roomServer).toBe(first.bridge as unknown as typeof state.roomServer);
 
     first.bridge.stop();
+  });
+});
+
+describe("main Assistant workspace write grant", () => {
+  const localScope = { kind: "LocalEngine" as const };
+
+  it("gives only the short-lived writable chat bridge controlled normal-file writes", async () => {
+    const dir = freshDir();
+    const { state, room, root } = fixtureWorkspaceRoom(dir);
+    const factory = roomServerDispatcherFactory(state, vi.fn());
+
+    expect(chatTurnWorkspaceWriteEnabled(room)).toBe(true);
+
+    // The long-lived/default Room server remains read-only: it has no owning
+    // chat turn, provider approval, or harness rollback boundary.
+    const persistent = factory(false, localScope, WEB_LANES_ALL);
+    const refused = await persistent.callTool(localScope, "workspace_write", {
+      path: "persistent.txt",
+      content: "must not be written\n",
+    });
+    expect(refused.isError).toBe(true);
+    expect(refused.content[0]).toEqual({ type: "text", text: '{"error":"This workspace bridge is read-only."}' });
+    expect(existsSync(path.join(root, "persistent.txt"))).toBe(false);
+
+    // registerChatTurnSurfaceIpc opts into this exact grant for one ask. The
+    // bridge still delegates path validation, atomic writes and indexing
+    // metadata to WorkspaceService.
+    const chat = factory(false, localScope, WEB_LANES_ALL, { workspaceWriteEnabled: true });
+    const written = await chat.callTool(localScope, "workspace_write", {
+      path: "Organized/assistant.txt",
+      content: "assistant write\n",
+    });
+    expect(written.isError).not.toBe(true);
+    expect(readFileSync(path.join(root, "Organized", "assistant.txt"), "utf8")).toBe("assistant write\n");
+  });
+
+  it("cannot grant writes to a read-only room and exposes no workspace backend for sealed or locked rooms", async () => {
+    const dir = freshDir();
+    const readOnly = fixtureWorkspaceRoom(dir, true);
+    expect(chatTurnWorkspaceWriteEnabled(readOnly.room)).toBe(false);
+    const readOnlyDispatcher = roomServerDispatcherFactory(readOnly.state, vi.fn())(
+      false,
+      localScope,
+      WEB_LANES_ALL,
+      { workspaceWriteEnabled: true },
+    );
+    const refused = await readOnlyDispatcher.callTool(localScope, "workspace_write", {
+      path: "forbidden.txt",
+      content: "no\n",
+    });
+    expect(refused.isError).toBe(true);
+    expect(existsSync(path.join(readOnly.root, "forbidden.txt"))).toBe(false);
+
+    const sealed = fixtureRoom(dir);
+    expect(chatTurnWorkspaceWriteEnabled(sealed.room)).toBe(false);
+    const sealedDispatcher = roomServerDispatcherFactory(sealed.state, vi.fn())(
+      false,
+      localScope,
+      WEB_LANES_ALL,
+      { workspaceWriteEnabled: true },
+    );
+    expect(sealedDispatcher.listTools(localScope).some((tool) => tool.name.startsWith("workspace_"))).toBe(false);
+
+    sealed.state.room = null;
+    const lockedDispatcher = roomServerDispatcherFactory(sealed.state, vi.fn())(
+      false,
+      localScope,
+      WEB_LANES_ALL,
+      { workspaceWriteEnabled: true },
+    );
+    expect(lockedDispatcher.listTools(localScope).some((tool) => tool.name.startsWith("workspace_"))).toBe(false);
+  });
+
+  it("carries an approved one-turn privacy bypass into the same chat file-tool bridge", async () => {
+    const dir = freshDir();
+    const { state, room } = fixtureWorkspaceRoom(dir);
+    const factory = roomServerDispatcherFactory(state, vi.fn());
+    const cloudScope = { kind: "CloudEngine" as const };
+
+    const writer = factory(false, localScope, WEB_LANES_ALL, { workspaceWriteEnabled: true });
+    await writer.callTool(localScope, "workspace_write", {
+      path: "notes.txt",
+      content: "Secret Squirrel owns this note.\n",
+    });
+    setPolicyRulesForTests(true, [["Secret Squirrel", "[Person A]"]]);
+
+    expect(chatTurnBridgeRunOptions(room, false)).toEqual({
+      workspaceWriteEnabled: true,
+      privacyBypass: false,
+    });
+    expect(chatTurnBridgeRunOptions(room, true)).toEqual({
+      workspaceWriteEnabled: true,
+      privacyBypass: true,
+    });
+
+    const protectedTurn = factory(
+      false,
+      cloudScope,
+      WEB_LANES_ALL,
+      chatTurnBridgeRunOptions(room, false),
+    );
+    const protectedRead = await protectedTurn.callTool(cloudScope, "workspace_read", { path: "notes.txt" });
+    const protectedText = (protectedRead.content[0] as { text: string }).text;
+    expect(protectedText).toContain("[Person A]");
+    expect(protectedText).not.toContain("Secret Squirrel");
+
+    const approvedTurn = factory(
+      false,
+      cloudScope,
+      WEB_LANES_ALL,
+      chatTurnBridgeRunOptions(room, true),
+    );
+    const approvedRead = await approvedTurn.callTool(cloudScope, "workspace_read", { path: "notes.txt" });
+    const approvedText = (approvedRead.content[0] as { text: string }).text;
+    expect(approvedText).toContain("Secret Squirrel");
+    expect(approvedText).not.toContain("[Person A]");
   });
 });
 
