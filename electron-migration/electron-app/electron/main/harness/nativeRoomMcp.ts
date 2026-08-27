@@ -1,6 +1,11 @@
 import { randomBytes } from "node:crypto";
 import path from "node:path";
-import { McpBridge, type ToolDispatcher, type ToolScope } from "../mcpBridge.js";
+import {
+  McpBridge,
+  type ToolCallResult,
+  type ToolDispatcher,
+  type ToolScope,
+} from "../mcpBridge.js";
 import type { RoomManagerState } from "../roomManager.js";
 import { createWorkspaceMcpBridge } from "../workspace/workspaceMcp.js";
 import {
@@ -34,6 +39,53 @@ export type NativeRoomDispatcherFactory = (
 ) => ToolDispatcher;
 
 export type NativeRoomMcpFactory = (context: HarnessContext) => Promise<NativeRoomMcpExposure>;
+
+const NATIVE_CONTENT_TOOLS = new Set([
+  "workspace_list",
+  "workspace_read",
+  "workspace_write",
+  "workspace_edit",
+  "workspace_glob",
+  "workspace_grep",
+  "list_room_files",
+  "create_file",
+  "edit_file",
+  "edit_files",
+  "write_file",
+]);
+
+const REDACTED_EXACT_ORGANIZATION_TOOLS = new Set([
+  "workspace_move",
+  "workspace_rename",
+  "workspace_delete",
+]);
+
+/**
+ * Native harnesses already have provider-owned file tools over their exposed
+ * root (real or redacted). Hide Arcelle's duplicate content tools. A redacted
+ * run also hides exact workspace organization because trusted standard
+ * rename/move/trash tools own metadata recovery against the real room.
+ */
+export function nativeRoomDispatcher(
+  base: ToolDispatcher,
+  exposure: "direct" | "redacted",
+): ToolDispatcher {
+  const hidden = (name: string): boolean => NATIVE_CONTENT_TOOLS.has(name)
+    || (exposure === "redacted" && REDACTED_EXACT_ORGANIZATION_TOOLS.has(name));
+  return {
+    listTools: (scope) => base.listTools(scope)
+      .filter((tool) => !hidden(tool.name)),
+    callTool: (scope, name, args): Promise<ToolCallResult> => {
+      if (hidden(name)) {
+        return Promise.resolve({
+          isError: true,
+          content: [{ type: "text", text: `unknown tool: ${name}` }],
+        });
+      }
+      return base.callTool(scope, name, args);
+    },
+  };
+}
 
 /**
  * Build the one MCP bridge owned by a native provider turn.
@@ -76,6 +128,7 @@ export function createNativeRoomMcpFactory(
     const realRoot = path.resolve(room.descriptor.rootPath);
     const exposedRoot = path.resolve(context.workspacePath);
     let workspace: WorkspaceCalls;
+    let nativeExposure: "direct" | "redacted";
     if (context.privacyMode === "cloud-redacted") {
       if (exposedRoot === realRoot) {
         throw new Error("Cloud Privacy native runs require the redacted workspace mirror.");
@@ -84,18 +137,21 @@ export function createNativeRoomMcpFactory(
         createMirrorWorkspaceBackend(context.workspacePath, context.writeEnabled),
         createWorkspaceMcpBridge(state, context.writeEnabled),
       );
+      nativeExposure = "redacted";
     } else {
       if (exposedRoot !== realRoot) {
         throw new Error("Direct native runs require the real verified workspace.");
       }
       workspace = createWorkspaceMcpBridge(state, context.writeEnabled);
+      nativeExposure = "direct";
     }
 
     const token = randomBytes(32).toString("base64url");
+    const selectedDispatcher = dispatcher(context, workspace);
     const bridge = new McpBridge({
       token,
       scope: ROOM_SCOPE,
-      dispatcher: dispatcher(context, workspace),
+      dispatcher: nativeRoomDispatcher(selectedDispatcher, nativeExposure),
     });
     await bridge.listen(0);
     let stopped = false;

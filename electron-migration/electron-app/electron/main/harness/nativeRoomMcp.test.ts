@@ -9,9 +9,11 @@ import { createWorkspaceRoom } from "../workspace/roomLayout.js";
 import { WorkspaceService } from "../workspace/workspaceService.js";
 import { claudeRoomMcpConfiguration } from "./claudeAgentSdk.js";
 import { codexRoomMcpConfiguration } from "./codexAppServer.js";
+import { loadAgentManifest } from "./agentManifest.js";
 import { RunProtection } from "./runProtection.js";
 import {
   createNativeRoomMcpFactory,
+  nativeRoomDispatcher,
   NATIVE_ROOM_MCP_TOKEN_ENV,
   type NativeRoomMcpExposure,
 } from "./nativeRoomMcp.js";
@@ -64,7 +66,136 @@ function dispatcher(): ToolDispatcher {
   };
 }
 
+const NATIVE_CATALOG_NAMES = [
+  "workspace_list", "workspace_read", "workspace_write", "workspace_edit",
+  "workspace_glob", "workspace_grep", "workspace_move", "workspace_rename",
+  "workspace_delete", "list_room_files", "create_file", "edit_file", "edit_files",
+  "write_file", "rename_file", "move_file", "trash_files", "organize_files",
+  "search_room", "open_file", "read_skill",
+];
+
+function catalogDispatcher(
+  calls: string[] = [],
+  names: readonly string[] = NATIVE_CATALOG_NAMES,
+): ToolDispatcher {
+  return {
+    listTools: () => names.map((name) => ({
+      name,
+      inputSchema: { type: "object", properties: {} },
+    })),
+    callTool: async (_scope, name) => {
+      calls.push(name);
+      return { isError: false, content: [{ type: "text", text: `called ${name}` }] };
+    },
+  };
+}
+
+async function mcpRequest(
+  exposure: NativeRoomMcpExposure,
+  id: number,
+  method: string,
+  params: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  const response = await fetch(exposure.url, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${exposure.token}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ jsonrpc: "2.0", id, method, params }),
+  });
+  return response.json() as Promise<Record<string, unknown>>;
+}
+
 describe("native Room MCP exposure", () => {
+  it("filters duplicate content tools while preserving direct metadata and specialist tools", async () => {
+    const calls: string[] = [];
+    const filtered = nativeRoomDispatcher(catalogDispatcher(calls), "direct");
+    const scope = { kind: "CloudEngine" as const };
+    expect(filtered.listTools(scope).map((tool) => tool.name)).toEqual([
+      "workspace_move", "workspace_rename", "workspace_delete",
+      "rename_file", "move_file", "trash_files", "organize_files",
+      "search_room", "open_file", "read_skill",
+    ]);
+    for (const hidden of [
+      "workspace_list", "workspace_read", "workspace_write", "workspace_edit",
+      "workspace_glob", "workspace_grep", "list_room_files", "create_file",
+      "edit_file", "edit_files", "write_file",
+    ]) {
+      const refused = await filtered.callTool(scope, hidden, {});
+      expect(refused).toEqual({
+        isError: true,
+        content: [{ type: "text", text: `unknown tool: ${hidden}` }],
+      });
+    }
+    for (const kept of [
+      "workspace_move", "workspace_rename", "workspace_delete",
+      "rename_file", "move_file", "trash_files", "organize_files",
+      "search_room", "open_file", "read_skill",
+    ]) {
+      expect((await filtered.callTool(scope, kept, {})).isError).toBe(false);
+    }
+    expect(calls).toEqual([
+      "workspace_move", "workspace_rename", "workspace_delete",
+      "rename_file", "move_file", "trash_files", "organize_files",
+      "search_room", "open_file", "read_skill",
+    ]);
+  });
+
+  it("keeps every MCP tool required by the shared specialist manifest visible", () => {
+    const required = [...new Set(loadAgentManifest().agents.flatMap((agent) => agent.tools))].sort();
+    const base = catalogDispatcher([], required);
+    for (const exposure of ["direct", "redacted"] as const) {
+      expect(nativeRoomDispatcher(base, exposure).listTools({ kind: "CloudEngine" })
+        .map((tool) => tool.name).sort()).toEqual(required);
+    }
+  });
+
+  it("applies reduced direct and redacted catalogs to their native exposures", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "arcelle-native-mcp-catalog-"));
+    roots.push(root);
+    const real = path.join(root, "real");
+    const mirror = path.join(root, "mirror");
+    await mkdir(real);
+    await mkdir(mirror);
+    const state = stateWith(real, { baseline_completed: 1, status: "running", write_enabled: 0 });
+    const factory = createNativeRoomMcpFactory(state, () => catalogDispatcher());
+    const direct = await factory(context(real, { writeEnabled: false, privacyMode: "cloud-direct" }));
+    try {
+      const listed = await mcpRequest(direct, 1, "tools/list", {});
+      const tools = (listed.result as { tools: ToolSpec[] }).tools.map((tool) => tool.name);
+      expect(tools).toEqual([
+        "workspace_move", "workspace_rename", "workspace_delete",
+        "rename_file", "move_file", "trash_files", "organize_files",
+        "search_room", "open_file", "read_skill",
+      ]);
+      const fabricated = await mcpRequest(direct, 2, "tools/call", {
+        name: "workspace_read", arguments: { path: "notes.txt" },
+      });
+      expect(fabricated.result).toMatchObject({ isError: true });
+    } finally {
+      await direct.stop();
+    }
+
+    const redacted = await factory(context(mirror, { writeEnabled: false, privacyMode: "cloud-redacted" }));
+    try {
+      const listed = await mcpRequest(redacted, 3, "tools/list", {});
+      expect((listed.result as { tools: ToolSpec[] }).tools.map((tool) => tool.name))
+        .toEqual([
+          "rename_file", "move_file", "trash_files", "organize_files",
+          "search_room", "open_file", "read_skill",
+        ]);
+      for (const hidden of ["workspace_read", "create_file", "workspace_move", "workspace_delete"]) {
+        const fabricated = await mcpRequest(redacted, 4, "tools/call", {
+          name: hidden, arguments: {},
+        });
+        expect(fabricated.result).toMatchObject({ isError: true });
+      }
+    } finally {
+      await redacted.stop();
+    }
+  });
+
   it("refuses write tools before the exact run baseline is complete", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "arcelle-native-mcp-baseline-"));
     roots.push(root);

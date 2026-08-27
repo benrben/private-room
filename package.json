@@ -2,7 +2,7 @@
   "name": "arcelle",
   "private": true,
   "license": "UNLICENSED",
-  "version": "0.26.2",
+  "version": "0.26.3",
   "type": "module",
   "scripts": {
     "clean": "node scripts/clean.mjs",

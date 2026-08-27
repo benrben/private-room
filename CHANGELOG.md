@@ -3,6 +3,18 @@
 All notable, user-facing changes to Arcelle. Versions follow
 [semver](https://semver.org); dates are the GitHub release dates.
 
+## 0.26.3 — 2026-08-27
+
+Codex app-server and Claude Agent SDK direct runs now use their own native file
+tools for normal listing, reading, creating and editing. Arcelle no longer
+shows duplicate content MCP tools in a real direct workspace.
+
+Arcelle-specific MCP operations remain available for moves, renames,
+recoverable deletes, Trash, organization, search and specialist features so
+stable file IDs, metadata, privacy and rollback behavior stay intact. Cloud
+Privacy mirrors, Ollama, OpenRouter, the regular Assistant and restricted
+fallback runs keep the complete controlled workspace catalog.
+
 ## 0.26.2 — 2026-08-27
 
 Agents can now create, edit, rename, move, organize and recoverably delete
