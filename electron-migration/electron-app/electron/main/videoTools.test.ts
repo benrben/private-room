@@ -882,27 +882,36 @@ describe("registerVideoIpc", () => {
     expect(result.name).toBe("talk @ 0-05.png");
   });
 
-  it("forwards an injected probe/emit/enqueueStt deps bag through to video_trim", async () => {
-    if (!canRunRealAvconvert) {
-      return;
-    }
-    freshRoom();
-    const { id } = insertVideoFile("clip.mov", fixtureClipBytes!);
-    const probe: ProbeVideoFn = () => Promise.resolve(FULL_META);
-    const emit = vi.fn();
-    const jobs: JobMeta[] = [];
-    const handle = vi.fn();
-    registerVideoIpc(
-      { handle },
-      roomSource({ open: true, epoch: 1 }),
-      { probe, emit, enqueueStt: (job) => jobs.push(job) }
-    );
-    const fn = listener(handle, "video_trim");
-    const file = (await fn({}, { id, startSecs: 1, endSecs: 3 })) as { id: string; name: string };
-    expect(getMediaMeta(db, file.id)).not.toBeNull();
-    expect(emit).toHaveBeenCalledWith("room-files-changed", undefined);
-    expect(jobs).toHaveLength(1);
-  });
+  it(
+    "forwards an injected probe/emit/enqueueStt deps bag through to video_trim",
+    async () => {
+      if (!canRunRealAvconvert) {
+        return;
+      }
+      freshRoom();
+      const { id } = insertVideoFile("clip.mov", fixtureClipBytes!);
+      const probe: ProbeVideoFn = () => Promise.resolve(FULL_META);
+      const emit = vi.fn();
+      const jobs: JobMeta[] = [];
+      const handle = vi.fn();
+      registerVideoIpc(
+        { handle },
+        roomSource({ open: true, epoch: 1 }),
+        { probe, emit, enqueueStt: (job) => jobs.push(job) }
+      );
+      const fn = listener(handle, "video_trim");
+      const file = (await fn({}, { id, startSecs: 1, endSecs: 3 })) as {
+        id: string;
+        name: string;
+      };
+      expect(getMediaMeta(db, file.id)).not.toBeNull();
+      expect(emit).toHaveBeenCalledWith("room-files-changed", undefined);
+      expect(jobs).toHaveLength(1);
+    },
+    // This exercises the real macOS avconvert binary. Under full-suite load it
+    // can legitimately exceed Vitest's five-second unit-test default.
+    15_000,
+  );
 });
 
 // ============================================================================
