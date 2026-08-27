@@ -6,6 +6,8 @@ import { activePolicy, type PolicyState } from "../privacy.js";
 import type { RoomManagerState } from "../roomManager.js";
 import type { LiveAppServices } from "../liveAppServices.js";
 import { runsOnThisMac } from "../capabilities.js";
+import { listModels as listOllamaModels } from "../engineRouting.js";
+import { registryName } from "../ollamaModels.js";
 import { roomServerDispatcherFactory } from "../roomServerLive.js";
 import { WEB_LANES_ALL } from "../toolSpecs.js";
 import {
@@ -90,6 +92,7 @@ export interface HarnessControllerOptions {
     writeEnabled: boolean,
   ) => Promise<boolean>;
   outsideWorkspaceIsolation?: boolean;
+  listOllamaModels?: () => Promise<string[]>;
 }
 
 /** Trusted bridge between room state, provider runtimes and renderer events. */
@@ -98,6 +101,7 @@ export class HarnessController {
   private readonly policy: () => PolicyState | null;
   private readonly flag: (name: WorkspaceHarnessFlag) => boolean;
   private readonly verifyExposure: NonNullable<HarnessControllerOptions["verifyExposure"]>;
+  private readonly listOllamaModels: () => Promise<string[]>;
   private isolationProven: boolean;
   private readonly mirrors = new Map<string, MirrorRun>();
   private readonly pendingMirrorApprovals = new Map<string, PendingMirrorApproval>();
@@ -149,6 +153,7 @@ export class HarnessController {
     };
     this.policy = options.policy ?? activePolicy;
     this.flag = options.flag ?? workspaceHarnessFlag;
+    this.listOllamaModels = options.listOllamaModels ?? listOllamaModels;
     this.verifyExposure = options.verifyExposure ?? (async (workspacePath, provider, runtimePath, writeEnabled) => {
       const runtime = this.runtimes[provider];
       if (runtime.verifyExposure !== undefined) {
@@ -297,9 +302,21 @@ export class HarnessController {
   async start(request: HarnessStartRequest): Promise<string> {
     if (!this.flag("unified_harness")) throw new Error("The unified harness feature is disabled.");
     const native = request.provider === "codex" || request.provider === "claude";
-    const selectedModel = native
-      ? nativeHarnessModel(request.model) ?? ""
-      : request.model.trim();
+    let selectedModel = native ? nativeHarnessModel(request.model) ?? "" : request.model.trim();
+    if (request.provider === "ollama-local" || request.provider === "ollama-cloud") {
+      const catalog = await this.listOllamaModels().catch(() => [] as string[]);
+      const exact = catalog.find((model) => model === selectedModel);
+      const folded = exact === undefined
+        ? catalog.filter((model) => model.toLowerCase() === selectedModel.toLowerCase())
+        : [];
+      if (exact !== undefined) selectedModel = exact;
+      else if (folded.length === 1) selectedModel = folded[0]!;
+      else if (folded.length === 0 && request.provider === "ollama-cloud") {
+        // Ollama Cloud rejects display-case variants of simple registry tags.
+        // Namespaced/custom paths keep their original casing.
+        selectedModel = registryName(selectedModel);
+      }
+    }
     if (!native && (selectedModel === "" || selectedModel.toLowerCase() === "default")) {
       throw new Error(`Choose a specific model for the ${request.provider} harness.`);
     }

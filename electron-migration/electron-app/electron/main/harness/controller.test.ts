@@ -166,6 +166,148 @@ describe("HarnessController", () => {
     },
   );
 
+  it.each([
+    {
+      name: "uses the Ollama catalog spelling for a cloud model",
+      provider: "ollama-cloud" as const,
+      requested: " Gpt-OSS:120B-Cloud ",
+      catalog: ["gpt-oss:120b-cloud"],
+      expected: "gpt-oss:120b-cloud",
+    },
+    {
+      name: "uses the Ollama catalog spelling for a local model",
+      provider: "ollama-local" as const,
+      requested: " QWEN3.5:4B ",
+      catalog: ["qwen3.5:4b"],
+      expected: "qwen3.5:4b",
+    },
+    {
+      name: "preserves an unmatched custom local model",
+      provider: "ollama-local" as const,
+      requested: " MyCustom:Latest ",
+      catalog: [],
+      expected: "MyCustom:Latest",
+    },
+    {
+      name: "preserves a namespaced local model when it is not in the catalog",
+      provider: "ollama-local" as const,
+      requested: " hf.co/Owner/Repo:Q4 ",
+      catalog: [],
+      expected: "hf.co/Owner/Repo:Q4",
+    },
+    {
+      name: "does not guess between ambiguous catalog spellings",
+      provider: "ollama-local" as const,
+      requested: " Model:Latest ",
+      catalog: ["model:latest", "MODEL:LATEST"],
+      expected: "Model:Latest",
+    },
+    {
+      name: "uses the safe registry fallback for an unmatched cloud tag",
+      provider: "ollama-cloud" as const,
+      requested: " Gpt-OSS:120B-Cloud ",
+      catalog: [],
+      expected: "gpt-oss:120b-cloud",
+    },
+  ])("$name", async ({ provider, requested, catalog, expected }) => {
+    const f = await fixture();
+    let completed!: () => void;
+    const terminal = new Promise<void>((resolve) => { completed = resolve; });
+    try {
+      const runtime = new CapturingRuntime();
+      const controller = new HarnessController(f.state, f.root, (event, payload) => {
+        if (event === "harness-event" && (payload as { type?: string }).type === "run_completed") completed();
+      }, {
+        runtimes: { [provider]: runtime },
+        flag: () => true,
+        outsideWorkspaceIsolation: false,
+        listOllamaModels: async () => catalog,
+      });
+      await controller.start({
+        provider,
+        model: requested,
+        privacyMode: provider === "ollama-local" ? "local" : "cloud-direct",
+        writeEnabled: false,
+        text: "review",
+      });
+      await terminal;
+      expect(runtime.context?.model).toBe(expected);
+    } finally {
+      f.created.db.close();
+    }
+  });
+
+  it.each([
+    {
+      name: "preserves a local model when the Ollama catalog fails",
+      provider: "ollama-local" as const,
+      requested: "MyCustom:Latest",
+      expected: "MyCustom:Latest",
+    },
+    {
+      name: "uses the safe registry fallback when the Ollama Cloud catalog fails",
+      provider: "ollama-cloud" as const,
+      requested: "Gpt-OSS:120B-Cloud",
+      expected: "gpt-oss:120b-cloud",
+    },
+  ])("$name", async ({ provider, requested, expected }) => {
+    const f = await fixture();
+    let completed!: () => void;
+    const terminal = new Promise<void>((resolve) => { completed = resolve; });
+    try {
+      const runtime = new CapturingRuntime();
+      const controller = new HarnessController(f.state, f.root, (event, payload) => {
+        if (event === "harness-event" && (payload as { type?: string }).type === "run_completed") completed();
+      }, {
+        runtimes: { [provider]: runtime },
+        flag: () => true,
+        outsideWorkspaceIsolation: false,
+        listOllamaModels: async () => { throw new Error("catalog offline"); },
+      });
+      await controller.start({
+        provider,
+        model: requested,
+        privacyMode: provider === "ollama-local" ? "local" : "cloud-direct",
+        writeEnabled: false,
+        text: "review",
+      });
+      await terminal;
+      expect(runtime.context?.model).toBe(expected);
+    } finally {
+      f.created.db.close();
+    }
+  });
+
+  it("does not query Ollama or change an OpenRouter model name", async () => {
+    const f = await fixture();
+    let catalogCalls = 0;
+    let completed!: () => void;
+    const terminal = new Promise<void>((resolve) => { completed = resolve; });
+    try {
+      const runtime = new CapturingRuntime();
+      const controller = new HarnessController(f.state, f.root, (event, payload) => {
+        if (event === "harness-event" && (payload as { type?: string }).type === "run_completed") completed();
+      }, {
+        runtimes: { openrouter: runtime },
+        flag: () => true,
+        outsideWorkspaceIsolation: false,
+        listOllamaModels: async () => { catalogCalls += 1; return []; },
+      });
+      await controller.start({
+        provider: "openrouter",
+        model: " Owner/Mixed-Case-Model ",
+        privacyMode: "cloud-direct",
+        writeEnabled: false,
+        text: "review",
+      });
+      await terminal;
+      expect(runtime.context?.model).toBe("Owner/Mixed-Case-Model");
+      expect(catalogCalls).toBe(0);
+    } finally {
+      f.created.db.close();
+    }
+  });
+
   it("rebinds history to the new SQLCipher connection after reopening the same room", async () => {
     const f = await fixture();
     let activeDb = f.created.db;
