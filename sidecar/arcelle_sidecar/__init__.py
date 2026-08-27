@@ -86,7 +86,7 @@ def disable_tracing() -> None:
 
 disable_tracing()
 
-__version__ = "0.26.0"
+__version__ = "0.26.1"
 
 #: The ONLY address the sidecar ever binds. Never 0.0.0.0 (SPEC §6).
 LOOPBACK_HOST = "127.0.0.1"

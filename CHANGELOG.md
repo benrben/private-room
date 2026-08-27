@@ -3,6 +3,13 @@
 All notable, user-facing changes to Arcelle. Versions follow
 [semver](https://semver.org); dates are the GitHub release dates.
 
+## 0.26.1 — 2026-08-27
+
+Claude's native Agent SDK harness can now use an existing Claude login inside
+Arcelle's macOS sandbox. The sandbox receives read-only access to the single
+encrypted login keychain database required by Claude; it still cannot write to
+the Keychain, inspect sibling keychains, access `.arcelle`, or escape the room.
+
 ## 0.26.0 — 2026-08-27
 
 Arcelle's rooms are now real folders, and every supported model can work through
