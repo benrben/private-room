@@ -42,7 +42,7 @@ from arcelle_sidecar.media.decode import MediaKind, decode_to_pcm
 from arcelle_sidecar.rec import vad
 from arcelle_sidecar.rec.meta import FRAME
 
-REPO_ROOT = "/Users/benreich/private-room"
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # The real, official Silero VAD v5 ONNX graph, cached outside the repo for
 # this test session only — see the module docstring above.
@@ -135,11 +135,11 @@ def test_vad_model_path_fallback_is_the_electron_development_models_dir() -> Non
     paths against.
     """
     assert vad._vad_model_path_override is None
-    expected = f"{REPO_ROOT}/electron-migration/electron-app/assets/models/silero_vad.onnx"
+    expected = str(REPO_ROOT / "electron-migration" / "electron-app" / "assets" / "models" / "silero_vad.onnx")
     assert vad._vad_model_path() == expected
     # The directory genuinely exists on this machine (it holds the OTHER
     # vendored models) even though the ONNX file itself does not yet.
-    assert Path(REPO_ROOT, "electron-migration", "electron-app", "assets", "models").is_dir()
+    assert (REPO_ROOT / "electron-migration" / "electron-app" / "assets" / "models").is_dir()
 
 
 def test_set_vad_model_path_overrides_and_is_callable_repeatedly() -> None:
