@@ -40,10 +40,15 @@
 
 import type Database from "better-sqlite3-multiple-ciphers";
 import { setChatTitleIfNew } from "./db-host/chats.js";
-import { getFileFull, listFileInventory } from "./db-host/files.js";
+import { getFileFull, listFileInventory, listFilesBrief } from "./db-host/files.js";
 import { listMemories } from "./db-host/memories.js";
 import { insertMessage, recentMessages } from "./db-host/messages.js";
-import { compactHistory, retrieveContext, selectMemories } from "./db-host/retrieval.js";
+import {
+  compactHistory,
+  retrieveContext,
+  retrieveContextForFiles,
+  selectMemories,
+} from "./db-host/retrieval.js";
 import { getSetting } from "./db-host/settings.js";
 import { findSkill, listSkillResources, listSkills } from "./db-host/skills.js";
 import type { SidecarChatMessage } from "./sidecar.js";
@@ -56,6 +61,7 @@ import {
   advertiseSkills,
   buildSystemPrompt,
   explicitSkillRequest,
+  explicitlyNamedRoomFiles,
   historyBudgetBytes,
   isBareSaveReference,
   isImage,
@@ -301,7 +307,23 @@ export function gatherContextAndSaveQuestion(
   // `recentMessages` is newest-first; the prompt wants chronological order.
   const history = [...recentMessages(db, chatId, AGENT_HISTORY_MESSAGES)].reverse();
 
-  const [contextChunks, contextFallback] = retrieveContext(db, effectiveQuestion, questionEmbedding);
+  const inventory = listFileInventory(db);
+  // `listFileInventory` intentionally stops at 101 rows for the system prompt.
+  // Explicit scope must still recognize an older file in a large room, so only
+  // the name resolver expands to the complete lightweight listing.
+  const scopeInventory =
+    inventory.length <= 100
+      ? inventory
+      : listFilesBrief(db).map(([name, mime, _size, summary]): [string, string, string | null] => [
+          name,
+          mime,
+          summary,
+        ]);
+  const namedFiles = explicitlyNamedRoomFiles(effectiveQuestion, scopeInventory);
+  const [contextChunks, contextFallback] =
+    namedFiles.length > 0
+      ? retrieveContextForFiles(db, effectiveQuestion, namedFiles)
+      : retrieveContext(db, effectiveQuestion, questionEmbedding);
 
   const { images, attachedNotes, sources, firstImage, carried } = processAttachments(
     db,
@@ -330,7 +352,7 @@ export function gatherContextAndSaveQuestion(
   const system = buildSystemPrompt({
     webEnabled,
     connectedMcp,
-    inventory: listFileInventory(db),
+    inventory,
     roomRoleId: roomRole,
     responseStyle,
     customInstructions,
@@ -346,6 +368,13 @@ export function gatherContextAndSaveQuestion(
   }
 
   let userContent = advertiseSkills(availableSkills.map((s): [string, string] => [s.name, s.description]));
+
+  if (namedFiles.length > 0) {
+    userContent +=
+      `The user explicitly scoped this request to these room files: ${namedFiles.join(", ")}.\n` +
+      "Use only those files and any paperclipped attachments as room-file evidence for this request. " +
+      "Do not search or cite other room files unless the user asks you to broaden the scope.\n\n";
+  }
 
   if (explicitSkill !== null) {
     const tree =

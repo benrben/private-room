@@ -253,6 +253,91 @@ export function advertiseSkills(skills: ReadonlyArray<readonly [name: string, de
   return `${out}\n`;
 }
 
+// ------------------------------------------------ explicit room-file scope
+
+/** Is one side of a filename mention a word boundary?
+ *
+ * Filenames commonly end in an ASCII letter (`notes.md`). A plain substring
+ * check would therefore treat `notes.md` as explicitly named inside
+ * `old-notes.md.bak`, silently narrowing retrieval to the wrong file. Common
+ * filename/path punctuation also continues a name; Unicode letters and numbers
+ * count as word characters because room names are not English-only. */
+function fileMentionStartBoundary(ch: string | undefined): boolean {
+  return ch === undefined || !/[\p{Alphabetic}\p{N}._\/-]/u.test(ch);
+}
+
+function fileMentionEndBoundary(question: string, at: number): boolean {
+  const ch = question[at];
+  if (ch === undefined) return true;
+  if (/[\p{Alphabetic}\p{N}_\/-]/u.test(ch)) return false;
+  // A dot followed by a filename character extends the name (`notes.md.bak`);
+  // a terminal sentence dot after `notes.md` is ordinary punctuation.
+  return ch !== "." || !/[\p{Alphabetic}\p{N}_-]/u.test(question[at + 1] ?? "");
+}
+
+function mentionIndex(question: string, candidate: string): number {
+  let at = question.indexOf(candidate);
+  while (at !== -1) {
+    const before = at === 0 ? undefined : question[at - 1];
+    const afterAt = at + candidate.length;
+    if (fileMentionStartBoundary(before) && fileMentionEndBoundary(question, afterAt)) {
+      return at;
+    }
+    at = question.indexOf(candidate, at + 1);
+  }
+  return -1;
+}
+
+/** Resolve the normal room files the user explicitly names in this question.
+ *
+ * The inventory supplies canonical display paths (`Research/findings.md`). A
+ * folder-qualified mention always wins. A basename mention is accepted only
+ * when exactly one inventory row has that basename; with two `notes.md` files
+ * Arcelle does not guess. Results follow the order in which the user named
+ * them, not database creation order.
+ *
+ * This is intentionally pure. It is the boundary used by the context gatherer
+ * before retrieval, so unrelated room chunks never enter a turn that named
+ * exact files (ARC-QA-005). */
+export function explicitlyNamedRoomFiles(
+  questionRaw: string,
+  inventory: ReadonlyArray<readonly [name: string, mime: string, summary: string | null]>,
+): string[] {
+  const question = questionRaw.normalize("NFC").toLowerCase();
+  if (question.trim() === "" || inventory.length === 0) return [];
+
+  const entries = inventory.map(([name], order) => {
+    const canonical = name.normalize("NFC");
+    const folded = canonical.toLowerCase();
+    const slash = folded.lastIndexOf("/");
+    return {
+      canonical,
+      folded,
+      basename: slash === -1 ? folded : folded.slice(slash + 1),
+      qualified: slash !== -1,
+      order,
+    };
+  });
+  const basenameCounts = new Map<string, number>();
+  for (const entry of entries) {
+    basenameCounts.set(entry.basename, (basenameCounts.get(entry.basename) ?? 0) + 1);
+  }
+
+  const found: Array<{ name: string; at: number; order: number }> = [];
+  const seen = new Set<string>();
+  for (const entry of entries) {
+    let at = mentionIndex(question, entry.folded);
+    if (at === -1 && entry.qualified && basenameCounts.get(entry.basename) === 1) {
+      at = mentionIndex(question, entry.basename);
+    }
+    if (at === -1 || seen.has(entry.folded)) continue;
+    seen.add(entry.folded);
+    found.push({ name: entry.canonical, at, order: entry.order });
+  }
+  found.sort((a, b) => a.at - b.at || a.order - b.order);
+  return found.slice(0, 12).map((entry) => entry.name);
+}
+
 // -------------------------------------------------- save-that-as-a-file
 
 const NAME_MARKERS = ["called ", "named ", "titled ", "as file ", "בשם "];

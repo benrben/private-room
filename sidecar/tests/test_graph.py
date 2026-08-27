@@ -130,6 +130,68 @@ async def test_question_is_not_duplicated_when_history_already_has_the_user_turn
     assert len(users) == 1, users
 
 
+async def test_follow_up_question_replaces_stale_history_as_the_active_turn() -> None:
+    """ARC-QA-004: ``messages`` is history, not authority for the active ask.
+
+    The installed local-Ollama review sent a follow-up boundary probe while a
+    stale payload ended at the previous summarisation request. Merely finding
+    *a* user row caused the graph to omit ``question``; the hub and its File
+    agent therefore repeated the old task. The current question must be the
+    final user turn seen by both loops, without deleting the useful history.
+    """
+    current = "probe outside-room, symlink, and .arcelle access"
+    stale: list[Message] = [
+        {"role": "system", "content": "You are the room assistant."},
+        {"role": "user", "content": "summarize notes.md and Research/findings.md"},
+        {"role": "assistant", "content": "Earlier summary."},
+    ]
+    chat = FakeChatModel(
+        [
+            Round(
+                calls=[
+                    call(
+                        "ask_file_agent",
+                        instruction=current,
+                    )
+                ]
+            ),
+            Round(content="FOUND: boundary probe completed."),
+            Round(content="Boundary probe completed."),
+        ]
+    )
+
+    out = await drive(make_request(current, messages=stale), chat)
+
+    main_first = out.chat.seen_messages[0]
+    assert main_first[-1] == {"role": "user", "content": current}
+    # The delegated worker starts from the same corrected base and receives its
+    # orchestration handoff after it. Its history remains intact.
+    worker_first = out.chat.seen_messages[1]
+    user_text = [str(m.get("content") or "") for m in worker_first if m.get("role") == "user"]
+    assert user_text[:2] == [stale[1]["content"], current]
+    assert current in user_text[-1]
+    assert out.final == "Boundary probe completed."
+
+
+async def test_enriched_current_question_is_not_duplicated() -> None:
+    """Electron's context wrapper already carries the ask after ``Question:``."""
+    question = "summarize notes.md"
+    enriched = f"Context from files stored in this room:\n...\n\n---\n\nQuestion: {question}"
+    chat = FakeChatModel([Round(content="ok")])
+    out = await drive(
+        make_request(
+            question,
+            messages=[
+                {"role": "system", "content": "You are the room assistant."},
+                {"role": "user", "content": enriched},
+            ],
+        ),
+        chat,
+    )
+    users = [m for m in out.chat.seen_messages[0] if m.get("role") == "user"]
+    assert users == [{"role": "user", "content": enriched}]
+
+
 # --------------------------------------------------------------------------- #
 # the tool catalog
 # --------------------------------------------------------------------------- #

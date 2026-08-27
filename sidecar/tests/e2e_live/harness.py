@@ -185,6 +185,7 @@ async def run_ask(
     system: str = BASE_SYSTEM,
     user_prefix: str = "",
     history: list[dict[str, str]] | None = None,
+    include_current_user: bool = True,
     temperature: float = 0.2,
     timeout: float = 420.0,
     turn_max_rounds: int | None = None,
@@ -198,7 +199,8 @@ async def run_ask(
 
     messages: list[dict[str, str]] = [{"role": "system", "content": system}]
     messages += list(history or [])
-    messages.append({"role": "user", "content": f"{user_prefix}Question: {question}"})
+    if include_current_user:
+        messages.append({"role": "user", "content": f"{user_prefix}Question: {question}"})
 
     app = create_app()
     body = {

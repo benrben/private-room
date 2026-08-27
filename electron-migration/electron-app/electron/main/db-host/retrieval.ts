@@ -56,6 +56,7 @@ import {
   searchChunksFtsRanked,
 } from "./embeddings.js";
 import { stripHebrewMarks } from "./files.js";
+import { queryRows } from "./util.js";
 
 // ------------------------------------------------------------- constants
 
@@ -223,6 +224,102 @@ export function retrieveContext(
   questionEmbedding: readonly number[] | null
 ): [ScoredChunk[], boolean] {
   return retrieveContextExcluding(db, question, questionEmbedding, new Set());
+}
+
+/** Retrieve prompt context only from files the user explicitly named.
+ *
+ * An explicit path is a stronger relevance signal than room-wide FTS/vector
+ * similarity. The old gatherer still ran ordinary room retrieval for
+ * “summarize notes.md and Research/findings.md”, so unrelated script/PDF/report
+ * chunks entered the prompt and appeared as source chips (ARC-QA-005).
+ *
+ * Names are canonical display paths from `listFileInventory`, not model text.
+ * Each target contributes one chunk when indexed, then matching chunks fill
+ * the remaining budget, then early chunks fill any space left. There is NO
+ * recent-room fallback: if a named file has no extracted text, unrelated
+ * content is worse than no context. */
+export function retrieveContextForFiles(
+  db: Database.Database,
+  question: string,
+  fileNames: readonly string[],
+  limit = MAX_CONTEXT_CHUNKS,
+): [ScoredChunk[], false] {
+  const names: string[] = [];
+  const seenNames = new Set<string>();
+  for (const raw of fileNames) {
+    const name = raw.normalize("NFC").trim();
+    const folded = name.toLowerCase();
+    if (name === "" || seenNames.has(folded)) continue;
+    seenNames.add(folded);
+    names.push(name);
+    if (names.length >= 12) break;
+  }
+  const cap = Math.max(0, Math.min(Math.trunc(limit), MAX_CONTEXT_CHUNKS));
+  if (names.length === 0 || cap === 0) return [[], false];
+
+  const displayName = "CASE WHEN fo.name IS NOT NULL THEN fo.name || '/' || f.name ELSE f.name END";
+  type Row = [number, string, string];
+  const perFile = new Map<string, Row[]>();
+  for (const name of names) {
+    const rows = queryRows(
+      db,
+      `SELECT c.rowid, ${displayName}, c.text
+       FROM chunks c
+       JOIN files f ON f.id = c.file_id
+       LEFT JOIN folders fo ON fo.id = f.folder_id
+       WHERE f.trashed_at IS NULL AND ${displayName} = ?
+       ORDER BY c.seq ASC LIMIT ?`,
+      [name, cap],
+      (r): Row => [r[0] as number, r[1] as string, r[2] as string],
+    );
+    perFile.set(name.toLowerCase(), rows);
+  }
+
+  let matches: Row[] = [];
+  const expr = ftsMatchExpr(questionTerms(question));
+  if (expr !== null) {
+    const placeholders = names.map(() => "?").join(",");
+    matches = queryRows(
+      db,
+      `SELECT chunks_fts.rowid, ${displayName}, c.text
+       FROM chunks_fts
+       JOIN chunks c ON c.rowid = chunks_fts.rowid
+       JOIN files f ON f.id = c.file_id
+       LEFT JOIN folders fo ON fo.id = f.folder_id
+       WHERE chunks_fts MATCH ?
+         AND f.trashed_at IS NULL
+         AND ${displayName} IN (${placeholders})
+       ORDER BY bm25(chunks_fts) LIMIT ?`,
+      [expr, ...names, Math.max(cap * 4, cap)],
+      (r): Row => [r[0] as number, r[1] as string, r[2] as string],
+    );
+  }
+
+  const out: ScoredChunk[] = [];
+  const seenRows = new Set<number>();
+  const add = (row: Row | undefined, score: number): void => {
+    if (row === undefined || out.length >= cap || seenRows.has(row[0])) return;
+    seenRows.add(row[0]);
+    out.push({ rowid: row[0], fileName: row[1], text: row[2], score });
+  };
+
+  // One best matching (or first) chunk from every named file before one long
+  // file can consume the whole prompt budget.
+  for (const name of names) {
+    const folded = name.toLowerCase();
+    add(matches.find((row) => row[1].normalize("NFC").toLowerCase() === folded) ?? perFile.get(folded)?.[0], 1);
+  }
+  matches.forEach((row, rank) => add(row, 1 / (RRF_K + rank)));
+  for (let seq = 0; out.length < cap; seq += 1) {
+    let found = false;
+    for (const name of names) {
+      const row = perFile.get(name.toLowerCase())?.[seq];
+      if (row !== undefined) found = true;
+      add(row, 0);
+    }
+    if (!found) break;
+  }
+  return [out, false];
 }
 
 /** CHG-13 + CHG-15 + CHG-16: as {@link retrieveContext}, but excludes chunk

@@ -13,6 +13,7 @@ import type Database from "better-sqlite3-multiple-ciphers";
 import { afterEach, describe, expect, it } from "vitest";
 import { createChat } from "./db-host/chats.js";
 import { insertFile } from "./db-host/files.js";
+import { createFolder } from "./db-host/folders.js";
 import { addMemory } from "./db-host/memories.js";
 import { insertMessage, listMessages } from "./db-host/messages.js";
 import { createRoom } from "./db-host/open.js";
@@ -375,6 +376,39 @@ describe("gatherContextAndSaveQuestion", () => {
     const ctx = gatherContextAndSaveQuestion(db, randomUUID(), "asdkjasldkj qwepoiqwe", [], null, null);
     expect(ctx.chatMessages.at(-1)!.content).toContain("Recently added content (may be unrelated to the question):");
     expect(ctx.sources).not.toContain("random.txt");
+  });
+
+  it("limits context and source chips to explicitly named files", () => {
+    const db = freshRoom();
+    insertFile(db, "notes.md", "text/markdown", Buffer.from("Project alpha notes"), "Project alpha notes", "upload");
+    const findings = insertFile(
+      db,
+      "findings.md",
+      "text/markdown",
+      Buffer.from("Project alpha findings"),
+      "Project alpha findings",
+      "upload",
+    );
+    const folder = createFolder(db, "Research");
+    db.prepare("UPDATE files SET folder_id = ? WHERE id = ?").run(folder.id, findings.id);
+    insertFile(db, "script.py", "text/x-python", Buffer.from("project alpha script"), "project alpha script", "upload");
+    insertFile(db, "report.pdf", "application/pdf", Buffer.from("project alpha report"), "project alpha report", "upload");
+
+    const ctx = gatherContextAndSaveQuestion(
+      db,
+      randomUUID(),
+      "Summarize notes.md and Research/findings.md for project alpha",
+      [],
+      null,
+      null,
+    );
+    const user = ctx.chatMessages.at(-1)!.content;
+    expect(ctx.sources).toEqual(["notes.md", "Research/findings.md"]);
+    expect(user).toContain("explicitly scoped this request to these room files: notes.md, Research/findings.md");
+    expect(user).toContain("[file: notes.md]");
+    expect(user).toContain("[file: Research/findings.md]");
+    expect(user).not.toContain("[file: script.py]");
+    expect(user).not.toContain("[file: report.pdf]");
   });
 
   it("preserves conversation history under the compaction budget, oldest to newest", () => {

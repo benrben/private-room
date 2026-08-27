@@ -3082,14 +3082,30 @@ async def run_agent(req: RunRequest, deps: Deps) -> str:
     deps.turn_stall_budget = req.resolved_turn_stalls()
 
     # The ask lives in `question` (a REQUIRED field); `messages` is optional
-    # history. Chat callers ALSO append the ask as the final user turn, but
-    # headless callers (workflow agent_run) send only `question` with an empty
-    # history. If no user turn is present, seed one from `question` — otherwise
-    # the model is called with zero messages, and Ollama answers an empty
-    # conversation with just a done_reason='load' response, which langchain_ollama
-    # skips, leaving zero generation chunks → "No generation chunks were returned".
+    # history. Chat callers normally append the ask as the FINAL user turn, but
+    # `question` is the authority for which turn is running. Do not use "there
+    # is any user message" as evidence that the current ask is present: a
+    # follow-up payload containing only the previous transcript then makes the
+    # model repeat the previous task, including the stale delegation handed to
+    # its child. This was ARC-QA-004 in the installed local-Ollama review.
+    #
+    # The Electron chat wrapper ends its enriched user turn with
+    # ``Question: <ask>``; headless callers send the plain ask. Recognise both
+    # forms and append the authoritative question when neither is the last user
+    # turn. This preserves full history/compaction while ensuring every model
+    # and every delegated worker sees the current request last.
     messages: list[Message] = [dict(m) for m in req.messages]  # type: ignore[misc]
-    if req.question.strip() and not any(m.get("role") == "user" for m in messages):
+    question = req.question.strip()
+    last_user = next(
+        (m for m in reversed(messages) if m.get("role") == "user"),
+        None,
+    )
+    last_user_content = str(last_user.get("content") or "").strip() if last_user else ""
+    current_is_present = bool(question) and (
+        last_user_content == question
+        or last_user_content.endswith(f"Question: {question}")
+    )
+    if question and not current_is_present:
         messages.append(user_message(req.question))
 
     # The composer's `*` tag rides in the question text, exactly as `/skill`

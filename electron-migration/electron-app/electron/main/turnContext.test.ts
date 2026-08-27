@@ -13,6 +13,7 @@ import {
   bestDefault,
   buildSystemPrompt,
   explicitSkillRequest,
+  explicitlyNamedRoomFiles,
   handoffBudgetBytes,
   historyBudgetBytes,
   isBareSaveReference,
@@ -53,6 +54,33 @@ describe("explicitSkillRequest", () => {
     expect(explicitSkillRequest("/UPPER do it")).toBeNull();
     expect(explicitSkillRequest("/")).toBeNull();
     expect(explicitSkillRequest(`/${"x".repeat(65)} go`)).toBeNull();
+  });
+});
+
+describe("explicitlyNamedRoomFiles", () => {
+  const inventory: Array<[string, string, string | null]> = [
+    ["notes.md", "text/markdown", null],
+    ["Research/findings.md", "text/markdown", null],
+    ["Archive/summary.md", "text/markdown", null],
+    ["Other/summary.md", "text/markdown", null],
+    ["report.pdf", "application/pdf", null],
+  ];
+
+  it("returns exact files in the order the user named them", () => {
+    expect(
+      explicitlyNamedRoomFiles("Compare `Research/findings.md` with notes.md.", inventory),
+    ).toEqual(["Research/findings.md", "notes.md"]);
+    expect(explicitlyNamedRoomFiles("Summarize findings.md", inventory)).toEqual([
+      "Research/findings.md",
+    ]);
+  });
+
+  it("does not guess an ambiguous basename or match inside a longer filename", () => {
+    expect(explicitlyNamedRoomFiles("Summarize summary.md", inventory)).toEqual([]);
+    expect(explicitlyNamedRoomFiles("Summarize old-notes.md.bak", inventory)).toEqual([]);
+    expect(explicitlyNamedRoomFiles("Use Archive/summary.md", inventory)).toEqual([
+      "Archive/summary.md",
+    ]);
   });
 });
 

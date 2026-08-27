@@ -153,6 +153,41 @@ async def test_plain_question_delegates_to_the_file_agent() -> None:
     assert out["final"].strip() and out["final"].strip() != DONE
 
 
+async def test_follow_up_uses_question_when_wire_history_ends_at_previous_task() -> None:
+    """ARC-QA-004, against the real local model.
+
+    Reproduce the installed review's malformed follow-up envelope: `question`
+    is current, while `messages` ends after the previous summary. The runtime
+    invariant must put the current ask last before the Main agent delegates.
+    """
+    current = 'Search this room for the exact marker "boundary-marker-742" and report the result.'
+
+    def reply(name: str, args: dict) -> str:
+        if name == "search_room":
+            query = str(args.get("query", ""))
+            return (
+                "[boundary.txt]\nboundary-marker-742 is present."
+                if "boundary" in query.lower() or "742" in query
+                else "No matching content found."
+            )
+        if name == "list_room_files":
+            return "boundary.txt (text/plain)"
+        return room_reply(name, args)
+
+    out = await run_ask_sampled(
+        current,
+        lambda o: "boundary-marker-742" in o["final"].lower(),
+        reply=reply,
+        history=[
+            {"role": "user", "content": "Question: Summarize notes.md and Research/findings.md"},
+            {"role": "assistant", "content": "The previous summary discussed project alpha."},
+        ],
+        include_current_user=False,
+    )
+    assert "boundary-marker-742" in out["final"].lower(), out["final"]
+    assert "search_room" in out["tool_calls"], out["tool_calls"]
+
+
 async def test_greetings_never_wake_a_worker() -> None:
     # "hi bro" (live QA): the Main agent answers itself — no bridge traffic.
     out = await run_ask_sampled(
