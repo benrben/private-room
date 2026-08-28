@@ -335,9 +335,12 @@ describe("runCommand end to end, through liveRunCommandDeps", () => {
     );
     const deps: RunCommandDeps = { ...liveRunCommandDeps(state, () => {}), ...FIXED_MODELS };
 
-    await expect(
-      runCommand(baseRequest({ command: "transcribe", refs: [file.id], raw: "#transcribe @meeting.mp3" }), deps)
-    ).rejects.toThrow(/NOT_IMPLEMENTED.*transcrib/i);
+    const message = await runCommand(
+      baseRequest({ command: "transcribe", refs: [file.id], raw: "#transcribe @meeting.mp3" }),
+      deps
+    );
+    expect(message.kind).toBe("turn_error");
+    expect(message.content).toMatch(/NOT_IMPLEMENTED.*transcrib/i);
   });
 });
 
@@ -367,7 +370,9 @@ describe("#sketch, end to end through liveRunCommandDeps", () => {
       layoutGraph: undefined,
     };
 
-    await expect(runCommand(sketchRequest(), deps)).rejects.toThrow(/NOT_IMPLEMENTED.*sketch layout engine/s);
+    const message = await runCommand(sketchRequest(), deps);
+    expect(message.kind).toBe("turn_error");
+    expect(message.content).toMatch(/NOT_IMPLEMENTED.*sketch layout engine/s);
     // The model call itself DID happen — so the refusal is specifically
     // layoutGraph's, not a knock-on from the engine seams never being reached.
     expect(seen.length).toBeGreaterThan(0);

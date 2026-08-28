@@ -28,6 +28,7 @@ import { isExternalEngine } from "./turnContext.js";
 import {
   agentRows,
   capabilitiesFor,
+  ANTIGRAVITY_CLI,
   capabilityPhrase,
   capsFromDecl,
   capsSupports,
@@ -113,15 +114,14 @@ describe("ported from capabilities.rs", () => {
     }
   });
 
-  /** THE CONVERSION THIS PACKET EXISTS FOR: "can it stream?" used to be
-   * `is_cli_engine(model)` written out at the decision point. It is now a
-   * declared field, and CLI engines that cannot stream say so once. */
+  /** THE CONVERSION THIS PACKET EXISTS FOR: "can it stream?" is a declared
+   * field, not a name sniff. Since 2026-08-27 every engine streams — the CLIs
+   * through their NDJSON envelopes (token deltas for Claude/Antigravity, one
+   * delta per completed message for Codex). */
   it("streaming_is_declared_not_sniffed_from_the_name", () => {
-    expect(declaredFor("claude-cli").streaming).toBe("no");
-    expect(declaredFor("codex-cli::gpt-5.6-sol::high").streaming).toBe("no");
-    expect(declaredFor("antigravity-cli::gemini-3.7-flash-high").streaming).toBe("no");
-    // Everything that speaks a real chat API streams — including the two
-    // non-local ones an `is_cli_engine` test got right only by accident.
+    expect(declaredFor("claude-cli").streaming).toBe("yes");
+    expect(declaredFor("codex-cli::gpt-5.6-sol::high").streaming).toBe("yes");
+    expect(declaredFor("antigravity-cli::gemini-3.7-flash-high").streaming).toBe("yes");
     expect(declaredFor("qwen3.5:4b").streaming).toBe("yes");
     expect(declaredFor("minimax-m3:cloud").streaming).toBe("yes");
     expect(declaredFor("openrouter::vendor/model").streaming).toBe("yes");
@@ -182,11 +182,12 @@ describe("ported from capabilities.rs", () => {
   /** PREFLIGHT: an incapable provider is caught before the run, with a sentence
    * naming the engine and what it cannot do. */
   it("preflight_blocks_an_incapable_provider_before_the_run", () => {
-    const cli = capsFromDecl("claude-cli", CLAUDE_CLI);
+    // Antigravity is the one engine still without an image channel.
+    const cli = capsFromDecl("antigravity-cli", ANTIGRAVITY_CLI);
     const verdict = preflight(cli, "vision");
     expect(verdict.status).toBe("blocked");
     if (verdict.status === "blocked") {
-      expect(verdict.reason).toContain("Claude Code");
+      expect(verdict.reason).toContain("Antigravity CLI");
       expect(verdict.reason).toContain("look at an image");
       // The engine is the obstacle, not a setting — so a caller may still offer
       // "install/choose a model that can see".
@@ -227,7 +228,7 @@ describe("ported from capabilities.rs", () => {
     }
     // ...and a plain "this engine is blind" block is NOT the door: same status,
     // different code, different offer.
-    const blind = preflight(capsFromDecl("claude-cli", CLAUDE_CLI), "vision");
+    const blind = preflight(capsFromDecl("antigravity-cli", ANTIGRAVITY_CLI), "vision");
     expect(blind.status).toBe("blocked");
     if (blind.status === "blocked") {
       expect(blind.code).toBe("capability");
@@ -617,14 +618,32 @@ describe("capabilitiesFor", () => {
     expect(caps.contextWindow).toBe(272_000);
   });
 
-  it("claude-cli (the default arm) is a blind, non-streaming chat engine with the flat fallback", async () => {
+  it("claude-cli streams, sees images, and keeps the flat context fallback", async () => {
     const caps = await capabilitiesFor("claude-cli", fakeDeps());
     expect(caps.chat).toBe("yes");
     expect(caps.contextWindow).toBe(CLAUDE_FALLBACK_MAX_CONTEXT);
     expect(caps.contextWindow).toBe(200_000);
-    expect(caps.streaming).toBe("no");
+    expect(caps.streaming).toBe("yes");
+    // The stream-json block channel is real and every catalog model reads
+    // images; only GENERATION stays impossible over a chat CLI.
+    expect(caps.vision).toBe("yes");
+    expect(caps.imageGeneration).toBe("no");
+    expect(caps.videoGeneration).toBe("no");
+  });
+
+  it("codex-cli reports vision through its -i channel", async () => {
+    const caps = await capabilitiesFor("codex-cli::gpt-5.6-sol::high", fakeDeps());
+    expect(caps.vision).toBe("yes");
+    expect(caps.streaming).toBe("yes");
+    expect(caps.imageGeneration).toBe("no");
+  });
+
+  it("antigravity-cli (the default arm) stays the one blind engine", async () => {
+    const caps = await capabilitiesFor("antigravity-cli::gemini-3.7-flash-high", fakeDeps());
+    expect(caps.chat).toBe("yes");
+    expect(caps.streaming).toBe("yes");
     // No image channel is a flat no from the TRANSPORT, whatever the model
-    // behind the CLI can do — `generate_external` has nowhere to put pixels.
+    // behind the CLI can do — its print mode has nowhere to put pixels.
     expect(caps.vision).toBe("no");
     expect(caps.imageGeneration).toBe("no");
     expect(caps.videoGeneration).toBe("no");
@@ -671,20 +690,22 @@ function visionDeps(overrides: Partial<VisionSupportDeps> = {}): VisionSupportDe
 describe("visionSupport", () => {
   it("no image channel is a flat No, without consulting any catalog", async () => {
     let asked = false;
-    const support = await visionSupport(
-      "claude-cli",
-      visionDeps({
-        ollamaCapabilities: async () => {
-          asked = true;
-          return ["vision"];
-        },
-        ensureProviderCatalog: async () => {
-          asked = true;
-        },
-        providerModelVision: () => true,
-      })
-    );
-    expect(support).toBe("no");
+    const noisyDeps = visionDeps({
+      ollamaCapabilities: async () => {
+        asked = true;
+        return ["vision"];
+      },
+      ensureProviderCatalog: async () => {
+        asked = true;
+      },
+      providerModelVision: () => true,
+    });
+    // Antigravity is the engine still without an image channel.
+    expect(await visionSupport("antigravity-cli::gemini-3.7-flash-high", noisyDeps)).toBe("no");
+    // Claude/Codex answer a flat Yes the same catalog-free way — their pixel
+    // channels are transport facts, live-verified.
+    expect(await visionSupport("claude-cli::opus", noisyDeps)).toBe("yes");
+    expect(await visionSupport("codex-cli::gpt-5.6-sol", noisyDeps)).toBe("yes");
     expect(asked).toBe(false);
   });
 
@@ -755,9 +776,11 @@ describe("engineSupportMatrix", () => {
     const claude = matrix.providers.find((p) => p.engine === "claude-cli");
     expect(claude).toBeDefined();
     expect(claude?.label).toBe("Claude Code");
-    expect(claude?.streaming).toBe("no");
+    expect(claude?.streaming).toBe("yes");
     expect(claude?.toolCalling).toBe("yes");
-    expect(claude?.vision).toBe("no");
+    // Provider-level rows stay per-model-agnostic where the decl says
+    // "unknown"; vision is now a transport-level yes for Claude.
+    expect(claude?.vision).toBe("unknown");
     expect(claude?.structuredOutput).toBe("no");
     expect(claude?.tier).toBe("cloud-engine");
     expect(claude?.available).toBe(false);
@@ -920,12 +943,14 @@ describe("enginePreflight / engineCapabilities", () => {
   });
 
   it("preflight composes capabilitiesFor with the resolved model", async () => {
-    const verdict = await enginePreflight("claude-cli", "vision", queryDeps([]));
+    const verdict = await enginePreflight("antigravity-cli", "vision", queryDeps([]));
     expect(verdict.status).toBe("blocked");
     if (verdict.status === "blocked") {
       expect(verdict.code).toBe("capability");
-      expect(verdict.reason).toContain("Claude Code");
+      expect(verdict.reason).toContain("Antigravity CLI");
     }
+    // Claude's stream-json image channel makes the same question pass now.
+    expect(await enginePreflight("claude-cli", "vision", queryDeps([]))).toEqual({ status: "ready" });
     expect(await enginePreflight("claude-cli", "tool_calling", queryDeps([]))).toEqual({ status: "ready" });
   });
 

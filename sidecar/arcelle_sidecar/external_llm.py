@@ -30,14 +30,16 @@ through *exactly the same code* — same registry, same scoped tool boxes, same
 ``plan``/``agent`` roster events. Claude and Codex receive the exact per-agent
 catalog through ephemeral, loopback-only MCP endpoints; Antigravity currently
 uses the equivalent text tool protocol because its print mode has no
-per-invocation MCP-config flag. Deltas are emitted only once the reply is known
-NOT to be a tool call — a half-streamed envelope would spray JSON into the
-transcript.
+per-invocation MCP-config flag. Answer text streams LIVE through
+:class:`_DeltaTap` (which withholds anything shaped like a tool envelope — the
+guard that retired the old buffer-everything rule), and images ride the
+engines' real channels (:data:`IMAGE_ENGINES`).
 """
 
 from __future__ import annotations
 
 import asyncio
+import codecs
 import json
 import os
 import re
@@ -49,7 +51,7 @@ from urllib.parse import urlsplit
 
 from . import hub_mcp
 from .hub_mcp import HUB_SERVER_NAME, HubToolServer
-from .messages import Message, ToolCall
+from .messages import Message, ToolCall, attach_images
 from .model_text import recover_json
 from .prompts import READ_RESULT_TOOL
 
@@ -138,13 +140,20 @@ def _stopped(cancel: Optional[Any]) -> bool:
     return cancel is not None and bool(getattr(cancel, "cancelled", False))
 
 
-async def _pump(reader: Any, sink: bytearray, beat: list[float]) -> None:
+async def _pump(
+    reader: Any, sink: bytearray, beat: list[float], tap: Any = None
+) -> None:
     """Drain one pipe into ``sink``, stamping ``beat`` on every chunk.
 
     Draining is not optional bookkeeping: a child whose stderr pipe fills
     blocks in ``write`` forever and would then look exactly like the wedge this
     module is trying to detect. ``read`` (not ``readline``) so a CLI that emits
     a partial line still counts as alive.
+
+    ``tap`` (stdout only) sees every chunk AS IT ARRIVES — that is the whole
+    live-streaming feature: :class:`_DeltaTap` turns the envelope events into
+    text deltas while the buffer above keeps accumulating for the terminal
+    parse, byte-identical to before.
     """
     while True:
         chunk = await reader.read(65536)
@@ -152,6 +161,8 @@ async def _pump(reader: Any, sink: bytearray, beat: list[float]) -> None:
             return
         sink.extend(chunk)
         beat[0] = time.monotonic()
+        if tap is not None:
+            await tap.feed(chunk)
 
 
 async def _feed(stdin: Any, payload: bytes) -> None:
@@ -173,6 +184,7 @@ async def drain_with_idle(
     payload: bytes,
     idle: float,
     cancel: Optional[Any] = None,
+    tap: Any = None,
 ) -> tuple[bytes, bytes]:
     """``communicate()`` with a LIVENESS deadline instead of a duration one.
 
@@ -188,7 +200,7 @@ async def drain_with_idle(
     beat = [time.monotonic()]
     tasks = [
         asyncio.ensure_future(_feed(proc.stdin, payload)),
-        asyncio.ensure_future(_pump(proc.stdout, out, beat)),
+        asyncio.ensure_future(_pump(proc.stdout, out, beat, tap)),
         asyncio.ensure_future(_pump(proc.stderr, err, beat)),
         asyncio.ensure_future(proc.wait()),
     ]
@@ -248,20 +260,94 @@ def is_external_model(model: str) -> bool:
     return split_external_model(model)[0] in EXTERNAL_ENGINES
 
 
-def _user_turn(m: Message, content: str) -> str:
-    """One user turn, flattened — and HONEST about pixels it cannot carry.
+#: How many attachments per turn are delivered to a CLI engine — the same cap
+#: the Electron advisor path stages (`externalAdvisor.ts MAX_IMAGES_PER_MESSAGE`).
+MAX_IMAGES_PER_MESSAGE = 3
 
-    These engines take ONE TEXT PROMPT: there is no channel for an image. The
-    perception tools nevertheless append ``IMAGE_HANDOFF`` ("the capture you
-    requested is attached") to the turn and hang the PNG off ``images``. Rendering
-    only ``content`` therefore shipped a prompt that ASSERTS an attachment the model
-    never received, and a harness believes the prompt — so it described a page it
-    had never seen. Live QA 2026-07-30: "the screenshot for the browser is not
-    working" was this, silently, on every flattened engine.
+#: Strict base64: standard alphabet, canonical padding, no whitespace. Anything
+#: else is skipped rather than delivered — a lenient decode would announce a
+#: corrupt attachment as an image the model should look at.
+_B64_RE = re.compile(r"^[A-Za-z0-9+/]+={0,2}$")
+
+#: Which engines have a real image channel. Claude takes base64 blocks over
+#: ``--input-format stream-json`` (live-verified 2026-08-27: a staged red PNG
+#: came back "Red"); Codex takes staged files via ``-i`` under the same sandbox
+#: flags the chat path pins (same live proof). Antigravity's print mode has no
+#: documented image input, so it stays on the honest not-sent note.
+IMAGE_ENGINES = ("claude-cli", "codex-cli")
+
+
+def message_images(m: Message) -> list[str]:
+    """The images of one turn that can actually be DELIVERED: strictly valid
+    base64 only, capped at :data:`MAX_IMAGES_PER_MESSAGE`."""
+    out: list[str] = []
+    for b64 in m.get("images") or []:
+        if (
+            isinstance(b64, str)
+            and b64
+            and len(b64) % 4 == 0
+            and _B64_RE.match(b64)
+        ):
+            out.append(b64)
+        if len(out) == MAX_IMAGES_PER_MESSAGE:
+            break
+    return out
+
+
+def collect_images(messages: list[Message]) -> list[str]:
+    """Every deliverable image in the transcript, in transcript order — the
+    order the flattened prompt's per-turn attachment notes describe."""
+    return [
+        b64
+        for m in messages
+        if m.get("role") == "user"
+        for b64 in message_images(m)
+    ]
+
+
+def _user_turn(m: Message, content: str, *, deliver_images: bool = False) -> str:
+    """One user turn, flattened — and HONEST about its pixels either way.
+
+    The perception tools append ``IMAGE_HANDOFF`` ("the capture you requested is
+    attached") to the turn and hang the PNG off ``images``, so whatever this
+    renders must keep that sentence true. Three states:
+
+    - the privacy door stripped the images (``images_blocked``, stamped by
+      ``privacy.redact_messages``): say so — the model must not describe a
+      picture the door withheld;
+    - ``deliver_images`` and the engine has a channel: the images ride the same
+      request (Claude: base64 blocks on stdin; Codex: staged ``-i`` files), so
+      the note says they are attached;
+    - no channel (Antigravity, or nothing deliverable survived validation):
+      the original not-sent note. Rendering only ``content`` here shipped a
+      prompt that ASSERTS an attachment the model never received, and a harness
+      believes the prompt — live QA 2026-07-30: "the screenshot for the browser
+      is not working" was this, silently, on every flattened engine.
     """
+    blocked = int(m.get("images_blocked") or 0)
+    if blocked:
+        return (
+            f"User: {content}\n"
+            f"[{blocked} image(s) accompanied that message, but the room's privacy "
+            f"settings withheld them — they were NOT sent. You have not seen them. "
+            f"Do not describe them; say the privacy settings block images if asked.]\n"
+        )
     n = len(m.get("images") or [])
     if not n:
         return f"User: {content}\n"
+    delivered = message_images(m) if deliver_images else []
+    if delivered:
+        note = (
+            f"[{len(delivered)} image(s) from this turn are attached to this "
+            f"request, in transcript order."
+        )
+        dropped = n - len(delivered)
+        if dropped:
+            note += (
+                f" {dropped} more could not be attached and were NOT sent — "
+                f"you have not seen those."
+            )
+        return f"User: {content}\n{note}]\n"
     return (
         f"User: {content}\n"
         f"[{n} image(s) accompanied that message, but THIS engine cannot receive "
@@ -270,11 +356,18 @@ def _user_turn(m: Message, content: str) -> str:
     )
 
 
-def flatten_messages(messages: list[Message], schema: dict[str, Any] | None) -> str:
+def flatten_messages(
+    messages: list[Message],
+    schema: dict[str, Any] | None,
+    *,
+    deliver_images: bool = False,
+) -> str:
     """The Rust prompt convention: role-labelled turns, one flat text prompt.
 
     A ``format`` schema becomes a strict JSON-only instruction — the callers'
     ``recover_json`` cleans whatever wrapping the CLI still adds.
+    ``deliver_images`` says the same request carries the turns' images on a real
+    channel, so each turn's note reads "attached" instead of "not sent".
     """
     out: list[str] = []
     for m in messages:
@@ -283,7 +376,7 @@ def flatten_messages(messages: list[Message], schema: dict[str, Any] | None) -> 
         if role == "system":
             out.append(f"Instructions:\n{content}\n")
         elif role == "user":
-            out.append(_user_turn(m, content))
+            out.append(_user_turn(m, content, deliver_images=deliver_images))
         elif role == "assistant":
             out.append(f"Assistant: {content}\n")
     if schema is not None:
@@ -298,7 +391,10 @@ def flatten_messages(messages: list[Message], schema: dict[str, Any] | None) -> 
 
 
 def flatten_agent_messages(
-    messages: list[Message], *, include_system: bool = True
+    messages: list[Message],
+    *,
+    include_system: bool = True,
+    deliver_images: bool = False,
 ) -> str:
     """The agent-loop transcript, flattened for a CLI that takes one text prompt.
 
@@ -320,7 +416,7 @@ def flatten_agent_messages(
             if include_system:
                 out.append(f"Instructions:\n{content}\n")
         elif role == "user":
-            out.append(_user_turn(m, content))
+            out.append(_user_turn(m, content, deliver_images=deliver_images))
         elif role == "assistant":
             calls = m.get("tool_calls") or []
             rendered = [
@@ -711,6 +807,18 @@ def _checked_arg(value: str | None, what: str) -> str | None:
     raise ValueError(f"Unsafe {what} in the room's model setting: {value!r}")
 
 
+def _image_flags(image_paths: list[str] | None) -> str:
+    """Codex's ``-i`` attachments. The paths are our own ``mkstemp`` names, but
+    they cross the same ``zsh -ilc`` boundary the model slug does, so anything
+    a quote could not contain fails loudly instead of being interpolated."""
+    flags = ""
+    for p in image_paths or []:
+        if "'" in p or "\n" in p:
+            raise ValueError(f"Unsafe staged image path: {p!r}")
+        flags += f" -i '{p}'"
+    return flags
+
+
 def build_agent_cmdline(
     engine: str,
     submodel: str | None,
@@ -721,6 +829,8 @@ def build_agent_cmdline(
     allowed: list[str] | None = None,
     hub_allowed: list[str] | None = None,
     codex_mcp_url: str | None = None,
+    stream_json_input: bool = False,
+    image_paths: list[str] | None = None,
 ) -> str:
     """The CLI invocation for one AGENT round, mirroring ``external.rs``.
 
@@ -773,15 +883,25 @@ def build_agent_cmdline(
         # unaffected: the terminal `type: result` event is byte-identical to
         # what `--output-format json` printed, and `claude_result_object` reads
         # both shapes.
+        #
+        # `--include-partial-messages` adds `stream_event` lines carrying
+        # `text_delta` pieces WHILE the model writes — the live-typing feed
+        # `_DeltaTap` forwards to the UI. `--input-format stream-json` is the
+        # image channel: the user turn rides stdin as one NDJSON message whose
+        # content interleaves text with base64 image blocks (the only channel a
+        # tool-less `claude -p` has for pixels — its own Read tool is fenced
+        # off, so a staged temp file would be unreachable).
+        input_flag = " --input-format stream-json" if stream_json_input else ""
         return (
-            f"claude -p --output-format stream-json --verbose{tool_flags}"
+            f"claude -p --output-format stream-json --verbose "
+            f"--include-partial-messages{input_flag}{tool_flags}"
             f"{system_flag}{model_flag}{effort_flag}"
         )
     if engine == "codex-cli":
         effort_flag = f" -c 'model_reasoning_effort={effort}'" if effort else ""
         return (
             f"codex exec --json{CODEX_ARCELLE_FLAGS}{_codex_mcp_flags(codex_mcp_url)}"
-            f"{model_flag}{effort_flag} -"
+            f"{model_flag}{effort_flag}{_image_flags(image_paths)} -"
         )
     if engine == "antigravity-cli":
         return (
@@ -1008,24 +1128,231 @@ def parse_antigravity_json_stream(stdout: str) -> tuple[str, int | None, int | N
     return text, input_tokens, None
 
 
-def build_cmdline(engine: str, submodel: str | None, effort: str | None) -> str:
-    """The exact CLI invocation Rust uses (external.rs), minus MCP bridging —
+def claude_user_event(prompt: str, images: list[str]) -> str:
+    """One stream-json input line: the flattened prompt plus its base64 image
+    blocks — Claude's ONLY pixel channel while its own file tools are fenced
+    off. Live-verified 2026-08-27 (a staged red PNG answered "Red")."""
+    content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+    for b64 in images:
+        content.append(
+            {
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/png", "data": b64},
+            }
+        )
+    return (
+        json.dumps({"type": "user", "message": {"role": "user", "content": content}})
+        + "\n"
+    )
+
+
+class _DeltaTap:
+    """Live text deltas out of one CLI's stdout WHILE it streams.
+
+    Fed raw stdout chunks by :func:`_pump`; splits them into the engine's NDJSON
+    events and forwards ANSWER text to ``sink`` as it is written — the module
+    used to hold the whole reply back ("a half-streamed envelope would spray
+    JSON into the transcript"), and the two guards below are what make live
+    forwarding safe instead:
+
+    - a message whose first non-space character is ``{``/``[`` is WITHHELD in
+      full — that is exactly the shape of a text-protocol tool envelope (and of
+      a legitimate JSON answer, which the terminal parse still delivers whole
+      via :meth:`finish`);
+    - the moment ``"tool_call`` appears in a prose message, forwarding stops
+      for the round — a framed envelope after a narration preamble must not
+      reach the transcript as text.
+
+    Interim assistant messages (a harness narrating between its tool calls)
+    ARE forwarded: the local engine already streams every round's text, the
+    live bubble is replaced by the persisted answer when the turn lands, and a
+    working harness showing its progress beats minutes of silence.
+
+    ``restorer`` is the privacy stream-restorer for this round, when the door
+    is engaged — deltas leave the model redacted and must reach the user real.
+    Nothing here parses tool calls or usage; the buffered terminal parse stays
+    the single source of truth for what the round MEANT.
+    """
+
+    def __init__(self, engine: str, sink: Any, restorer: Any = None) -> None:
+        self.engine = engine
+        self.sink = sink
+        self.restorer = restorer
+        self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        self._pending = ""  # a partial NDJSON line straddling two chunks
+        self._fenced = False  # past the login shell's banner?
+        self._msg_raw = ""  # the current message's full raw text
+        self._msg_sent = ""  # the part of it already forwarded (raw)
+        self._withheld = False  # current message held back (JSON-shaped)
+        self._blocked = False  # saw a tool-call marker: stop for the round
+
+    async def feed(self, chunk: bytes) -> None:
+        self._pending += self._decoder.decode(chunk)
+        while "\n" in self._pending:
+            line, self._pending = self._pending.split("\n", 1)
+            await self._line(line)
+
+    async def _line(self, line: str) -> None:
+        if not self._fenced:
+            # Everything before the fence belongs to the shell, not the engine
+            # (see _OUTPUT_FENCE) — and a banner without a trailing newline
+            # glues itself onto the fence line, hence `in` rather than `==`.
+            if _OUTPUT_FENCE in line:
+                self._fenced = True
+            return
+        line = line.strip()
+        if not line.startswith("{"):
+            return
+        try:
+            event = json.loads(line)
+        except ValueError:  # a partial or non-JSON line among the events
+            return
+        if not isinstance(event, dict):
+            return
+        if self.engine == "claude-cli":
+            if event.get("type") != "stream_event":
+                return
+            ev = event.get("event")
+            if not isinstance(ev, dict):
+                return
+            if ev.get("type") == "message_start":
+                await self._new_message()
+            elif ev.get("type") == "content_block_delta":
+                delta = ev.get("delta")
+                # text_delta only: thinking_delta / signature_delta are the
+                # model's private reasoning, never transcript text.
+                if isinstance(delta, dict) and delta.get("type") == "text_delta":
+                    text = delta.get("text")
+                    if isinstance(text, str):
+                        await self._delta(text)
+        elif self.engine == "codex-cli":
+            # Codex's exec stream has no token deltas (live-verified
+            # 2026-08-27) — each completed agent_message is one delta, which
+            # still turns an end-of-run wall of text into live progress.
+            if event.get("type") == "item.completed":
+                item = event.get("item")
+                if (
+                    isinstance(item, dict)
+                    and item.get("type") == "agent_message"
+                    and isinstance(item.get("text"), str)
+                ):
+                    await self._new_message()
+                    await self._delta(item["text"])
+        elif self.engine == "antigravity-cli":
+            if event.get("event") == "step_update":
+                update = event.get("step_update")
+                if (
+                    isinstance(update, dict)
+                    and update.get("step_type") == "agent_response"
+                    and isinstance(update.get("text_delta"), str)
+                ):
+                    await self._delta(update["text_delta"])
+
+    async def _delta(self, s: str) -> None:
+        if not s:
+            return
+        self._msg_raw += s
+        if self._blocked or self._withheld:
+            return
+        stripped = self._msg_raw.lstrip()
+        if not stripped:
+            return  # only whitespace so far — the first-char test must wait
+        if not self._msg_sent and stripped[0] in "{[":
+            self._withheld = True
+            return
+        if '"tool_call' in self._msg_raw:
+            self._blocked = True
+            return
+        out = self._msg_raw[len(self._msg_sent) :]
+        self._msg_sent = self._msg_raw
+        await self._emit(out)
+
+    async def _emit(self, text: str) -> None:
+        if self.restorer is not None:
+            text = self.restorer.feed(text)
+        if text:
+            await self.sink(text)
+
+    async def _new_message(self) -> None:
+        await self.flush()
+        self._msg_raw = ""
+        self._msg_sent = ""
+        self._withheld = False
+
+    async def flush(self) -> None:
+        """Release the restorer's held-back tail (a possible partial
+        placeholder) — on a message boundary and at the end of the round."""
+        if self.restorer is not None:
+            tail = self.restorer.flush()
+            if tail:
+                await self.sink(tail)
+
+    def tail_for(self, final_raw: str) -> str:
+        """What of the round's FINAL text was never forwarded live.
+
+        The terminal parse is the source of truth; live deltas are only its
+        preview. When the final text extends what was streamed, the remainder
+        is owed; when it was withheld (or the engine emitted no usable deltas),
+        all of it is; when the stream already delivered it — nothing, or the
+        transcript would show the answer twice.
+        """
+        if not final_raw:
+            return ""
+        sent = self._msg_sent
+        if sent and final_raw.startswith(sent):
+            return final_raw[len(sent) :]
+        if sent and sent.startswith(final_raw):
+            return ""
+        return final_raw
+
+    async def finish(self, final_raw: str) -> None:
+        """Deliver the unstreamed remainder of the final text, then flush."""
+        tail = self.tail_for(final_raw)
+        if tail:
+            await self._emit(tail)
+        await self.flush()
+
+
+def build_cmdline(
+    engine: str,
+    submodel: str | None,
+    effort: str | None,
+    *,
+    stream_json_input: bool = False,
+    image_paths: list[str] | None = None,
+) -> str:
+    """The one-shot generation invocation (external.rs minus MCP bridging) —
     pipeline generation is a pure text call, the CLI is not an agent here.
 
     submodel/effort are always our own known slugs in practice (a Codex catalog
     slug + level, or a Claude alias + ``--effort`` value), but they are READ
     FROM THE ROOM FILE, so what makes the quoting safe here is the
     :data:`_SAFE_CLI_ARG` check, not that assumption.
+
+    Both Claude and Codex now ask for their machine-readable STREAMED envelopes
+    (``stream-json`` / ``--json``) here too, which buys this path three things at
+    once: the between-events liveness heartbeat the module doc used to name as
+    this path's one gap, live text deltas for :func:`generate_external_stream`,
+    and the structured terminal object the image channel needs. The parsers
+    degrade to raw stdout, so a CLI change costs the accounting, never the
+    answer.
     """
     submodel = _checked_arg(submodel, "model name")
     effort = _checked_arg(effort, "effort level")
     model_flag = f" --model '{submodel}'" if submodel else ""
     if engine == "claude-cli":
         effort_flag = f" --effort '{effort}'" if effort else ""
-        return f"claude -p{model_flag}{effort_flag}"
+        input_flag = " --input-format stream-json" if stream_json_input else ""
+        return (
+            f"claude -p --output-format stream-json --verbose "
+            f"--include-partial-messages{input_flag}{model_flag}{effort_flag}"
+        )
     if engine == "codex-cli":
         effort_flag = f" -c 'model_reasoning_effort={effort}'" if effort else ""
-        return f"codex exec --skip-git-repo-check{model_flag}{effort_flag} -"
+        return (
+            f"codex exec --json --skip-git-repo-check{model_flag}{effort_flag}"
+            f"{_image_flags(image_paths)} -"
+        )
     if engine == "antigravity-cli":
         return (
             "agy --sandbox --mode plan --input-format stream-json "
@@ -1034,57 +1361,123 @@ def build_cmdline(engine: str, submodel: str | None, effort: str | None) -> str:
     raise ValueError(f"Unknown external engine: {engine}")
 
 
+def _stage_image_files(images: list[str]) -> list[str]:
+    """Codex's image channel: each base64 PNG becomes a private temp file for
+    ``-i`` to attach (the CLI reads and embeds them itself — no tool needed).
+    The caller unlinks every path on EVERY exit: the files hold decrypted room
+    pixels. A write failure skips that image rather than aborting the turn —
+    same contract as the Electron advisor's staging."""
+    import base64
+
+    paths: list[str] = []
+    for b64 in images:
+        try:
+            data = base64.b64decode(b64, validate=True)
+        except (ValueError, TypeError):
+            continue
+        try:
+            fd, path = tempfile.mkstemp(prefix="arcelle-img-", suffix=".png")
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(data)
+            paths.append(path)
+        except OSError:
+            continue
+    return paths
+
+
+def _unlink_all(paths: list[str]) -> None:
+    for path in paths:
+        try:
+            os.unlink(path)
+        except OSError:  # pragma: no cover - best-effort cleanup
+            pass
+
+
 async def generate_external(
     model: str,
     messages: list[Message],
     *,
     format: dict[str, Any] | None = None,  # noqa: A002 - matches llm.generate
+    images: list[str] | None = None,
     cancel: Optional[Any] = None,
+    tap: "_DeltaTap | None" = None,
 ) -> str:
-    """One non-streaming turn through a cloud CLI. Raises :class:`.llm.LlmError`
-    with the sentinel contract on failure (``ENGINE_ERROR`` — there is no daemon
-    or pull state to map to the other codes).
+    """One turn through a cloud CLI. Raises :class:`.llm.LlmError` with the
+    sentinel contract on failure (``ENGINE_ERROR`` — there is no daemon or pull
+    state to map to the other codes).
+
+    ``images`` are top-level base64 PNGs (the vision-param convention this
+    gateway shares with the local engine): attached to the last user turn, then
+    delivered on the engine's real channel — Claude as stream-json content
+    blocks, Codex as staged ``-i`` files. Antigravity has no channel, so its
+    turns keep the honest not-sent note instead.
 
     ``cancel`` reaches the child: one spawn here is a whole CLI session bounded
     only by the idle budget, so a caller that can be stopped — compaction, which
-    runs a pass of this per chunk — must be able to take the process with it."""
+    runs a pass of this per chunk — must be able to take the process with it.
+
+    ``tap`` is :func:`generate_external_stream`'s live feed; the buffered parse
+    below stays the source of truth either way."""
     from .llm import LlmError  # local import: llm.py imports this module
 
     engine, submodel, effort = split_external_model(model)
-    prompt = flatten_messages(messages, format)
+    if images:
+        messages = attach_images(messages, images)
+    deliverable = collect_images(messages) if engine in IMAGE_ENGINES else []
+    prompt = flatten_messages(messages, format, deliver_images=bool(deliverable))
     idle = external_idle_secs()
+    staged = (
+        _stage_image_files(deliverable) if engine == "codex-cli" and deliverable else []
+    )
     try:
-        cmdline = build_cmdline(engine, submodel, effort)
-    except ValueError as exc:  # doctored model string — never reaches a shell
-        raise LlmError("ENGINE_ERROR", str(exc)) from exc
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "zsh",
-            "-ilc",
-            fenced_cmdline(cmdline),
-            cwd=tempfile.gettempdir() if engine == "antigravity-cli" else None,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        wire_prompt = (
-            json.dumps({"event": "user", "message": {"role": "user", "content": prompt}}) + "\n"
-            if engine == "antigravity-cli"
-            else prompt
-        )
-        stdout, stderr = await drain_with_idle(proc, wire_prompt.encode("utf-8"), idle, cancel)
-    except _Wedged as exc:
-        # Silent for the whole idle budget: stopped rather than hung forever.
-        # This raise is NOT caught by the generic `except Exception` below — an
-        # exception raised inside one except clause bypasses its siblings.
-        raise LlmError(
-            "ENGINE_ERROR",
-            f"{engine} produced no output for {idle:g}s and was stopped.",
-        ) from exc
-    except FileNotFoundError as exc:  # zsh itself missing — effectively impossible
-        raise LlmError("ENGINE_ERROR", f"Could not start {engine}: {exc}") from exc
-    except Exception as exc:  # noqa: BLE001 - re-raised as the sentinel contract
-        raise LlmError("ENGINE_ERROR", f"{engine} failed: {exc}") from exc
+        try:
+            cmdline = build_cmdline(
+                engine,
+                submodel,
+                effort,
+                stream_json_input=engine == "claude-cli" and bool(deliverable),
+                image_paths=staged,
+            )
+        except ValueError as exc:  # doctored model string — never reaches a shell
+            raise LlmError("ENGINE_ERROR", str(exc)) from exc
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "zsh",
+                "-ilc",
+                fenced_cmdline(cmdline),
+                cwd=tempfile.gettempdir() if engine == "antigravity-cli" else None,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            if engine == "antigravity-cli":
+                wire_prompt = (
+                    json.dumps(
+                        {"event": "user", "message": {"role": "user", "content": prompt}}
+                    )
+                    + "\n"
+                )
+            elif engine == "claude-cli" and deliverable:
+                wire_prompt = claude_user_event(prompt, deliverable)
+            else:
+                wire_prompt = prompt
+            stdout, stderr = await drain_with_idle(
+                proc, wire_prompt.encode("utf-8"), idle, cancel, tap
+            )
+        except _Wedged as exc:
+            # Silent for the whole idle budget: stopped rather than hung forever.
+            # This raise is NOT caught by the generic `except Exception` below — an
+            # exception raised inside one except clause bypasses its siblings.
+            raise LlmError(
+                "ENGINE_ERROR",
+                f"{engine} produced no output for {idle:g}s and was stopped.",
+            ) from exc
+        except FileNotFoundError as exc:  # zsh itself missing — effectively impossible
+            raise LlmError("ENGINE_ERROR", f"Could not start {engine}: {exc}") from exc
+        except Exception as exc:  # noqa: BLE001 - re-raised as the sentinel contract
+            raise LlmError("ENGINE_ERROR", f"{engine} failed: {exc}") from exc
+    finally:
+        _unlink_all(staged)
     # Stop killed the child, so its non-zero exit is the user's decision, not a
     # failure to report as one.
     if _stopped(cancel):
@@ -1097,7 +1490,59 @@ async def generate_external(
         )
     if engine == "antigravity-cli":
         return parse_antigravity_json_stream(out)[0].strip()
-    return out.strip()
+    if engine == "claude-cli":
+        return parse_claude_json_result(out)[0].strip()
+    return parse_codex_json_stream(out)[0].strip()
+
+
+async def generate_external_stream(
+    model: str,
+    messages: list[Message],
+    *,
+    format: dict[str, Any] | None = None,  # noqa: A002 - matches llm.generate
+    images: list[str] | None = None,
+    cancel: Optional[Any] = None,
+):
+    """Streaming twin of :func:`generate_external`: yields text deltas WHILE
+    the CLI writes (token-level for Claude and Antigravity, per completed
+    message for Codex), then whatever of the terminal answer was never
+    streamed — so callers always end up with exactly the final text, live when
+    the engine allows it and whole when it does not.
+
+    Restoration is the caller's job (``llm.generate_stream`` runs its stream
+    restorer over every engine's deltas alike), so no restorer rides the tap
+    here.
+    """
+    engine = split_external_model(model)[0]
+    queue: asyncio.Queue[str | None] = asyncio.Queue()
+
+    async def sink(text: str) -> None:
+        await queue.put(text)
+
+    tap = _DeltaTap(engine, sink)
+
+    async def run() -> str:
+        try:
+            return await generate_external(
+                model, messages, format=format, images=images, cancel=cancel, tap=tap
+            )
+        finally:
+            await queue.put(None)
+
+    task = asyncio.ensure_future(run())
+    try:
+        while True:
+            item = await queue.get()
+            if item is None:
+                break
+            yield item
+        final = await task  # re-raises the run's LlmError, if any
+        tail = tap.tail_for(final)
+        if tail:
+            yield tail
+    finally:
+        if not task.done():
+            task.cancel()
 
 
 #: How the seam asks for a tool call. One JSON object, nothing else — the
@@ -1307,13 +1752,18 @@ class ExternalChatModel:
     CLI is stateless per call, so each round re-sends the composed transcript —
     the same thing the Ollama path does over the wire, just flattened to text.
 
-    Deliberately NOT token-streamed: the reply has to be complete before we
-    know whether it is a tool call (branch A) or the answer (branch B), and the
-    CLI chat path never streamed live text anyway (agent.rs emitted a step chip
-    instead). The whole answer is handed to ``on_delta`` in one piece.
+    LIVE-streamed since 2026-08-27: a :class:`_DeltaTap` on stdout forwards
+    answer text to ``on_delta`` while the CLI writes (token deltas from Claude
+    and Antigravity, per completed message from Codex). The old buffer-it-all
+    rule existed because "a half-streamed envelope would spray JSON into the
+    transcript" — the tap's withhold-JSON-shaped-messages guard is what retired
+    it. The buffered terminal parse below stays the source of truth for what
+    the round meant; :meth:`_DeltaTap.finish` reconciles the two so the answer
+    is never delivered twice.
 
-    Images do not ride along — these CLIs take a text prompt on stdin. Vision
-    turns stay on the local engine, which is where the perception tools live.
+    Images ride along on the engines that have a channel (:data:`IMAGE_ENGINES`
+    — Claude as stream-json content blocks, Codex as staged ``-i`` files);
+    Antigravity keeps the honest not-sent note.
     """
 
     def __init__(
@@ -1442,7 +1892,13 @@ class ExternalChatModel:
         flag, so its instructions ride the stdin prompt as before."""
         return self.engine == "claude-cli"
 
-    def _prompt(self, messages: list[Message], tools: list[dict[str, Any]]) -> str:
+    def _prompt(
+        self,
+        messages: list[Message],
+        tools: list[dict[str, Any]],
+        *,
+        deliver_images: bool = False,
+    ) -> str:
         """The conversation for one round, as one flat prompt on stdin.
 
         The CATALOG lives in the system prompt (:meth:`_system`) — it needs the
@@ -1453,7 +1909,9 @@ class ExternalChatModel:
         last thing before generation is a one-line reminder of the two branches.
         """
         base = flatten_agent_messages(
-            messages, include_system=not self._takes_system_prompt
+            messages,
+            include_system=not self._takes_system_prompt,
+            deliver_images=deliver_images,
         )
         if not tools:
             return base
@@ -1509,6 +1967,8 @@ class ExternalChatModel:
         bridge_tools: list[str] | None = None,
         hub: HubToolServer | None = None,
         hub_tools: list[str] | None = None,
+        images: list[str] | None = None,
+        tap: "_DeltaTap | None" = None,
     ) -> str:
         """One CLI process, killed on Stop or after going silent.
 
@@ -1519,7 +1979,13 @@ class ExternalChatModel:
         Claude as a real MCP allowlist; ``hub`` is the per-round captured-tool
         endpoint (:mod:`.hub_mcp`). Claude uses it for delegation and Codex
         uses it for its entire exact scoped catalog.
-        Both files live for the call only.
+
+        ``images`` are the round's deliverable pixels: Claude takes them as
+        base64 blocks on stdin, Codex as staged temp files (decrypted room
+        content, so they are removed with the other per-call files below on
+        EVERY exit). ``tap`` is the live delta feed.
+
+        All files live for the call only.
         """
         paths: list[str] = []
         system_path: str | None = None
@@ -1540,6 +2006,10 @@ class ExternalChatModel:
                     )
                 )
             paths.append(mcp_path)
+        image_paths: list[str] = []
+        if self.engine == "codex-cli" and images:
+            image_paths = _stage_image_files(images)
+            paths.extend(image_paths)
         try:
             return await self._spawn(
                 prompt,
@@ -1551,6 +2021,9 @@ class ExternalChatModel:
                 codex_mcp=(hub.url, hub.token)
                 if self.engine == "codex-cli" and hub is not None
                 else None,
+                images=images or [],
+                image_paths=image_paths,
+                tap=tap,
             )
         finally:
             for path in paths:
@@ -1568,9 +2041,13 @@ class ExternalChatModel:
         allowed: list[str] | None = None,
         hub_tools: list[str] | None = None,
         codex_mcp: tuple[str, str] | None = None,
+        images: list[str] | None = None,
+        image_paths: list[str] | None = None,
+        tap: "_DeltaTap | None" = None,
     ) -> str:
         from .llm import LlmError  # local import: llm.py imports this module
 
+        claude_images = self.engine == "claude-cli" and bool(images)
         try:
             cmdline = build_agent_cmdline(
                 self.engine,
@@ -1581,6 +2058,8 @@ class ExternalChatModel:
                 allowed=allowed,
                 hub_allowed=hub_tools,
                 codex_mcp_url=codex_mcp[0] if codex_mcp is not None else None,
+                stream_json_input=claude_images,
+                image_paths=image_paths,
             )
         except ValueError as exc:  # doctored model string — never reaches a shell
             raise LlmError("ENGINE_ERROR", str(exc)) from exc
@@ -1608,13 +2087,19 @@ class ExternalChatModel:
         # wrong instrument and what replaced it.
         idle = external_idle_secs()
         try:
-            wire_prompt = (
-                json.dumps({"event": "user", "message": {"role": "user", "content": prompt}}) + "\n"
-                if self.engine == "antigravity-cli"
-                else prompt
-            )
+            if self.engine == "antigravity-cli":
+                wire_prompt = (
+                    json.dumps(
+                        {"event": "user", "message": {"role": "user", "content": prompt}}
+                    )
+                    + "\n"
+                )
+            elif claude_images:
+                wire_prompt = claude_user_event(prompt, images or [])
+            else:
+                wire_prompt = prompt
             stdout, stderr = await drain_with_idle(
-                proc, wire_prompt.encode("utf-8"), idle, cancel
+                proc, wire_prompt.encode("utf-8"), idle, cancel, tap
             )
         except _Wedged as exc:
             raise LlmError(
@@ -1642,11 +2127,23 @@ class ExternalChatModel:
         from .privacy import guard_outbound
 
         # PRIV-1: same door as every other non-local model — the composed
-        # history goes out redacted, the reply comes back restored.
+        # history goes out redacted, the reply comes back restored. The door
+        # pops images and stamps `images_blocked`, so a door-on room collects
+        # nothing below and the flattened turns say the pixels were withheld.
         send, _, engaged = guard_outbound(self.composite_model, messages, self.privacy)
         send = await self._compact(send, tools, self._stated_context, cancel)
         if _stopped(cancel):
             return "", [], self._usage()
+        # AFTER compaction: a digested turn has no pixels left to deliver, so
+        # what is collected is exactly what the delivered-mode notes describe.
+        images = collect_images(send) if self.engine in IMAGE_ENGINES else []
+        # The live feed: answer text reaches the user while the CLI writes,
+        # restored through the same door the buffered reply passes.
+        tap = _DeltaTap(
+            self.engine,
+            on_delta,
+            engaged.restorer() if engaged is not None else None,
+        )
         codex_aliases = (
             {
                 name: _CODEX_NATIVE_TOOL_ALIASES.get(name, f"arcelle_{name}")
@@ -1705,14 +2202,23 @@ class ExternalChatModel:
         system = self._system(
             rendered_messages, protocol_tools, native=bool(native or hub_names)
         )
-        prompt = self._prompt(rendered_messages, protocol_tools)
+        prompt = self._prompt(
+            rendered_messages, protocol_tools, deliver_images=bool(images)
+        )
         hub: HubToolServer | None = None
         try:
             if hub_names:
                 hub = HubToolServer(hub_tools, secrets.token_urlsafe(24))
             if self._takes_system_prompt:
                 stdout = await self._run(
-                    prompt, cancel, system, native, hub=hub, hub_tools=hub_names
+                    prompt,
+                    cancel,
+                    system,
+                    native,
+                    hub=hub,
+                    hub_tools=hub_names,
+                    images=images,
+                    tap=tap,
                 )
             else:
                 # Codex/Antigravity have no system-prompt flag, so instructions
@@ -1722,6 +2228,8 @@ class ExternalChatModel:
                     cancel,
                     hub=hub,
                     hub_tools=hub_names,
+                    images=images,
+                    tap=tap,
                 )
             captured = list(hub.calls) if hub is not None else []
         finally:
@@ -1757,21 +2265,26 @@ class ExternalChatModel:
         )
         if calls:
             # Branch (A): an envelope is machinery, never transcript text. Its
-            # arguments carry real values back through the door.
+            # arguments carry real values back through the door. Whatever
+            # narration already streamed stays on screen exactly as a local
+            # model's tool-round text does; only the restorer's held tail is
+            # still owed.
             if engaged is not None:
                 for call in calls:
                     call.arguments = engaged.restore_value(call.arguments)
                     fn = call.raw.get("function")
                     if isinstance(fn, dict):
                         fn["arguments"] = call.arguments
+            await tap.flush()
             return "", calls, self._usage(input_tokens, window)
 
-        # Branch (B): the answer. Restored, then delivered in one piece.
+        # Branch (B): the answer. The tap already streamed most (often all) of
+        # it live; `finish` delivers only what it never forwarded, so nothing
+        # reaches the transcript twice. The RETURNED text is restored whole —
+        # it is what the graph files as the round's content.
+        await tap.finish(text)
         if engaged is not None:
-            restorer = engaged.restorer()
-            text = restorer.feed(text) + restorer.flush()
-        if text:
-            await on_delta(text)
+            text = engaged.restore_text(text)
         return text, [], self._usage(input_tokens, window)
 
     def _usage(self, input_tokens: int | None = None, window: int | None = None) -> Any:
@@ -1793,6 +2306,8 @@ class ExternalChatModel:
 __all__ = [
     "EXTERNAL_ENGINES",
     "EXTERNAL_IDLE_SECS",
+    "IMAGE_ENGINES",
+    "MAX_IMAGES_PER_MESSAGE",
     "CODEX_ARCELLE_FLAGS",
     "DISPLAY_CONTEXT_FALLBACK",
     "ExternalChatModel",
@@ -1802,6 +2317,9 @@ __all__ = [
     "strip_shell_banner",
     "build_agent_cmdline",
     "claude_result_object",
+    "claude_user_event",
+    "collect_images",
+    "message_images",
     "parse_claude_json_result",
     "parse_codex_json_stream",
     "parse_antigravity_json_stream",
@@ -1813,4 +2331,5 @@ __all__ = [
     "flatten_agent_messages",
     "build_cmdline",
     "generate_external",
+    "generate_external_stream",
 ]

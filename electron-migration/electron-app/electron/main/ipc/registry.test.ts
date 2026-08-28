@@ -422,6 +422,18 @@ describe("registerAllIpc — one shared room across module boundaries", () => {
     });
 
     expect(readFileSync(path.join(roomPath, "Normal file.sketch"), "utf8")).toBe(doc);
+    const publicFiles = await handlers.get("list_files")!(fakeEvent, {}) as Array<{
+      id: string;
+      name: string;
+      libraryVisibility: string;
+    }>;
+    expect(publicFiles).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: sketch.id,
+        name: "Normal file.sketch",
+        libraryVisibility: "sectionOnly",
+      }),
+    ]));
   });
 
   it("reuses a staged media token until a file-change event invalidates it", async () => {

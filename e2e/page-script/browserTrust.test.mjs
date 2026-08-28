@@ -39,6 +39,7 @@ const load = async (source) => {
 const VIEW = read("src/workspace/BrowserView.tsx");
 const READER = read("src/workspace/BrowserReader.tsx");
 const CSS = read("src/styles/browser.css");
+const CAPTURE = read("e2e/capture-specs/browseraudit.mjs");
 
 /* A COMPONENT module cannot be loaded the way the pure ones above are: its
  * react/api/icon specifiers do not resolve from a data: URL. Nothing runs at
@@ -187,6 +188,17 @@ test("the view renders the derived claim, not a hardcoded boast", () => {
   assert.ok(
     VIEW.includes("browserRetryProtection"),
     "a failed blocker is reported with no way to retry it",
+  );
+});
+
+test("the browser audit toggles the journal by shield state, not privacy verdict text", () => {
+  assert.ok(CAPTURE.includes("async function setJournalOpen(open)"));
+  assert.ok(CAPTURE.includes('getAttribute("aria-pressed")'));
+  assert.ok(CAPTURE.includes("await setJournalOpen(true)"));
+  assert.ok(CAPTURE.includes("await setJournalOpen(false)"));
+  assert.ok(
+    !CAPTURE.includes('clickText(".browser-chrome", "Journal")'),
+    "capture still searches for a Journal label the privacy shield does not render",
   );
 });
 

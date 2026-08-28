@@ -94,6 +94,24 @@ async function clickText(scope, label) {
   return false;
 }
 
+/** Open/close the journal through its actual control.
+ *
+ * The shield's visible word is a live privacy verdict (No page / Checking /
+ * Partly private / Private), not a stable action label. Looking for a button
+ * whose text was "Journal" became stale when that truthful verdict landed and
+ * silently left the panel closed. `aria-pressed` is the control's state
+ * contract, so this remains correct across every privacy state. */
+async function setJournalOpen(open) {
+  const shield = await $(".browser-shield");
+  await shield.waitForExist({ timeout: 10_000 });
+  const pressed = (await shield.getAttribute("aria-pressed")) === "true";
+  if (pressed !== open) await shield.click();
+  await browser.waitUntil(
+    async () => (await $(".browser-journal").isExisting()) === open,
+    { timeout: 5_000, timeoutMsg: `browser journal did not ${open ? "open" : "close"}` },
+  );
+}
+
 describe("the private browser's trust states, photographed", () => {
   before(() => fs.mkdirSync(OUT, { recursive: true }));
   after(() => {
@@ -165,7 +183,7 @@ describe("the private browser's trust states, photographed", () => {
   it("shows the journal as sittings rather than a dump", async () => {
     await goBrowser();
     await openPage();
-    await clickText(".browser-chrome", "Journal");
+    await setJournalOpen(true);
     const panel = await $(".browser-journal");
     expect(await panel.isExisting()).toBe(true);
     await shot("04-journal");
@@ -194,7 +212,7 @@ describe("the private browser's trust states, photographed", () => {
     } else {
       note("NO CLEAR BUTTON — nothing to confirm");
     }
-    await clickText(".browser-chrome", "Journal");
+    await setJournalOpen(false);
   });
 
   it("gives the reading view the pane, and the page back only to compare", async () => {

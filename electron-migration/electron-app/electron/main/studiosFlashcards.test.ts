@@ -550,7 +550,8 @@ describe("execStudioFlashcards", () => {
 
     const reply = await execStudioFlashcards(deps, null, {});
 
-    expect(reply).toBe('Saved "Flashcards - Test Room.html" into the room.');
+    expect(reply).toContain('Saved "Flashcards - Test Room.html" into the room.');
+    expect(reply).toContain("ARCELLE_ARTIFACT_RECEIPT");
   });
 
   it("resolves refs by NAME, exactly as the model supplies them from list_room_files", async () => {
@@ -561,7 +562,8 @@ describe("execStudioFlashcards", () => {
 
     const reply = await execStudioFlashcards(deps, null, { refs: ["Chapter 3.md"] });
 
-    expect(reply).toBe('Saved "Flashcards - Chapter 3.html" into the room.');
+    expect(reply).toContain('Saved "Flashcards - Chapter 3.html" into the room.');
+    expect(reply).toContain("ARCELLE_ARTIFACT_RECEIPT");
   });
 
   it("threads instructions through to the model prompt path (no crash, no ignored argument)", async () => {
@@ -633,7 +635,8 @@ describe("the exec_tool arm is shared, not forked per artifact", () => {
       insertFile(room.db, "src.md", "text/markdown", Buffer.from("m"), "Material to study.", "upload");
       const deps = fakeRunStudioDeps(room, null, [{ q: "Q?", a: "A.", hint: "" }]);
       const reply = await execStudioFlashcards(deps, null, {});
-      expect(reply).toBe('Saved "Flashcards - Deck Room.html" into the room.');
+      expect(reply).toContain('Saved "Flashcards - Deck Room.html" into the room.');
+      expect(reply).toContain("ARCELLE_ARTIFACT_RECEIPT");
     } finally {
       room.dispose();
     }

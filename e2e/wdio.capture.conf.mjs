@@ -17,6 +17,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import http from "node:http";
+import { readinessGate } from "./wdio-readiness.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(__dirname, "..");
@@ -25,6 +26,7 @@ const PORT = process.env.QA_PREVIEW_PORT || "4174";
 export const BASE_URL = `http://127.0.0.1:${PORT}/qa.html`;
 
 let preview;
+const readiness = readinessGate("screenshot capture");
 
 export const config = {
   runner: "local",
@@ -59,27 +61,33 @@ export const config = {
   baseUrl: BASE_URL,
 
   onPrepare: async () => {
-    if (!process.env.SKIP_BUILD) {
-      run("npm", ["run", "build"], "vite build");
-      run(process.execPath, [path.join(projectRoot, "qa", "make-qa.mjs")], "make-qa");
-    }
-    // See wdio.qa.conf.mjs: without an explicit `--host 127.0.0.1`, vite binds
-    // ::1 only on macOS and everything below is refused.
-    preview = spawn(
-      path.join(projectRoot, "node_modules", ".bin", "vite"),
-      ["preview", "--host", "127.0.0.1", "--port", PORT, "--strictPort"],
-      { cwd: projectRoot, stdio: "inherit" },
-    );
+    readiness.begin();
     try {
+      if (!process.env.SKIP_BUILD) {
+        run("npm", ["run", "build"], "vite build");
+        run(process.execPath, [path.join(projectRoot, "qa", "make-qa.mjs")], "make-qa");
+      }
+      // See wdio.qa.conf.mjs: without an explicit `--host 127.0.0.1`, vite binds
+      // ::1 only on macOS and everything below is refused.
+      preview = spawn(
+        path.join(projectRoot, "node_modules", ".bin", "vite"),
+        ["preview", "--host", "127.0.0.1", "--port", PORT, "--strictPort"],
+        { cwd: projectRoot, stdio: "inherit" },
+      );
       await waitFor(BASE_URL);
+      readiness.pass();
     } catch (err) {
-      preview.kill();
+      readiness.fail(err);
+      preview?.kill();
       throw err;
     }
   },
 
+  onWorkerStart: () => readiness.assertWorkerMayStart(),
+
   onComplete: () => {
     if (preview) preview.kill();
+    readiness.reset();
   },
 };
 

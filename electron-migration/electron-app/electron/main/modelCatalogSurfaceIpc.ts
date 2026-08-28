@@ -2,11 +2,19 @@
 
 import { execFile } from "node:child_process";
 import type { IpcMain, IpcMainInvokeEvent } from "electron";
-import type { CreateCatalog, CreateExclusion, CreateModel, ExternalModelInfo } from "../shared/apiTypes.js";
+import type {
+  CreateCatalog,
+  CreateExclusion,
+  CreateModel,
+  ExternalModelInfo,
+  ModelSelectionValidation,
+} from "../shared/apiTypes.js";
 import { DECLARED } from "./capabilities.js";
+import { probeOllamaModelSelection } from "./ollamaModels.js";
 import {
   listProviderModels,
   openrouterKey,
+  providerModelSelectable,
   providerConnected,
 } from "./providers.js";
 import { ensureMediaLimits, limitsFor, mediaTableLoaded } from "./mediaLimits.js";
@@ -125,6 +133,73 @@ export async function listEngineModels(engine: string): Promise<ExternalModelInf
   throw new Error(`Unknown engine: ${engine}`);
 }
 
+export interface ModelSelectionValidatorDeps {
+  probeOllama(model: string): Promise<{ ok: boolean; detail: string | null }>;
+  listProviderModels(provider: string): Promise<ExternalModelInfo[]>;
+  providerModelKnown(selection: string): boolean;
+  now(): number;
+}
+
+const FAILED_VALIDATION_TTL_MS = 60_000;
+
+/**
+ * Exact-ID capability check used by the model picker. Successes live for this
+ * process; transient failures are retried after one minute. OpenRouter is
+ * deliberately lazy: its hundreds of catalog rows are not probed one by one.
+ */
+export function createModelSelectionValidator(deps: ModelSelectionValidatorDeps) {
+  const cache = new Map<string, { result: ModelSelectionValidation; expiresAt: number }>();
+  return async (engine: string, model: string): Promise<ModelSelectionValidation> => {
+    const exactId = model.trim();
+    if (exactId === "") return { selectable: false, reason: "Choose a specific model first." };
+    const cacheKey = `${engine}\0${exactId}`;
+    const prior = cache.get(cacheKey);
+    if (prior && prior.expiresAt > deps.now()) return prior.result;
+
+    let result: ModelSelectionValidation;
+    if (engine === "ollama-local" || engine === "ollama-cloud") {
+      const probe = await deps.probeOllama(exactId);
+      result = probe.ok
+        ? { selectable: true, reason: null }
+        : {
+            selectable: false,
+            reason: `Ollama could not validate the exact model ID “${exactId}”. ${probe.detail ?? "Refresh the model list and try again."}`,
+          };
+    } else if (engine === "openrouter") {
+      // A prior picker catalog fetch already populated this exact-slug cache.
+      // Otherwise do one authenticated, account-scoped catalog read now. This
+      // is one lazy check for the chosen model, not N probes for N rows.
+      let known = deps.providerModelKnown(`openrouter::${exactId}`);
+      if (known !== true) {
+        const rows = await deps.listProviderModels("openrouter");
+        known = rows.some((row) => row.slug === exactId);
+      }
+      result = known
+        ? { selectable: true, reason: null }
+        : {
+            selectable: false,
+            reason: `OpenRouter does not offer the exact model ID “${exactId}” for this account. Refresh the catalog or choose another model.`,
+          };
+    } else {
+      // Native CLI catalogs are produced by the installed CLI itself. Their
+      // listed IDs are already the runtime IDs and need no second provider call.
+      result = { selectable: true, reason: null };
+    }
+    cache.set(cacheKey, {
+      result,
+      expiresAt: result.selectable ? Number.POSITIVE_INFINITY : deps.now() + FAILED_VALIDATION_TTL_MS,
+    });
+    return result;
+  };
+}
+
+export const validateModelSelection = createModelSelectionValidator({
+  probeOllama: probeOllamaModelSelection,
+  listProviderModels,
+  providerModelKnown: (selection) => providerModelSelectable(selection) === true,
+  now: Date.now,
+});
+
 function exclusion(engine: string, reason: string, names: string[]): CreateExclusion | null {
   if (names.length === 0) return null;
   return {
@@ -202,4 +277,8 @@ export function registerModelCatalogSurfaceIpc(ipcMain: Pick<IpcMain, "handle">)
   ipcMain.handle("list_engine_models", (_event: IpcMainInvokeEvent, raw: unknown) =>
     listEngineModels(String(object(raw).engine ?? "")));
   ipcMain.handle("list_create_models", () => listCreateModels());
+  ipcMain.handle("validate_engine_model", (_event: IpcMainInvokeEvent, raw: unknown) => {
+    const row = object(raw);
+    return validateModelSelection(String(row.engine ?? ""), String(row.model ?? ""));
+  });
 }

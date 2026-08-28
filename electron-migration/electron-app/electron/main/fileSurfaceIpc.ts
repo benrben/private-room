@@ -12,7 +12,7 @@ import {
   emptyTrash,
   getFileMeta,
   inTransaction,
-  listLibraryFiles,
+  listPublicFiles,
   listTrashedFiles,
   renameFile,
   restoreFile,
@@ -98,7 +98,11 @@ export function registerFileSurfaceIpc(
     return report;
   };
 
-  ipcMain.handle("list_files", () => listLibraryFiles(room().conn));
+  // The renderer owns several destination lists, not only Home's Library.
+  // Keep section-only Sketches/Creations in its shared inventory; their Home
+  // visibility is filtered in fileVisibility.ts. Only internal preview objects
+  // are absent from this public surface.
+  ipcMain.handle("list_files", () => listPublicFiles(room().conn));
   ipcMain.handle("list_trashed_files", () => listTrashedFiles(room().conn));
   ipcMain.handle("rename_file", (_event: IpcMainInvokeEvent, raw: unknown) => {
     const a = args(raw);

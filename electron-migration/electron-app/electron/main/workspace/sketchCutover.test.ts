@@ -13,6 +13,7 @@ import {
 } from "../sketchCommands.js";
 import { applyScript, defaultSketch, sketchToJson } from "../sketchDoc.js";
 import { createRoom } from "../db-host/open.js";
+import { listPublicFiles } from "../db-host/files.js";
 import { convertLegacyRoomToWorkspace } from "./conversion.js";
 import { createWorkspaceRoom, openWorkspaceRoom } from "./roomLayout.js";
 import { WorkspaceService } from "./workspaceService.js";
@@ -87,6 +88,13 @@ describe("workspace drawing cutover", () => {
     const workspace = new WorkspaceService(opened.db, root);
     const room = { db: opened.db, path: root, workspace };
     try {
+      expect(listPublicFiles(opened.db)).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          id: meta.id,
+          name: "Converted flow.sketch",
+          libraryVisibility: "sectionOnly",
+        }),
+      ]));
       const outcome = await execTool(
         "draw",
         { name: "Converted flow", script: 'text 220 80 red 24 "After conversion"' },

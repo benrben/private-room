@@ -859,6 +859,9 @@ export interface RunViaSidecarRequest {
     connectors?: boolean;
   };
   webEnabled?: boolean;
+  /** Host-authoritative capability boundary. `none` means the empty MCP
+   * catalog is intentional and the sidecar must not plan or delegate tools. */
+  toolPolicy?: "auto" | "none";
   maxRounds?: number | null;
   /** Whole-ask runaway net across the delegation tree. */
   turnMaxRounds?: number | null;
@@ -911,6 +914,7 @@ export function buildRunRequestBody(req: RunViaSidecarRequest): Record<string, u
     },
     ...(req.routing === undefined ? {} : { routing: req.routing }),
     web_enabled: req.webEnabled ?? false,
+    tool_policy: req.toolPolicy ?? "auto",
     max_rounds: req.maxRounds ?? null,
     turn_max_rounds: req.turnMaxRounds ?? null,
     turn_max_stalls: req.turnMaxStalls ?? null,
@@ -1138,9 +1142,13 @@ export function processLine(
     case "step_status": {
       // `ok` defaults to FALSE here and TRUE on `report` — deliberately
       // opposite, matching Rust's `unwrap_or(false)`/`unwrap_or(true)`.
+      // `tool` is present only for a real room-tool completion. Delegation
+      // status deliberately leaves it null because `report` is that child's
+      // normalized completion and emitting both would count the work twice.
       const payload = {
         ok: typeof ev.ok === "boolean" ? ev.ok : false,
         node: optionalStringField(ev, "node"),
+        tool: optionalStringField(ev, "tool"),
       };
       return { kind: "event", state, event: { name: "ask-step-status", payload } };
     }

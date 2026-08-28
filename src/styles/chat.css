@@ -379,6 +379,14 @@
   color: var(--text);
 }
 
+/* A command failure is part of its turn, not an unrelated toast. The leading
+   rule and explicit Error label in the content preserve meaning without
+   relying on colour alone. */
+.msg.assistant.is-turn-error {
+  padding-inline-start: var(--sp-3);
+  border-inline-start: 3px solid var(--sem-urgent);
+}
+
 /* ----- the question: a lightly outlined note -----
    The imperfection is the system's own: an asymmetric radius makes the
    rectangle read as drawn rather than computed, and the signature alternates

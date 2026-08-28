@@ -93,9 +93,17 @@ try {
   await window.reload({ waitUntil: "domcontentloaded", timeout: 15_000 });
   const reloadedRoom = await invoke(window, "room_info");
   assert.equal(reloadedRoom.path, workspacePath);
+  const listedAfterReload = await invoke(window, "list_files");
+  log(`files after reload: ${listedAfterReload.map((file) => `${file.id}:${file.name}`).join(", ")}`);
+  assert.ok(
+    listedAfterReload.some((file) => file.id === sketch.id && file.name === "Converted flow.sketch"),
+    "the renderer's public file inventory lost the converted section-only sketch",
+  );
   await window.locator(".workspace").waitFor();
   await window.locator('[data-area="sketch"]').evaluate((button) => button.click());
-  await window.getByRole("list", { name: "Sketches in this room" }).waitFor();
+  const sketchList = window.getByRole("list", { name: "Sketches in this room" });
+  await sketchList.waitFor();
+  log(`sketch list: ${JSON.stringify((await sketchList.innerText()).trim())}`);
   await window.locator('[title="Open Converted flow.sketch"]').evaluate((row) => row.click());
   await window.locator(".sk-page").waitFor();
   await window.getByRole("img", { name: "Drawing canvas, 1 object" }).waitFor();

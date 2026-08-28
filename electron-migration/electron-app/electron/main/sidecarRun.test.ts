@@ -89,6 +89,7 @@ describe("buildRunRequestBody", () => {
         baseline_run_id: "",
       },
       web_enabled: false,
+      tool_policy: "auto",
       max_rounds: null,
       turn_max_rounds: null,
       turn_max_stalls: null,
@@ -114,6 +115,7 @@ describe("buildRunRequestBody", () => {
       temperature: 0.4,
       ollamaBaseUrl: "http://127.0.0.1:9999",
       webEnabled: true,
+      toolPolicy: "none",
       maxRounds: 5,
       turnMaxRounds: 10,
       turnMaxStalls: 2,
@@ -137,6 +139,7 @@ describe("buildRunRequestBody", () => {
       },
       routing: { write: true },
       web_enabled: true,
+      tool_policy: "none",
       max_rounds: 5,
       turn_max_rounds: 10,
       turn_max_stalls: 2,
@@ -253,7 +256,23 @@ describe("processLine -- every line kind", () => {
     // unwrap_or(false)/unwrap_or(true) is the only reason either is right.
     const outcome = processLine({ t: "step_status", node: "main", run_id: runId }, runId, freshAccumulator());
     if (outcome.kind !== "event") throw new Error("expected event");
-    expect(outcome.event).toEqual({ name: "ask-step-status", payload: { ok: false, node: "main" } });
+    expect(outcome.event).toEqual({
+      name: "ask-step-status",
+      payload: { ok: false, node: "main", tool: null },
+    });
+  });
+
+  it("step_status preserves the exact completed room-tool name", () => {
+    const outcome = processLine(
+      { t: "step_status", ok: true, node: "files.read#0", tool: "workspace_rename", run_id: runId },
+      runId,
+      freshAccumulator(),
+    );
+    if (outcome.kind !== "event") throw new Error("expected event");
+    expect(outcome.event).toEqual({
+      name: "ask-step-status",
+      payload: { ok: true, node: "files.read#0", tool: "workspace_rename" },
+    });
   });
 
   it("final: records the text and the seen flag, but emits NOTHING", () => {

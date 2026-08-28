@@ -419,6 +419,7 @@ async def test_live_seam_single_tool_run():
         "t": "step_status",
         "ok": True,
         "node": "files.read#0",
+        "tool": "search_room",
         "run_id": token,
     }
     # `delta` and `round` carry the same optional `node` stamp `step` does — the

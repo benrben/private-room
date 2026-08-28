@@ -66,7 +66,9 @@ import {
   isBareSaveReference,
   isImage,
   passthroughPrepareImage,
+  resolveTurnEvidencePolicy,
   type PreparedImage,
+  type TurnEvidencePolicy,
 } from "./turnContext.js";
 import { readRoomFile } from "./workspace/roomContent.js";
 import type { WorkspaceService } from "./workspace/workspaceService.js";
@@ -140,6 +142,7 @@ export interface QuestionContext {
   webEnabled: boolean;
   advisorsOn: boolean;
   advisorToolsOn: boolean;
+  evidencePolicy: TurnEvidencePolicy;
 }
 
 /** The two out-of-scope seams — see this module's own doc for both. */
@@ -151,6 +154,22 @@ export interface GatherContextDeps {
   prepareImage?: (bytes: Buffer) => PreparedImage;
   /** Trusted pre-read workspace image bytes. Internal to the async room wrapper. */
   workspaceAttachmentBytes?: ReadonlyMap<string, Buffer | null>;
+  /** A host preflight may force the hard policy before any asynchronous file
+   * preparation. It can only tighten, never relax, the policy inferred here. */
+  evidencePolicy?: TurnEvidencePolicy;
+}
+
+/** Resolve the turn policy early enough for embedding and MCP bridge setup.
+ * Missing/disabled skills still throw later in the normal gather path; this
+ * read-only preflight only decides whether capabilities must be closed. */
+export function turnEvidencePolicyForQuestion(
+  db: Database.Database,
+  question: string,
+): TurnEvidencePolicy {
+  const requested = explicitSkillRequest(question);
+  const effective = requested === null ? question.trim() : requested.request;
+  const skill = requested === null ? null : findSkill(db, requested.name);
+  return resolveTurnEvidencePolicy(effective, skill?.instructions ?? null);
 }
 
 // ------------------------------------------------------------- attachments
@@ -259,7 +278,6 @@ export function gatherContextAndSaveQuestion(
   viewing: string | null,
   deps: GatherContextDeps = {}
 ): QuestionContext {
-  const connectedMcp = deps.connectedMcpServers?.() ?? [];
   const prepareImage = deps.prepareImage ?? passthroughPrepareImage;
 
   const skillRequest = explicitSkillRequest(question);
@@ -267,18 +285,6 @@ export function gatherContextAndSaveQuestion(
 
   const explicitModel = modelSetting(db);
   const temperature = parseTemperature(getSetting(db, "temperature"));
-  const customInstructions = getSetting(db, "custom_instructions");
-  const responseStyle = getSetting(db, "response_style");
-  const roomRole = getSetting(db, "room_role");
-
-  const memories = listMemories(db).map((m) => m.content);
-
-  // Agent Skills progressive disclosure, level 1: only enabled name+description
-  // metadata enters every turn, and only for GENERAL skills — a skill owned by
-  // one sub-agent must not be advertised to (or openable by) the main
-  // assistant. It rides in the per-turn USER message, never the system prompt,
-  // so the stable prefix survives a skill being added.
-  const availableSkills = listSkills(db, true).filter((s) => s.agent.trim() === "");
 
   let explicitSkill: {
     name: string;
@@ -300,14 +306,45 @@ export function gatherContextAndSaveQuestion(
       name: skill.name,
       description: skill.description,
       instructions: skill.instructions,
-      resources: listSkillResources(db, skill.id).map((r) => ({ path: r.path, kind: r.kind })),
+      resources: [],
     };
   }
 
-  // `recentMessages` is newest-first; the prompt wants chronological order.
-  const history = [...recentMessages(db, chatId, AGENT_HISTORY_MESSAGES)].reverse();
+  const inferredPolicy = resolveTurnEvidencePolicy(
+    effectiveQuestion,
+    explicitSkill?.instructions ?? null,
+  );
+  const evidencePolicy = deps.evidencePolicy === "no-tools-no-sources"
+    || inferredPolicy === "no-tools-no-sources"
+    ? "no-tools-no-sources"
+    : "normal";
+  const hardNoEvidence = evidencePolicy === "no-tools-no-sources";
 
-  const inventory = listFileInventory(db);
+  // Only the selected skill instructions and the current request survive the
+  // hard boundary. In particular, do not even enumerate resources or general
+  // skills: resource names and descriptions are room-derived evidence too.
+  if (explicitSkill !== null && !hardNoEvidence) {
+    const skill = findSkill(db, explicitSkill.name);
+    explicitSkill.resources = skill === null
+      ? []
+      : listSkillResources(db, skill.id).map((r) => ({ path: r.path, kind: r.kind }));
+  }
+
+  const connectedMcp = hardNoEvidence ? [] : deps.connectedMcpServers?.() ?? [];
+  const customInstructions = hardNoEvidence ? null : getSetting(db, "custom_instructions");
+  const responseStyle = hardNoEvidence ? null : getSetting(db, "response_style");
+  const roomRole = hardNoEvidence ? null : getSetting(db, "room_role");
+  const memories = hardNoEvidence ? [] : listMemories(db).map((m) => m.content);
+  const availableSkills = hardNoEvidence
+    ? []
+    : listSkills(db, true).filter((s) => s.agent.trim() === "");
+
+  // `recentMessages` is newest-first; the prompt wants chronological order.
+  const history = hardNoEvidence
+    ? []
+    : [...recentMessages(db, chatId, AGENT_HISTORY_MESSAGES)].reverse();
+
+  const inventory = hardNoEvidence ? [] : listFileInventory(db);
   // `listFileInventory` intentionally stops at 101 rows for the system prompt.
   // Explicit scope must still recognize an older file in a large room, so only
   // the name resolver expands to the complete lightweight listing.
@@ -319,18 +356,19 @@ export function gatherContextAndSaveQuestion(
           mime,
           summary,
         ]);
-  const namedFiles = explicitlyNamedRoomFiles(effectiveQuestion, scopeInventory);
+  const namedFiles = hardNoEvidence
+    ? []
+    : explicitlyNamedRoomFiles(effectiveQuestion, scopeInventory);
   const [contextChunks, contextFallback] =
-    namedFiles.length > 0
+    hardNoEvidence
+      ? [[], false] as const
+      : namedFiles.length > 0
       ? retrieveContextForFiles(db, effectiveQuestion, namedFiles)
       : retrieveContext(db, effectiveQuestion, questionEmbedding);
 
-  const { images, attachedNotes, sources, firstImage, carried } = processAttachments(
-    db,
-    attachments,
-    prepareImage,
-    deps.workspaceAttachmentBytes,
-  );
+  const { images, attachedNotes, sources, firstImage, carried } = hardNoEvidence
+    ? { images: [], attachedNotes: [], sources: [], firstImage: null, carried: 0 }
+    : processAttachments(db, attachments, prepareImage, deps.workspaceAttachmentBytes);
 
   // Only credit files that genuinely matched the question: on the zero-score
   // fallback the chunks are just "recent content", so they must not appear as
@@ -343,13 +381,14 @@ export function gatherContextAndSaveQuestion(
     }
   }
 
-  const webEnabled = webAccessEnabled(db);
+  const webEnabled = hardNoEvidence ? false : webAccessEnabled(db);
   // ADD-21: whether the advisor tool may be offered this turn, and whether a
   // consulted Claude advisor may reach the room's tools.
-  const advisorsOn = advisorsEnabled(db);
+  const advisorsOn = hardNoEvidence ? false : advisorsEnabled(db);
   const advisorToolsOn = advisorsOn && advisorToolsEnabled(db);
 
   const system = buildSystemPrompt({
+    evidencePolicy,
     webEnabled,
     connectedMcp,
     inventory,
@@ -377,15 +416,22 @@ export function gatherContextAndSaveQuestion(
   }
 
   if (explicitSkill !== null) {
-    const tree =
-      explicitSkill.resources.length === 0
-        ? "(no bundled resources)"
-        : explicitSkill.resources.map((r) => `- ${r.path} (${r.kind})`).join("\n");
     const instructions = clampBytesMarked(explicitSkill.instructions, 20_000, SKILL_BODY_TRUNCATED);
-    userContent +=
-      `Explicitly selected Agent Skill: /${explicitSkill.name}\n` +
-      "Follow this skill for the current request. The slash selection overrides automatic skill choice, but never the user's request or safety/privacy rules. Read listed resources with read_skill_resource when the instructions call for them.\n" +
-      `Description: ${explicitSkill.description}\n\nSkill instructions:\n${instructions}\n\nBundled resources:\n${tree}\n\n`;
+    if (hardNoEvidence) {
+      userContent +=
+        `Explicitly selected Agent Skill: /${explicitSkill.name}\n` +
+        "Follow only these instructions where they agree with the user's request. This turn has no tools, file reads, bundled resources, or other sources.\n\n" +
+        `Skill instructions:\n${instructions}\n\n`;
+    } else {
+      const tree =
+        explicitSkill.resources.length === 0
+          ? "(no bundled resources)"
+          : explicitSkill.resources.map((r) => `- ${r.path} (${r.kind})`).join("\n");
+      userContent +=
+        `Explicitly selected Agent Skill: /${explicitSkill.name}\n` +
+        "Follow this skill for the current request. The slash selection overrides automatic skill choice, but never the user's request or safety/privacy rules. Read listed resources with read_skill_resource when the instructions call for them.\n" +
+        `Description: ${explicitSkill.description}\n\nSkill instructions:\n${instructions}\n\nBundled resources:\n${tree}\n\n`;
+    }
   }
 
   if (memories.length > 0) {
@@ -424,7 +470,7 @@ export function gatherContextAndSaveQuestion(
   // about what this question is about, and there is no anaphora left to
   // resolve. What was CARRIED, not what was clipped — a paperclip whose
   // content never reached the model resolves nothing.
-  if (carried === 0) {
+  if (!hardNoEvidence && carried === 0) {
     const open = viewing?.trim() ?? "";
     if (open !== "") {
       userContent +=
@@ -466,6 +512,7 @@ export function gatherContextAndSaveQuestion(
     webEnabled,
     advisorsOn,
     advisorToolsOn,
+    evidencePolicy,
   };
 }
 
@@ -487,7 +534,11 @@ export async function gatherContextAndSaveQuestionInRoom(
   viewing: string | null,
   deps: GatherContextDeps = {},
 ): Promise<QuestionContext> {
-  if (room.workspace === undefined) {
+  const evidencePolicy = deps.evidencePolicy === "no-tools-no-sources"
+    ? deps.evidencePolicy
+    : turnEvidencePolicyForQuestion(room.db, question);
+  const resolvedDeps = { ...deps, evidencePolicy };
+  if (room.workspace === undefined || evidencePolicy === "no-tools-no-sources") {
     return gatherContextAndSaveQuestion(
       room.db,
       chatId,
@@ -495,7 +546,7 @@ export async function gatherContextAndSaveQuestionInRoom(
       attachments,
       questionEmbedding,
       viewing,
-      deps,
+      resolvedDeps,
     );
   }
   const workspaceAttachmentBytes = new Map<string, Buffer | null>();
@@ -516,6 +567,6 @@ export async function gatherContextAndSaveQuestionInRoom(
     attachments,
     questionEmbedding,
     viewing,
-    { ...deps, workspaceAttachmentBytes },
+    { ...resolvedDeps, workspaceAttachmentBytes },
   );
 }

@@ -17,6 +17,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import http from "node:http";
+import { readinessGate } from "./wdio-readiness.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(__dirname, "..");
@@ -25,6 +26,7 @@ const PORT = process.env.QA_PREVIEW_PORT || "4173";
 export const BASE_URL = `http://127.0.0.1:${PORT}/qa.html`;
 
 let preview;
+const readiness = readinessGate("QA e2e");
 
 export const config = {
   runner: "local",
@@ -58,31 +60,37 @@ export const config = {
   // Build the app, generate qa.html, serve it. SKIP_BUILD=1 reuses dist/ when
   // iterating on the specs themselves.
   onPrepare: async () => {
-    if (!process.env.SKIP_BUILD) {
-      run("npm", ["run", "build"], "vite build");
-      run(process.execPath, [path.join(projectRoot, "qa", "make-qa.mjs")], "make-qa");
-    }
-    // `--host 127.0.0.1` is load-bearing: vite's default host is `localhost`,
-    // which on macOS resolves to ::1 first, so the server listens on IPv6 ONLY
-    // and every request to 127.0.0.1 — the poll below and then Chrome itself —
-    // is refused. The whole suite died with ERR_CONNECTION_REFUSED before this.
-    preview = spawn(
-      path.join(projectRoot, "node_modules", ".bin", "vite"),
-      ["preview", "--host", "127.0.0.1", "--port", PORT, "--strictPort"],
-      { cwd: projectRoot, stdio: "inherit" },
-    );
+    readiness.begin();
     try {
+      if (!process.env.SKIP_BUILD) {
+        run("npm", ["run", "build"], "vite build");
+        run(process.execPath, [path.join(projectRoot, "qa", "make-qa.mjs")], "make-qa");
+      }
+      // `--host 127.0.0.1` is load-bearing: vite's default host is `localhost`,
+      // which on macOS resolves to ::1 first, so the server listens on IPv6 ONLY.
+      preview = spawn(
+        path.join(projectRoot, "node_modules", ".bin", "vite"),
+        ["preview", "--host", "127.0.0.1", "--port", PORT, "--strictPort"],
+        { cwd: projectRoot, stdio: "inherit" },
+      );
       await waitFor(BASE_URL);
+      readiness.pass();
     } catch (err) {
       // Otherwise a half-started preview keeps --strictPort's port and the
       // NEXT run fails too, for a different and more confusing reason.
-      preview.kill();
+      readiness.fail(err);
+      preview?.kill();
       throw err;
     }
   },
 
+  // `onPrepare` rejection alone did not stop this WDIO version from launching
+  // its enumerated workers. This launcher-side gate is the final boundary.
+  onWorkerStart: () => readiness.assertWorkerMayStart(),
+
   onComplete: () => {
     if (preview) preview.kill();
+    readiness.reset();
   },
 };
 

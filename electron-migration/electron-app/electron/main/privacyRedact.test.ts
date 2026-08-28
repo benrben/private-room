@@ -110,6 +110,34 @@ describe("Redactor.redact", () => {
   });
 });
 
+describe("Redactor.stream", () => {
+  it("redacts a longest protected value split across arbitrary deltas", () => {
+    const report = emptyPrivacyReport();
+    const stream = redactor().stream(report);
+    const visible = [
+      stream.feed("Call BEN "),
+      stream.feed("RE"),
+      stream.feed("ICH at 12 her"),
+      stream.feed("zl st today."),
+      stream.flush(),
+    ].join("");
+
+    expect(visible).toBe("Call [Person A] at [Address A] today.");
+    expect(visible.toLowerCase()).not.toContain("ben");
+    expect(visible.toLowerCase()).not.toContain("herzl");
+    expect(report).toEqual({ entitiesHidden: 2, replacements: 2, imagesBlocked: 0 });
+  });
+
+  it("reset drops the undecidable suffix from a replaced model round", () => {
+    const stream = redactor().stream(emptyPrivacyReport());
+    expect(stream.feed("Ben Re")).toBe("");
+    stream.reset();
+    const visible = stream.feed("final plain answer") + stream.flush();
+    expect(visible).toBe("final plain answer");
+    expect(visible).not.toContain("Ben Re");
+  });
+});
+
 describe("leftmost-longest, non-overlapping", () => {
   it("a shorter rule that PREFIXES a longer one never wins", () => {
     const r = new Redactor([

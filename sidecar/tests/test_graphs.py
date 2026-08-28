@@ -415,6 +415,16 @@ def test_referent_names_reads_each_write_tools_real_argument_shape() -> None:
     assert _referent_names("create_file", {}) == []
     # a 4B flattening `edits` to a string is salvaged rather than self-accused
     assert _referent_names("edit_files", {"edits": "notes.md"}) == ["notes.md"]
+    receipt = (
+        'Saved "deck.html".\nARCELLE_ARTIFACT_RECEIPT '
+        '{"fileId":"file-1","name":"deck.html","size":12,'
+        '"sha256":"' + "a" * 64 + '"}'
+    )
+    assert _referent_names("studio_flashcards", {}, receipt) == ["deck.html"]
+    assert _referent_names("studio_flashcards", {}, 'Saved "deck.html".') == []
+    assert _referent_names(
+        "studio_flashcards", {}, receipt.replace("a" * 64, "not-a-hash")
+    ) == []
 
 
 async def test_a_successful_edit_files_is_not_reported_as_a_failed_write() -> None:

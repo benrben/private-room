@@ -495,6 +495,21 @@ REGISTRY: tuple[AgentSpec, ...] = (
         # would go unreachable on any tier that withholds the organize box.
         core_capable=True,
         prompt=FILES_PROMPT,
+        # Domain-level signals for requests that explicitly name Arcelle's
+        # workspace/filesystem surface.  Keep these namespace-shaped rather
+        # than broad verbs such as "delete" or "move": those verbs also
+        # describe skills, jobs and messages, while these phrases mean the
+        # room's files unambiguously.  Besides sibling selection, the
+        # deterministic planner reads the default member's hints to route a
+        # small local model before it has to invent a delegation itself.
+        hints=(
+            "workspace_",
+            "workspace file",
+            "workspace folder",
+            "filesystem",
+            "room file",
+            "files in this room",
+        ),
     ),
     AgentSpec(
         id="scripts.run",

@@ -104,6 +104,7 @@ import type {
   RoomRole,
   RuntimeStatus,
   ExternalModelInfo,
+  ModelSelectionValidation,
   NeuralVoiceInfo,
   AskPrivacy,
   AiProviderStatus,
@@ -1025,6 +1026,9 @@ export const api = {
    *  for the Cloud picker's second level. */
   listEngineModels: (engine: string) =>
     invoke<ExternalModelInfo[]>("list_engine_models", { engine }),
+  /** Validate the provider's exact runtime ID before persisting a selection. */
+  validateEngineModel: (engine: string, model: string) =>
+    invoke<ModelSelectionValidation>("validate_engine_model", { engine, model }),
   listAiProviders: () => invoke<AiProviderStatus[]>("list_ai_providers"),
   connectAiProvider: (provider: string, apiKey: string) =>
     invoke<number>("connect_ai_provider", { provider, apiKey }),

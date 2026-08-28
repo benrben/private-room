@@ -10,7 +10,7 @@ import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
 import type Database from "better-sqlite3-multiple-ciphers";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createChat } from "./db-host/chats.js";
 import { insertFile } from "./db-host/files.js";
 import { createFolder } from "./db-host/folders.js";
@@ -26,9 +26,10 @@ import {
   gatherContextAndSaveQuestionInRoom,
   modelSetting,
   parseTemperature,
+  turnEvidencePolicyForQuestion,
   webAccessEnabled,
 } from "./gatherContext.js";
-import { BASE_SYSTEM_PROMPT } from "./turnContext.js";
+import { BASE_SYSTEM_PROMPT, NO_TOOLS_NO_SOURCES_SYSTEM_PROMPT } from "./turnContext.js";
 import { createWorkspaceRoom } from "./workspace/roomLayout.js";
 import { WorkspaceService } from "./workspace/workspaceService.js";
 
@@ -100,6 +101,74 @@ describe("settings one-liners", () => {
 // ------------------------------------------- gatherContextAndSaveQuestion
 
 describe("gatherContextAndSaveQuestion", () => {
+  it("hard mode keeps only the selected skill instructions and current request", () => {
+    const db = freshRoom();
+    const chat = createChat(db);
+    insertMessage(db, chat.id, "user", "Old private conversation", [], null);
+    addMemory(db, "Private remembered value", null);
+    const attached = insertFile(
+      db,
+      "secret.txt",
+      "text/plain",
+      Buffer.from("private file content"),
+      "private file content",
+      "upload",
+    );
+    createSkill(db, "ordinary", "Automatic private description", "Use tools.", true, "user", "");
+    createSkill(
+      db,
+      "knowledge-only",
+      "Private selected description",
+      "Do not read files. Explain in simple words.",
+      true,
+      "user",
+      "",
+    );
+    setSetting(db, "web_provider", "duckduckgo");
+    setSetting(db, "advisors_enabled", "on");
+    setSetting(db, "custom_instructions", "Mention the private room.");
+    const connectedMcpServers = vi.fn(() => ["notion"]);
+    const prepareImage = vi.fn(() => ({ bytes: Buffer.from("x"), width: 1, height: 1 }));
+
+    expect(turnEvidencePolicyForQuestion(db, "/knowledge-only Explain a mutex")).toBe(
+      "no-tools-no-sources",
+    );
+    const ctx = gatherContextAndSaveQuestion(
+      db,
+      chat.id,
+      "/knowledge-only Explain a mutex",
+      [attached.id],
+      [0.1],
+      "secret.txt",
+      { connectedMcpServers, prepareImage },
+    );
+
+    expect(ctx.evidencePolicy).toBe("no-tools-no-sources");
+    expect(ctx.sources).toEqual([]);
+    expect(ctx.firstImage).toBeNull();
+    expect(ctx.webEnabled).toBe(false);
+    expect(ctx.advisorsOn).toBe(false);
+    expect(ctx.advisorToolsOn).toBe(false);
+    expect(ctx.chatMessages).toHaveLength(2);
+    expect(ctx.chatMessages[0]?.content).toBe(NO_TOOLS_NO_SOURCES_SYSTEM_PROMPT);
+    const user = ctx.chatMessages[1]!.content;
+    expect(user).toContain("Do not read files. Explain in simple words.");
+    expect(user).toContain("Question: Explain a mutex");
+    for (const privateText of [
+      "Old private conversation",
+      "Private remembered value",
+      "private file content",
+      "secret.txt",
+      "Automatic private description",
+      "Private selected description",
+      "notion",
+    ]) {
+      expect(user).not.toContain(privateText);
+    }
+    expect(connectedMcpServers).not.toHaveBeenCalled();
+    expect(prepareImage).not.toHaveBeenCalled();
+  });
+
   it("builds a system+user pair, saves the question, and titles the chat", () => {
     const db = freshRoom();
     const chat = createChat(db);

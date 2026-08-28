@@ -204,6 +204,23 @@ export function insertMessage(
   };
 }
 
+/** Insert an assistant failure that belongs to one user turn.
+ *
+ * A command failure is transcript data, but it must not become model history:
+ * feeding an old runtime error back to the model makes the next answer reason
+ * about Arcelle's machinery instead of the conversation. The `kind` column
+ * gives the renderer a stable error-card signal and lets {@link recentMessages}
+ * exclude it mechanically. */
+export function insertTurnErrorMessage(
+  db: Database.Database,
+  chatId: string,
+  content: string
+): Message {
+  const message = insertMessage(db, chatId, "assistant", content, [], null);
+  executeOne(db, "UPDATE messages SET kind = 'turn_error' WHERE id = ?", [message.id]);
+  return { ...message, kind: "turn_error" };
+}
+
 /** Room map: the `sources` list of the newest `limit` answers that cited
  * anything, newest first — one array of file NAMES per message.
  *
@@ -315,6 +332,7 @@ export function recentMessages(
     db,
     `SELECT role, content FROM messages
      WHERE chat_id = ?
+       AND (kind IS NULL OR kind = 'handoff')
        AND rowid >= COALESCE(
              (SELECT MAX(rowid) FROM messages WHERE chat_id = ? AND kind = 'handoff'),
              0)

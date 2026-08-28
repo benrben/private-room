@@ -77,6 +77,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import weakref
 from dataclasses import dataclass, field, replace
 from typing import Any, Awaitable, Callable, NamedTuple, TypedDict
@@ -419,6 +420,7 @@ class AgentState(TypedDict, total=False):
 
     # --- inputs
     question: str
+    tool_policy: str
     web_enabled: bool
     write: bool
     advisors: bool
@@ -779,6 +781,7 @@ async def prepare(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
     write = bool(state.get("write", False))
     advisors = bool(state.get("advisors", False))
     agent = get_agent(str(state.get("agent_id", "")))
+    no_tools = state.get("tool_policy") == "none"
     unlocked: set[str] = set(state.get("unlocked_groups", set()))
 
     # ADD-22: let the user see which lane was chosen, so an odd answer is
@@ -800,7 +803,7 @@ async def prepare(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
         )
 
     # Never hardcode the catalog — the host decides our trust scope (SPEC §2.1).
-    served = await _list_tools(deps)
+    served = [] if no_tools else await _list_tools(deps)
     served_specs = [s.to_ollama() for s in served]
     served_names = {s.get("function", {}).get("name") for s in served_specs}
     # Hub v3: the MAIN agent's only tools are its specialists — the
@@ -836,7 +839,7 @@ async def prepare(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
     #
     # A step chip cannot be mistaken for the model's opinion, so the cause
     # travels with the symptom.
-    if agent.main and not tools:
+    if agent.main and not tools and not no_tools:
         await deps.emit(
             {
                 "t": "step",
@@ -865,7 +868,7 @@ async def prepare(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
             web_enabled=web_enabled,
             served_names=served_names,
         )
-        if agent.main
+        if agent.main and not no_tools
         else None
     )
     if plan is not None and plan.steps:
@@ -885,7 +888,7 @@ async def prepare(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
     locked = [] if agent.main else _locked_groups(served_names, offered, unlocked, agent.group)
     if locked:
         tools.append(request_tools_spec(locked))
-    if messages and messages[0].get("role") == "system":
+    if messages and messages[0].get("role") == "system" and not no_tools:
         # Only describe tools the model actually has this turn — telling it
         # about tools it wasn't given teaches it to hallucinate calls. The
         # active sub-agent contributes its own paragraph; locked groups are
@@ -1327,11 +1330,19 @@ LEDGER_TOOLS: frozenset[str] = frozenset(
         # verify_claims fires a guaranteed false accusation at the one tool
         # that did the work.
         "draw",
+        "studio_flashcards",
+        "studio_mindmap",
+        "generate_podcast_script",
     }
 )
 
 
-def _referent_names(tool: str, args: dict[str, Any] | None) -> list[str]:
+_ARTIFACT_RECEIPT = re.compile(r"(?:^|\n)ARCELLE_ARTIFACT_RECEIPT\s+(\{[^\n]+\})")
+
+
+def _referent_names(
+    tool: str, args: dict[str, Any] | None, result_text: str = ""
+) -> list[str]:
     """What a successful write actually left behind, read per tool SHAPE.
 
     This used to be a single `arguments["name"]` lookup for every tool, which
@@ -1349,6 +1360,36 @@ def _referent_names(tool: str, args: dict[str, Any] | None) -> list[str]:
     which is the old behaviour, never an exception inside the tool loop.
     """
     args = args or {}
+    if tool in {
+        "studio_flashcards",
+        "studio_mindmap",
+        "generate_podcast_script",
+    }:
+        match = _ARTIFACT_RECEIPT.search(result_text)
+        if match is None:
+            return []
+        try:
+            receipt = json.loads(match.group(1))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return []
+        if not isinstance(receipt, dict):
+            return []
+        name = receipt.get("name")
+        file_id = receipt.get("fileId")
+        sha256 = receipt.get("sha256")
+        size = receipt.get("size")
+        if not (
+            isinstance(name, str)
+            and name.strip()
+            and isinstance(file_id, str)
+            and file_id.strip()
+            and isinstance(sha256, str)
+            and re.fullmatch(r"[0-9a-f]{64}", sha256)
+            and isinstance(size, int)
+            and size >= 0
+        ):
+            return []
+        return [name.strip()[:80]]
     if tool == "draw":
         # The artifact is the SKETCH, which `draw` names directly — and a name
         # that did not exist yet is still the right referent, because the tool
@@ -2574,6 +2615,8 @@ class _ToolPass:
             self.reports_so_far.append(
                 (self.delegator.launched_label.get(call.id, "specialist"), report)
             )
+        # No `tool` discriminator here: `report` is the specialist's single
+        # normalized completion. Adding the ask_* name would count it twice.
         await self.deps.emit({"t": "step_status", "ok": ok, "node": self.node})
         self._memoise_delegation(key)
         # Truthful either way: this log is the small model's only record of
@@ -2650,7 +2693,9 @@ class _ToolPass:
         ok = not outcome.is_error
         # ADD-22: tell the UI whether the step succeeded, so a failed chip doesn't
         # look identical to a successful one.
-        await self.deps.emit({"t": "step_status", "ok": ok, "node": self.node})
+        await self.deps.emit(
+            {"t": "step_status", "ok": ok, "node": self.node, "tool": call.name}
+        )
 
         if ok:
             # Only remember successful calls, so a failed one may be re-attempted
@@ -2661,7 +2706,7 @@ class _ToolPass:
             # kickoff note can name them deterministically — and so the
             # write-claim gate can tell a real write from a claimed one.
             if call.name in LEDGER_TOOLS:
-                for artifact in _referent_names(call.name, call.arguments):
+                for artifact in _referent_names(call.name, call.arguments, result):
                     entry_text = f"{call.name}: {artifact}"
                     self.referents.append(entry_text)
                     self.produced.append(entry_text)
@@ -3067,7 +3112,7 @@ async def run_agent(req: RunRequest, deps: Deps) -> str:
     # per-lane budgets were removed — its own docstring says so. Four scans of
     # the question whose results went straight into the bin, which is why this
     # asks for the ONE lane it reads rather than taking `[0]` of all five.
-    write = req.resolved_write()
+    write = False if req.tool_policy == "none" else req.resolved_write()
     run_max_rounds = req.resolved_max_rounds()
     # No per-agent budget narrows this any more: the Main agent delegates until
     # it has what it needs, bounded only by the shared runaway backstop.
@@ -3123,7 +3168,7 @@ async def run_agent(req: RunRequest, deps: Deps) -> str:
     # Read before the branch because BOTH paths run a loop that needs it.
     small_model = req.provider is None and not is_nonlocal_model(req.model)
     tagged, ask = tagged_specialist(req.question)
-    if tagged:
+    if tagged and req.tool_policy != "none":
         return await _run_tagged(
             req,
             deps,
@@ -3146,7 +3191,11 @@ async def run_agent(req: RunRequest, deps: Deps) -> str:
                 {
                     "agent": main.id,
                     "label": main.label,
-                    "instruction": "decide, delegate to specialists, answer",
+                    "instruction": (
+                        "answer without tools or sources"
+                        if req.tool_policy == "none"
+                        else "decide, delegate to specialists, answer"
+                    ),
                     "status": "running",
                     "batch": None,
                     "key": MAIN_NODE_KEY,
@@ -3169,6 +3218,7 @@ async def run_agent(req: RunRequest, deps: Deps) -> str:
 
     initial: AgentState = {
         "question": req.question,
+        "tool_policy": req.tool_policy,
         "web_enabled": req.web_enabled,
         "write": write,
         "advisors": bool(req.advisors),
@@ -3234,7 +3284,7 @@ async def stream_events(req: RunRequest, deps_factory: Callable[[Emit], Deps]):
 
     async def driver() -> None:
         try:
-            if req.harness == "deep":
+            if req.harness == "deep" and req.tool_policy != "none":
                 from .deep_harness import run_deep_agent, select_deep_harness
 
                 decision = await select_deep_harness(req)

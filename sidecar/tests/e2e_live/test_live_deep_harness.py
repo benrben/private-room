@@ -4,7 +4,7 @@ This is deliberately opt-in. It exercises the real Deep Agents runtime, the
 real selected Ollama model, and a loopback-only workspace MCP bridge. It never
 uses a cloud provider, browser tool, shell backend, or external network socket.
 
-    ARCELLE_E2E=1 ARCELLE_E2E_MODEL=qwen3.5:4b-mlx \
+    ARCELLE_E2E=1 ARCELLE_E2E_MODEL=qwen3.5:4b \
         uv run pytest tests/e2e_live/test_live_deep_harness.py -q
 """
 
@@ -26,9 +26,19 @@ from .harness import E2E_MODEL, OLLAMA, RecordingBridge, skip_unless_live, tool_
 
 skip_unless_live()
 
-FIXTURE_VALUE = "orchid-7ZQ9"
+# A pronounceable sentinel avoids turning this harness/tool test into a tiny
+# model's random-string copying benchmark. The old `orchid-7ZQ9` was read via
+# the tool correctly but qwen3.5:4b once omitted only its final digit.
+FIXTURE_VALUE = "ORCHID-SEVEN"
 
 WORKSPACE_TOOLS = [
+    # The installed LocalEngine catalog exposes Arcelle's compatibility file
+    # surface as well as the exact workspace surface. Small models use the
+    # deterministic File agent, whose narrow tool box intentionally speaks
+    # these stable compatibility verbs; larger models can use workspace_*.
+    tool_spec("list_room_files", "List files in the room."),
+    tool_spec("search_room", "Search room file contents.", query={"type": "string"}),
+    tool_spec("open_file", "Read a room file.", name={"type": "string"}),
     tool_spec("workspace_list", "List files under a workspace path.", path={"type": "string"}),
     tool_spec(
         "workspace_read",
@@ -54,6 +64,12 @@ WORKSPACE_TOOLS = [
 
 def workspace_reply(name: str, args: dict[str, Any]) -> str:
     """Small read-only fixture in the Workspace Service wire shape."""
+    if name == "list_room_files":
+        return "/fixture.md"
+    if name == "search_room":
+        return f"/fixture.md: The private fixture codename is {FIXTURE_VALUE}."
+    if name == "open_file" and args.get("name") in {"/fixture.md", "fixture.md"}:
+        return f"The private fixture codename is {FIXTURE_VALUE}."
     if name == "workspace_list":
         return json.dumps(
             {
@@ -197,7 +213,14 @@ async def test_local_deep_harness_reads_workspace_finishes_once_and_cancels(
             assert len(finals) == 1, f"expected one final result, got: {events}"
             assert FIXTURE_VALUE.casefold() in finals[0].casefold()
             assert any(
-                name == "workspace_read" and args.get("path") == "/fixture.md"
+                (
+                    name == "workspace_read"
+                    and args.get("path") == "/fixture.md"
+                )
+                or (
+                    name == "open_file"
+                    and args.get("name") in {"/fixture.md", "fixture.md"}
+                )
                 for name, args in bridge.calls
             )
 
@@ -238,5 +261,9 @@ async def test_local_deep_harness_reads_workspace_finishes_once_and_cancels(
         "run_mcp_tool",
     }
     assert offered_tools and all(not (names & forbidden) for names in offered_tools)
-    assert all(name.startswith("workspace_") for name, _args in bridge.calls)
+    assert all(
+        name.startswith("workspace_")
+        or name in {"list_room_files", "search_room", "open_file"}
+        for name, _args in bridge.calls
+    )
     assert loopback_only == []

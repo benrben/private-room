@@ -539,6 +539,13 @@
 .composer .ac-item.active {
   box-shadow: inset 3px 0 0 var(--accent-fill);
 }
+.composer .ac-item.unavailable,
+.composer .ac-item.unavailable:hover {
+  opacity: 0.68;
+  cursor: not-allowed;
+  background: transparent;
+  box-shadow: none;
+}
 
 /* ===== Wave 3 (Workspace) additions ===== */
 
@@ -958,4 +965,3 @@ video.audio-view-media {
   flex: 1;
   min-width: 0;
 }
-

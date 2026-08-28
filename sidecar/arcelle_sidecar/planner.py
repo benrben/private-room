@@ -49,17 +49,12 @@ happened here:
   step. Unclaimed clauses ride back to the hub by name
   (:data:`.prompts.PLAN_REMAINDER_NOTE`) — neither substituted nor dropped.
 
-  The cost of that rule is stated plainly: ``files.read`` carries no hints, so
-  the FILE domain — the room's own default specialist — is never *claimed* by
-  vocabulary and, now that it is no longer *assumed*, never appears in a plan at
-  all. Its clauses arrive at the hub as remainder, with the room-content
-  sentence attached. Closing that needs a domain-level file vocabulary that does
-  not exist yet, and inventing one here would be the hand-synced substring list
-  the design docs warn against. A wrong plan
-  handed over as fact is worse than no plan: the model's own judgement is the
-  documented fallback and it is a good one, whereas a forced-but-wrong
-  specialist is a confident non-answer, which is the failure this codebase
-  spends most of its guardrails on.
+  The default File agent carries only namespace-shaped hints such as
+  ``workspace_`` and ``filesystem``. That lets explicit harness/file-tool
+  requests be claimed without turning broad verbs such as "move" or "delete"
+  into a hand-written default route. Everything else still abstains: a wrong
+  plan handed over as fact is worse than no plan, whereas the model's own
+  judgement remains the documented fallback.
 
 What this module never does is fill a SLOT. Every instruction it hands over is
 the user's own words, verbatim, cut only at separators they typed themselves —
@@ -251,18 +246,17 @@ def _clauses(question: str) -> list[tuple[str, bool]]:
 #: domain added or reordered there brings its vocabulary with it and there is
 #: nothing here to keep in step by hand.
 #:
-#: Two domains resolve to a member with no hints at all (``file`` ->
-#: ``files.read``, ``app`` -> ``app.ui``), so NEITHER IS EVER PLANNED. That is a
-#: real limit, stated rather than papered over. The App agent's vocabulary
+#: The App domain resolves to a member with no hints at all (``app`` ->
+#: ``app.ui``), so it is never planned. That is a real limit, stated rather
+#: than papered over. The App agent's vocabulary
 #: (``routing.UI_HINTS``) is a lane GATE that overlaps three other domains'
 #: nouns — "flashcard", "video", "map" — so reading it as a router would steal
-#: their work; the File agent simply has no vocabulary of its own, because
-#: everywhere else in this codebase it is reached by being the DEFAULT rather
-#: than by being named. Treating "default" as "claimed" is what this module
-#: tried first and had to undo (see the third rule above), so both domains'
-#: clauses go back to the hub — which is exactly today's behaviour for them, and
-#: leaves the room's most-used specialist outside every plan until a
-#: domain-level file vocabulary exists.
+#: their work. The File agent has only explicit workspace/filesystem namespace
+#: vocabulary because everywhere else in this codebase it is reached by being
+#: the DEFAULT rather than by being named. Treating "default" as "claimed" is
+#: what this module tried first and had to undo (see the third rule above), so
+#: ordinary room-content clauses still go back to the hub. Explicit harness
+#: workspace language is the narrow exception.
 _DOMAIN_VOCABULARY: tuple[tuple[str, AgentSpec], ...] = tuple(
     (name.removeprefix("ask_").removesuffix("_agent"), get_agent(members[0]))
     for name, members, _ in AGENT_TOOL_DOMAINS

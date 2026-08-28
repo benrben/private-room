@@ -70,6 +70,7 @@ import {
 let tmpDir: string;
 
 afterEach(() => {
+  vi.useRealTimers();
   if (tmpDir) {
     rmSync(tmpDir, { recursive: true, force: true });
   }
@@ -875,7 +876,14 @@ describe("resolveStudioRefs / execStudio — the one shared exec_tool arm", () =
       [podcastSpec(), "Podcast script - Interop Room.html"],
     ] as const) {
       const reply = await execStudio(deps, spec, null, {});
-      expect(reply).toBe(`Saved "${expected}" into the room.`);
+      expect(reply).toContain(`Saved "${expected}" into the room.`);
+      const rawReceipt = reply.split("ARCELLE_ARTIFACT_RECEIPT ")[1];
+      expect(rawReceipt).toBeTruthy();
+      const receipt = JSON.parse(rawReceipt!);
+      expect(receipt.name).toBe(expected);
+      expect(receipt.fileId).toBe(fileByExactName(db, expected)?.id);
+      expect(receipt.size).toBeGreaterThan(0);
+      expect(receipt.sha256).toMatch(/^[0-9a-f]{64}$/);
       // …and the page is really in the room, not just named in a reply.
       expect(fileByExactName(db, expected)?.name).toBe(expected);
     }
@@ -911,6 +919,22 @@ describe("resolveStudioRefs / execStudio — the one shared exec_tool arm", () =
     expect(sawFlagged).toBe(true);
     // Nothing was written: the commit guard is what a parent's Stop reaches.
     expect(fileByExactName(db, "Mind map - Interop Room.html")).toBeNull();
+  });
+
+  it("times out a stalled Studio model and never writes an artifact", async () => {
+    vi.useFakeTimers();
+    const { flashcardsSpec } = await import("./studiosFlashcards.js");
+    const db = freshRoom("Timeout Room");
+    addFile(db, "src.md", "Source material.");
+    const deps = testDeps(fakeRoomSource({ db, path: "timeout.roomai", name: "Timeout Room" }), {
+      studioTimeoutMs: 50,
+      chatStructured: (() => new Promise<string>(() => {})) as never,
+    });
+    const pending = execStudio(deps, flashcardsSpec(), null, {});
+    const rejected = expect(pending).rejects.toThrow("Studio timed out before an artifact was saved");
+    await vi.advanceTimersByTimeAsync(51);
+    await rejected;
+    expect(fileByExactName(db, "Flashcards - Timeout Room.html")).toBeNull();
   });
 
   it("throws 'No room is open.' rather than resolving refs against nothing", async () => {

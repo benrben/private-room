@@ -158,6 +158,9 @@ WRITE_TOOLS: frozenset[str] = frozenset(
         # A drawing is a versioned write to a room file, so "I drew it" is
         # audited exactly like "I saved it".
         "draw",
+        "studio_flashcards",
+        "studio_mindmap",
+        "generate_podcast_script",
         # OUTBOUND effects, 2026-07-27. `run_mcp_tool` is how the Connector
         # agent sends email and Slack messages — the least reversible thing any
         # agent here does — and it ran under plain `react` with no gate of any

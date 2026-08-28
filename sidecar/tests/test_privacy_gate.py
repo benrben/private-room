@@ -210,7 +210,7 @@ async def test_llm_generate_external_cli_redacts_and_restores(monkeypatch) -> No
 
     seen: dict[str, Any] = {}
 
-    async def fake_external(model, messages, *, format=None):  # noqa: A002
+    async def fake_external(model, messages, *, format=None, **kwargs):  # noqa: A002
         seen["messages"] = messages
         return "About [Person A]: fine."
 

@@ -819,17 +819,28 @@ export function makeChatActions(
     if (s.ac && items.length > 0) {
       if (e.key === "ArrowDown") {
         e.preventDefault();
-        s.setAc({ ...s.ac, index: (s.ac.index + 1) % items.length });
+        let index = s.ac.index;
+        for (let n = 0; n < items.length; n += 1) {
+          index = (index + 1) % items.length;
+          if (!items[index].disabled) break;
+        }
+        s.setAc({ ...s.ac, index });
         return;
       }
       if (e.key === "ArrowUp") {
         e.preventDefault();
-        s.setAc({ ...s.ac, index: (s.ac.index - 1 + items.length) % items.length });
+        let index = s.ac.index;
+        for (let n = 0; n < items.length; n += 1) {
+          index = (index - 1 + items.length) % items.length;
+          if (!items[index].disabled) break;
+        }
+        s.setAc({ ...s.ac, index });
         return;
       }
       if (e.key === "Enter" || e.key === "Tab") {
         e.preventDefault();
-        acceptAutocomplete(items[Math.min(s.ac.index, items.length - 1)].insert);
+        const selected = items[Math.min(s.ac.index, items.length - 1)];
+        if (!selected.disabled) acceptAutocomplete(selected.insert);
         return;
       }
     }

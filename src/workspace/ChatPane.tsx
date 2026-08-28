@@ -638,7 +638,7 @@ export default function ChatPane({
           <div
             key={m.id}
             id={`msg-${m.id}`}
-            className={`msg ${m.role}${hand ? " is-hand" : ""}${m.id === lastAssistantId ? " is-latest" : ""}`}
+            className={`msg ${m.role}${m.kind === "turn_error" ? " is-turn-error" : ""}${hand ? " is-hand" : ""}${m.id === lastAssistantId ? " is-latest" : ""}`}
           >
             <div className="msg-label">
               <span className="msg-avatar" aria-hidden>

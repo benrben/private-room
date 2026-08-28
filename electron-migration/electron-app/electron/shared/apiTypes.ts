@@ -210,6 +210,12 @@ export interface Specialist {
   area: string;
   /** The full sentence: what it can actually be asked for. */
   description: string;
+  /** Effective ability after the selected provider and privacy policy. */
+  capability?: "full" | "inspect-only" | "unavailable";
+  /** Why actions are restricted, written for display before dispatch. */
+  capabilityReason?: string;
+  /** Changing to an on-device model restores the restricted actions. */
+  localHandoff?: boolean;
 }
 
 /** Grouped results of a room-wide search (ADD-6). */
@@ -880,6 +886,13 @@ export interface ExternalModelInfo {
   videoOutput: boolean;
   reasoning: boolean;
   structuredOutputs: boolean;
+}
+
+/** Result of validating the provider's exact model ID before selection. */
+export interface ModelSelectionValidation {
+  selectable: boolean;
+  /** Human-readable reason when selection is blocked. */
+  reason: string | null;
 }
 
 /** One model the Create page may offer, as `list_create_models` returns it. */

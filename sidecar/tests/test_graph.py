@@ -116,6 +116,33 @@ async def test_question_only_request_seeds_a_user_turn() -> None:
     assert out.final == "up 3%"
 
 
+async def test_hard_no_tools_policy_never_lists_or_offers_tools() -> None:
+    """An empty catalog is intentional in hard mode, not a bridge failure."""
+    req = make_request(
+        "Do not use tools. Explain mutexes.",
+        messages=[
+            {"role": "system", "content": "Answer without tools or sources."},
+            {"role": "user", "content": "Question: Explain mutexes."},
+        ],
+        web_enabled=True,
+        advisors=["claude"],
+        routing={"write": True},
+    )
+    req.tool_policy = "none"
+    mcp = FakeMCP()
+    out = await drive(req, FakeChatModel([Round(content="A mutex protects shared state.")]), mcp)
+
+    assert out.final == "A mutex protects shared state."
+    assert mcp.list_calls == 0
+    assert mcp.calls == []
+    assert out.chat.offered_names == [[]]
+    assert not any(
+        event.get("t") == "step" and "No specialists available" in str(event.get("v"))
+        for event in out.events
+    )
+    assert out.chat.seen_messages[0][0]["content"] == "Answer without tools or sources."
+
+
 async def test_question_is_not_duplicated_when_history_already_has_the_user_turn() -> None:
     """Chat callers include the ask as the final user turn AND set ``question``.
     The seed must not double it."""
@@ -1217,6 +1244,7 @@ async def test_step_status_reports_failure() -> None:
         mcp,
     )
     assert [e["ok"] for e in out.of("step_status")] == [False, True]
+    assert [e["tool"] for e in out.of("step_status")] == ["open_file", "search_room"]
     assert [e["v"] for e in out.of("step")] == ["Opened a file", "Searched the room"]
 
 
@@ -1677,6 +1705,11 @@ async def test_event_sequence() -> None:
     assert out.of("lane")[0] == {"t": "lane", "v": "Working on your files"}
     assert out.of("delta")[-1]["v"] == "The rent is 1200."
     assert out.of("final")[0]["v"] == "The rent is 1200."
+    statuses = out.of("step_status")
+    assert statuses[0]["tool"] == "search_room"
+    assert "tool" not in statuses[1], (
+        "delegation status must not duplicate the ask-report completion"
+    )
 
 async def test_message_thread_shape() -> None:
     chat = FakeChatModel(

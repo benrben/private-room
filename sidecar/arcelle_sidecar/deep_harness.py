@@ -199,6 +199,17 @@ async def select_deep_harness(req: RunRequest) -> DeepHarnessDecision:
     # compatibility endpoint stay on the proven deterministic adapter.
     if MODEL_SEPARATOR in req.model:
         return DeepHarnessDecision("deterministic", "This engine uses its native or compatibility harness.", small)
+    # A tool-capability bit says the API accepts tool schemas; it does not say a
+    # small model can reliably complete a multi-step filesystem loop. Arcelle's
+    # existing 4B protections are the deterministic specialist graph, which
+    # narrows each round to the relevant workspace tools and verifies writes.
+    # Keep that protection even when modern Ollama metadata advertises `tools`.
+    if small:
+        return DeepHarnessDecision(
+            "deterministic",
+            "Small Ollama models use Arcelle's deterministic workspace harness.",
+            True,
+        )
     caps = await ollama_capabilities(req.model, req.ollama_base_url)
     if "tools" not in {str(cap).casefold() for cap in caps}:
         location = "cloud" if is_nonlocal_model(req.model) else "local"

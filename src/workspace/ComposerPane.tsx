@@ -341,13 +341,17 @@ export default function Composer({ s, a }: { s: WSState; a: WSActions }) {
                     id={`ac-opt-${i}`}
                     role="option"
                     aria-selected={i === s.ac!.index}
-                    className={`ac-item ${i === s.ac!.index ? "active" : ""}`}
+                    aria-disabled={it.disabled || undefined}
+                    disabled={it.disabled}
+                    title={it.disabled ? it.hint : undefined}
+                    className={`ac-item ${i === s.ac!.index ? "active" : ""}${it.disabled ? " unavailable" : ""}`}
                     ref={(el) => {
                       // Arrow-keying below the fold must scroll the list with it.
                       if (i === s.ac!.index) el?.scrollIntoView({ block: "nearest" });
                     }}
                     onMouseDown={(e) => {
                       e.preventDefault();
+                      if (it.disabled) return;
                       a.acceptAutocomplete(it.insert);
                     }}
                   >

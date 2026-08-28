@@ -533,7 +533,9 @@
    * `browser_tabs`, the tab strip's New page button is not rendered, and the
    * Browser area is a chrome bar over a start screen with nothing behind it.
    * The harness has to sit on the side of the switch where those exist. */
-  const settings = { memory_auto_save: "0", autolock_minutes: "off", web_provider: "on", voice_archetype: "off", edit_approval: "off" };
+  // The GH #4 fixture represents a speaker-recording room whose user opted
+  // into echo/noise cleanup. Real new rooms have no value and remain off.
+  const settings = { memory_auto_save: "0", autolock_minutes: "off", web_provider: "on", voice_archetype: "off", edit_approval: "off", mic_voice_processing: "1" };
 
   // A saved recording with a real transcript (GH #5 speaker naming). Mutable:
   // rec_set_speaker_name writes the overlay back here, so a reload inside one
@@ -650,6 +652,13 @@
   };
 
   const commands = {
+    // Shell-level calls made before/alongside the room workspace. Keep their
+    // shapes exact so a new background surface cannot crash the QA renderer
+    // before the readiness selector appears.
+    updater_check: () => null,
+    set_unsaved_edits: () => null,
+    harness_list_runs: () => [],
+    validate_engine_model: () => ({ selectable: true, reason: null }),
     room_info: () => (gateMode ? null : { ...roomInfo, fileCount: files.length }),
     rename_room: (a2) => {
       const name = String(a2?.name ?? "").trim();

@@ -56,4 +56,16 @@ describe("workspace harness parity manifest", () => {
     expect(new Set(agents.agents.map((agent) => agent.id)).size).toBe(16);
     expect(new Set(agents.agents.map((agent) => agent.graph)).size).toBe(8);
   });
+
+  it("pins every documented non-hub specialist tag in the shared manifest", () => {
+    const tags = (agents.agents as Array<{ id: string; tag?: unknown }>)
+      .map((agent) => agent.tag)
+      .filter((tag): tag is string => typeof tag === "string" && tag !== "");
+    expect(tags).toEqual([
+      "file", "scripts", "web", "browse", "app", "jobs", "workflows",
+      "skills", "skillbuilder", "connectorsetup", "connector", "transcribe",
+      "video", "studio", "sketch",
+    ]);
+    expect(new Set(tags).size).toBe(15);
+  });
 });

@@ -126,6 +126,58 @@ describe("listSpecialists", () => {
     };
     await expect(listSpecialists(room(false, undefined), deps)).rejects.toThrow("sidecar unreachable");
   });
+
+  it("labels restricted specialists from the effective Cloud Privacy roster before dispatch", async () => {
+    const row = (key: string, agent: string) => ({
+      key,
+      tool: `ask_${key}_agent`,
+      agent,
+      label: `${key} agent`,
+      area: `${key} work`,
+      description: `Does ${key} work.`,
+    });
+    const fullRoster = [
+      row("web", "chat.web"),
+      row("sketch", "creator.draw"),
+      row("app", "app.ui"),
+    ];
+    const calls: string[][] = [];
+    const deps: ListSpecialistsDeps = {
+      listModels: async () => [],
+      bestDefault: () => "openrouter:auto",
+      servedToolNames: () => ["web_search", "save_link", "draw", "read_drawing", "ui_snapshot", "ui_act"],
+      effectiveServedToolNames: () => ["web_search", "read_drawing", "ui_snapshot"],
+      agentToolNames: (agent) => ({
+        "chat.web": ["web_search", "save_link"],
+        "creator.draw": ["draw", "read_drawing"],
+        "app.ui": ["ui_snapshot", "ui_act"],
+      }[agent] ?? []),
+      fetchAgents: async ({ served_names }) => {
+        calls.push(served_names);
+        return {
+          // Web and Sketch can genuinely run with their remaining inspect
+          // tools. App requires ui_snapshot + ui_act together and disappears.
+          agents: served_names.includes("draw") ? fullRoster : fullRoster.slice(0, 2),
+        };
+      },
+    };
+
+    const result = await listSpecialists(room(true, undefined), deps);
+    expect(calls).toHaveLength(2);
+    expect(result.find((specialist) => specialist.key === "web")).toMatchObject({
+      capability: "inspect-only",
+      localHandoff: true,
+    });
+    expect(result.find((specialist) => specialist.key === "sketch")).toMatchObject({
+      capability: "inspect-only",
+      localHandoff: true,
+    });
+    expect(result.find((specialist) => specialist.key === "app")).toMatchObject({
+      capability: "unavailable",
+      localHandoff: true,
+    });
+    expect(result.find((specialist) => specialist.key === "app")?.capabilityReason).toContain("On this Mac");
+  });
 });
 
 describe("cancelAsk", () => {

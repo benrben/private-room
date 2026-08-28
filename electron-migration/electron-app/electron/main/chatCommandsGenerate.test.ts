@@ -465,20 +465,49 @@ describe("cmdCompare", () => {
     await expect(cmdCompare(ctx)).rejects.toThrow("Those files have no readable text to compare.");
   });
 
-  it("compares two files with a real streamed answer", async () => {
+  it("compares two files only from verified per-file quotes", async () => {
     const db = freshRoom();
     const a = addFile(db, "plan-a.md", "Ship Friday.");
     const b = addFile(db, "plan-b.md", "Ship Monday.");
     const ctx = makeCtx(db, {
       refs: [a, b],
-      generateStream: async (_path, _body, _cancel, _controller, onDelta) => {
-        onDelta("They differ on the date.");
-        return "They differ on the date.";
-      },
+      chatStructured: async () => JSON.stringify({
+        overview: "The plans choose different dates.",
+        similarities: [],
+        differences: [{
+          claim: "The planned ship dates differ.",
+          evidence: [
+            { file: "plan-a.md", quote: "Ship Friday." },
+            { file: "plan-b.md", quote: "Ship Monday." },
+          ],
+        }],
+      }),
     });
     const result = await cmdCompare(ctx);
-    expect(result.content).toBe("They differ on the date.");
+    expect(result.content).toContain("The planned ship dates differ.");
+    expect(result.content).toContain("**plan-a.md**: “Ship Friday.”");
     expect(result.sources).toEqual(["plan-a.md", "plan-b.md"]);
+  });
+
+  it("rejects a fact attributed to a file that does not contain its quote", async () => {
+    const db = freshRoom();
+    const report = addFile(db, "report.txt", "Disposable QA baseline and rollback test purpose.");
+    const findings = addFile(db, "Research/findings.md", "Three records total 10. Shared fact: Cedar Lantern.");
+    const ctx = makeCtx(db, {
+      refs: [report, findings],
+      chatStructured: async () => JSON.stringify({
+        overview: "Both discuss the findings dataset.",
+        similarities: [{
+          claim: "Both contain Cedar Lantern.",
+          evidence: [
+            { file: "report.txt", quote: "Cedar Lantern" },
+            { file: "Research/findings.md", quote: "Cedar Lantern" },
+          ],
+        }],
+        differences: [],
+      }),
+    });
+    await expect(cmdCompare(ctx)).rejects.toThrow("no claims supported by quotes");
   });
 });
 

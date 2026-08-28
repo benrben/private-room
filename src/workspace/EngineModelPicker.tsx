@@ -96,7 +96,37 @@ export default function EngineModelPicker({
   const [needsVision, setNeedsVision] = useState(false);
   const [needsReasoning, setNeedsReasoning] = useState(false);
   const [needsStructured, setNeedsStructured] = useState(false);
+  const [validatingModel, setValidatingModel] = useState<string | null>(null);
+  const [modelValidation, setModelValidation] = useState<
+    Record<string, { selectable: boolean; reason: string | null }>
+  >({});
   const externalCatalogVersion = ai.external.join("|");
+
+  async function selectValidated(engine: string, exactModelId: string, selection: string) {
+    const key = `${engine}\0${exactModelId}`;
+    const known = modelValidation[key];
+    if (known?.selectable === false) return;
+    if (known?.selectable === true) {
+      onSelect(selection);
+      return;
+    }
+    setValidatingModel(key);
+    try {
+      const result = await api.validateEngineModel(engine, exactModelId);
+      setModelValidation((current) => ({ ...current, [key]: result }));
+      if (result.selectable) onSelect(selection);
+    } catch {
+      setModelValidation((current) => ({
+        ...current,
+        [key]: {
+          selectable: false,
+          reason: "This model could not be checked. Refresh the model list and try again.",
+        },
+      }));
+    } finally {
+      setValidatingModel((current) => current === key ? null : current);
+    }
+  }
 
   // Fetch an engine's model list whenever it becomes the expanded one and
   // isn't cached yet. Keyed on `expanded` (not only on a click) so a menu that
@@ -226,22 +256,32 @@ export default function EngineModelPicker({
           {/* Ollama `:cloud` models (bare ids, selected directly like local
               ones) live here — they run remotely. renderLocalExtra still gives
               them Settings' delete button and capability badges. */}
-          {remoteModels.map((m) => (
-            <div key={m} className="model-menu-row">
+          {remoteModels.map((m) => {
+            const validationKey = `ollama-cloud\0${m}`;
+            const validation = modelValidation[validationKey];
+            const checking = validatingModel === validationKey;
+            return <div key={m} className="model-menu-row">
               <button
                 type="button"
                 className={`model-menu-item${m === model ? " sel" : ""}`}
                 aria-pressed={m === model}
-                onClick={() => onSelect(m)}
+                disabled={checking || validation?.selectable === false}
+                title={validation?.reason ?? (checking ? "Checking this exact Ollama model ID…" : undefined)}
+                onClick={() => void selectValidated("ollama-cloud", m, m)}
               >
                 <span className="model-dot cloud" />
                 <span className="model-menu-name">{modelLabel(m) ?? m}</span>
-                <span className="model-menu-tier cloud">Cloud</span>
+                <span className="model-menu-tier cloud">{checking ? "Checking…" : "Cloud"}</span>
                 {m === model && <CheckIcon size={14} />}
               </button>
               {renderLocalExtra?.(m)}
+              {validation?.selectable === false && (
+                <div className="settings-hint engine-submodel-loading" role="status">
+                  {validation.reason}
+                </div>
+              )}
             </div>
-          ))}
+          })}
           {ai.external.map((engine) => {
             const models = engineModels[engine] ?? [];
             const hasRichCatalog = models.some(
@@ -350,6 +390,9 @@ export default function EngineModelPicker({
                       visibleModels.map((mi) => {
                         const base = `${engine}::${mi.slug}`;
                         const picked = selEngine === engine && selModel === mi.slug;
+                        const validationKey = `${engine}\0${mi.slug}`;
+                        const validation = modelValidation[validationKey];
+                        const checking = validatingModel === validationKey;
                         const perMillion = (raw: string | null) => {
                           if (!raw) return null;
                           const value = Number(raw) * 1_000_000;
@@ -367,8 +410,9 @@ export default function EngineModelPicker({
                               type="button"
                               className={`model-menu-item${model === base ? " sel" : ""}`}
                               aria-pressed={model === base}
-                              title={mi.description ?? mi.label}
-                              onClick={() => onSelect(base)}
+                              disabled={checking || validation?.selectable === false}
+                              title={validation?.reason ?? (checking ? `Checking ${mi.slug}…` : mi.description ?? mi.label)}
+                              onClick={() => void selectValidated(engine, mi.slug, base)}
                             >
                               <span className="model-dot cloud" />
                               <span className="model-menu-name model-catalog-name">
@@ -391,6 +435,11 @@ export default function EngineModelPicker({
                               </span>
                               {model === base && <CheckIcon size={14} />}
                             </button>
+                            {validation?.selectable === false && (
+                              <div className="settings-hint engine-submodel-loading" role="status">
+                                {validation.reason}
+                              </div>
+                            )}
                             {/* Effort chips: shown once this model is the picked
                              * one, so the picker stays compact. "Default" clears
                              * the effort back to the CLI's own default. */}

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { cp, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { chmod, cp, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
@@ -33,6 +33,29 @@ async function fixture(label: string) {
 }
 
 describe("workspace hardening acceptance", () => {
+  it("creates and repairs private database and recovery files as owner-only", async () => {
+    const f = await fixture("private-modes");
+    const dbPath = path.join(f.root, ".arcelle", "room.db");
+    const recoveryPath = `${dbPath}.recovery`;
+    try {
+      expect((await stat(dbPath)).mode & 0o777).toBe(0o600);
+      await writeRecovery(dbPath, password);
+      expect((await stat(recoveryPath)).mode & 0o777).toBe(0o600);
+      await chmod(dbPath, 0o644);
+      await chmod(recoveryPath, 0o644);
+    } finally {
+      f.created.db.close();
+    }
+
+    const reopened = openWorkspaceRoom(f.root, password);
+    try {
+      expect((await stat(dbPath)).mode & 0o777).toBe(0o600);
+      expect((await stat(recoveryPath)).mode & 0o777).toBe(0o600);
+    } finally {
+      reopened.db.close();
+    }
+  });
+
   it("handles startup recovery at every filesystem journal phase without touching normal files", async () => {
     const f = await fixture("journal");
     try {

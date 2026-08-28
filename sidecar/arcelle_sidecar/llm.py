@@ -168,7 +168,9 @@ async def generate(
     policy = privacy_mod.policy_from_payload(privacy)
     messages, images, engaged = privacy_mod.guard_outbound(model, messages, policy, images)
     if external_llm.is_external_model(model):
-        text = await external_llm.generate_external(model, messages, format=format)
+        text = await external_llm.generate_external(
+            model, messages, format=format, images=images
+        )
         return engaged.restore_text(text) if engaged else text
     if provider is not None:
         chat = OpenAICompatibleChatModel(model, provider, temperature)
@@ -216,8 +218,10 @@ async def generate_stream(
     emit the terminal ``{"t":"error","code":...}`` line — the SAME sentinels
     (OLLAMA_DOWN / MODEL_MISSING) the non-streaming paths use.
 
-    Engine parity: an external CLI cannot stream tokens, so its whole reply is
-    yielded as one final delta — callers see a single chunk instead of many.
+    Engine parity: an external CLI streams through its machine-readable
+    envelope — token deltas from Claude and Antigravity, one delta per
+    completed message from Codex — with the unstreamed remainder of the final
+    answer yielded last (see :func:`external_llm.generate_external_stream`).
 
     PRIV-1: guarded like :func:`generate`; a placeholder split across deltas is
     re-joined by the stream restorer before the caller sees it.
@@ -225,8 +229,19 @@ async def generate_stream(
     policy = privacy_mod.policy_from_payload(privacy)
     messages, images, engaged = privacy_mod.guard_outbound(model, messages, policy, images)
     if external_llm.is_external_model(model):
-        text = await external_llm.generate_external(model, messages, format=format)
-        yield engaged.restore_text(text) if engaged else text
+        restorer = engaged.restorer() if engaged else None
+        async for delta in external_llm.generate_external_stream(
+            model, messages, format=format, images=images
+        ):
+            if restorer is not None:
+                delta = restorer.feed(delta)
+                if not delta:
+                    continue
+            yield delta
+        if restorer is not None:
+            tail = restorer.flush()
+            if tail:
+                yield tail
         return
     if provider is not None:
         chat = OpenAICompatibleChatModel(model, provider, temperature)

@@ -118,6 +118,31 @@ const settle = async () => {
   for (let i = 0; i < 6; i++) await Promise.resolve();
 };
 
+test("a new room defaults off while opt-in and device handoff never enable gain control", async () => {
+  const M = await load(makeWorld());
+
+  assert.equal(M.micVoiceProcessingFromSetting(null), false, "missing setting keeps a new room off");
+  assert.deepEqual(M.micConstraints(), {
+    echoCancellation: false,
+    noiseSuppression: false,
+    autoGainControl: false,
+  });
+
+  M.configureMic(M.micVoiceProcessingFromSetting("1"));
+  assert.deepEqual(M.micConstraints(), {
+    echoCancellation: true,
+    noiseSuppression: true,
+    autoGainControl: false,
+  });
+
+  M.configureMic(M.micVoiceProcessingFromSetting("0"));
+  assert.deepEqual(M.micConstraints(), {
+    echoCancellation: false,
+    noiseSuppression: false,
+    autoGainControl: false,
+  });
+});
+
 test("a second Resume cannot leave a microphone tap with nobody holding it", async () => {
   const world = makeWorld();
   const M = await load(world);

@@ -175,8 +175,12 @@ export async function writeSidecarAtomically(path: string, json: string): Promis
   // If the temp file cannot even be created (e.g. the directory does not
   // exist), nothing has been written yet — propagate directly, no cleanup
   // to do, and the existing sidecar (if any) is untouched.
-  const handle = await fsp.open(tmp, "w");
+  const handle = await fsp.open(tmp, "w", 0o600);
   try {
+    // `mode` only applies when the temp file is newly created. A stale temp
+    // file from an interrupted older write may be 0644, so repair the open
+    // inode before placing the encrypted recovery wrapper into it.
+    await handle.chmod(0o600);
     await handle.writeFile(json, "utf8");
     await handle.sync();
   } catch (err) {

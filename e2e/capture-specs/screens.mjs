@@ -93,11 +93,11 @@ const SETTINGS_PAGES = [
   "App",
 ];
 
-/** Pane-layout shots: the toggle to press, and what the result depicts. */
+/** Pane-layout shots: stable Layout-menu action id and what it depicts. */
 const LAYOUT_TOGGLES = [
-  ['button[aria-label="Toggle the Library pane (⌘1)"]', "library pane hidden"],
-  ['button[aria-label="Toggle the AI and Studio pane (⌘3)"]', "AI pane hidden"],
-  ['button[aria-label="Focus the editor — hide both side panes"]', "focus mode"],
+  ["layout-toggle-library", "library pane hidden"],
+  ["layout-toggle-assistant", "AI pane hidden"],
+  ["layout-toggle-focus", "focus mode"],
 ];
 
 const PALETTE_DETAILS = ["command palette open", "command palette with results"];
@@ -113,6 +113,11 @@ const few = (list, n) => (SMOKE ? list.slice(0, n) : list);
 
 let n = 0;
 const shots = [];
+// The `after` hook still runs when the first navigation/render fails. Coverage
+// is meaningful only after the app itself reached a rendered workspace; until
+// then, report the readiness failure instead of masking it with hundreds of
+// derivative "missing coverage" entries.
+let appReady = false;
 /** `state/area` pairs whose screenshot was NOT taken because the state never
  * reached the pane — deduplicated, since the same pair recurs once per theme
  * and window size. Reported at the end: a missing shot is recoverable, a
@@ -149,6 +154,7 @@ async function open({ state = "full", theme = "dark", wipe = true } = {}) {
   // `loading` never settles by design, so the rail is the only thing that can
   // be waited on — the pane inside it is the subject of the screenshot.
   await $(".activity-rail").waitForExist({ timeout: 20_000 });
+  appReady = true;
   await browser.pause(state === "loading" ? 700 : 500);
 }
 
@@ -215,6 +221,10 @@ describe("capture the app's screens", () => {
   before(ensureDirs);
 
   after(() => {
+    if (!appReady) {
+      console.log("capture coverage skipped: the app never reached its ready workspace");
+      return;
+    }
     fs.writeFileSync(
       MANIFEST,
       shots.map((s) => JSON.stringify(s)).join("\n") + "\n",
@@ -385,10 +395,19 @@ describe("capture the app's screens", () => {
 
   it("the pane layouts — library only, focus, all three", async () => {
     for (const theme of few(THEMES, 1)) {
-      for (const [sel, detail] of LAYOUT_TOGGLES) {
+      for (const [testId, detail] of LAYOUT_TOGGLES) {
         await open({ theme });
-        const btn = await $(sel);
-        if (!(await btn.isExisting())) continue;
+        const menu = await $('[data-testid="layout-menu"]');
+        await menu.waitForExist({
+          timeout: 10_000,
+          timeoutMsg: `cannot capture ${detail}: the toolbar Layout menu is missing`,
+        });
+        await menu.click();
+        const btn = await $(`[data-testid="${testId}"]`);
+        await btn.waitForExist({
+          timeout: 5_000,
+          timeoutMsg: `cannot capture ${detail}: Layout action ${testId} is missing`,
+        });
         await btn.click();
         await browser.pause(400);
         await shoot({ kind: "layout", detail, state: "full", theme, w: 1440, h: 900 });

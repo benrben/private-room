@@ -198,6 +198,9 @@ function jUnsignedInt(value: unknown): number | null {
 // mutex below reproduces the same externally visible behavior.
 
 const modelRuntimeCache = new Map<string, ModelRuntimeFacts>();
+/** Exact IDs in the authenticated, account-scoped chat catalog. Kept separate
+ * from display labels and from supplementary public media catalog entries. */
+const selectableProviderModelIds = new Set<string>();
 
 /** Providers whose saved key the provider ITSELF rejected (HTTP 401) at least
  * once this session — `providers.rs`'s `rejected_keys`.
@@ -313,6 +316,7 @@ async function withFetchLock<T>(fn: () => Promise<T>): Promise<T> {
  * code. */
 export function resetProviderStateForTests(): void {
   modelRuntimeCache.clear();
+  selectableProviderModelIds.clear();
   rejectedKeys.clear();
   catalogLoaded = false;
   catalogAttemptedAtMs = null;
@@ -666,6 +670,14 @@ export function providerModelVision(model: string): boolean | undefined {
   return providerModelFacts(model)?.vision;
 }
 
+/** Whether the authenticated account catalog contains this exact runtime ID.
+ * `undefined` means the catalog has not been loaded yet. */
+export function providerModelSelectable(model: string): boolean | undefined {
+  if (!catalogLoaded) return undefined;
+  const raw = selectedSlug(model);
+  return raw === undefined ? false : selectableProviderModelIds.has(raw.trim());
+}
+
 /** `providers.rs::is_api_provider_model`. */
 export function isApiProviderModel(model: string): boolean {
   return model.split("::")[0] === OPENROUTER_ID;
@@ -796,6 +808,8 @@ async function fetchOpenrouterModels(key: string, fetchJson: FetchJsonLike): Pro
   // so a bad key fails HERE, before the supplementary calls below.
   const models = await fetchOpenrouterCatalog(key, "/models/user", fetchJson);
   clearKeyRejected(OPENROUTER_ID);
+  selectableProviderModelIds.clear();
+  for (const model of models) selectableProviderModelIds.add(model.slug);
 
   // Then the media catalogues, merged in by slug. A failure on one of these
   // is NOT fatal: the chat catalog above already succeeded, and losing the

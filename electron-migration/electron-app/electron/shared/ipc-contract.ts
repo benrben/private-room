@@ -711,6 +711,10 @@ export interface Commands {
     args: { engine: string };
     result: ExternalModelInfo[];
   };
+  validate_engine_model: {
+    args: { engine: string; model: string };
+    result: import("./apiTypes.js").ModelSelectionValidation;
+  };
   list_ai_providers: { args: Record<string, never>; result: AiProviderStatus[] };
   connect_ai_provider: {
     args: { provider: string; apiKey: string };

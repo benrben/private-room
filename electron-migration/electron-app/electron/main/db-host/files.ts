@@ -637,6 +637,24 @@ export function listFiles(db: Database.Database): FileMeta[] {
   );
 }
 
+/**
+ * Files the renderer may present anywhere in the room UI. Unlike Home's
+ * Library query this deliberately includes section-only Sketches, Creations,
+ * recordings, and similar user files; their destination views all derive from
+ * the renderer's one shared inventory. Internal stored preview objects remain
+ * hidden because they are implementation bytes, not user documents.
+ */
+export function listPublicFiles(db: Database.Database): FileMeta[] {
+  return queryRows(
+    db,
+    `SELECT ${FILE_META_COLS} FROM files f
+     WHERE ${LIVE_FILE} AND ${NOT_DERIVED_PREVIEW}
+     ORDER BY f.created_at DESC, f.rowid DESC`,
+    [],
+    fileMetaRow
+  );
+}
+
 /** Files Home's Library may show.  Internal inventories deliberately keep
  * using {@link listFiles}; a stored renderer preview is a room implementation
  * detail, not a second document row. */

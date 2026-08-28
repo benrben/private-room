@@ -64,9 +64,9 @@
  *   - {@link formatHistory} — over `db-host/retrieval.ts`'s real
  *     `stripMarkupBlocks`.
  *   - {@link quietStepText}/{@link streamIdleSecs} — over `engineRouting.ts`'s
- *     real `stripThinkSpans` and `capabilities.ts`'s real `declaredFor`/
- *     `Support` (this port's `is_cli_engine`-successor, per that module's own
- *     doc).
+ *     real `stripThinkSpans` and `turnContext.ts`'s real `isCliEngine`
+ *     (the silence budget is about engine KIND, not the streaming flag — see
+ *     `streamIdleSecs`).
  *   - `#checkpoint` — over `roomCheckpoints.ts`'s format-aware checkpoint command.
  *   - {@link watchStream} — the Stop/stall watchdog race, pure and fully
  *     ported (both Rust tests reproduced) — see its own doc for the one place
@@ -141,11 +141,11 @@
 
 import { CancelFlag, forget, type CancelState } from "./cancel.js";
 import { getSetting } from "./db-host/settings.js";
-import { insertMessage, recentMessages } from "./db-host/messages.js";
+import { insertMessage, insertTurnErrorMessage, recentMessages } from "./db-host/messages.js";
 import { setChatTitleIfNew } from "./db-host/chats.js";
 import { stripMarkupBlocks } from "./db-host/retrieval.js";
 import { byteLength, partitionWindows, sliceUtf8 } from "./extractionWindow.js";
-import { declaredFor } from "./capabilities.js";
+
 import { stripThinkSpans, listModels as listModelsReal } from "./engineRouting.js";
 import { bestLocalDefault } from "./ollamaModels.js";
 import { generate as generateReal, chatStructured as chatStructuredReal } from "./ollamaGenerate.js";
@@ -346,10 +346,11 @@ export const COMMAND_STEP_TIMEOUT_SECS = 300;
  * `COMMAND_STREAM_IDLE_SECS`. */
 export const COMMAND_STREAM_IDLE_SECS = COMMAND_STEP_TIMEOUT_SECS;
 
-/** The cloud-CLI twin: sized past the sidecar's own wedged-CLI budget (900s)
- * because a CLI engine cannot stream — the whole answer arrives as one delta
- * at the end, so the silence clock spans the entire answer. Ported verbatim
- * from `COMMAND_STREAM_IDLE_CLI_SECS`. */
+/** The cloud-CLI twin: sized past the sidecar's own wedged-CLI budget (900s).
+ * A CLI engine now streams its answer text live, but its SILENT phases are
+ * still whole work sessions — thinking blocks and tool loops emit no text
+ * delta for minutes at a time — so the ordinary streaming clock would kill
+ * healthy work. Ported verbatim from `COMMAND_STREAM_IDLE_CLI_SECS`. */
 export const COMMAND_STREAM_IDLE_CLI_SECS = 960;
 
 /** How long Stop waits for the stream to notice the flag by itself before
@@ -359,13 +360,13 @@ export const COMMAND_STOP_GRACE_MS = 1_500;
 
 /**
  * How long a streamed step may go with no token before it counts as stalled,
- * for the engine actually answering. Ported verbatim from `stream_idle_secs`,
- * reading `capabilities.ts`'s real `declaredFor(model).streaming` — the
- * successor this module's own doc names for the old `is_cli_engine` name test.
+ * for the engine actually answering. One rule, defined once in
+ * `chatCommandsGenerate.ts` (this module and that one each grew a copy during
+ * the parallel port, and the copies drifted the day the rule changed) —
+ * re-exported here so both call sites and both test files read the same
+ * behavior.
  */
-export function streamIdleSecs(model: string): number {
-  return declaredFor(model).streaming === "no" ? COMMAND_STREAM_IDLE_CLI_SECS : COMMAND_STREAM_IDLE_SECS;
-}
+export { streamIdleSecs } from "./chatCommandsGenerate.js";
 
 // ============================================================================
 // watchStream — the Stop/stall watchdog. Pure, fully ported, both Rust tests
@@ -777,6 +778,7 @@ export async function runCommand(req: RunCommandRequest, deps: RunCommandDeps): 
   // entry, not a cancel-tree root. See the module doc.
   const cancel = new CancelFlag();
   deps.cancelState.cancels.set(req.askId, cancel);
+  let savedQuestionRoomPath: string | null = null;
   try {
     // Phase 1 (locked): read history + settings, save the user's typed line.
     const room = deps.room.currentRoom();
@@ -791,6 +793,7 @@ export async function runCommand(req: RunCommandRequest, deps: RunCommandDeps): 
     const newestFirst = recentMessages(room.db, req.chatId, -1);
     const history: [string, string][] = [...newestFirst].reverse();
     insertMessage(room.db, req.chatId, "user", req.raw, [], null);
+    savedQuestionRoomPath = room.path;
     const rawChars = Array.from(req.raw);
     const title = rawChars.slice(0, 48).join("") + (rawChars.length > 48 ? "…" : "");
     setChatTitleIfNew(room.db, req.chatId, title);
@@ -875,6 +878,21 @@ export async function runCommand(req: RunCommandRequest, deps: RunCommandDeps): 
     // Phase 3 (locked): save the assistant reply (HLT-7: room may have
     // closed) — same persistence seam as `ask`.
     return persistAssistantReply(deps.room, req.chatId, content, result.sources, effectsValue);
+  } catch (err) {
+    // Once the user's command is stored, its failure belongs beside it in the
+    // transcript. A toast can remain as a secondary signal, but it must not be
+    // the only place carrying the real reason.
+    if (savedQuestionRoomPath === null || cancel.load()) {
+      throw err;
+    }
+    const room = deps.room.currentRoom();
+    if (room === null || room.path !== savedQuestionRoomPath) {
+      throw err;
+    }
+    const raw = err instanceof Error ? err.message : String(err);
+    const reason = raw.replace(/\s+/gu, " ").trim().slice(0, 600) || "The command failed.";
+    const content = `#${req.command} could not finish: ${reason}\n\nCheck the selected file and model, then try the command again.`;
+    return insertTurnErrorMessage(room.db, req.chatId, content);
   } finally {
     deps.cancelState.cancels.delete(req.askId);
     forget(deps.cancelState, req.askId);

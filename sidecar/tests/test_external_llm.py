@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import re
 
 import pytest
 
@@ -138,23 +140,46 @@ def test_flatten_folds_schema_into_a_json_only_instruction() -> None:
 # ---------------------------------------------------------------- cmdlines
 
 
-def test_cmdline_claude_matches_rust_flags() -> None:
-    assert build_cmdline("claude-cli", None, None) == "claude -p"
-    assert (
-        build_cmdline("claude-cli", "opus", "xhigh")
-        == "claude -p --model 'opus' --effort 'xhigh'"
+def test_cmdline_claude_asks_for_the_streamed_envelope() -> None:
+    # The one-shot path rides the same machine-readable stream the agent path
+    # does: liveness heartbeat, live deltas, and the structured terminal object
+    # the image channel needs.
+    assert build_cmdline("claude-cli", None, None) == (
+        "claude -p --output-format stream-json --verbose --include-partial-messages"
     )
+    assert build_cmdline("claude-cli", "opus", "xhigh").endswith(
+        "--include-partial-messages --model 'opus' --effort 'xhigh'"
+    )
+    # Images switch stdin to stream-json input — the base64-block channel.
+    assert "--input-format stream-json" in build_cmdline(
+        "claude-cli", None, None, stream_json_input=True
+    )
+    assert "--input-format" not in build_cmdline("claude-cli", None, None)
 
 
-def test_cmdline_codex_matches_rust_flags() -> None:
+def test_cmdline_codex_asks_for_the_streamed_envelope() -> None:
     assert (
         build_cmdline("codex-cli", None, None)
-        == "codex exec --skip-git-repo-check -"
+        == "codex exec --json --skip-git-repo-check -"
     )
     assert (
         build_cmdline("codex-cli", "gpt-5.6-sol", "high")
-        == "codex exec --skip-git-repo-check --model 'gpt-5.6-sol' -c 'model_reasoning_effort=high' -"
+        == "codex exec --json --skip-git-repo-check --model 'gpt-5.6-sol' -c 'model_reasoning_effort=high' -"
     )
+
+
+def test_cmdline_codex_attaches_staged_images() -> None:
+    cmd = build_cmdline(
+        "codex-cli", None, None, image_paths=["/tmp/a.png", "/tmp/b.png"]
+    )
+    assert cmd.endswith("-i '/tmp/a.png' -i '/tmp/b.png' -")
+
+
+def test_cmdline_rejects_an_unquotable_image_path() -> None:
+    # The staged paths are our own mkstemp names, but they cross the same
+    # shell boundary the model slug does — a quote must fail loudly.
+    with pytest.raises(ValueError):
+        build_cmdline("codex-cli", None, None, image_paths=["/tmp/a'b.png"])
 
 
 def test_cmdline_antigravity_matches_headless_flags() -> None:
@@ -289,7 +314,8 @@ async def test_generate_external_pipes_prompt_and_strips_output(monkeypatch) -> 
     assert seen["argv"][1] == "-ilc"
     # The CLI invocation is unchanged; it is only preceded by the fence that
     # separates the login shell's own chatter from the engine's reply.
-    assert seen["argv"][2].endswith("claude -p --model 'opus'")
+    assert seen["argv"][2].endswith("--model 'opus'")
+    assert "claude -p --output-format stream-json" in seen["argv"][2]
     assert seen["argv"][2].startswith("printf ")
 
 
@@ -509,7 +535,7 @@ async def test_the_raised_idle_budget_is_the_one_actually_applied(monkeypatch) -
 
 @pytest.mark.asyncio
 async def test_llm_generate_routes_external_models_to_the_cli(monkeypatch) -> None:
-    async def fake_generate_external(model, messages, *, format=None):
+    async def fake_generate_external(model, messages, *, format=None, **kwargs):
         return "cli says hi"
 
     monkeypatch.setattr(external_llm, "generate_external", fake_generate_external)
@@ -525,7 +551,9 @@ async def test_llm_generate_routes_external_models_to_the_cli(monkeypatch) -> No
 async def test_llm_generate_stream_yields_one_final_delta_for_external(
     monkeypatch,
 ) -> None:
-    async def fake_generate_external(model, messages, *, format=None):
+    # An engine that produced no live delta events still delivers its whole
+    # reply — as the terminal remainder rather than a live token stream.
+    async def fake_generate_external(model, messages, *, format=None, **kwargs):
         return "whole reply"
 
     monkeypatch.setattr(external_llm, "generate_external", fake_generate_external)
@@ -1260,3 +1288,402 @@ def test_the_hub_only_list_names_every_tool_the_bridge_cannot_serve() -> None:
     assert not (loop_resolved & ALL_REGISTRY_TOOLS), (
         "a loop-resolved tool must never also be a registry tool the bridge serves"
     )
+
+
+# ---------------------------------------------------- images (the pixel lanes)
+
+# A strictly valid base64 PNG header — enough for the validation seams, which
+# never decode pixels.
+_PNG = "iVBORw0KGgo="
+
+
+def test_message_images_validates_and_caps() -> None:
+    m = {"role": "user", "content": "x", "images": [_PNG, "not base64!!", _PNG, _PNG, _PNG]}
+    # The corrupt entry is skipped, the rest capped at the advisor-path limit.
+    assert external_llm.message_images(m) == [_PNG] * 3
+
+
+def test_collect_images_walks_user_turns_in_order() -> None:
+    msgs = [
+        {"role": "system", "content": "s"},
+        {"role": "user", "content": "a", "images": ["AAAA"]},
+        {"role": "assistant", "content": "b", "images": ["BBBB"]},
+        {"role": "user", "content": "c", "images": ["CCCC"]},
+    ]
+    assert external_llm.collect_images(msgs) == ["AAAA", "CCCC"]
+
+
+def test_flatten_delivered_mode_says_attached_not_blind() -> None:
+    prompt = external_llm.flatten_agent_messages(
+        [{"role": "user", "content": "look", "images": [_PNG]}], deliver_images=True
+    )
+    assert "attached to this request" in prompt
+    assert "cannot receive images" not in prompt
+
+
+def test_flatten_delivered_mode_admits_what_it_dropped() -> None:
+    prompt = external_llm.flatten_agent_messages(
+        [{"role": "user", "content": "look", "images": [_PNG] * 5}], deliver_images=True
+    )
+    assert "3 image(s)" in prompt
+    assert "2 more could not be attached" in prompt
+
+
+def test_flatten_says_privacy_withheld_when_the_door_stripped() -> None:
+    # `privacy.redact_messages` pops the pixels and stamps `images_blocked`;
+    # whatever mode the engine is in, the turn must not read as "attached".
+    msgs = [{"role": "user", "content": "look", "images_blocked": 2}]
+    for deliver in (False, True):
+        prompt = external_llm.flatten_agent_messages(list(msgs), deliver_images=deliver)
+        assert "privacy settings withheld them" in prompt
+        assert "attached to this request" not in prompt
+
+
+def test_the_privacy_door_stamps_the_blocked_count_per_turn() -> None:
+    from arcelle_sidecar import privacy
+
+    policy = privacy.policy_from_payload(
+        {"active": True, "rules": [{"real": "Ben Reich", "placeholder": "[Person A]"}], "concepts": []}
+    )
+    guarded, _imgs, engaged = privacy.guard_outbound(
+        "claude-cli",
+        [{"role": "user", "content": "who is on screen?", "images": [_PNG, _PNG]}],
+        policy,
+    )
+    assert engaged is not None
+    assert "images" not in guarded[0]
+    prompt = external_llm.flatten_agent_messages(guarded, deliver_images=True)
+    assert "2 image(s)" in prompt and "privacy settings withheld them" in prompt
+
+
+def test_claude_user_event_interleaves_text_and_image_blocks() -> None:
+    line = external_llm.claude_user_event("User: look\n", [_PNG])
+    event = json.loads(line)
+    blocks = event["message"]["content"]
+    assert event["type"] == "user"
+    assert blocks[0] == {"type": "text", "text": "User: look\n"}
+    assert blocks[1]["source"] == {
+        "type": "base64",
+        "media_type": "image/png",
+        "data": _PNG,
+    }
+
+
+@pytest.mark.asyncio
+async def test_generate_external_claude_ships_images_as_stream_json_blocks(
+    monkeypatch,
+) -> None:
+    seen: dict = {}
+
+    async def fake_exec(*argv, **kwargs):
+        seen["argv"] = argv
+        proc = _FakeProc(_envelope("Red"))
+        seen["proc"] = proc
+        return proc
+
+    monkeypatch.setattr(external_llm.asyncio, "create_subprocess_exec", fake_exec)
+    out = await external_llm.generate_external(
+        "claude-cli",
+        [{"role": "user", "content": "what color?", "images": [_PNG]}],
+    )
+    assert out == "Red"
+    assert "--input-format stream-json" in seen["argv"][2]
+    event = json.loads(seen["proc"].stdin_payload.decode())
+    blocks = event["message"]["content"]
+    assert blocks[0]["type"] == "text"
+    assert "attached to this request" in blocks[0]["text"]
+    assert blocks[1]["source"]["data"] == _PNG
+
+
+@pytest.mark.asyncio
+async def test_generate_external_codex_stages_files_and_cleans_them_up(
+    monkeypatch,
+) -> None:
+    seen: dict = {}
+    codex_reply = (
+        json.dumps({"type": "item.completed", "item": {"id": "i0", "type": "agent_message", "text": "Red"}})
+        + "\n"
+        + json.dumps({"type": "turn.completed", "usage": {"input_tokens": 9}})
+        + "\n"
+    ).encode()
+
+    async def fake_exec(*argv, **kwargs):
+        seen["argv"] = argv
+        paths = re.findall(r"-i '([^']+)'", argv[2])
+        # The decrypted pixels must exist WHILE the CLI runs…
+        seen["staged"] = [(p, os.path.exists(p)) for p in paths]
+        return _FakeProc(codex_reply)
+
+    monkeypatch.setattr(external_llm.asyncio, "create_subprocess_exec", fake_exec)
+    out = await external_llm.generate_external(
+        "codex-cli",
+        [{"role": "user", "content": "what color?", "images": [_PNG]}],
+    )
+    assert out == "Red"
+    assert len(seen["staged"]) == 1
+    path, existed_during_run = seen["staged"][0]
+    assert existed_during_run
+    # …and be gone the moment the call is over: they are room content.
+    assert not os.path.exists(path)
+
+
+@pytest.mark.asyncio
+async def test_generate_external_antigravity_keeps_the_honest_note(
+    monkeypatch,
+) -> None:
+    seen: dict = {}
+    agy_reply = (
+        json.dumps({"event": "result", "result": {"response": "done"}}) + "\n"
+    ).encode()
+
+    async def fake_exec(*argv, **kwargs):
+        proc = _FakeProc(agy_reply)
+        seen["proc"] = proc
+        return proc
+
+    monkeypatch.setattr(external_llm.asyncio, "create_subprocess_exec", fake_exec)
+    out = await external_llm.generate_external(
+        "antigravity-cli",
+        [{"role": "user", "content": "look", "images": [_PNG]}],
+    )
+    assert out == "done"
+    event = json.loads(seen["proc"].stdin_payload.decode())
+    assert "cannot receive images" in event["message"]["content"]
+
+
+# ------------------------------------------------------------- live streaming
+
+
+def _fence() -> bytes:
+    return external_llm._OUTPUT_FENCE.encode() + b"\n"
+
+
+def _claude_stream(*events: dict, result: str) -> bytes:
+    lines = [json.dumps({"type": "stream_event", "event": e}) for e in events]
+    lines.append(
+        json.dumps(
+            {"type": "result", "result": result, "usage": {"input_tokens": 5, "cache_read_input_tokens": 0}}
+        )
+    )
+    return _fence() + ("\n".join(lines) + "\n").encode()
+
+
+def _msg_start() -> dict:
+    return {"type": "message_start", "message": {}}
+
+
+def _text_delta(s: str) -> dict:
+    return {"type": "content_block_delta", "index": 1, "delta": {"type": "text_delta", "text": s}}
+
+
+def _thinking_delta(s: str) -> dict:
+    return {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": s}}
+
+
+def _streaming_proc(payload: bytes, chunks: int = 13) -> "_FakeProc":
+    proc = _FakeProc(b"")
+    proc.stdout = _FakeReader(payload, chunks=chunks)
+    return proc
+
+
+@pytest.mark.asyncio
+async def test_stream_forwards_claude_text_deltas_live(monkeypatch) -> None:
+    payload = _claude_stream(
+        _msg_start(),
+        _thinking_delta("private reasoning"),
+        _text_delta("The room 🏠 "),
+        _text_delta("has three files."),
+        result="The room 🏠 has three files.",
+    )
+
+    async def fake_exec(*argv, **kwargs):
+        # chunks=13 splits lines (and the emoji's UTF-8 bytes) across reads —
+        # the tap must reassemble both.
+        return _streaming_proc(payload)
+
+    monkeypatch.setattr(external_llm.asyncio, "create_subprocess_exec", fake_exec)
+    deltas: list[str] = []
+
+    async def on_delta(d: str) -> None:
+        deltas.append(d)
+
+    content, calls, _usage = await _model().stream(
+        [{"role": "user", "content": "what's here?"}], TOOLS, on_delta
+    )
+    assert calls == []
+    assert deltas == ["The room 🏠 ", "has three files."]  # live, in pieces
+    assert content == "The room 🏠 has three files."
+    # The answer streamed once and only once — no terminal re-delivery.
+    assert "".join(deltas) == content
+    # The model's private reasoning never reached the transcript.
+    assert all("private reasoning" not in d for d in deltas)
+
+
+@pytest.mark.asyncio
+async def test_stream_withholds_a_streamed_envelope(monkeypatch) -> None:
+    env = '{"tool_calls":[{"name":"create_file","arguments":{"name":"a.md"}}]}'
+    payload = _claude_stream(
+        _msg_start(), _text_delta('{"tool_'), _text_delta('calls":…'), result=env
+    )
+
+    async def fake_exec(*argv, **kwargs):
+        return _streaming_proc(payload)
+
+    monkeypatch.setattr(external_llm.asyncio, "create_subprocess_exec", fake_exec)
+    deltas: list[str] = []
+
+    async def on_delta(d: str) -> None:
+        deltas.append(d)
+
+    content, calls, _usage = await _model().stream(
+        [{"role": "user", "content": "make a file"}], TOOLS, on_delta
+    )
+    assert [c.name for c in calls] == ["create_file"]
+    assert content == ""
+    # A JSON-shaped message is machinery until proven otherwise: none of it
+    # may stream into the chat.
+    assert deltas == []
+
+
+@pytest.mark.asyncio
+async def test_stream_stops_forwarding_at_a_framed_envelope(monkeypatch) -> None:
+    full = 'Let me create that. {"tool_calls":[{"name":"create_file","arguments":{}}]}'
+    payload = _claude_stream(
+        _msg_start(),
+        _text_delta("Let me create that. "),
+        _text_delta('{"tool_calls":[{"name":"create_file","arguments":{}}]}'),
+        result=full,
+    )
+
+    async def fake_exec(*argv, **kwargs):
+        return _streaming_proc(payload)
+
+    monkeypatch.setattr(external_llm.asyncio, "create_subprocess_exec", fake_exec)
+    deltas: list[str] = []
+
+    async def on_delta(d: str) -> None:
+        deltas.append(d)
+
+    content, calls, _usage = await _model().stream(
+        [{"role": "user", "content": "make a file"}], TOOLS, on_delta
+    )
+    # The preamble streamed (a working model narrating), the envelope did not.
+    assert deltas == ["Let me create that. "]
+    assert [c.name for c in calls] == ["create_file"]
+    assert content == ""
+
+
+@pytest.mark.asyncio
+async def test_stream_forwards_codex_messages_as_they_complete(monkeypatch) -> None:
+    lines = [
+        json.dumps({"type": "item.completed", "item": {"id": "i0", "type": "agent_message", "text": "Checking the room."}}),
+        json.dumps({"type": "item.completed", "item": {"id": "i1", "type": "agent_message", "text": "Done: three files."}}),
+        json.dumps({"type": "turn.completed", "usage": {"input_tokens": 11}}),
+    ]
+    payload = _fence() + ("\n".join(lines) + "\n").encode()
+
+    async def fake_exec(*argv, **kwargs):
+        return _streaming_proc(payload)
+
+    monkeypatch.setattr(external_llm.asyncio, "create_subprocess_exec", fake_exec)
+    deltas: list[str] = []
+
+    async def on_delta(d: str) -> None:
+        deltas.append(d)
+
+    content, calls, usage = await _model("codex-cli").stream(
+        [{"role": "user", "content": "what's here?"}], TOOLS, on_delta
+    )
+    assert calls == []
+    # Each completed message arrived as one live delta; the terminal parse
+    # (last agent_message) was not re-delivered.
+    assert deltas == ["Checking the room.", "Done: three files."]
+    assert content == "Done: three files."
+    assert usage.input_tokens == 11
+
+
+@pytest.mark.asyncio
+async def test_stream_forwards_antigravity_text_deltas_live(monkeypatch) -> None:
+    lines = [
+        json.dumps({"event": "step_update", "step_update": {"step_type": "agent_response", "text_delta": "All "}}),
+        json.dumps({"event": "step_update", "step_update": {"step_type": "agent_response", "text_delta": "good."}}),
+        json.dumps({"event": "result", "result": {"response": "All good.", "usage": {"input_tokens": 7}}}),
+    ]
+    payload = _fence() + ("\n".join(lines) + "\n").encode()
+
+    async def fake_exec(*argv, **kwargs):
+        return _streaming_proc(payload)
+
+    monkeypatch.setattr(external_llm.asyncio, "create_subprocess_exec", fake_exec)
+    deltas: list[str] = []
+
+    async def on_delta(d: str) -> None:
+        deltas.append(d)
+
+    content, calls, _usage = await _model("antigravity-cli").stream(
+        [{"role": "user", "content": "status?"}], TOOLS, on_delta
+    )
+    assert calls == []
+    assert deltas == ["All ", "good."]
+    assert content == "All good."
+
+
+@pytest.mark.asyncio
+async def test_stream_restores_placeholders_split_across_live_deltas(
+    monkeypatch,
+) -> None:
+    from arcelle_sidecar import privacy
+
+    payload = _claude_stream(
+        _msg_start(),
+        _text_delta("[Per"),
+        _text_delta("son A] is here."),
+        result="[Person A] is here.",
+    )
+
+    async def fake_exec(*argv, **kwargs):
+        return _streaming_proc(payload)
+
+    monkeypatch.setattr(external_llm.asyncio, "create_subprocess_exec", fake_exec)
+    model = _model()
+    model.privacy = privacy.policy_from_payload(
+        {"active": True, "rules": [{"real": "Ben Reich", "placeholder": "[Person A]"}], "concepts": []}
+    )
+    deltas: list[str] = []
+
+    async def on_delta(d: str) -> None:
+        deltas.append(d)
+
+    content, _calls, _usage = await model.stream(
+        [{"role": "user", "content": "who?"}], TOOLS, on_delta
+    )
+    assert content == "Ben Reich is here."
+    assert "".join(deltas) == "Ben Reich is here."
+    # No fragment of the placeholder ever reached the user.
+    assert all("[Per" not in d for d in deltas)
+
+
+@pytest.mark.asyncio
+async def test_generate_external_stream_yields_live_then_only_the_remainder(
+    monkeypatch,
+) -> None:
+    payload = _claude_stream(
+        _msg_start(),
+        _text_delta("Hello "),
+        _text_delta("world"),
+        result="Hello world!",
+    )
+
+    async def fake_exec(*argv, **kwargs):
+        return _streaming_proc(payload)
+
+    monkeypatch.setattr(external_llm.asyncio, "create_subprocess_exec", fake_exec)
+    chunks = [
+        c
+        async for c in external_llm.generate_external_stream(
+            "claude-cli", [{"role": "user", "content": "hi"}]
+        )
+    ]
+    # Live deltas first, then exactly the unstreamed tail — never the whole
+    # answer again.
+    assert chunks == ["Hello ", "world", "!"]

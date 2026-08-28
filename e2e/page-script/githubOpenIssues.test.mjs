@@ -107,16 +107,18 @@ test("GH #29: the GUI downloader detects Homebrew ffmpeg and requests mergeable 
   assert.match(tests, /GH #29: finds Apple Silicon Homebrew ffmpeg even when the GUI PATH omits Homebrew/);
 });
 
-test("GH #30: recording defaults to coexistence-safe mic constraints", () => {
+test("GH #4/#30: new rooms coexist while an opted-in room cleans echo without automatic gain", () => {
   const mic = read("src/workspace/liveRec.ts");
   const effects = read("src/workspace/effects.ts");
   const settings = read("src/settings/MicSection.tsx");
+  const qaMock = read("qa/qa-mock.js");
   assert.match(mic, /let voiceProcessing = false;/);
   assert.match(mic, /echoCancellation:\s*voiceProcessing/);
   assert.match(mic, /noiseSuppression:\s*voiceProcessing/);
   assert.match(mic, /autoGainControl:\s*false/);
-  assert.match(effects, /getSetting\("mic_voice_processing"\)[\s\S]*?configureMic\(v === "1"\)/);
-  assert.match(settings, /Teams, Slack, Zoom, and Meet can continue/);
+  assert.match(effects, /getSetting\("mic_voice_processing"\)[\s\S]*?micVoiceProcessingFromSetting\(v\)/);
+  assert.match(settings, /new room does not take over macOS voice processing/);
+  assert.match(qaMock, /mic_voice_processing:\s*"1"/);
 });
 
 test("GH #31: transcription keeps clear speech and rejects periodic stock hallucinations", () => {

@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import {
+  chmodSync,
   closeSync,
   existsSync,
   mkdirSync,
@@ -16,6 +17,7 @@ import type Database from "better-sqlite3-multiple-ciphers";
 import { createRoom, openRoom, openRoomReadonly } from "../db-host/open.js";
 import { migrate } from "../db-host/migrate.js";
 import { setMeta } from "../db-host/meta.js";
+import { recoverySidecarPath } from "../db-host/recovery.js";
 import { PRIVATE_DIR } from "./pathSafety.js";
 import type { RoomDescriptor, WorkspaceMarker } from "./types.js";
 
@@ -45,6 +47,15 @@ export class WorkspaceLeaseConflictError extends Error {
 
 function privatePath(rootPath: string, child: string): string {
   return path.join(rootPath, PRIVATE_DIR, child);
+}
+
+/** Private workspace state is encrypted, but it is still owner-only data.
+ * Creation modes are subject to the process umask and old builds created the
+ * database/recovery wrap as 0644, so every create/open also repairs the mode. */
+function enforcePrivateDatabasePermissions(dbPath: string): void {
+  chmodSync(dbPath, 0o600);
+  const recoveryPath = recoverySidecarPath(dbPath);
+  if (existsSync(recoveryPath)) chmodSync(recoveryPath, 0o600);
 }
 
 export function readWorkspaceMarker(rootPath: string): WorkspaceMarker {
@@ -109,6 +120,7 @@ export function createWorkspaceRoom(
     mkdirSync(path.join(privateRoot, TEMP_DIR), { recursive: true, mode: 0o700 });
     const dbPath = path.join(privateRoot, DATABASE_FILE);
     db = createRoom(dbPath, password, displayName);
+    enforcePrivateDatabasePermissions(dbPath);
     migrate(db);
     setMeta(db, "room_kind", "workspace-folder");
     setMeta(db, "workspace_room_id", roomId);
@@ -149,6 +161,7 @@ export function openWorkspaceRoom(
   if (descriptor.kind !== "workspace-folder" || descriptor.rootPath === null) {
     throw new Error("This path is not an Arcelle workspace folder.");
   }
+  enforcePrivateDatabasePermissions(descriptor.dbPath);
   const db = readOnly
     ? openRoomReadonly(descriptor.dbPath, password)
     : openRoom(descriptor.dbPath, password);

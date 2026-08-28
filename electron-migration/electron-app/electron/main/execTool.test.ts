@@ -921,12 +921,28 @@ describe("effectsJson", () => {
     e.boxes = { x: 1 };
     e.annotation = { y: 2 };
     e.editOutcomes = [{ tool: "edit_file", outcome: "exact", n: 1 }];
+    e.mediaFrames = [{
+      fileName: "video.mp4",
+      requestedAt: "0:01",
+      actualSeconds: 1,
+      sha256: "abc",
+      width: 640,
+      height: 360,
+    }];
     e.tokenUsage = { used: 10 };
     e.agentPlan = [{ agent: "chat.web" }];
     expect(effectsJson(e)).toEqual({
       boxes: { x: 1 },
       annotation: { y: 2 },
       edits: [{ tool: "edit_file", outcome: "exact", n: 1 }],
+      mediaFrames: [{
+        fileName: "video.mp4",
+        requestedAt: "0:01",
+        actualSeconds: 1,
+        sha256: "abc",
+        width: 640,
+        height: 360,
+      }],
       usage: { used: 10 },
       agents: [{ agent: "chat.web" }],
     });

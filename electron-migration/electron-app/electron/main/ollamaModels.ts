@@ -266,6 +266,27 @@ export async function ollamaCapabilities(model: string): Promise<string[]> {
 }
 
 /**
+ * Strict, metadata-only validation for a model picker or first-use guard.
+ * Unlike {@link ollamaCapabilities}, failure is meaningful here: a tag that
+ * Ollama cannot resolve must never be persisted and sent to a real agent run.
+ * `/capabilities` delegates to Ollama `/api/show`; it does not load or run the
+ * model and therefore is safe for cloud relay tags as well as local tags.
+ */
+export async function probeOllamaModelSelection(model: string): Promise<{ ok: boolean; detail: string | null }> {
+  const outcome = await sidecarJsonCancellable(
+    "/capabilities",
+    { model, base_url: resolvedBaseUrl() },
+    new CancelFlag(),
+    METADATA_TIMEOUT_MS
+  );
+  if (outcome.kind === "value") return { ok: true, detail: null };
+  if (outcome.kind === "error") {
+    return { ok: false, detail: sidecarErrorSentinel(outcome.error, model) };
+  }
+  return { ok: false, detail: "The model check was cancelled." };
+}
+
+/**
  * `ollama::native_context_length` — a model's real advertised context length,
  * from Ollama's own catalog (the sidecar's `/context_length`,
  * `model_limits.native_context_length` underneath). `null` on ANY failure —

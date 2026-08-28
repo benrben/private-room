@@ -191,6 +191,12 @@ class PrivacyPolicy:
                 mm["tool_calls"] = self.redact_value(mm["tool_calls"])
             if mm.get("images"):
                 self.report.images_blocked += len(mm["images"])
+                # The count alone vanishes into the aggregate report, but the
+                # PROMPT still contains text asserting an attachment (the
+                # perception tools' IMAGE_HANDOFF) — so the flattened engines
+                # need a per-message trace to answer it honestly. See
+                # `external_llm._user_turn`.
+                mm["images_blocked"] = len(mm["images"])
                 mm.pop("images", None)
             out.append(mm)  # type: ignore[arg-type]
         return out

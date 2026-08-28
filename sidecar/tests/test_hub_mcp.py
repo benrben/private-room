@@ -584,7 +584,7 @@ async def test_a_native_delegation_becomes_an_ordinary_tool_call(monkeypatch) ->
     model = external_llm.ExternalChatModel("claude-cli::sonnet")
     captured: dict[str, Any] = {}
 
-    async def fake_run(self, prompt, cancel=None, system="", bridge_tools=None, hub=None, hub_tools=None):
+    async def fake_run(self, prompt, cancel=None, system="", bridge_tools=None, hub=None, hub_tools=None, **kwargs):
         captured["system"] = system
         captured["hub_tools"] = list(hub_tools or [])
         # What the harness does: call the tool, then narrate around it.
@@ -631,7 +631,7 @@ async def test_codex_gets_rename_and_organize_as_real_scoped_tools(monkeypatch) 
     model = external_llm.ExternalChatModel("codex-cli::gpt-5.6-sol")
     seen: dict[str, Any] = {}
 
-    async def fake_run(self, prompt, cancel=None, system="", bridge_tools=None, hub=None, hub_tools=None):
+    async def fake_run(self, prompt, cancel=None, system="", bridge_tools=None, hub=None, hub_tools=None, **kwargs):
         seen["system"] = system
         seen["hub_tools"] = list(hub_tools or [])
         listed = rpc(hub, "tools/list").json()["result"]["tools"]
@@ -690,6 +690,7 @@ async def test_codex_delegation_names_avoid_harness_agent_collision(monkeypatch)
         bridge_tools=None,
         hub=None,
         hub_tools=None,
+        **kwargs,
     ):
         seen["prompt"] = prompt
         seen["system"] = system
@@ -778,7 +779,7 @@ async def test_a_native_round_still_disowns_the_harnesss_own_world(monkeypatch) 
     model = external_llm.ExternalChatModel("claude-cli::sonnet")
     seen: dict[str, Any] = {}
 
-    async def fake_run(self, prompt, cancel=None, system="", bridge_tools=None, hub=None, hub_tools=None):
+    async def fake_run(self, prompt, cancel=None, system="", bridge_tools=None, hub=None, hub_tools=None, **kwargs):
         seen["system"] = system
         return json.dumps({"result": "ok"})
 
@@ -806,7 +807,7 @@ async def test_room_tools_without_a_bridge_still_ride_the_text_protocol(monkeypa
     model = external_llm.ExternalChatModel("claude-cli::sonnet")
     seen: dict[str, Any] = {}
 
-    async def fake_run(self, prompt, cancel=None, system="", bridge_tools=None, hub=None, hub_tools=None):
+    async def fake_run(self, prompt, cancel=None, system="", bridge_tools=None, hub=None, hub_tools=None, **kwargs):
         seen["system"] = system
         seen["hub"] = hub
         seen["hub_tools"] = list(hub_tools or [])

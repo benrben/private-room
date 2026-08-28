@@ -150,6 +150,7 @@
  */
 
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as os from "node:os";
@@ -188,6 +189,7 @@ import { declaredFor } from "./capabilities.js";
 import { isExternalEngine, ROLLBACK_BUSY } from "./turnContext.js";
 import { isSummaryFile } from "./summarizeTools.js";
 import type { WorkspaceService } from "./workspace/workspaceService.js";
+import { readRoomFile } from "./workspace/roomContent.js";
 
 // ============================================================================
 // room access — this file's own minimal slice of the (not-yet-ported)
@@ -836,6 +838,10 @@ export interface RunStudioDeps {
    * HTML-authoring primary path and the JSON fallback/structured-first path
    * use it. Defaults to the real `chatStructured` (`ollamaGenerate.ts`). */
   chatStructured?: typeof chatStructuredReal;
+  /** Wall-clock ceiling for one foreground Studio build. The model client
+   * still receives the shared cancel flag, so timing out also stops its
+   * network/CLI work and the final commit guard prevents a late write. */
+  studioTimeoutMs?: number;
   /** Best-effort structured-storage failure log. Defaults to the real `obs`
    * sink (a no-op until `obs.init` has installed one). */
   log?: StudioLog;
@@ -863,9 +869,21 @@ export async function runStudio(
     throw new Error(ROLLBACK_BUSY);
   }
   const node = registerStudioCancel(deps.cancelState, opId, parentRun, spec.filenamePrefix);
+  let timer: ReturnType<typeof setTimeout> | null = null;
   try {
-    return await runStudioCore(deps, spec, scope, instructions, refs, node.flag(), null);
+    const timeoutMs = deps.studioTimeoutMs ?? 120_000;
+    const timedOut = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => {
+        node.flag().store(true);
+        reject(new Error("Studio timed out before an artifact was saved. Nothing was written; try again or use a faster model."));
+      }, timeoutMs);
+    });
+    return await Promise.race([
+      runStudioCore(deps, spec, scope, instructions, refs, node.flag(), null),
+      timedOut,
+    ]);
   } finally {
+    if (timer !== null) clearTimeout(timer);
     // `CancelGuard::drop` (commands.rs:481-495): remove the flat registration
     // on every exit path.
     if (opId !== null) {
@@ -1120,7 +1138,23 @@ export async function execStudio(
   const refs = resolveStudioRefs(room.db, (args as { refs?: unknown }).refs);
   const instructions = typeof args.instructions === "string" ? args.instructions : null;
   const meta = await runStudio(deps, spec, null, instructions, refs, null, parentRun);
-  return `Saved "${meta.name}" into the room.`;
+  // Success is not prose: re-open the committed artifact through the same
+  // content abstraction every viewer uses and issue a hash receipt. The
+  // sidecar write ledger accepts Studio output only when this receipt exists.
+  const after = deps.rooms.current();
+  if (after === null) throw new Error(NO_ROOM_OPEN);
+  const reopened = await readRoomFile(after, meta.id);
+  if (reopened.bytes === null) {
+    throw new Error(`Studio artifact "${meta.name}" could not be verified after it was saved.`);
+  }
+  const bytes = reopened.bytes;
+  const receipt = {
+    fileId: meta.id,
+    name: meta.name,
+    size: bytes.byteLength,
+    sha256: createHash("sha256").update(bytes).digest("hex"),
+  };
+  return `Saved "${meta.name}" into the room.\nARCELLE_ARTIFACT_RECEIPT ${JSON.stringify(receipt)}`;
 }
 
 // ============================================================================

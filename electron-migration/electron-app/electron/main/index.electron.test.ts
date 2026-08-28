@@ -318,10 +318,10 @@ describe("real Electron boot (index.ts, compiled + launched for real)", () => {
     expect(marker?.completenessOk).toBe(true);
     // This count is pinned independently in `channelAllowlist.test.ts`, where
     // the typed object literal proves it is exactly every `Commands` key.
-    expect(marker?.totalCommandCount).toBe(325);
+    expect(marker?.totalCommandCount).toBe(326);
     // Every Commands key plus the two documented non-Commands compatibility
     // channels (`restore_memory` and `dict-stop-timeout`).
-    expect(marker?.registeredChannelCount).toBe(327);
+    expect(marker?.registeredChannelCount).toBe(328);
   });
 
   it("the documented stdout ready-marker line was actually printed by the real process", () => {

@@ -29,6 +29,8 @@ import { insertHandoffMessage, insertMessage, listMessages } from "./db-host/mes
 import { createRoom } from "./db-host/open.js";
 import { setSetting } from "./db-host/settings.js";
 import { createToolEffects } from "./execTool.js";
+import type { PolicyState } from "./privacy.js";
+import { Redactor } from "./privacyRedact.js";
 import { RoomPin } from "./roomPin.js";
 import { streamRun, type RunViaSidecarOptions, type RunViaSidecarRequest, type SidecarOutcome } from "./sidecar.js";
 import { TurnId } from "./turn.js";
@@ -109,6 +111,20 @@ function fakeOutcome(o: Partial<SidecarOutcome> & { kind: SidecarOutcome["kind"]
     toolRan: (o as { toolRan?: boolean }).toolRan ?? false,
     usage: o.usage ?? null,
     plan: o.plan ?? null,
+  };
+}
+
+function protectedPolicy(): PolicyState {
+  const rules = [
+    ["Ben Reich", "[Person A]"],
+    ["ben@example.com", "[Email A]"],
+  ] as const;
+  return {
+    active: true,
+    rules: rules.map((rule) => [rule[0], rule[1]] as const),
+    concepts: [],
+    guardModel: "qwen3.5:4b",
+    redactor: new Redactor(rules),
   };
 }
 
@@ -327,6 +343,7 @@ describe("streamAnswer", () => {
       effects: createToolEffects(),
       webEnabled: false,
       advisorsOn: false,
+      evidencePolicy: "normal",
       cancel: alwaysFlag(false),
       privacyBypass: false,
       turn: new TurnId("run-1", "chat-1"),
@@ -361,6 +378,81 @@ describe("streamAnswer", () => {
     // C1: a room pointed at a remote Ollama must not silently fall back to the
     // sidecar's own localhost default.
     expect(server.runs[0]?.ollama_base_url).toBe("http://closet:11434");
+  });
+
+  it("sends the host hard tool policy and disables web and advisors", async () => {
+    const runViaSidecar = vi.fn(async (request: RunViaSidecarRequest) =>
+      fakeOutcome({ kind: "done", text: "A mutex protects shared state." }));
+    await streamAnswer(
+      baseReq({
+        question: "Do not use tools. Explain mutexes.",
+        webEnabled: false,
+        advisorsOn: false,
+        evidencePolicy: "no-tools-no-sources",
+      }),
+      depsFor({ runViaSidecar }),
+    );
+    expect(runViaSidecar).toHaveBeenCalledWith(
+      expect.objectContaining({ toolPolicy: "none", webEnabled: false, advisors: [] }),
+      expect.anything(),
+    );
+  });
+
+  it("sends the active policy and stream-redacts split output for local and cloud models", async () => {
+    for (const model of ["qwen3.5:4b", "claude-cli::opus"]) {
+      const { send, events } = recordingSender();
+      let seen: RunViaSidecarRequest | null = null;
+      const answer = await streamAnswer(
+        baseReq({ model }),
+        depsFor({
+          send,
+          privacyPolicy: protectedPolicy,
+          runViaSidecar: async (request, opts) => {
+            seen = request;
+            opts.turn?.emit(opts.onEvent, "ask-delta", "Call Ben ");
+            opts.turn?.emit(opts.onEvent, "ask-delta", "Reich at ben@");
+            opts.turn?.emit(opts.onEvent, "ask-delta", "example.com.");
+            return fakeOutcome({
+              kind: "done",
+              text: "Call Ben Reich at ben@example.com.",
+            });
+          },
+        }),
+      );
+
+      const request = seen as RunViaSidecarRequest | null;
+      expect(request?.privacy).toMatchObject({
+        active: true,
+        rules: [
+          { real: "Ben Reich", placeholder: "[Person A]" },
+          { real: "ben@example.com", placeholder: "[Email A]" },
+        ],
+      });
+      const visible = events
+        .filter(([event]) => event === "ask-delta")
+        .map(([, payload]) => (payload as AskEnvelope<string>).v)
+        .join("");
+      expect(visible).toBe("Call [Person A] at [Email A].");
+      expect(visible).not.toContain("Ben Reich");
+      expect(visible).not.toContain("ben@example.com");
+      expect(answer).toBe("Call [Person A] at [Email A].");
+    }
+  });
+
+  it("an explicit privacy bypass sends no policy and keeps the answer unchanged", async () => {
+    let seen: RunViaSidecarRequest | null = null;
+    const answer = await streamAnswer(
+      baseReq({ privacyBypass: true }),
+      depsFor({
+        privacyPolicy: protectedPolicy,
+        runViaSidecar: async (request) => {
+          seen = request;
+          return fakeOutcome({ kind: "done", text: "Ben Reich" });
+        },
+      }),
+    );
+    expect((seen as RunViaSidecarRequest | null)?.privacy).toBeNull();
+    expect(answer).toBe("Ben Reich");
   });
 
   it("a Stop mid-stream reaches the sidecar: /cancel is POSTed and the partial is kept", async () => {
@@ -586,6 +678,35 @@ describe("ask", () => {
     expect(nodeFor(cancelState, "ask-1")).toBeUndefined();
   });
 
+  it("persists only the deterministically redacted final assistant answer", async () => {
+    const db = freshRoomDb();
+    const chat = createChat(db);
+    const room = makeRoomSource({ db, path: "/rooms/private.roomai" });
+    const msg = await ask(
+      {
+        askId: "ask-private",
+        chatId: chat.id,
+        question: "Who should I call?",
+        attachments: [],
+        viewing: null,
+        privacyBypass: false,
+      },
+      askDeps(room, createCancelState(), () => {}, {
+        privacyPolicy: protectedPolicy,
+        runViaSidecar: async () =>
+          fakeOutcome({
+            kind: "done",
+            text: "Call Ben Reich at ben@example.com.",
+          }),
+      }),
+    );
+
+    expect(msg.content).toBe("Call [Person A] at [Email A].");
+    expect(listMessages(db, chat.id).at(-1)?.content).toBe(
+      "Call [Person A] at [Email A].",
+    );
+  });
+
   it("clears both cancel registries even when Phase 1 throws", async () => {
     const db = freshRoomDb();
     const chat = createChat(db);
@@ -740,6 +861,46 @@ describe("ask", () => {
 
     expect(labelsWhenEmbedding).toEqual(["Preparing the search…"]);
     expect(stepLabels(events)).toEqual(["Preparing the search…", "Searching your files…"]);
+  });
+
+  it("hard mode skips embedding and search before sending a tool-less turn", async () => {
+    const db = freshRoomDb();
+    const chat = createChat(db);
+    insertFile(db, "private.txt", "text/plain", Buffer.from("secret"), "secret", "upload");
+    setSetting(db, "web_provider", "duckduckgo");
+    setSetting(db, "advisors_enabled", "on");
+    const room = makeRoomSource({ db, path: "/rooms/a.roomai" });
+    const embedQuestion = vi.fn(async () => [0.1]);
+    const connectedMcpServers = vi.fn(() => ["notion"]);
+    const runViaSidecar = vi.fn(async (request: RunViaSidecarRequest) => {
+      expect(request.toolPolicy).toBe("none");
+      expect(request.webEnabled).toBe(false);
+      expect(request.advisors).toEqual([]);
+      expect(request.messages).toHaveLength(2);
+      expect(request.messages?.at(-1)?.content).toBe("Question: Explain mutexes. Do not use tools.");
+      return fakeOutcome({ kind: "done", text: "A mutex protects shared state." });
+    });
+    const { send, events } = recordingSender();
+
+    await ask(
+      {
+        askId: "ask-hard",
+        chatId: chat.id,
+        question: "Explain mutexes. Do not use tools.",
+        attachments: [],
+        viewing: "private.txt",
+        privacyBypass: false,
+      },
+      askDeps(room, createCancelState(), send, {
+        embedQuestion,
+        connectedMcpServers,
+        runViaSidecar,
+      }),
+    );
+
+    expect(embedQuestion).not.toHaveBeenCalled();
+    expect(connectedMcpServers).not.toHaveBeenCalled();
+    expect(stepLabels(events)).toEqual(["Answering without tools or room sources"]);
   });
 
   it("hands the bridge seam this run's id and the room's advisor-tools decision", async () => {

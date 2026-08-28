@@ -122,6 +122,19 @@ test("each row carries what the popover draws", () => {
   assert.equal(row.insert, "*web ");
 });
 
+test("Cloud Privacy labels inspect-only specialists and disables unavailable ones", () => {
+  const reason = "Cloud Privacy blocks this action. Switch to On this Mac to use it.";
+  const items = specialistItems([
+    { ...ROSTER[0], capability: "unavailable", capabilityReason: reason, localHandoff: true },
+    { ...ROSTER[1], capability: "inspect-only", capabilityReason: reason, localHandoff: true },
+  ], "");
+  assert.equal(items[0].disabled, true);
+  assert.match(items[0].usage, /On this Mac/);
+  assert.equal(items[0].hint, reason);
+  assert.equal(items[1].disabled, false);
+  assert.match(items[1].usage, /Inspect only/);
+});
+
 // ---- the honest empty state -------------------------------------------
 
 test("a roster that has not been read yet says so, not 'none'", () => {
@@ -245,6 +258,15 @@ test("a room with no specialists says THAT rather than 'Try: '", () => {
   assert.doesNotMatch(specialistErrorMessage("web", []), /Try:/);
 });
 
+test("an unavailable specialist is refused before dispatch with its local handoff", () => {
+  const reason = "Cloud Privacy blocks *file actions. Switch to On this Mac to use this specialist.";
+  const roster = [{ ...ROSTER[0], capability: "unavailable", capabilityReason: reason }];
+  const parsed = parseComposer("*file organize this", NO_COMMANDS, NO_SKILLS, NO_FILES, NO_FOLDERS, roster);
+  assert.equal(parsed.specialist, undefined);
+  assert.equal(parsed.specialistError, "file");
+  assert.equal(specialistErrorMessage("file", roster), reason);
+});
+
 /* The sidecar's `agents._TAG_RE` once also matched "_" and "." so a MODEL's
  * spellings of a domain resolved as tags. This parser cannot lex those, so it
  * sent them as prose — and the sidecar dispatched the Web agent for a turn the
@@ -310,6 +332,43 @@ test("a tag after an @reference is read, because refs are lifted out first", () 
   );
   assert.equal(parsed.specialist, "file");
   assert.deepEqual(parsed.refIds, ["f1"]);
+});
+
+test("a nested file reference consumes its full folder/file spelling", () => {
+  const commands = [{ name: "extract" }];
+  const folders = [{ id: "research", name: "Research" }];
+  const files = [
+    { id: "notes", name: "notes.md", folderId: null, mimeType: "text/markdown" },
+    { id: "findings", name: "findings.md", folderId: "research", mimeType: "text/markdown" },
+    { id: "other", name: "other.md", folderId: "research", mimeType: "text/markdown" },
+  ];
+  const parsed = parseComposer(
+    "#extract Project codename, expected quantity total from @notes.md @Research/findings.md",
+    commands,
+    NO_SKILLS,
+    files,
+    folders,
+  );
+  assert.equal(parsed.command, "extract");
+  assert.equal(parsed.args, "Project codename, expected quantity total from");
+  assert.deepEqual(parsed.refIds, ["notes", "findings"]);
+});
+
+test("a folder reference ending at the slash still attaches the whole folder", () => {
+  const folders = [{ id: "research", name: "Research" }];
+  const files = [
+    { id: "one", name: "one.md", folderId: "research", mimeType: "text/markdown" },
+    { id: "two", name: "two.md", folderId: "research", mimeType: "text/markdown" },
+  ];
+  const parsed = parseComposer(
+    "summarize @Research/",
+    NO_COMMANDS,
+    NO_SKILLS,
+    files,
+    folders,
+  );
+  assert.equal(parsed.args, "summarize");
+  assert.deepEqual(parsed.refIds, ["one", "two"]);
 });
 
 // ---- and it reaches the backend where the backend looks ----------------

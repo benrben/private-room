@@ -20,9 +20,9 @@ let attaching = false;
 let firstFrameTimer: number | null = null;
 let muted = false;
 let liveStt = true;
-// Coexistence first: macOS voice-processing mode can reconfigure the shared
-// input device underneath Teams, Slack, Zoom, or Meet. It is opt-in so starting
-// an Arcelle recording never makes the call app lose or attenuate the user.
+// Coexistence first: a new room does not seize macOS voice-processing mode.
+// Speaker users can opt into echo/noise cleanup; automatic gain control stays
+// off in both modes.
 let voiceProcessing = false;
 let recordingAudioSink: ((rate: number, frame: Float32Array) => void) | null = null;
 
@@ -84,9 +84,8 @@ export function micMuted(): boolean {
  *
  * `echoCancellation` is useful when explicitly enabled: it stops meeting
  * audio played through the speakers from re-entering the mic lane and being
- * attributed to "You" (see recording_cmds::rec_start). It defaults off because
- * letting the meeting app keep its normal microphone session is the safer
- * starting point; users recording on speakers can opt into cleanup.
+ * attributed to "You" (see recording_cmds::rec_start). A new room defaults
+ * off so another app keeps its normal microphone session.
  *
  * Read SYNCHRONOUSLY (module state, not an await): `acquireMic` has to be the
  * first thing awaited in the click handler or WebKit revokes the capture
@@ -103,6 +102,13 @@ export function micConstraints(): MediaTrackConstraints {
  * (effects.ts) and whenever Settings saves it. */
 export function configureMic(processing: boolean): void {
   voiceProcessing = processing;
+}
+
+/** A new room has no saved value and stays coexistence-safe (cleanup off).
+ * Only a saved literal `"1"` opts into voice processing. Kept here so startup
+ * and Settings cannot interpret the same room value differently. */
+export function micVoiceProcessingFromSetting(value: string | null): boolean {
+  return value === "1";
 }
 
 export function micVoiceProcessing(): boolean {

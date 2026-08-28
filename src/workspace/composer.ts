@@ -63,6 +63,19 @@ export function resolveRefs(
   // Build match candidates, longest label first (so "Room summary.md" wins over
   // a file literally named "Room").
   const candidates: { label: string; ids: string[] }[] = [];
+  // A file inside a folder is displayed and inserted as `Folder/file.ext`.
+  // Add that complete spelling before the folder candidate itself. Otherwise
+  // `@Research/findings.md` matches only `Research/`, attaches the whole
+  // folder, and leaves the literal `findings.md` behind in a command's args.
+  // Longest-first sorting below then makes the complete file reference win
+  // while preserving `@Research/` as the explicit whole-folder spelling.
+  const folderNames = new Map(folders.map((folder) => [folder.id, folder.name]));
+  for (const file of files) {
+    const folderName = file.folderId === null ? undefined : folderNames.get(file.folderId);
+    if (folderName !== undefined) {
+      candidates.push({ label: `${folderName}/${file.name}`, ids: [file.id] });
+    }
+  }
   for (const fo of folders) {
     const ids = files.filter((f) => f.folderId === fo.id).map((f) => f.id);
     candidates.push({ label: `${fo.name}/`, ids });
@@ -216,6 +229,8 @@ export interface AutocompleteItem {
   hint: string;
   insert: string;
   usage?: string;
+  /** A visible explanation row that cannot be selected or dispatched. */
+  disabled?: boolean;
 }
 
 /** The "*" menu's rows: the room's specialists filtered by what's been typed.
@@ -239,9 +254,15 @@ export function specialistItems(
     .map((sp) => ({
       key: `ag-${sp.key}`,
       label: `*${sp.key}`,
-      hint: sp.area,
+      hint: sp.capabilityReason ?? sp.area,
       insert: `*${sp.key} `,
-      usage: sp.label,
+      usage:
+        sp.capability === "unavailable"
+          ? `${sp.label} · On this Mac`
+          : sp.capability === "inspect-only"
+            ? `${sp.label} · Inspect only`
+            : sp.label,
+      disabled: sp.capability === "unavailable",
     }));
 }
 
@@ -293,6 +314,11 @@ export function specialistErrorMessage(
   name: string,
   specialists: readonly Specialist[] | null,
 ): string {
+  const selected = (specialists ?? []).find((sp) => sp.key === name);
+  if (selected?.capability === "unavailable") {
+    return selected.capabilityReason
+      ?? `*${name} is unavailable while Cloud Privacy is active. Switch to On this Mac to use this specialist.`;
+  }
   const names = (specialists ?? []).map((sp) => `*${sp.key}`).join(", ");
   return `*${name} isn't a specialist this room has. ${
     names ? `Try: ${names}` : "This room has no specialists right now."
@@ -372,7 +398,11 @@ export function parseComposer(
     // receives against the live catalog and refuses it BY NAME in the answer
     // (`prompts.TAG_UNAVAILABLE_ANSWER`) — an unknown tag is never silently
     // dropped into an ordinary turn on either side of the wire.
-    if (specialists !== null && !specialists.some((sp) => sp.key === key)) {
+    const selected = specialists?.find((sp) => sp.key === key);
+    if (
+      specialists !== null
+      && (selected === undefined || selected.capability === "unavailable")
+    ) {
       return { args: cleaned, refIds, specialistError: key };
     }
     if (/^[/#][a-z0-9-]+\b/.test(rest)) {

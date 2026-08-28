@@ -403,12 +403,18 @@ describe("groundingPick", () => {
 
   it("returns null with nothing installed to fall back to — an empty list, never a guessed name", async () => {
     const deps = groundingDeps(() => false, false);
-    expect(await groundingPick([], "claude-cli", deps)).toBeNull();
+    expect(await groundingPick([], "antigravity-cli", deps)).toBeNull();
   });
 
-  it("a cloud CLI has no image channel at all, regardless of what the deps claim", async () => {
+  it("the one CLI without an image channel stays null, regardless of what the deps claim", async () => {
     const deps = groundingDeps(() => true, false);
-    expect(await groundingPick([], "claude-cli", deps)).toBeNull();
+    expect(await groundingPick([], "antigravity-cli", deps)).toBeNull();
+  });
+
+  it("a Claude/Codex room keeps its own engine for image questions when the door is open", async () => {
+    const deps = groundingDeps(() => false, false);
+    expect(await groundingPick([], "claude-cli", deps)).toBe("claude-cli");
+    expect(await groundingPick([], "codex-cli::gpt-5.6-sol", deps)).toBe("codex-cli::gpt-5.6-sol");
   });
 
   it("a model the privacy door would blind is not eligible, even though it can see", async () => {
@@ -542,7 +548,7 @@ describe("locateInImage", () => {
   it("throws NO_VISION_MODEL when nothing can see and the privacy door has nothing more specific to say", async () => {
     const { db } = freshRoom();
     const file = insertFile(db, "photo.png", "image/png", new Uint8Array([1, 2, 3]), null, "library");
-    setSetting(db, "model", "claude-cli");
+    setSetting(db, "model", "antigravity-cli");
     await expect(
       locateInImage(db, file.id, "the cat", {
         listModels: async () => [],

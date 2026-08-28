@@ -51,7 +51,7 @@ import {
   type CommandResult,
   type RunCommandDeps,
 } from "./chatCommands.js";
-import { insertMessage, listMessages } from "./db-host/messages.js";
+import { insertMessage, listMessages, recentMessages } from "./db-host/messages.js";
 import { listFiles } from "./db-host/files.js";
 import { listMemories } from "./db-host/memories.js";
 import { createRoom } from "./db-host/open.js";
@@ -419,20 +419,24 @@ describe("runCommand", () => {
     expect(handler).toHaveBeenCalledTimes(1);
   });
 
-  it("a command with no handler at all rejects honestly, after the user's line is saved", async () => {
+  it("a command with no handler stores an inline error beside the user's line", async () => {
     // All thirteen have a real body wired by default now, so this path is
     // reached only by a caller that explicitly opts out (a catalog entry added
     // without an implementation would land here too).
     const fixture = freshRoom();
-    await expect(
-      runCommand(
-        { askId: "a1", chatId: "c1", command: "find", args: "budget", refs: [], raw: "#find budget" },
-        baseDeps(fixture, { handlers: { find: notImplementedChatCommandHandler("find") } })
-      )
-    ).rejects.toThrow(/NOT_IMPLEMENTED: #find/);
+    const message = await runCommand(
+      { askId: "a1", chatId: "c1", command: "find", args: "budget", refs: [], raw: "#find budget" },
+      baseDeps(fixture, { handlers: { find: notImplementedChatCommandHandler("find") } })
+    );
+    expect(message.kind).toBe("turn_error");
+    expect(message.content).toContain("#find could not finish");
+    expect(message.content).toContain("NOT_IMPLEMENTED: #find");
     const rows = listMessages(fixture.db, "c1");
-    expect(rows).toHaveLength(1);
+    expect(rows).toHaveLength(2);
     expect(rows[0]!.role).toBe("user");
+    expect(rows[1]!.kind).toBe("turn_error");
+    // Runtime errors are visible history, not model context.
+    expect(recentMessages(fixture.db, "c1", -1)).toEqual([["user", "#find budget"]]);
   });
 
   it("swallows a handler's failure into a stopped marker when the user had already pressed Stop", async () => {
@@ -497,12 +501,12 @@ describe("runCommand", () => {
 
   it("refuses when no explicit model is set and none is installed", async () => {
     const fixture = freshRoom();
-    await expect(
-      runCommand(
-        { askId: "a1", chatId: "c1", command: "remember", args: "x", refs: [], raw: "#remember x" },
-        baseDeps(fixture, { listModels: async () => [], handlers: { remember: notImplementedChatCommandHandler("remember") } })
-      )
-    ).rejects.toThrow(/No local AI model is installed/);
+    const message = await runCommand(
+      { askId: "a1", chatId: "c1", command: "remember", args: "x", refs: [], raw: "#remember x" },
+      baseDeps(fixture, { listModels: async () => [], handlers: { remember: notImplementedChatCommandHandler("remember") } })
+    );
+    expect(message.kind).toBe("turn_error");
+    expect(message.content).toContain("No local AI model is installed");
   });
 
   it("throws 'No room is open.' when the room source has nothing open", async () => {
@@ -674,11 +678,10 @@ describe("runCommand", () => {
     expect(msg.content).toBe("Saved to memory:\n\n> a fact");
   });
 
-  it("registers and then cleans up the cancel flag, even on failure", async () => {
+  it("registers and then cleans up the cancel flag after an inline failure", async () => {
     const fixture = freshRoom();
     const cancelState: CancelState = createCancelState();
-    await expect(
-      runCommand(
+    const message = await runCommand(
         { askId: "a1", chatId: "c1", command: "find", args: "", refs: [], raw: "#find" },
         baseDeps(fixture, {
           cancelState,
@@ -688,8 +691,9 @@ describe("runCommand", () => {
             },
           },
         })
-      )
-    ).rejects.toThrow(/the engine fell over/);
+      );
+    expect(message.kind).toBe("turn_error");
+    expect(message.content).toContain("the engine fell over");
     expect(cancelState.cancels.has("a1")).toBe(false);
     expect(cancelState.cancelTree.has("a1")).toBe(false);
   });

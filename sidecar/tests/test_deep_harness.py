@@ -222,10 +222,31 @@ async def test_ollama_capability_selects_deep_or_deterministic(monkeypatch: pyte
         return ["completion"]
 
     monkeypatch.setattr("arcelle_sidecar.deep_harness.ollama_capabilities", no_tools)
-    weak = await select_deep_harness(deep_request(model="tiny:4b"))
+    weak = await select_deep_harness(deep_request(model="tiny:12b"))
     assert not weak.use_deep_agent
-    assert weak.small_model
+    assert not weak.small_model
     assert "does not declare tool support" in weak.reason
+
+
+@pytest.mark.asyncio
+async def test_small_ollama_model_keeps_deterministic_4b_protection_even_with_tools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    async def tools(_model: str, _base_url: str) -> list[str]:
+        nonlocal calls
+        calls += 1
+        return ["completion", "tools"]
+
+    monkeypatch.setattr("arcelle_sidecar.deep_harness.ollama_capabilities", tools)
+    decision = await select_deep_harness(deep_request(model="qwen3.5:4b"))
+    assert not decision.use_deep_agent
+    assert decision.small_model
+    assert "deterministic workspace harness" in decision.reason
+    # Size is enough to choose the protected adapter; no metadata/network probe
+    # is needed before the run can begin.
+    assert calls == 0
 
 
 @pytest.mark.asyncio

@@ -91,8 +91,18 @@ export function mediaEvent(
 /** One grabbed still, or the reason there isn't one. Never both, and never a
  * blank success — a caller that gets no `imageB64` has an `error` to show. */
 export type GrabbedFrame =
-  | { imageB64: string; width: number; height: number; atSeconds: number }
+  | { imageB64: string; width: number; height: number; atSeconds: number; sha256: string }
   | { error: string };
+
+/** SHA-256 of the decoded frame bytes, not of their base64 spelling. Exported
+ * so the renderer contract can be pinned without constructing a video DOM. */
+export async function frameSha256(imageB64: string): Promise<string> {
+  const binary = atob(imageB64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+  const digest = await globalThis.crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
 
 /**
  * Grab one frame of a staged video at `seconds`.
@@ -158,8 +168,9 @@ export async function grabFrame(
     await presentedFrame(video, 2500);
 
     try {
+      const imageB64 = drawToPngB64(video, video.videoWidth, video.videoHeight, maxWidth);
       return {
-        imageB64: drawToPngB64(video, video.videoWidth, video.videoHeight, maxWidth),
+        imageB64,
         width: video.videoWidth,
         height: video.videoHeight,
         // The time actually PRESENTED, not the one asked for. A request past
@@ -167,6 +178,9 @@ export async function grabFrame(
         // advances the pipeline — so the two can differ, and a caption that
         // asserted the requested time either way would be quietly wrong.
         atSeconds: video.currentTime,
+        // Hash the exact PNG attached to the model. The Electron host verifies
+        // this receipt again before accepting the frame into tool provenance.
+        sha256: await frameSha256(imageB64),
       };
     } catch {
       return { error: "That video's frames couldn't be exported to an image." };

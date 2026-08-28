@@ -1073,6 +1073,45 @@ const MIRROR_UNROUTED_WORKSPACE_MUTATIONS = new Set([
 ]);
 
 /**
+ * Whether Cloud Privacy must hide a tool because its implementation still
+ * writes directly to the real room instead of going through the validated
+ * redacted-workspace backend. Exported so specialist discovery can derive the
+ * same effective capability catalog as tools/list.
+ */
+export function cloudPrivacyBlocksDirectTool(name: string): boolean {
+  return MIRROR_UNROUTED_WORKSPACE_MUTATIONS.has(name);
+}
+
+/** Apply the Cloud Privacy capability door to an already-scoped catalog. */
+export function effectiveToolsForCloudPrivacy(
+  tools: readonly ToolSpec[],
+  cloudPrivacyActive: boolean,
+): ToolSpec[] {
+  return cloudPrivacyActive
+    ? tools.filter((tool) => !cloudPrivacyBlocksDirectTool(tool.name))
+    : [...tools];
+}
+
+/**
+ * The effective names advertised to a cloud engine for this room. This is the
+ * discovery-side counterpart of RoomToolDispatcher.listTools/callTool.
+ */
+export function effectiveRoomToolNamesWith(
+  webEnabled: boolean,
+  lanes: WebLanes,
+  scope: ToolScope,
+  routes: readonly McpRoute[],
+  cloudPrivacyActive: boolean,
+): string[] {
+  const applies = cloudPrivacyActive
+    && (scope.kind === "CloudAdvisor" || scope.kind === "CloudEngine" || scope.kind === "ExternalAgent");
+  return namesOf(effectiveToolsForCloudPrivacy(
+    servedToolsWith(webEnabled, lanes, scope, null, routes),
+    applies,
+  ));
+}
+
+/**
  * THE REAL {@link ToolDispatcher}. Ported from `room_mcp.rs`'s `tool_call`
  * (the transport-independent dispatch body — everything from "only an
  * advertised tool is callable" through the cloud-redaction wrap at the end).
@@ -1101,10 +1140,14 @@ export class RoomToolDispatcher implements ToolDispatcher {
   constructor(private readonly opts: RoomToolDispatcherOptions) {}
 
   listTools(scope: ToolScope): ToolSpec[] {
-    return [
+    const cloudPrivacyActive =
+      (scope.kind === "CloudAdvisor" || scope.kind === "CloudEngine" || scope.kind === "ExternalAgent")
+      && !this.opts.privacyBypass
+      && this.opts.activePolicy() !== null;
+    return effectiveToolsForCloudPrivacy([
       ...servedToolsWith(this.opts.webEnabled, this.opts.lanes, scope, this.opts.advisor, this.opts.routes),
       ...workspaceTools(scope, this.opts.workspace),
-    ];
+    ], cloudPrivacyActive);
   }
 
   async callTool(scope: ToolScope, name: string, rawArgs: Record<string, unknown>): Promise<ToolCallResult> {
@@ -1122,11 +1165,24 @@ export class RoomToolDispatcher implements ToolDispatcher {
     // Only an advertised tool for THIS scope is callable, even if a client
     // fabricates a name — checked against the SAME served list `tools/list`
     // returns, so the two can never disagree.
-    const served = [
+    const unfilteredServed = [
       ...servedToolsWith(opts.webEnabled, opts.lanes, scope, opts.advisor, opts.routes),
       ...workspaceTools(scope, opts.workspace),
     ];
+    const served = effectiveToolsForCloudPrivacy(unfilteredServed, cloudPolicy !== null);
     if (!served.some((t) => t.name === name)) {
+      if (
+        cloudPolicy !== null
+        && cloudPrivacyBlocksDirectTool(name)
+        && unfilteredServed.some((tool) => tool.name === name)
+      ) {
+        return toolResult(
+          `${name} is unavailable while Cloud Privacy is active because it cannot use the validated redacted workspace. `
+          + "Switch the model to On this Mac to use this action.",
+          true,
+          [],
+        );
+      }
       // See this class's doc: an ordinary refusal, folded into isError:true
       // rather than thrown.
       return toolResult(`unknown tool: ${name}`, true, []);
@@ -1162,19 +1218,6 @@ export class RoomToolDispatcher implements ToolDispatcher {
         return toolResult(cloudPolicy.redact(text).text, isError, []);
       }
       return toolResult(text, isError, []);
-    }
-
-    if (
-      cloudPolicy !== null
-      && opts.workspace != null
-      && MIRROR_UNROUTED_WORKSPACE_MUTATIONS.has(name)
-    ) {
-      return toolResult(
-        `${name} cannot run directly against the private room during Cloud Privacy. `
-        + "Use the exposed workspace file tools; their mirror changes are validated and applied after the run.",
-        true,
-        [],
-      );
     }
 
     if (name === "consult_advisor") {
@@ -1373,6 +1416,7 @@ function createThrowawayEffects(scope: ToolScope): ToolEffects {
     webSearchThrottled: false,
     advisorCalls: 0,
     pendingImages: [],
+    mediaFrames: [],
     visionChat: scope.kind === "ExternalAgent",
     editOutcomes: [],
     runScoped: false,

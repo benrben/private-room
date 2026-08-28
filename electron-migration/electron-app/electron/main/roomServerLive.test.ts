@@ -22,7 +22,11 @@ import { setSetting } from "./db-host/settings.js";
 import { clearPolicy, setPolicyRulesForTests } from "./privacy.js";
 import { discoveryFile } from "./moonshotDiscovery.js";
 import { createLiveRoomManagerDeps } from "./ipc/registry.js";
-import { chatTurnBridgeRunOptions, chatTurnWorkspaceWriteEnabled } from "./chatTurnSurfaceIpc.js";
+import {
+  chatTurnBridgeRunOptions,
+  chatTurnWorkspaceWriteEnabled,
+  noToolsDispatcher,
+} from "./chatTurnSurfaceIpc.js";
 import {
   closeRoom,
   createRoom,
@@ -307,6 +311,16 @@ describe("main Assistant workspace write grant", () => {
     const approvedText = (approvedRead.content[0] as { text: string }).text;
     expect(approvedText).toContain("Secret Squirrel");
     expect(approvedText).not.toContain("[Person A]");
+  });
+
+  it("the hard turn dispatcher exposes zero tools and rejects guessed calls", async () => {
+    const dispatcher = noToolsDispatcher();
+    expect(dispatcher.listTools(localScope)).toEqual([]);
+    await expect(dispatcher.callTool(localScope, "workspace_read", { path: "secret.txt" }))
+      .resolves.toEqual({
+        isError: true,
+        content: [{ type: "text", text: "Tools are disabled for this turn." }],
+      });
   });
 });
 

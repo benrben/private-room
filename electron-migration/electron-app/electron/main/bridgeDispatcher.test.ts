@@ -9,11 +9,12 @@
  * `execTool.ts`.
  */
 
+import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { CancelFlag } from "./cancel.js";
 import type { ToolScope } from "./mcpBridge.js";
 import type { McpRoute } from "./toolSpecs.js";
-import { createToolEffects, type ExecToolDeps } from "./execTool.js";
+import { createToolEffects, effectsJson, type ExecToolDeps } from "./execTool.js";
 import {
   AdvisorRuntime,
   MCP_RUN_TOOL,
@@ -589,6 +590,12 @@ describe("RoomToolDispatcher.listTools", () => {
       },
     }));
 
+    const advertised = dispatcher.listTools(CLOUD_ENGINE).map((tool) => tool.name);
+    expect(advertised).not.toContain("organize_files");
+    expect(advertised).not.toContain("merge_files");
+    expect(advertised).not.toContain("draw");
+    expect(advertised).toContain("workspace_read");
+
     for (const [name, args] of [
       ["organize_files", { files: [{ name: "notes.md", folder: "Archive" }] }],
       ["merge_files", { names: ["a.md", "b.md"], into: "merged.md" }],
@@ -596,9 +603,22 @@ describe("RoomToolDispatcher.listTools", () => {
     ] as const) {
       const result = await dispatcher.callTool(CLOUD_ENGINE, name, args);
       expect(result.isError, name).toBe(true);
-      expect((result.content[0] as { text: string }).text, name).toContain("cannot run directly");
+      expect((result.content[0] as { text: string }).text, name).toContain("Cloud Privacy");
+      expect((result.content[0] as { text: string }).text, name).toContain("On this Mac");
     }
     expect(calls).toEqual([]);
+  });
+
+  it("restores direct action tools when the user bypasses Cloud Privacy for the turn", () => {
+    const policy: RedactionPolicy = {
+      restoreValue: (value) => value,
+      redact: (text) => ({ text, entitiesHidden: 0 }),
+    };
+    const dispatcher = new RoomToolDispatcher(baseOpts({
+      activePolicy: () => policy,
+      privacyBypass: true,
+    }));
+    expect(dispatcher.listTools(CLOUD_ENGINE).map((tool) => tool.name)).toContain("draw");
   });
 });
 
@@ -1113,6 +1133,81 @@ describe("RoomToolDispatcher.callTool — cloud redaction", () => {
 });
 
 describe("RoomToolDispatcher.callTool — effects sink", () => {
+  it("gives every interpreting provider the same exact frame bytes and SHA-256 receipt", async () => {
+    const imageB64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAAAAAA6fptVAAAACklEQVR4nGNgAAIAAAUAAen63NgAAAAASUVORK5CYII=";
+    const sha256 = createHash("sha256").update(Buffer.from(imageB64, "base64")).digest("hex");
+    const results = [];
+    for (const scope of [LOCAL_ENGINE, CLOUD_ENGINE, EXTERNAL_AGENT]) {
+      const dispatcher = new RoomToolDispatcher(baseOpts({
+        execDeps: execDeps({
+          agentUi: async () => ({
+            imageB64,
+            width: 1920,
+            height: 1080,
+            atSeconds: 1.03125,
+            sha256,
+          }),
+        }),
+      }));
+      results.push(await dispatcher.callTool(scope, "view_media_frame", { name: "video.mp4", at: "0:01" }));
+    }
+
+    for (const result of results) {
+      expect(result.content).toEqual([
+        {
+          type: "text",
+          text: `Frame receipt: video.mp4 at 1.031s; SHA-256 ${sha256}; 1920×1080 PNG.`,
+        },
+        { type: "image", data: imageB64, mimeType: "image/png" },
+      ]);
+    }
+  });
+
+  it("persists timestamp/hash provenance for the exact frame attached to the local turn", async () => {
+    const imageB64 = Buffer.from("deterministic frame bytes").toString("base64");
+    const sha256 = createHash("sha256").update(Buffer.from(imageB64, "base64")).digest("hex");
+    const shared = createToolEffects();
+    const dispatcher = new RoomToolDispatcher(baseOpts({
+      sharedEffects: shared,
+      execDeps: execDeps({
+        agentUi: async () => ({ imageB64, width: 640, height: 360, atSeconds: 1, sha256 }),
+      }),
+    }));
+    await dispatcher.callTool(LOCAL_ENGINE, "view_media_frame", { name: "video.mp4", at: "0:01" });
+    expect(shared.mediaFrames).toEqual([{
+      fileName: "video.mp4",
+      requestedAt: "0:01",
+      actualSeconds: 1,
+      sha256,
+      width: 640,
+      height: 360,
+    }]);
+    expect(effectsJson(shared)).toEqual({ mediaFrames: shared.mediaFrames });
+  });
+
+  it("refuses pixels whose renderer receipt does not match the attached bytes", async () => {
+    const dispatcher = new RoomToolDispatcher(baseOpts({
+      execDeps: execDeps({
+        agentUi: async () => ({
+          imageB64: Buffer.from("real frame").toString("base64"),
+          width: 10,
+          height: 10,
+          atSeconds: 1,
+          sha256: "0".repeat(64),
+        }),
+      }),
+    }));
+    const result = await dispatcher.callTool(LOCAL_ENGINE, "view_media_frame", {
+      name: "video.mp4",
+      at: "0:01",
+    });
+    expect(result.isError).toBe(true);
+    expect(result.content).toEqual([{
+      type: "text",
+      text: "That video frame failed its SHA-256 receipt check.",
+    }]);
+  });
+
   it("a shared effects object PERSISTS across calls and is marked runScoped", async () => {
     const shared = createToolEffects();
     const dispatcher = new RoomToolDispatcher(baseOpts({ sharedEffects: shared }));

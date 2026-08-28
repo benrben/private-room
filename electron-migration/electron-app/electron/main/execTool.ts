@@ -90,6 +90,7 @@
  *   binary-download engines) but are not wired to a tool arm here.
  */
 
+import { createHash } from "node:crypto";
 import type Database from "better-sqlite3-multiple-ciphers";
 import { webAccessEnabled } from "./browser/webAccess.js";
 import {
@@ -203,6 +204,9 @@ export interface ToolEffects {
   advisorCalls: number;
   /** ADD-25: base64 PNGs captured this round. */
   pendingImages: string[];
+  /** Exact locally-extracted video frames used by a model this turn. The
+   * encrypted message effects retain the timestamp/hash receipt, not pixels. */
+  mediaFrames: MediaFrameReceipt[];
   /** ADD-25: whether the chat model can read attached images. */
   visionChat: boolean;
   /** Wave 2 (Idea 4): content-free per-edit outcome records for this turn. */
@@ -217,6 +221,15 @@ export interface ToolEffects {
   agentPlan: unknown | null;
 }
 
+export interface MediaFrameReceipt {
+  fileName: string;
+  requestedAt: string;
+  actualSeconds: number;
+  sha256: string;
+  width: number;
+  height: number;
+}
+
 /** A fresh, all-default `ToolEffects` — the TS analogue of Rust's
  * `#[derive(Default)]`. */
 export function createToolEffects(): ToolEffects {
@@ -227,6 +240,7 @@ export function createToolEffects(): ToolEffects {
     webSearchThrottled: false,
     advisorCalls: 0,
     pendingImages: [],
+    mediaFrames: [],
     visionChat: false,
     editOutcomes: [],
     runScoped: false,
@@ -246,6 +260,7 @@ export function effectsJson(effects: ToolEffects): Record<string, unknown> | nul
     effects.boxes === null &&
     effects.annotation === null &&
     effects.editOutcomes.length === 0 &&
+    effects.mediaFrames.length === 0 &&
     effects.tokenUsage === null &&
     effects.agentPlan === null
   ) {
@@ -260,6 +275,9 @@ export function effectsJson(effects: ToolEffects): Record<string, unknown> | nul
   }
   if (effects.editOutcomes.length > 0) {
     map.edits = effects.editOutcomes;
+  }
+  if (effects.mediaFrames.length > 0) {
+    map.mediaFrames = effects.mediaFrames;
   }
   if (effects.tokenUsage !== null) {
     map.usage = effects.tokenUsage;
@@ -1751,8 +1769,33 @@ export async function execTool(
           : { value: payload };
         if (typeof value.error === "string") return fail(value.error);
         if (typeof value.imageB64 === "string" && value.imageB64 !== "") {
+          const bytes = Buffer.from(value.imageB64, "base64");
+          if (bytes.length === 0) return fail("That video frame arrived empty.");
+          const sha256 = createHash("sha256").update(bytes).digest("hex");
+          const rendererHash = typeof value.sha256 === "string" ? value.sha256.toLowerCase() : "";
+          if (rendererHash !== "" && rendererHash !== sha256) {
+            return fail("That video frame failed its SHA-256 receipt check.");
+          }
+          const actualSeconds = typeof value.atSeconds === "number" && Number.isFinite(value.atSeconds)
+            ? value.atSeconds
+            : null;
+          if (actualSeconds === null) return fail("That video frame arrived without its exact timestamp.");
+          const width = typeof value.width === "number" && Number.isFinite(value.width) ? value.width : 0;
+          const height = typeof value.height === "number" && Number.isFinite(value.height) ? value.height : 0;
+          const receipt: MediaFrameReceipt = {
+            fileName: typeof args.name === "string" ? args.name : "video",
+            requestedAt: typeof args.at === "string" || typeof args.at === "number" ? String(args.at) : "0",
+            actualSeconds,
+            sha256,
+            width,
+            height,
+          };
           effects.pendingImages.push(value.imageB64);
-          const note = typeof value.note === "string" ? value.note : "Image captured for inspection.";
+          effects.mediaFrames.push(receipt);
+          const note = typeof value.note === "string"
+            ? value.note
+            : `Frame receipt: ${receipt.fileName} at ${actualSeconds.toFixed(3)}s; ` +
+              `SHA-256 ${sha256}; ${width}×${height} PNG.`;
           return ok(note);
         }
         return ok(JSON.stringify(value, null, 2));

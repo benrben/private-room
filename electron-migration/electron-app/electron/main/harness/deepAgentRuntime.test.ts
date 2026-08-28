@@ -39,6 +39,11 @@ describe("DeepAgentRuntime", () => {
       request = req;
       opts.onEvent("ask-agent", { runId: req.runId, chatId: "", v: { id: "files.read", label: "File agent" } });
       opts.onEvent("ask-delta", { runId: req.runId, chatId: "", v: "Found it" });
+      opts.onEvent("ask-step-status", {
+        runId: req.runId,
+        chatId: "",
+        v: { node: "files.read#0", ok: true, tool: "search_room" },
+      });
       opts.onEvent("ask-token-usage", { runId: req.runId, chatId: "", v: { input_tokens: 12, output_tokens: 3 } });
       return { kind: "done" as const, text: "Found it", usage: null, plan: null };
     });
@@ -61,6 +66,7 @@ describe("DeepAgentRuntime", () => {
       { type: "run_started", runId: "run-1", harness: "arcelle-deep" },
       { type: "agent_started", runId: "run-1", agentId: "files.read", label: "File agent" },
       { type: "text_delta", runId: "run-1", text: "Found it" },
+      { type: "tool_completed", runId: "run-1", tool: "search_room" },
       { type: "usage_updated", runId: "run-1", inputTokens: 12, outputTokens: 3, costUsd: undefined },
       { type: "run_completed", runId: "run-1", status: "completed" },
     ]));
@@ -176,6 +182,9 @@ describe("DeepAgentRuntime", () => {
     const secret = "Ben Reich Bearer secret-token /room/private.txt";
     const runtime = new DeepAgentRuntime(state(), () => {}, undefined, vi.fn(async (req, opts) => {
       opts.onEvent("ask-report", { runId: req.runId, chatId: "", v: { node: "files.read", ok: false, text: secret } });
+      // The parent delegation's status has no room-tool name. It must not
+      // duplicate the completion already produced by ask-report.
+      opts.onEvent("ask-step-status", { runId: req.runId, chatId: "", v: { node: "main", ok: false, tool: null } });
       return { kind: "done" as const, text: "", usage: null, plan: null };
     }));
     const started = await runtime.startTurn(context(), { text: "read notes" });
@@ -183,8 +192,39 @@ describe("DeepAgentRuntime", () => {
     for await (const event of started.events) events.push(event);
     const tool = events.find((event) => event.type === "tool_completed");
     expect(tool).toMatchObject({ type: "tool_completed", tool: "files.read" });
+    expect(events.filter((event) => event.type === "tool_completed")).toHaveLength(1);
     expect(JSON.stringify(tool)).not.toContain("Ben Reich");
     expect(JSON.stringify(tool)).not.toContain("secret-token");
     expect(JSON.stringify(tool)).not.toContain("/room/private.txt");
+  });
+
+  it("normalizes a failed room-tool status with a safe provider error", async () => {
+    const runtime = new DeepAgentRuntime(state(), () => {}, undefined, vi.fn(async (req, opts) => {
+      opts.onEvent("ask-step-status", {
+        runId: req.runId,
+        chatId: "",
+        v: {
+          node: "files.read#0",
+          ok: false,
+          tool: "workspace_delete",
+          diagnostic: "Ben Reich Bearer secret-token /room/private.txt",
+        },
+      });
+      return { kind: "done" as const, text: "", usage: null, plan: null };
+    }));
+    const started = await runtime.startTurn(context(), { text: "delete notes" });
+    const events: HarnessEvent[] = [];
+    for await (const event of started.events) events.push(event);
+
+    const completed = events.find((event) => event.type === "tool_completed");
+    expect(completed).toEqual({
+      type: "tool_completed",
+      runId: "run-1",
+      tool: "workspace_delete",
+      error: "Local Ollama tool failed. Provider diagnostics were omitted to protect room data.",
+    });
+    expect(JSON.stringify(completed)).not.toContain("Ben Reich");
+    expect(JSON.stringify(completed)).not.toContain("secret-token");
+    expect(JSON.stringify(completed)).not.toContain("/room/private.txt");
   });
 });

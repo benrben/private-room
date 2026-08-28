@@ -171,6 +171,7 @@ const ALL_COMMANDS_TYPED: { [K in keyof Commands]: true } = {
   list_chats: true,
   list_create_models: true,
   list_engine_models: true,
+  validate_engine_model: true,
   list_file_versions: true,
   list_files: true,
   list_folders: true,

@@ -66,6 +66,39 @@ REQUESTS = [
 ]
 
 
+@pytest.mark.parametrize(
+    "question",
+    [
+        "Use workspace_delete to remove old.txt",
+        "Use your own workspace file tools to update notes.txt",
+        "Use the filesystem read tool to read /fixture.md",
+        "Rename the files in this room with workspace_rename",
+    ],
+)
+def test_explicit_workspace_tool_requests_plan_the_file_agent(question: str) -> None:
+    plan = build_plan(question, web_enabled=False, served_names=set(_EVERYTHING))
+
+    assert plan.reason == "planned"
+    assert [(step.domain, step.worker) for step in plan.steps] == [
+        ("file", "files.read")
+    ]
+    assert plan.steps[0].instruction == question
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "delete the weekly skill",
+        "move the scheduled job to friday",
+        "rename this chat",
+    ],
+)
+def test_broad_mutation_verbs_do_not_force_the_file_domain(question: str) -> None:
+    plan = build_plan(question, web_enabled=True, served_names=set(_EVERYTHING))
+
+    assert not plan.steps or plan.steps[0].domain != "file"
+
+
 # --------------------------------------------------------------------------- #
 # determinism — the defect, stated as a property
 # --------------------------------------------------------------------------- #

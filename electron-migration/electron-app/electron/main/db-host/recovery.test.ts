@@ -13,7 +13,7 @@
  * Rust doc comments spell out for this security-critical module.
  */
 
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -150,7 +150,9 @@ describe("recovery_sidecar_is_written_temp_then_renamed", () => {
       const p = tempRoomPath();
       const code = await writeRecovery(p, "first-password");
       const sidecar = recoverySidecarPath(p);
+      expect(statSync(sidecar).mode & 0o777).toBe(0o600);
       writeFileSync(`${sidecar}.tmp`, "junk from a crashed write");
+      chmodSync(`${sidecar}.tmp`, 0o644);
 
       // A failed write must not have consumed the existing sidecar.
       await expect(
@@ -161,6 +163,7 @@ describe("recovery_sidecar_is_written_temp_then_renamed", () => {
       // A successful write leaves no temp file behind and swaps the wrap.
       const code2 = await writeRecovery(p, "second-password");
       expect(existsSync(`${sidecar}.tmp`)).toBe(false);
+      expect(statSync(sidecar).mode & 0o777).toBe(0o600);
       expect(await recoverPassword(p, code2)).toBe("second-password");
     });
   });

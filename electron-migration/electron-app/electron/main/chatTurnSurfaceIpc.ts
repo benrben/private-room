@@ -7,7 +7,8 @@ import { ask, handoffChat, type AskRequest } from "./turnEngine.js";
 import { liveTurnRoomSource } from "./liveContext.js";
 import { createRoomBridge, type RunningBridge } from "./moonshotServer.js";
 import { roomServerDispatcherFactory } from "./roomServerLive.js";
-import { modelSetting } from "./gatherContext.js";
+import { modelSetting, turnEvidencePolicyForQuestion } from "./gatherContext.js";
+import type { ToolDispatcher } from "./mcpBridge.js";
 import { runsOnThisMac } from "./capabilities.js";
 import { detectedExternal } from "./externalDetection.js";
 import { chatModelSeesImages, groundingPick } from "./ollamaModels.js";
@@ -44,6 +45,18 @@ export function chatTurnBridgeRunOptions(
   };
 }
 
+/** An intentional empty capability surface. Listing returns zero schemas and
+ * calling a guessed tool fails without ever touching the live dispatcher. */
+export function noToolsDispatcher(): ToolDispatcher {
+  return {
+    listTools: () => [],
+    callTool: async () => ({
+      isError: true,
+      content: [{ type: "text", text: "Tools are disabled for this turn." }],
+    }),
+  };
+}
+
 export function registerChatTurnSurfaceIpc(
   ipcMain: Pick<IpcMain, "handle">,
   state: RoomManagerState,
@@ -57,6 +70,17 @@ export function registerChatTurnSurfaceIpc(
     const args = object(raw);
     const open = state.room;
     if (!open) throw new Error("No room is open.");
+    const request: AskRequest = {
+      chatId: String(args.chatId ?? ""),
+      question: String(args.question ?? ""),
+      attachments: Array.isArray(args.attachments)
+        ? args.attachments.filter((value): value is string => typeof value === "string")
+        : [],
+      askId: String(args.askId ?? ""),
+      viewing: typeof args.viewing === "string" ? args.viewing : null,
+      privacyBypass: args.privacyBypass === true,
+    };
+    const evidencePolicy = turnEvidencePolicyForQuestion(open.conn, request.question);
     const model = modelSetting(open.conn) ?? "";
     const scope = runsOnThisMac(model)
       ? { kind: "LocalEngine" as const }
@@ -67,25 +91,17 @@ export function registerChatTurnSurfaceIpc(
     // factory clamps the grant off when another process owns the room lease.
     // The same explicit one-turn privacy approval used by ask() must also
     // reach its file tools; otherwise their results stay redacted mid-turn.
-    const dispatcher = roomServerDispatcherFactory(state, emit, services)(
-      online,
-      scope,
-      WEB_LANES_ALL,
-      chatTurnBridgeRunOptions(open, args.privacyBypass === true),
-    );
+    const dispatcher = evidencePolicy === "no-tools-no-sources"
+      ? noToolsDispatcher()
+      : roomServerDispatcherFactory(state, emit, services)(
+          online,
+          scope,
+          WEB_LANES_ALL,
+          chatTurnBridgeRunOptions(open, request.privacyBypass),
+        );
     let bridge: RunningBridge | null = null;
     try {
       bridge = await createRoomBridge({ scope, dispatcher });
-      const request: AskRequest = {
-        chatId: String(args.chatId ?? ""),
-        question: String(args.question ?? ""),
-        attachments: Array.isArray(args.attachments)
-          ? args.attachments.filter((value): value is string => typeof value === "string")
-          : [],
-        askId: String(args.askId ?? ""),
-        viewing: typeof args.viewing === "string" ? args.viewing : null,
-        privacyBypass: args.privacyBypass === true,
-      };
       const running = bridge;
       return await ask(request, {
         room: roomSource,
@@ -102,6 +118,7 @@ export function registerChatTurnSurfaceIpc(
         runsOnThisMac,
         detectedAdvisors: detectedExternal,
         privacyActive: () => activePolicy() !== null,
+        privacyPolicy: activePolicy,
         chatModelSeesImages,
         groundingPass: async ({ model: chatModel, question, image }) => {
           const models = await listModels();

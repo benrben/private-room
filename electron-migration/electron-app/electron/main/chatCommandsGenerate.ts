@@ -128,7 +128,7 @@ import { serializeDelim } from "./editMatchCells.js";
 import { extensionOf } from "./editMatchExtraction.js";
 import { createToolEffects } from "./execTool.js";
 import { chatStructured, plainGenerateBody } from "./ollamaGenerate.js";
-import { declaredFor } from "./capabilities.js";
+import { isCliEngine } from "./turnContext.js";
 import { webAccessEnabled } from "./gatherContext.js";
 import { blockedNote, fetchReadable, joinNames, searchWeb } from "./web.js";
 import { linkFileName } from "./browser/saved.js";
@@ -155,6 +155,10 @@ export type { CommandResult };
 
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+function ownValue(obj: Record<string, unknown>, key: string): unknown {
+  return Object.prototype.hasOwnProperty.call(obj, key) ? obj[key] : undefined;
 }
 
 /** Rust's `char::is_alphanumeric()` — `\p{Alphabetic}\p{N}`, not `\p{L}`.
@@ -486,20 +490,25 @@ export async function generateStream(
  * Ported verbatim from `COMMAND_STREAM_IDLE_SECS`. */
 export const COMMAND_STREAM_IDLE_SECS = 300;
 
-/** The cloud-CLI twin — a harness engine hands back its whole reply as ONE
- * delta at the very end, so the silence clock spans the whole answer. Ported
- * verbatim from `COMMAND_STREAM_IDLE_CLI_SECS`. */
+/** The cloud-CLI twin — sized past the sidecar's own wedged-CLI budget
+ * (900s). A CLI engine streams its answer text live now, but its SILENT
+ * phases are still whole work sessions — thinking blocks and tool loops emit
+ * no text delta for minutes at a time. Ported verbatim from
+ * `COMMAND_STREAM_IDLE_CLI_SECS`. */
 export const COMMAND_STREAM_IDLE_CLI_SECS = 960;
 
 /** How long Stop waits for the stream to notice the flag by itself before
  * hanging up on its behalf. Ported verbatim from `COMMAND_STOP_GRACE_MS`. */
 export const COMMAND_STOP_GRACE_MS = 1_500;
 
-/** Reads the DECLARED transport property rather than the model's name.
- * Ported verbatim from `stream_idle_secs`, using the already-real
- * `declaredFor` (`capabilities.ts`). */
+/** THE one copy of this rule (`chatCommands.ts` re-exports it). Keyed on the
+ * ENGINE KIND (the subprocess CLIs only — OpenRouter is a real chat API on
+ * the ordinary clock), not the `streaming` declaration: the CLI engines
+ * stream now, but what this clock really measures is tolerable silence, and
+ * a harness thinking or driving its tools is silent on the text channel
+ * while being entirely alive. */
 export function streamIdleSecs(model: string): number {
-  return declaredFor(model).streaming === "no" ? COMMAND_STREAM_IDLE_CLI_SECS : COMMAND_STREAM_IDLE_SECS;
+  return isCliEngine(model) ? COMMAND_STREAM_IDLE_CLI_SECS : COMMAND_STREAM_IDLE_SECS;
 }
 
 /**
@@ -1096,34 +1105,139 @@ export async function cmdSummarize(ctx: CmdCtx): Promise<CommandResult> {
 // #compare
 // ============================================================================
 
+interface ComparisonEvidence {
+  file: string;
+  quote: string;
+}
+
+interface ComparisonClaim {
+  claim: string;
+  evidence: ComparisonEvidence[];
+}
+
+function comparisonSchema(): Record<string, unknown> {
+  const evidence = {
+    type: "object",
+    additionalProperties: false,
+    required: ["file", "quote"],
+    properties: { file: { type: "string" }, quote: { type: "string" } },
+  };
+  const claim = {
+    type: "object",
+    additionalProperties: false,
+    required: ["claim", "evidence"],
+    properties: { claim: { type: "string" }, evidence: { type: "array", items: evidence } },
+  };
+  return {
+    type: "object",
+    additionalProperties: false,
+    required: ["overview", "similarities", "differences"],
+    properties: {
+      overview: { type: "string" },
+      similarities: { type: "array", items: claim },
+      differences: { type: "array", items: claim },
+    },
+  };
+}
+
+function comparisonText(v: unknown): string {
+  return typeof v === "string" ? v.trim() : "";
+}
+
+function normalizedEvidenceText(value: string): string {
+  return value.normalize("NFC").replace(/\s+/gu, " ").trim().toLocaleLowerCase();
+}
+
+/** Accept only claims carrying a quote that exists in the named source.
+ * This is deliberately mechanical: a fluent comparison with no supporting
+ * span is rejected instead of being shown as a fact. */
+function verifiedComparisonClaims(
+  value: unknown,
+  sourceByName: ReadonlyMap<string, string>,
+  needTwoFiles: boolean
+): ComparisonClaim[] {
+  if (!Array.isArray(value)) return [];
+  const out: ComparisonClaim[] = [];
+  for (const raw of value) {
+    if (!isRecord(raw)) continue;
+    const claim = comparisonText(ownValue(raw, "claim"));
+    const evidenceRaw = ownValue(raw, "evidence");
+    if (claim === "" || !Array.isArray(evidenceRaw)) continue;
+    const evidence: ComparisonEvidence[] = [];
+    for (const item of evidenceRaw) {
+      if (!isRecord(item)) continue;
+      const file = comparisonText(ownValue(item, "file"));
+      const quote = comparisonText(ownValue(item, "quote"));
+      const source = sourceByName.get(file);
+      if (source === undefined || Array.from(quote).length < 4) continue;
+      if (!normalizedEvidenceText(source).includes(normalizedEvidenceText(quote))) continue;
+      evidence.push({ file, quote });
+    }
+    const distinctFiles = new Set(evidence.map((e) => e.file));
+    if (evidence.length > 0 && (!needTwoFiles || distinctFiles.size >= 2)) {
+      out.push({ claim, evidence });
+    }
+  }
+  return out;
+}
+
+function renderComparisonSection(title: string, claims: readonly ComparisonClaim[]): string {
+  if (claims.length === 0) return `### ${title}\n\n- No supported ${title.toLowerCase()} were found.`;
+  return `### ${title}\n\n${claims.map((item) => {
+    const refs = item.evidence.map((e) => `**${e.file}**: “${e.quote}”`).join("; ");
+    return `- ${item.claim} (${refs})`;
+  }).join("\n")}`;
+}
+
 export async function cmdCompare(ctx: CmdCtx): Promise<CommandResult> {
   if (ctx.refs.length < 2) {
     throw new Error("Add at least two files with @ — e.g. #compare @plan-a.md @plan-b.md");
   }
   const db = requireRoom(ctx.rooms).db;
   const files = refsFiles(db, ctx.refs);
-  const names = files.map(([n]) => n);
-  let refctx = "";
+  const sourceByName = new Map(files.map(([name, text]) => [name, text] as const));
+  const digests: string[] = [];
   for (const [name, text] of files) {
     if (text.trim() === "") {
       continue;
     }
     const d = await digest(ctx, text, `Reading ${name}`);
     if (d.trim() !== "") {
-      refctx += `[file: ${name}]\n${d}\n\n`;
+      digests.push(`[file: ${name}]\n${d}`);
     }
   }
-  const folded = await digest(ctx, refctx, "Lining the documents up");
-  if (folded.trim() === "") {
+  if (digests.length < 2) {
     throw new Error("Those files have no readable text to compare.");
   }
-  const out = await askStreaming(
+  const raw = await askStructured(
     ctx,
-    "You compare documents clearly and fairly.",
-    "Compare the following documents. Give a one-sentence overview, then a short bullet list of the key " +
-      `similarities and a short bullet list of the key differences.\n\n${folded}`
+    "Compare documents using only grounded evidence. Every claim must include the exact source file name and " +
+      "a short verbatim quote from that same file. A similarity needs evidence from at least two different files. " +
+      "Never transfer a fact from one file to another.",
+    `Compare these separately labelled documents.\n\n${digests.join("\n\n")}`,
+    0.1,
+    comparisonSchema()
   );
-  return commandResult(out, names);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw.trim());
+  } catch {
+    throw new Error("The comparison was not grounded in readable source evidence. Try again.");
+  }
+  if (!isRecord(parsed)) {
+    throw new Error("The comparison was not grounded in readable source evidence. Try again.");
+  }
+  const similarities = verifiedComparisonClaims(ownValue(parsed, "similarities"), sourceByName, true);
+  const differences = verifiedComparisonClaims(ownValue(parsed, "differences"), sourceByName, false);
+  if (similarities.length === 0 && differences.length === 0) {
+    throw new Error("The comparison contained no claims supported by quotes from the named files.");
+  }
+  const overview = comparisonText(ownValue(parsed, "overview"));
+  const usedNames = [...new Set([...similarities, ...differences].flatMap((c) => c.evidence.map((e) => e.file)))];
+  const out = [overview, renderComparisonSection("Similarities", similarities), renderComparisonSection("Differences", differences)]
+    .filter((part) => part.trim() !== "")
+    .join("\n\n");
+  return commandResult(out, usedNames);
 }
 
 // ============================================================================

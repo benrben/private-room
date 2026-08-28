@@ -227,6 +227,48 @@ export function explicitSkillRequest(question: string): { name: string; request:
   return { name, request: rest.slice(end).trim() };
 }
 
+// ------------------------------------------------------ hard evidence policy
+
+/** Host-authoritative evidence policy for one turn. */
+export type TurnEvidencePolicy = "normal" | "no-tools-no-sources";
+
+/** Recognize a direct instruction not to use tools or file/outside evidence.
+ * A question that merely does not need tools remains in normal mode. */
+export function explicitlyProhibitsToolsOrSources(text: string): boolean {
+  const normalized = text
+    .normalize("NFKC")
+    .replace(/[\u2018\u2019]/g, "'")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+  if (normalized === "") return false;
+
+  const targets =
+    "(?:tools?|file(?: system)?(?: reads?)?|files?|documents?|room(?: data| files?)?|workspace(?: files?)?|sources?|attachments?|retrieval|search|web|internet|browsing)";
+  const qualifiers =
+    "(?:(?:any|the|outside|external|online|room|workspace|local|additional|other|bundled|browser|file|available)\\s+){0,3}";
+  const direct = new RegExp(
+    `\\b(?:do not|don't|dont|never)\\s+(?:use|call|run|invoke|access|read|open|search|retrieve|consult|browse|look at|load)\\s+(?:from\\s+)?${qualifiers}${targets}\\b`,
+  );
+  const without = new RegExp(`\\b(?:without|with no|using no)\\s+${qualifiers}${targets}\\b`);
+  const terse = new RegExp(`(?:^|[.!?;:]\\s*)no\\s+${qualifiers}${targets}\\b`);
+  const ownKnowledge =
+    /\b(?:answer|respond|reply|work)\s+(?:only\s+)?(?:from|using)\s+(?:your\s+)?(?:own|general)\s+knowledge(?:\s+only)?\b/;
+  return direct.test(normalized) || without.test(normalized) || terse.test(normalized) || ownKnowledge.test(normalized);
+}
+
+/** Selected skill instructions are policy input too. */
+export function resolveTurnEvidencePolicy(
+  userRequest: string,
+  selectedSkillInstructions: string | null = null,
+): TurnEvidencePolicy {
+  return explicitlyProhibitsToolsOrSources(userRequest)
+    || (selectedSkillInstructions !== null
+      && explicitlyProhibitsToolsOrSources(selectedSkillInstructions))
+    ? "no-tools-no-sources"
+    : "normal";
+}
+
 /** `agent.rs::advertise_skills` — level 1 of skill progressive disclosure: the
  * block offering the room's enabled GENERAL skills at the top of every
  * question. Empty when there are none; a cut always SAYS it was cut, because
@@ -613,6 +655,11 @@ export const BASE_SYSTEM_PROMPT =
   'Scripts: a .py or .js file in the room can be Run with one click and scheduled. When you create or edit a runnable Python script that imports third-party packages, you MUST declare them inline so they install automatically on Run — the user should never have to pip install anything. Put a PEP-723 block at the very top:\n    # /// script\n    # dependencies = ["pandas", "yfinance"]\n    # ///\n' +
   '(a bare `# dependencies = ["pkg", ...]` line also works). List every third-party import; the standard library needs no declaration. Do not tell the user to run pip or create a venv — declaring the dependencies is how the install happens. When a script reads or writes room files, refer to each by its EXACT room file name (e.g. open("ETF Tracker.csv")); you MAY also list them under `# room-inputs:` / `# room-outputs:` for clarity, but you do not have to — the runner auto-copies any room file whose name appears in the script and saves back any it modifies in place (every write is versioned and undoable).';
 
+/** Minimal system boundary for a hard no-tools turn. It intentionally omits
+ * room settings, inventory, capability advertisements, and standing context. */
+export const NO_TOOLS_NO_SOURCES_SYSTEM_PROMPT =
+  "Answer the user's request without tools or sources. You cannot read files, attachments, room data, memories, the web, or connected services in this turn. Use only the user's request, general knowledge, and any explicitly selected skill instructions included with the request. Do not claim that you opened, searched, changed, or verified anything.";
+
 /** The web-access addition, appended only when the room's internet switch is
  * on (`agent.rs` lines ~949-958). */
 const WEB_ENABLED_ADDITION =
@@ -623,6 +670,7 @@ const INVENTORY_TRAILER =
 
 /** Everything {@link buildSystemPrompt} needs beyond the byte-stable base. */
 export interface SystemPromptInputs {
+  evidencePolicy?: TurnEvidencePolicy;
   webEnabled: boolean;
   /** Connected MCP servers with at least one served tool — the `state.mcp`
    * disclosure sentence. See `gatherContext.ts`'s `connectedMcpServers` dep. */
@@ -639,6 +687,9 @@ export interface SystemPromptInputs {
 /** `agent.rs`'s system-prompt assembly (the `let mut system = …` block, lines
  * ~898-1046) — pure, so its byte-stability can be pinned by a test. */
 export function buildSystemPrompt(inputs: SystemPromptInputs): string {
+  if (inputs.evidencePolicy === "no-tools-no-sources") {
+    return NO_TOOLS_NO_SOURCES_SYSTEM_PROMPT;
+  }
   let system = BASE_SYSTEM_PROMPT;
   if (inputs.webEnabled) {
     system += WEB_ENABLED_ADDITION;

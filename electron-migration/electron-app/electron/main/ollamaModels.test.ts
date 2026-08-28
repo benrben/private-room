@@ -266,10 +266,13 @@ describe("chatModelSeesImages", () => {
     expect(await chatModelSeesImages("nomic-embed-text:latest", deps)).toBe(false);
   });
 
-  it("a cloud CLI is a subprocess with no image channel at all", async () => {
+  it("cloud CLI image channels answer per engine, catalog-free", async () => {
     const deps = fakeVisionDeps(new Map());
-    expect(await chatModelSeesImages("claude-cli", deps)).toBe(false);
-    expect(await chatModelSeesImages("codex-cli::some-model::high", deps)).toBe(false);
+    // Claude and Codex gained real pixel channels (stream-json blocks / -i
+    // files, both live-verified); Antigravity's print mode still has none.
+    expect(await chatModelSeesImages("claude-cli", deps)).toBe(true);
+    expect(await chatModelSeesImages("codex-cli::some-model::high", deps)).toBe(true);
+    expect(await chatModelSeesImages("antigravity-cli::gemini-3.7-flash-high", deps)).toBe(false);
   });
 });
 
@@ -285,7 +288,11 @@ describe("groundingPick", () => {
   });
 
   it("is null when nothing installed can see, rather than a name we hope is multimodal", async () => {
-    expect(await groundingPick([], "claude-cli", pickDeps(new Map(), false))).toBeNull();
+    expect(await groundingPick([], "antigravity-cli", pickDeps(new Map(), false))).toBeNull();
+  });
+
+  it("a CLI room's own engine wins the grounding pick when the door is open", async () => {
+    expect(await groundingPick([], "claude-cli", pickDeps(new Map(), false))).toBe("claude-cli");
   });
 
   it("a capable cloud model is NOT picked when the privacy door would blind it", async () => {

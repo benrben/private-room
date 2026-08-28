@@ -120,6 +120,7 @@ function fullEffects(overrides: Partial<ToolEffects> = {}): ToolEffects {
     webSearchThrottled: false,
     advisorCalls: 0,
     pendingImages: [],
+    mediaFrames: [],
     visionChat: false,
     editOutcomes: [],
     runScoped: false,

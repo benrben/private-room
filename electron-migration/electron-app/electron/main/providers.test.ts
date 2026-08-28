@@ -41,6 +41,7 @@ import {
   parseOpenrouterModels,
   providerConnected,
   providerModelFacts,
+  providerModelSelectable,
   providerModelVision,
   providerRuntimeConfig,
   providerRuntimeConfigWire,
@@ -986,6 +987,11 @@ describe("catalog fetch over real HTTP", () => {
     expect(providerModelFacts("openrouter::vendor/alpha")?.imageOutput).toBe(true);
     expect(providerModelFacts("openrouter::vendor/beta")?.videoOutput).toBe(true);
     expect(providerModelVision("openrouter::vendor/beta")).toBe(false);
+    expect(providerModelSelectable("openrouter::vendor/zeta")).toBe(true);
+    // Supplementary public media rows are capability metadata, not proof that
+    // this account may select the ID for a chat/agent run.
+    expect(providerModelSelectable("openrouter::vendor/alpha")).toBe(false);
+    expect(providerModelSelectable("openrouter::vendor/beta")).toBe(false);
   });
 
   it("a real 401 response rejects the key and turns providerConnected false", async () => {

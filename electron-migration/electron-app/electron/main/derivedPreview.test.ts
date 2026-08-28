@@ -12,6 +12,7 @@ import {
   libraryFileCount,
   listFiles,
   listLibraryFiles,
+  listPublicFiles,
   listTrashedFiles,
   markDerivedPreview,
   restoreFile,
@@ -53,11 +54,18 @@ describe("derived preview database lifecycle", () => {
       const original = insertFile(room.db, "camera.raw", "image/x-raw", Buffer.from("raw"), null, "upload");
       const preview = insertFile(room.db, "camera-preview.jpg", "image/jpeg", Buffer.from("jpg"), "pixels", "derived-preview");
       const report = insertFile(room.db, "camera-report.md", "text/markdown", Buffer.from("report"), "report", "generated");
+      const sketch = insertFile(room.db, "flow.sketch", "application/x-arcelle-sketch", Buffer.from("{}"), "{}", "sketch");
       markDerivedPreview(room.db, preview.id, original.id);
       setDerivedFrom(room.db, report.id, original.id);
+      room.db.prepare("UPDATE files SET library_visibility = 'sectionOnly' WHERE id = ?").run(sketch.id);
 
       expect(listFiles(room.db).map((file) => file.id)).toContain(preview.id);
+      expect(listPublicFiles(room.db).map((file) => file.id)).toEqual(
+        expect.arrayContaining([original.id, report.id, sketch.id]),
+      );
+      expect(listPublicFiles(room.db).map((file) => file.id)).not.toContain(preview.id);
       expect(listLibraryFiles(room.db).map((file) => file.id)).toEqual(expect.arrayContaining([original.id, report.id]));
+      expect(listLibraryFiles(room.db).map((file) => file.id)).not.toContain(sketch.id);
       expect(listLibraryFiles(room.db).map((file) => file.id)).not.toContain(preview.id);
       expect(libraryFileCount(room.db)).toBe(2);
       expect(getDerivedPreview(room.db, original.id)?.id).toBe(preview.id);

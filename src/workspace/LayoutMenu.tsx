@@ -68,6 +68,7 @@ export default function LayoutMenu({
               Panes
             </div>
             <MenuCheck
+              testId="layout-toggle-library"
               label={sidebarTitle}
               hint="⌘1"
               icon={<PanelLeftIcon size={14} />}
@@ -78,6 +79,7 @@ export default function LayoutMenu({
               }}
             />
             <MenuCheck
+              testId="layout-toggle-assistant"
               label="Assistant"
               hint="⌘2"
               icon={<PanelRightIcon size={14} />}
@@ -88,6 +90,7 @@ export default function LayoutMenu({
               }}
             />
             <MenuCheck
+              testId="layout-toggle-focus"
               label="Focus the workspace"
               hint={focused ? "Esc to leave" : undefined}
               icon={<FocusIcon size={14} />}
@@ -148,12 +151,14 @@ export default function LayoutMenu({
  * `aria-hidden`, because `aria-checked` already carries it and a reader
  * announcing both would say it twice. */
 function MenuCheck({
+  testId,
   label,
   hint,
   icon,
   checked,
   onClick,
 }: {
+  testId: string;
   label: string;
   hint?: string;
   icon: React.ReactNode;
@@ -163,6 +168,7 @@ function MenuCheck({
   return (
     <button
       className="pop-item"
+      data-testid={testId}
       role="menuitemcheckbox"
       aria-checked={checked}
       onClick={onClick}

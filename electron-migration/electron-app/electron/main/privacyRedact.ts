@@ -379,6 +379,7 @@ export class Redactor {
   private readonly ruleCount: number;
   private readonly redactMatcher: PatternMatcher | null;
   private readonly restoreMatcher: PatternMatcher | null;
+  private readonly longestRedactPattern: number;
 
   /**
    * `rules` is (real, placeholder) as the room stores them. Anything under the
@@ -404,6 +405,10 @@ export class Redactor {
       }
     }
     this.redactMatcher = PatternMatcher.build(redactPatterns);
+    this.longestRedactPattern = redactPatterns.reduce(
+      (longest, [real]) => Math.max(longest, real.length),
+      0,
+    );
 
     // Restore is built from the CANONICAL rules only: a placeholder must come
     // back as the room's own spelling, never a case variant of it.
@@ -434,9 +439,80 @@ export class Redactor {
     return mapJsonStrings(v, (s) => this.redact(s, report));
   }
 
+  /** Build a bounded real -> placeholder redactor for token streams.
+   *
+   * A protected value may cross any delta boundary. Redacting each delta on
+   * its own would release both halves unchanged. The stream holds only starts
+   * that still need more input before leftmost-longest matching can decide. */
+  stream(report: PrivacyReport): StreamRedactor {
+    return new StreamRedactor(
+      this.redactMatcher,
+      this.longestRedactPattern,
+      report,
+    );
+  }
+
   /** No usable rule survived the floor — the room has nothing to mask
    * mechanically. Ported from `Redactor::is_empty`. */
   isEmpty(): boolean {
     return this.ruleCount === 0;
+  }
+}
+
+/** Stream-safe counterpart to {@link Redactor.redact}.
+ *
+ * Constructed by {@link Redactor.stream}, which owns the compiled matcher and
+ * knows the true longest case-expanded pattern. */
+export class StreamRedactor {
+  private buffer = "";
+  private readonly seen = new Set<string>();
+
+  constructor(
+    private readonly matcher: PatternMatcher | null,
+    private readonly longestPattern: number,
+    private readonly report: PrivacyReport,
+  ) {}
+
+  /** Redact one delta and return only text that is safe to display now. */
+  feed(delta: string): string {
+    if (this.matcher === null || this.longestPattern === 0) return delta;
+    this.buffer += delta;
+    // A pattern beginning before this index already has its full maximum
+    // possible length in the buffer, so future input cannot change its match.
+    const decidedStarts = this.buffer.length - this.longestPattern + 1;
+    return decidedStarts > 0 ? this.drain(decidedStarts) : "";
+  }
+
+  /** Release the final bounded suffix at the end of a stream. */
+  flush(): string {
+    if (this.matcher === null || this.buffer === "") return "";
+    return this.drain(Number.POSITIVE_INFINITY);
+  }
+
+  /** Drop an unfinished suffix when the UI starts a replacement model round. */
+  reset(): void {
+    this.buffer = "";
+  }
+
+  private drain(decidedStarts: number): string {
+    let out = "";
+    let consumed = 0;
+    while (consumed < this.buffer.length && consumed < decidedStarts) {
+      const match = this.matcher!.longestMatchAt(this.buffer, consumed);
+      if (match === null) {
+        out += this.buffer[consumed]!;
+        consumed += 1;
+        continue;
+      }
+      out += match.becomes;
+      consumed += match.length;
+      this.report.replacements += 1;
+      if (!this.seen.has(match.becomes)) {
+        this.seen.add(match.becomes);
+        this.report.entitiesHidden += 1;
+      }
+    }
+    this.buffer = this.buffer.slice(consumed);
+    return out;
   }
 }

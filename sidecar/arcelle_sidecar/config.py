@@ -130,6 +130,9 @@ class RunRequest(BaseModel):
     mcp: McpConfig | None = None
     routing: Routing | None = None
     web_enabled: bool = False
+    #: Host-authoritative hard boundary. ``none`` means an empty catalog is
+    #: intentional: do not list, plan, delegate, or call any tool.
+    tool_policy: Literal["auto", "none"] = "auto"
     max_rounds: int | None = None
     #: Whole-ask runaway net across the delegation tree
     #: (:data:`TURN_ROUND_BACKSTOP` when absent). 0 or negative disables it.

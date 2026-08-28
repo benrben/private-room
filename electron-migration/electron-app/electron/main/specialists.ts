@@ -45,6 +45,12 @@ export interface Specialist {
   area: string;
   /** The full catalog sentence: what it can actually be asked for. */
   description: string;
+  /** Effective ability after provider and privacy policy are applied. */
+  capability?: "full" | "inspect-only" | "unavailable";
+  /** Plain-language explanation shown before the user dispatches this tag. */
+  capabilityReason?: string;
+  /** True when changing to an on-device model restores the blocked actions. */
+  localHandoff?: boolean;
 }
 
 function isRecord(v: unknown): v is Record<string, unknown> {
@@ -119,6 +125,11 @@ export interface ListSpecialistsDeps {
   /** `room_mcp::room_tool_names` (scoped by `sidecar::bridge_scope_for(model)`)
    * — the tool names this room's bridge would serve right now. */
   servedToolNames(model: string, webEnabled: boolean): string[];
+  /** The catalog after provider/privacy policy is applied. Optional for legacy
+   * callers; production supplies it so list and call expose the same tools. */
+  effectiveServedToolNames?(model: string, webEnabled: boolean): string[];
+  /** Tool ownership from the shared agent manifest. */
+  agentToolNames?(agentId: string): readonly string[];
   /** `sidecar_json("/agents", body)` — POSTs `{web_enabled, served_names}`
    * and resolves with the parsed JSON body's `agents` field (or throws/rejects
    * on a transport failure, mirroring `.map_err(|e| e.sentinel(None))`). */
@@ -142,7 +153,45 @@ export async function listSpecialists(
   const served = deps.servedToolNames(model, webEnabled);
   const value = await deps.fetchAgents({ web_enabled: webEnabled, served_names: served });
   const agents = isRecord(value) ? value.agents : undefined;
-  return parseSpecialists(agents);
+  const roster = parseSpecialists(agents);
+  const effective = deps.effectiveServedToolNames?.(model, webEnabled);
+  if (effective === undefined || deps.agentToolNames === undefined) return roster;
+
+  const effectiveSet = new Set(effective);
+  const removed = new Set(served.filter((name) => !effectiveSet.has(name)));
+  if (removed.size === 0) return roster;
+
+  // Ask the same registry a second time with the effective catalog. This is
+  // important for agents such as App whose read and action tools are a paired
+  // runtime requirement: merely seeing one read-like tool in the manifest
+  // does not prove that an inspect-only worker can actually start.
+  const effectiveValue = await deps.fetchAgents({
+    web_enabled: webEnabled,
+    served_names: effective,
+  });
+  const effectiveAgents = parseSpecialists(
+    isRecord(effectiveValue) ? effectiveValue.agents : undefined,
+  );
+  const reachable = new Set(effectiveAgents.map((specialist) => specialist.agent));
+
+  return roster.map((specialist) => {
+    const affected = deps.agentToolNames!(specialist.agent).some((name) => removed.has(name));
+    if (!affected) return specialist;
+    if (!reachable.has(specialist.agent)) {
+      return {
+        ...specialist,
+        capability: "unavailable" as const,
+        capabilityReason: `Cloud Privacy blocks the action tools required by *${specialist.key}. Switch to On this Mac to use this specialist.`,
+        localHandoff: true,
+      };
+    }
+    return {
+      ...specialist,
+      capability: "inspect-only" as const,
+      capabilityReason: `Cloud Privacy lets *${specialist.key} inspect, but blocks its direct action tools. Switch to On this Mac to use those actions.`,
+      localHandoff: true,
+    };
+  });
 }
 
 // -------------------------------------------------------------------- cancel

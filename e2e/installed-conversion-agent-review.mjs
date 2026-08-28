@@ -5,6 +5,7 @@ import { createRequire } from "node:module";
 import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { resolveInstalledOllamaModel } from "./helpers/installedAgentModel.mjs";
 
 const requireFromElectron = createRequire(
   new URL("../electron-migration/electron-app/package.json", import.meta.url),
@@ -14,9 +15,9 @@ const { _electron: electron } = requireFromElectron("playwright");
 const appPath = process.env.ARCELLE_INSTALLED_APP || "/Applications/Arcelle.app";
 const executablePath = path.join(appPath, "Contents", "MacOS", "Arcelle");
 const provider = process.env.ARCELLE_AGENT_PROVIDER || "ollama-local";
-const model = process.env.ARCELLE_AGENT_MODEL
-  || process.env.ARCELLE_LOCAL_AGENT_MODEL
-  || (provider === "ollama-local" ? "qwen3.5:4b-mlx" : undefined);
+const configuredModel = process.env.ARCELLE_AGENT_MODEL
+  || process.env.ARCELLE_LOCAL_AGENT_MODEL;
+let model = configuredModel;
 const privacyMode = process.env.ARCELLE_AGENT_PRIVACY_MODE
   || (provider === "ollama-local" ? "local" : "cloud-direct");
 const expectedHarness = {
@@ -24,7 +25,7 @@ const expectedHarness = {
   codex: "codex-app-server",
   claude: "claude-agent-sdk",
 }[provider];
-if (!model) {
+if (!model && provider !== "ollama-local") {
   throw new Error("Set ARCELLE_AGENT_MODEL when reviewing a non-local provider.");
 }
 const password = "converted-agent-review-password";
@@ -99,6 +100,12 @@ try {
   await invoke(window, "open_room", { path: workspacePath, password });
   log("legacy room converted and opened as a normal-files workspace");
 
+  if (provider === "ollama-local") {
+    const ai = await invoke(window, "ai_status");
+    model = resolveInstalledOllamaModel(ai, configuredModel);
+    log(`using installed local Ollama model ${model}`);
+  }
+
   const capabilities = await invoke(window, "harness_capabilities");
   assert.equal(capabilities.roomFormat, "workspace-folder");
   assert.equal(capabilities.providers[provider].enabled, true, JSON.stringify(capabilities.providers[provider]));
@@ -169,7 +176,7 @@ try {
     "Use your own workspace file tools and complete every operation below. " +
       "(1) Append the exact line REAL AGENT EDIT CONFIRMED. to notes.txt. " +
       "(2) Create Organized/new-file.txt containing exactly NEW FILE CONFIRMED. followed by a newline. " +
-      "(3) Rename rename-me.txt to Organized/renamed.txt without changing its bytes. " +
+      "(3) Rename rename-me.txt to renamed.txt in the workspace root without changing its bytes. " +
       "(4) Move move-me.txt to Archive/move-me.txt without changing its bytes. " +
       "Do not change any other file. Complete the file operations; do not only describe them.",
   );
@@ -180,7 +187,7 @@ try {
     /REAL AGENT EDIT CONFIRMED/,
   );
   assert.equal(await readFile(path.join(workspacePath, "Organized", "new-file.txt"), "utf8"), "NEW FILE CONFIRMED.\n");
-  assert.equal(await readFile(path.join(workspacePath, "Organized", "renamed.txt"), "utf8"), "Rename baseline.\n");
+  assert.equal(await readFile(path.join(workspacePath, "renamed.txt"), "utf8"), "Rename baseline.\n");
   assert.equal(await readFile(path.join(workspacePath, "Archive", "move-me.txt"), "utf8"), "Move baseline.\n");
   assert.equal(await missing(path.join(workspacePath, "rename-me.txt")), true);
   assert.equal(await missing(path.join(workspacePath, "move-me.txt")), true);
@@ -210,7 +217,7 @@ try {
   assert.equal(await readFile(path.join(workspacePath, "move-me.txt"), "utf8"), "Move baseline.\n");
   assert.equal(await readFile(path.join(workspacePath, "delete-me.txt"), "utf8"), "Delete baseline.\n");
   assert.equal(await missing(path.join(workspacePath, "Organized", "new-file.txt")), true);
-  assert.equal(await missing(path.join(workspacePath, "Organized", "renamed.txt")), true);
+  assert.equal(await missing(path.join(workspacePath, "renamed.txt")), true);
   assert.equal(await missing(path.join(workspacePath, "Archive", "move-me.txt")), true);
   assert.equal(await readFile(privateCanaryPath, "utf8"), "PRIVATE CANARY\n");
   assert.deepEqual(pageErrors, []);

@@ -1,7 +1,11 @@
 import { useEffect, useState } from "react";
 import { api } from "../api";
 import { CircleCheckIcon } from "../icons";
-import { configureMic, micVoiceProcessing } from "../workspace/liveRec";
+import {
+  configureMic,
+  micVoiceProcessing,
+  micVoiceProcessingFromSetting,
+} from "../workspace/liveRec";
 
 /** GH #4 — microphone clean-up, and the one thing about it a user can decide.
  *
@@ -10,8 +14,8 @@ import { configureMic, micVoiceProcessing } from "../workspace/liveRec";
  * microphone hear that as their own volume dropping. The remaining voice
  * processing (echo cancellation + noise suppression) earns its keep on
  * speakers, but it also takes the device into macOS's voice-processing mode.
- * It therefore defaults off so Teams, Slack, Zoom and Meet retain the shared
- * input unchanged; users recording through speakers can opt in. */
+ * It defaults off so another app retains its normal microphone session;
+ * speaker users can opt in when they need echo cleanup. */
 export default function MicSection() {
   const [on, setOn] = useState(micVoiceProcessing());
   const [saved, setSaved] = useState(false);
@@ -20,7 +24,7 @@ export default function MicSection() {
     void api
       .getSetting("mic_voice_processing")
       .then((v) => {
-        const next = v === "1";
+        const next = micVoiceProcessingFromSetting(v);
         setOn(next);
         configureMic(next);
       })
@@ -44,9 +48,9 @@ export default function MicSection() {
       <h3>Microphone</h3>
       <p className="settings-hint">
         Applies to recordings and dictation. Arcelle never changes your
-        microphone's input level — your other apps keep the volume you set for
-        them. Cleanup starts off so Teams, Slack, Zoom, and Meet can continue
-        using the microphone normally while Arcelle records.
+        microphone's input level — automatic gain control stays off, so your
+        other apps keep the volume you set for them. Cleanup starts off so a
+        new room does not take over macOS voice processing.
       </p>
 
       <label className="rec-opt">

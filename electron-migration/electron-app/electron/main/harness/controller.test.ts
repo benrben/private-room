@@ -3,7 +3,15 @@ import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type Database from "better-sqlite3-multiple-ciphers";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("../modelCatalogSurfaceIpc.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../modelCatalogSurfaceIpc.js")>();
+  return {
+    ...actual,
+    validateModelSelection: vi.fn(async () => ({ selectable: true, reason: null })),
+  };
+});
 import { Redactor, type PrivacyRule } from "../privacyRedact.js";
 import { createRoomManagerState } from "../roomManager.js";
 import { createWorkspaceRoom, openWorkspaceRoom } from "../workspace/roomLayout.js";
@@ -165,6 +173,33 @@ describe("HarnessController", () => {
       }
     },
   );
+
+  it("does not send a failed exact model ID to the provider runtime", async () => {
+    const f = await fixture();
+    try {
+      const runtime = new CapturingRuntime();
+      const controller = new HarnessController(f.state, f.root, () => undefined, {
+        runtimes: { "ollama-cloud": runtime },
+        flag: () => true,
+        outsideWorkspaceIsolation: false,
+        listOllamaModels: async () => ["bad:cloud"],
+        validateModelSelection: async () => ({
+          selectable: false,
+          reason: "Ollama could not validate the exact model ID “bad:cloud”.",
+        }),
+      });
+      await expect(controller.start({
+        provider: "ollama-cloud",
+        model: "bad:cloud",
+        privacyMode: "cloud-direct",
+        writeEnabled: false,
+        text: "review",
+      })).rejects.toThrow("exact model ID “bad:cloud”");
+      expect(runtime.starts).toBe(0);
+    } finally {
+      f.created.db.close();
+    }
+  });
 
   it.each([
     {

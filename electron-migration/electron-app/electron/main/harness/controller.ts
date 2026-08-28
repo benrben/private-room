@@ -32,6 +32,7 @@ import {
 } from "./runProtection.js";
 import { nativeWorkspaceSandboxSupported, verifyNativeHarnessExecutable } from "./seatbelt.js";
 import { nativeCliExecutable, nativeHarnessModel } from "./nativeCli.js";
+import { validateModelSelection } from "../modelCatalogSurfaceIpc.js";
 import { createNativeRoomMcpFactory } from "./nativeRoomMcp.js";
 import type {
   ApprovalDecision,
@@ -93,6 +94,7 @@ export interface HarnessControllerOptions {
   ) => Promise<boolean>;
   outsideWorkspaceIsolation?: boolean;
   listOllamaModels?: () => Promise<string[]>;
+  validateModelSelection?: typeof validateModelSelection;
 }
 
 /** Trusted bridge between room state, provider runtimes and renderer events. */
@@ -102,6 +104,7 @@ export class HarnessController {
   private readonly flag: (name: WorkspaceHarnessFlag) => boolean;
   private readonly verifyExposure: NonNullable<HarnessControllerOptions["verifyExposure"]>;
   private readonly listOllamaModels: () => Promise<string[]>;
+  private readonly validateModelSelection: typeof validateModelSelection;
   private isolationProven: boolean;
   private readonly mirrors = new Map<string, MirrorRun>();
   private readonly pendingMirrorApprovals = new Map<string, PendingMirrorApproval>();
@@ -154,6 +157,7 @@ export class HarnessController {
     this.policy = options.policy ?? activePolicy;
     this.flag = options.flag ?? workspaceHarnessFlag;
     this.listOllamaModels = options.listOllamaModels ?? listOllamaModels;
+    this.validateModelSelection = options.validateModelSelection ?? validateModelSelection;
     this.verifyExposure = options.verifyExposure ?? (async (workspacePath, provider, runtimePath, writeEnabled) => {
       const runtime = this.runtimes[provider];
       if (runtime.verifyExposure !== undefined) {
@@ -354,6 +358,12 @@ export class HarnessController {
     }
     if (room.readOnly === true) {
       throw new Error("Agent runs are unavailable because another Arcelle process owns the workspace writer lease.");
+    }
+    if (!native) {
+      const validation = await this.validateModelSelection(request.provider, selectedModel);
+      if (!validation.selectable) {
+        throw new Error(validation.reason ?? `The exact ${request.provider} model ID is unavailable.`);
+      }
     }
     const runId = randomUUID();
     const runRuntimePath = path.join(this.runtimeRoot(), room.descriptor.roomId, runId);

@@ -134,17 +134,19 @@ describe("post-QA round", () => {
 
   it("a file opened from the browser does not claim browser context", async () => {
     await open("dark");
-    // The reader's own route: a file is open, they step into the browser, then
-    // come back to the document's tab. Activating a file tab deliberately does
-    // NOT change the area (Workspace.tsx), so the browser stays the place —
-    // which is precisely the state that used to mislabel the document.
-    await openFile("Ideas.md");
+    // Reproduce the real cross-area route: an agent asks Arcelle to open a
+    // room file while the private browser is the active destination. Document
+    // tabs intentionally exist only on Home now, and their keyboard shortcuts
+    // intentionally do nothing in Browser, so waiting for/calling a hidden
+    // `.tab` here tested UI that no longer exists rather than this context rule.
     await goArea("browser");
-    await $(".tab").waitForExist({ timeout: 10_000 });
-    // ⌥⌘1 rather than a click: this asserts the CONTEXT, and a click also
-    // exercises the strip's hit targets, which the tab-width test owns.
-    await browser.keys(["Alt", "Meta", "1"]);
-    await browser.pause(1200);
+    await $(".browser-area").waitForExist({ timeout: 10_000 });
+    const listeners = await browser.execute(() =>
+      window.__qaEmit?.("agent-open-file", { id: "f-ideas" }) ?? 0,
+    );
+    if (listeners < 1) {
+      throw new Error("the QA page has no agent-open-file subscriber");
+    }
     const crumb = await $(".editor-breadcrumb");
     await crumb.waitForExist({ timeout: 10_000 });
     const trail = (await crumb.getText()).replace(/\s+/g, " ");
@@ -153,12 +155,18 @@ describe("post-QA round", () => {
     }
     // The left pane must be the library again, not the browser's navigator.
     const heading = await $(".pane-heading");
+    await browser.waitUntil(
+      async () => !/private browser/i.test(await heading.getText()),
+      { timeout: 10_000, timeoutMsg: "the file open did not leave Browser context" },
+    );
     const where = await heading.getText();
     if (/private browser/i.test(where)) {
       throw new Error(`the left pane still says: ${where}`);
     }
-    // …and the way back has to be on screen, since Escape is the only other one.
-    const back = await $(".crumb-back");
+    // …and the way back is the destination rail now. The old breadcrumb-back
+    // chip belonged to the invalid "file over Browser" mixed context and was
+    // removed when opening a document began moving the whole shell to Home.
+    const back = await $('.rail-button[data-area="browser"]');
     if (!(await back.isExisting())) {
       throw new Error("no way back to the browser is drawn");
     }

@@ -115,6 +115,21 @@ export class DeepAgentRuntime implements HarnessRuntime {
           });
           break;
         }
+        case "ask-step-status": {
+          const row = typeof value === "object" && value !== null ? value as Record<string, unknown> : {};
+          // Only ordinary room tools carry their exact name. Specialist asks
+          // intentionally do not: ask-report above is their one completion.
+          const tool = typeof row.tool === "string" ? row.tool.trim() : "";
+          if (tool === "") break;
+          const failed = row.ok !== true;
+          output.push({
+            type: "tool_completed",
+            runId: context.runId,
+            tool,
+            ...(failed ? { error: safeProviderFailure(context.provider, "tool") } : {}),
+          });
+          break;
+        }
         case "ask-token-usage": {
           const row = typeof value === "object" && value !== null ? value as Record<string, unknown> : {};
           output.push({

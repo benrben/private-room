@@ -27,6 +27,12 @@ class Message(TypedDict, total=False):
     tool_call_id: str
     #: user only: base64 PNGs (Ollama reads images from user turns).
     images: list[str]
+    #: user only, sidecar-internal: how many images the privacy door stripped
+    #: from this turn. Never on the wire to any engine — it exists so the
+    #: flattened-prompt path (`external_llm._user_turn`) can say honestly that
+    #: an asserted attachment was withheld rather than let the model describe
+    #: a picture it never received.
+    images_blocked: int
 
 
 def compact_json(value: Any) -> str:

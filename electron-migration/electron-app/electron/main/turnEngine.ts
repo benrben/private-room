@@ -79,6 +79,8 @@ import {
 import { compactHistory } from "./db-host/retrieval.js";
 import { getSetting } from "./db-host/settings.js";
 import { createToolEffects, effectsJson, type ToolEffects } from "./execTool.js";
+import { activePolicy as activePrivacyPolicy, policyPayload, type PolicyState } from "./privacy.js";
+import { emptyPrivacyReport, type StreamRedactor } from "./privacyRedact.js";
 import {
   handoffSummary as handoffSummaryReal,
   isAwake as isAwakeReal,
@@ -89,6 +91,7 @@ import {
   gatherContextAndSaveQuestionInRoom,
   modelSetting,
   parseTemperature,
+  turnEvidencePolicyForQuestion,
   type FirstImage,
   type GatherContextDeps,
   type QuestionContext,
@@ -293,6 +296,8 @@ export interface StreamAnswerRequest {
   effects: ToolEffects;
   webEnabled: boolean;
   advisorsOn: boolean;
+  /** Omitted by non-chat callers, which retain the normal tool policy. */
+  evidencePolicy?: QuestionContext["evidencePolicy"];
   cancel: CancelFlag;
   /** PRIV-1: the user confirmed sharing real values for THIS turn only. */
   privacyBypass: boolean;
@@ -329,6 +334,9 @@ export interface StreamAnswerDeps {
    * bypass that bypassed nothing would be its own small fabrication.
    */
   privacyActive?: () => boolean;
+  /** The active room policy, captured once for both the outbound /run door and
+   * the deterministic visible/stored answer boundary. */
+  privacyPolicy?: () => PolicyState | null;
   /** `agent.rs::background_work_live` — see `turnNotices.ts` for why the job
    * read is injected (no `db-host/jobs.ts` exists yet). */
   jobStatuses?: () => Array<{ status: string }> | undefined;
@@ -338,6 +346,35 @@ export interface StreamAnswerDeps {
  * sidecar stream. `sidecar.ts` polls its own `AbortSignal` at the same cadence,
  * so chaining the two does not worsen a Stop's end-to-end latency. */
 const CANCEL_BRIDGE_POLL_MS = 100;
+
+/** Redact only visible answer text while preserving the turn envelope.
+ *
+ * `ask-round` replaces the live answer, so its unfinished suffix must be
+ * discarded too; otherwise two different rounds could be joined into one
+ * apparent protected value. */
+function redactVisibleAnswerEvents(send: EventSender, redactor: StreamRedactor): EventSender {
+  return (event, payload) => {
+    if (event === "ask-round") {
+      redactor.reset();
+      send(event, payload);
+      return;
+    }
+    if (event !== "ask-delta") {
+      send(event, payload);
+      return;
+    }
+    if (typeof payload === "string") {
+      const visible = redactor.feed(payload);
+      if (visible !== "") send(event, visible);
+      return;
+    }
+    if (typeof payload !== "object" || payload === null) return;
+    const envelope = payload as Record<string, unknown>;
+    if (typeof envelope.v !== "string") return;
+    const visible = redactor.feed(envelope.v);
+    if (visible !== "") send(event, { ...envelope, v: visible });
+  };
+}
 
 /**
  * Bridge `cancel.ts`'s polled {@link CancelFlag} (Rust's `Arc<AtomicBool>`) to
@@ -393,11 +430,27 @@ function abortSignalFor(flag: CancelFlag): { signal: AbortSignal; stop: () => vo
  * connection keeps the partial the user watched arrive.
  */
 export async function streamAnswer(req: StreamAnswerRequest, deps: StreamAnswerDeps): Promise<string> {
+  const privacyPolicy = deps.privacyPolicy === undefined
+    ? activePrivacyPolicy()
+    : deps.privacyPolicy();
+  const privacyIsActive = privacyPolicy !== null || (deps.privacyActive?.() ?? false);
   // PRIV-1: an explicit bypass is loud — the transcript records that real
   // details were shared this once, whichever engine answers.
-  if (req.privacyBypass && (deps.privacyActive?.() ?? false)) {
+  if (req.privacyBypass && privacyIsActive) {
     req.turn.emit(deps.send, "ask-privacy", { bypassed: true });
   }
+
+  // ARC-002: output privacy is provider-independent. A local model can repeat
+  // a protected value just as easily as a cloud model can restore a placeholder
+  // in its reply. Holding the undecidable token suffix prevents a split value
+  // from flashing on screen before the final defensive redaction below.
+  const outputRedactor =
+    privacyPolicy !== null && !req.privacyBypass
+      ? privacyPolicy.redactor.stream(emptyPrivacyReport())
+      : null;
+  const visibleSend = outputRedactor === null
+    ? deps.send
+    : redactVisibleAnswerEvents(deps.send, outputRedactor);
 
   const advisors = req.advisorsOn ? await (deps.detectedAdvisors?.() ?? Promise.resolve([])) : [];
 
@@ -420,10 +473,15 @@ export async function streamAnswer(req: StreamAnswerRequest, deps: StreamAnswerD
         ollamaBaseUrl: (deps.resolvedBaseUrl ?? resolvedBaseUrlReal)(),
         mcp: req.mcp,
         webEnabled: req.webEnabled,
+        toolPolicy: req.evidencePolicy === "no-tools-no-sources" ? "none" : "auto",
         runId: req.turn.runId,
+        privacy:
+          privacyPolicy !== null && !req.privacyBypass
+            ? policyPayload(privacyPolicy)
+            : null,
         advisors,
       },
-      { turn: req.turn, onEvent: deps.send, signal: bridge.signal }
+      { turn: req.turn, onEvent: visibleSend, signal: bridge.signal }
     );
   } catch (err) {
     // Rust's `SidecarOutcome::Unavailable` arm — see this function's doc.
@@ -440,6 +498,16 @@ export async function streamAnswer(req: StreamAnswerRequest, deps: StreamAnswerD
   } finally {
     bridge.stop();
   }
+
+  if (outputRedactor !== null) {
+    const tail = outputRedactor.flush();
+    if (tail !== "") req.turn.emit(deps.send, "ask-delta", tail);
+  }
+
+  const redactFinal = (text: string): string =>
+    privacyPolicy !== null && !req.privacyBypass
+      ? privacyPolicy.redactor.redact(text, emptyPrivacyReport())
+      : text;
 
   // Merged on every outcome, mirroring `run_via_sidecar`'s own contract. A
   // `null` means "not reported this run" and must not erase what a bridge
@@ -460,13 +528,15 @@ export async function streamAnswer(req: StreamAnswerRequest, deps: StreamAnswerD
       // is a job from this turn still running — because "nothing was written.
       // Please try again." was a CLAIM, and it was false exactly when it
       // mattered (live QA 2026-07-30).
-      return emptyReplyNotice(
-        req.cancel.load(),
-        req.effects.wrote,
-        backgroundWorkLive(deps.jobStatuses ?? (() => undefined))
+      return redactFinal(
+        emptyReplyNotice(
+          req.cancel.load(),
+          req.effects.wrote,
+          backgroundWorkLive(deps.jobStatuses ?? (() => undefined))
+        )
       );
     }
-    return outcome.text;
+    return redactFinal(outcome.text);
   }
 
   // `failed`: a tool may already have committed a side effect this turn, and
@@ -480,7 +550,7 @@ export async function streamAnswer(req: StreamAnswerRequest, deps: StreamAnswerD
     out += "\n\n";
   }
   out += `*(The agent hit an error and stopped mid-run: ${outcome.error}. Any change shown here was already applied.)*`;
-  return out;
+  return redactFinal(out);
 }
 
 // -------------------------------------------------------------------- ask
@@ -533,6 +603,7 @@ export interface AskDeps {
   runViaSidecar?: typeof runViaSidecarReal;
   detectedAdvisors?: StreamAnswerDeps["detectedAdvisors"];
   privacyActive?: StreamAnswerDeps["privacyActive"];
+  privacyPolicy?: StreamAnswerDeps["privacyPolicy"];
   jobStatuses?: StreamAnswerDeps["jobStatuses"];
   /**
    * `models.rs::chat_model_sees_images` — can THIS engine read attached
@@ -586,6 +657,22 @@ export async function ask(req: AskRequest, deps: AskDeps): Promise<Message> {
   const cancel = node.flag();
   try {
     const turn = new TurnId(req.askId, req.chatId);
+    // One immutable policy decision for the whole turn. A settings change or
+    // room close while the model is running must not make its final suffix use
+    // a different entity map than its first streamed delta.
+    const turnPrivacyPolicy = deps.privacyPolicy === undefined
+      ? activePrivacyPolicy()
+      : deps.privacyPolicy();
+    const redactTurnText = (text: string): string =>
+      turnPrivacyPolicy !== null && !req.privacyBypass
+        ? turnPrivacyPolicy.redactor.redact(text, emptyPrivacyReport())
+        : text;
+
+    const room = deps.room.currentRoom();
+    if (room === null) {
+      throw new Error("No room is open.");
+    }
+    const evidencePolicy = turnEvidencePolicyForQuestion(room.db, req.question);
 
     // ADD-31: name the two hidden phases — waking the daemon, and searching
     // the room — instead of one anonymous 30-second "Thinking locally…".
@@ -596,17 +683,17 @@ export async function ask(req: AskRequest, deps: AskDeps): Promise<Message> {
     // "Searching your files…" must NOT be emitted before the embed below: a
     // warm daemon holding a COLD embed model shows no chip at all through that
     // 274 MB load, so each phase names itself as it begins.
-    turn.step(deps.send, "Preparing the search…");
-    // ADD-13: embed the request TEXT of an explicit `/skill` turn, never the
-    // slash command itself — `ask`'s own `.map(|(_, request)| request)`.
-    const skillRequest = explicitSkillRequest(req.question);
-    const embeddingQuestion = skillRequest !== null ? skillRequest.request : req.question.trim();
-    const questionEmbedding = deps.embedQuestion ? await deps.embedQuestion(embeddingQuestion) : null;
-    turn.step(deps.send, "Searching your files…");
-
-    const room = deps.room.currentRoom();
-    if (room === null) {
-      throw new Error("No room is open.");
+    let questionEmbedding: readonly number[] | null = null;
+    if (evidencePolicy === "no-tools-no-sources") {
+      turn.step(deps.send, "Answering without tools or room sources");
+    } else {
+      turn.step(deps.send, "Preparing the search…");
+      // ADD-13: embed the request TEXT of an explicit `/skill` turn, never the
+      // slash command itself — `ask`'s own `.map(|(_, request)| request)`.
+      const skillRequest = explicitSkillRequest(req.question);
+      const embeddingQuestion = skillRequest !== null ? skillRequest.request : req.question.trim();
+      questionEmbedding = deps.embedQuestion ? await deps.embedQuestion(embeddingQuestion) : null;
+      turn.step(deps.send, "Searching your files…");
     }
 
     // Phase 1 (locked): gather context, save the user message.
@@ -617,7 +704,11 @@ export async function ask(req: AskRequest, deps: AskDeps): Promise<Message> {
       req.attachments,
       questionEmbedding,
       req.viewing,
-      { connectedMcpServers: deps.connectedMcpServers, prepareImage: deps.prepareImage }
+      {
+        connectedMcpServers: deps.connectedMcpServers,
+        prepareImage: deps.prepareImage,
+        evidencePolicy,
+      }
     );
 
     // Live-QA 2026-07-23: a PURE "save that as a file" turn is deterministic —
@@ -625,7 +716,11 @@ export async function ask(req: AskRequest, deps: AskDeps): Promise<Message> {
     // The 4B model failed this twice (asked for the content, then fabricated a
     // different document without calling create_file), so CODE does it and the
     // model gets no vote. Attachments or transform verbs fall through.
-    if (req.attachments.length === 0 && isPureSaveReference(req.question)) {
+    if (
+      evidencePolicy === "normal"
+      && req.attachments.length === 0
+      && isPureSaveReference(req.question)
+    ) {
       const prev = lastRealAssistantReply(room.db, req.chatId);
       if (prev !== null) {
         const name = requestedFileName(req.question) ?? "Saved answer";
@@ -636,7 +731,7 @@ export async function ask(req: AskRequest, deps: AskDeps): Promise<Message> {
           // Best-effort, matching Rust's `let _ = app.emit(...)`.
         }
         turn.step(deps.send, "Saved to the room");
-        const text = `Saved your previous answer to the room as "${meta.name}".`;
+        const text = redactTurnText(`Saved your previous answer to the room as "${meta.name}".`);
         turn.emit(deps.send, "ask-delta", text);
         const fx = createToolEffects();
         fx.wrote = true;
@@ -672,6 +767,7 @@ export async function ask(req: AskRequest, deps: AskDeps): Promise<Message> {
         effects,
         webEnabled: ctx.webEnabled,
         advisorsOn: ctx.advisorsOn,
+        evidencePolicy: ctx.evidencePolicy,
         cancel,
         privacyBypass: req.privacyBypass,
         turn,
@@ -683,6 +779,7 @@ export async function ask(req: AskRequest, deps: AskDeps): Promise<Message> {
         resolvedBaseUrl: deps.resolvedBaseUrl,
         detectedAdvisors: deps.detectedAdvisors,
         privacyActive: deps.privacyActive,
+        privacyPolicy: () => turnPrivacyPolicy,
         jobStatuses: deps.jobStatuses,
       }
     );
@@ -724,6 +821,7 @@ export async function ask(req: AskRequest, deps: AskDeps): Promise<Message> {
       }
       content += " *(stopped)*";
     }
+    content = redactTurnText(content);
 
     // ADD-23: viewer effects ride the message's own `effects` column as
     // structured data — the visible answer stays plain prose.

@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useRef } from "react";
 import { listen, onDragDropEvent, setWindowTitle } from "../platform";
 import { api, AskTurn, RoomInfo } from "../api";
-import { configureMic, stopMicTap } from "./liveRec";
+import { configureMic, micVoiceProcessingFromSetting, stopMicTap } from "./liveRec";
 import { handleAgentUiRequest } from "../agent/driver";
 import { annotationTarget } from "./markup";
 import { MEMORY_INTRO_SEEN } from "./constants";
@@ -12,6 +12,7 @@ import { ownerOf as ownsEvent } from "./runIdentity";
 import { applyRecState } from "./recSession";
 import { startRecordingTransport } from "./recordingTransport";
 import { applyHarnessEvent, mergeHarnessHistory } from "./harnessUi";
+import { refreshSharedFilesForHarnessEvent } from "./harnessFileRefresh";
 
 /** How many of the assistant's organization changes Activity keeps. A record of
  * this session, not an archive — the transcript is where every one of them is
@@ -436,9 +437,7 @@ export function useWorkspaceEffects(
     const unlistenHarness = api.onHarnessEvent((event) => {
       s.setHarnessRuns((runs) => applyHarnessEvent(runs, event));
       if (event.type === "approval_requested") s.setAiTab("activity");
-      if (event.type === "file_changed") {
-        api.listFiles().then(s.setFiles).catch(() => {});
-      }
+      void refreshSharedFilesForHarnessEvent(event, api.listFiles, s.setFiles).catch(() => {});
       if (event.type === "run_failed") {
         s.pushToast("error", `Agent run failed: ${event.error}`);
       }
@@ -470,13 +469,12 @@ export function useWorkspaceEffects(
         });
       })
       .catch(() => {});
-    // GH #30: microphone clean-up is off unless the user opted in. macOS voice
-    // processing can reconfigure the shared input underneath Teams/Slack.
-    // Cached in
+    // GH #4/#30: a new room leaves voice processing off; a saved literal "1"
+    // enables speaker echo cleanup. Cached in
     // liveRec because acquireMic can't await IPC without losing the gesture.
     void api
       .getSetting("mic_voice_processing")
-      .then((v) => configureMic(v === "1"))
+      .then((v) => configureMic(micVoiceProcessingFromSetting(v)))
       .catch(() => {});
     // Idea 3: the spoken voice's per-room config + the hands-free re-arm.
     void Promise.all([

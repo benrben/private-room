@@ -18,7 +18,11 @@ import { listModels, resolvedBaseUrl } from "./engineRouting.js";
 import { bestDefault } from "./turnContext.js";
 import { bestLocalDefault } from "./ollamaModels.js";
 import { declaredFor, engineCapabilities, enginePreflight, engineSupportMatrix } from "./capabilities.js";
-import { roomToolNamesWith, WEB_LANES_ALL } from "./bridgeDispatcher.js";
+import {
+  effectiveRoomToolNamesWith,
+  roomToolNamesWith,
+  WEB_LANES_ALL,
+} from "./bridgeDispatcher.js";
 import { webAccessEnabled } from "./browser/webAccess.js";
 import { modelSetting } from "./gatherContext.js";
 import { CancelFlag } from "./cancel.js";
@@ -37,10 +41,56 @@ import {
 } from "./privacy.js";
 import type { EventSender } from "./turn.js";
 import { detectedExternal } from "./externalDetection.js";
+import { liveMcpRoutes } from "./liveAppServices.js";
+import type { McpRoute } from "./toolSpecs.js";
+import { loadAgentManifest } from "./harness/agentManifest.js";
 
 export interface CoreSurfaceHost {
   appVersion(): string;
   osVersion(): string;
+}
+
+/**
+ * The exact bridge catalog used to decide which specialists are reachable.
+ * Keep this small seam exported so the installed-roster contract can prove
+ * that a live connector enables the Connector specialist while a room with no
+ * connected routes still advertises nothing it cannot run.
+ */
+export function specialistServedToolNames(
+  model: string,
+  webEnabled: boolean,
+  routes: readonly McpRoute[],
+): string[] {
+  return roomToolNamesWith(
+    webEnabled,
+    WEB_LANES_ALL,
+    declaredFor(model).tier,
+    routes,
+  );
+}
+
+/** The discovery catalog after the same Cloud Privacy door as tools/list. */
+export function specialistEffectiveToolNames(
+  model: string,
+  webEnabled: boolean,
+  routes: readonly McpRoute[],
+  cloudPrivacyActive: boolean,
+): string[] {
+  return effectiveRoomToolNamesWith(
+    webEnabled,
+    WEB_LANES_ALL,
+    declaredFor(model).tier,
+    routes,
+    cloudPrivacyActive,
+  );
+}
+
+/** Resolve connector routes lazily from the manager owned by app bootstrap. */
+export function specialistMcpRoutes(
+  state: RoomManagerState,
+  roomDeps: RoomManagerDeps,
+): McpRoute[] {
+  return roomDeps.mcp === undefined ? [] : liveMcpRoutes(state, roomDeps.mcp);
 }
 
 function args(value: unknown): Record<string, unknown> {
@@ -113,7 +163,22 @@ export function registerCoreSurfaceIpc(
       {
         listModels,
         bestDefault,
-        servedToolNames: (model, web) => roomToolNamesWith(web, WEB_LANES_ALL, declaredFor(model).tier, []),
+        // Read the manager at invocation time: connector connections and tool
+        // preferences can change while the room stays open. A startup snapshot
+        // would make the menu stale until the next room open.
+        servedToolNames: (model, web) => specialistServedToolNames(
+          model,
+          web,
+          specialistMcpRoutes(state, roomDeps),
+        ),
+        effectiveServedToolNames: (model, web) => specialistEffectiveToolNames(
+          model,
+          web,
+          specialistMcpRoutes(state, roomDeps),
+          activePolicy() !== null,
+        ),
+        agentToolNames: (agentId) =>
+          loadAgentManifest().agents.find((agent) => agent.id === agentId)?.tools ?? [],
         fetchAgents: (body) => sidecarValue("/agents", body),
       },
     );

@@ -205,8 +205,9 @@ export interface EngineDecl {
   readonly local: boolean;
   readonly streaming: Support;
   /** Is there a channel to hand this engine PIXELS at all? Distinct from
-   * whether the model can see: `generate_external` takes no images, so a cloud
-   * CLI is blind to us even when the model behind it is not. */
+   * whether the model can see: Antigravity's print mode takes no images, so it
+   * is blind to us even when the model behind it is not. (Claude and Codex
+   * gained real channels 2026-08-27 — stream-json blocks and `-i` files.) */
   readonly imageChannel: boolean;
   readonly toolCalling: Support;
   readonly structuredOutput: Support;
@@ -258,42 +259,49 @@ export const OLLAMA_CLOUD: EngineDecl = {
   tier: primaryCliScope(),
 };
 
-/** Claude Code as the room's engine. A one-shot `claude -p` subprocess: the
- * sidecar hands its whole reply back as ONE delta at the end, there is no image
- * channel, and its structured replies are recovered rather than constrained. It
- * DOES call tools — through the room's MCP bridge, which is why it is a
- * `CloudEngine` and not an advisor. */
+/** Claude Code as the room's engine. A `claude -p` subprocess in its streamed
+ * NDJSON envelope: `--include-partial-messages` carries live text deltas the
+ * sidecar forwards as they arrive (2026-08-27), and images ride
+ * `--input-format stream-json` as base64 content blocks — the pixel channel a
+ * tool-less CLI has (live-verified: a staged red PNG answered "Red"). Its
+ * structured replies are still recovered rather than constrained. It DOES call
+ * tools — through the room's MCP bridge, which is why it is a `CloudEngine`
+ * and not an advisor. */
 export const CLAUDE_CLI: EngineDecl = {
   id: "claude-cli",
   label: "Claude Code",
   local: false,
-  streaming: "no",
-  imageChannel: false,
+  streaming: "yes",
+  imageChannel: true,
   toolCalling: "yes",
   structuredOutput: "no",
   tier: primaryCliScope(),
 };
 
-/** Codex as the room's engine — same transport shape as {@link CLAUDE_CLI}. */
+/** Codex as the room's engine. Its exec stream has no token deltas, but each
+ * completed agent message is forwarded live as one delta (message-granular
+ * streaming), and images ride staged temp files via `-i` — verified live under
+ * the exact sandbox flags the chat path pins. */
 export const CODEX_CLI: EngineDecl = {
   id: "codex-cli",
   label: "Codex",
   local: false,
-  streaming: "no",
-  imageChannel: false,
+  streaming: "yes",
+  imageChannel: true,
   toolCalling: "yes",
   structuredOutput: "no",
   tier: primaryCliScope(),
 };
 
-/** Antigravity CLI as the room's engine. Arcelle uses its headless JSON stream and
- * the same scoped text tool protocol as Codex, so transport capabilities match
- * the other CLI-backed engines. */
+/** Antigravity CLI as the room's engine. Its headless stream-json output carries
+ * `text_delta` events the sidecar forwards live, but its print mode documents
+ * no image input — so it streams, and stays the one blind engine (its turns
+ * carry the honest "images were NOT sent" note instead). */
 export const ANTIGRAVITY_CLI: EngineDecl = {
   id: "antigravity-cli",
   label: "Antigravity CLI",
   local: false,
-  streaming: "no",
+  streaming: "yes",
   imageChannel: false,
   toolCalling: "yes",
   structuredOutput: "no",
@@ -735,10 +743,31 @@ export async function capabilitiesFor(model: string, deps: CapabilitiesForDeps):
       // `engineIdOf` only returns "codex-cli" when the split's head is it.
       const submodel = splitExternalModel(model)[1];
       caps.chat = "yes";
+      // Codex's own catalog publishes no vision column; its served models are
+      // the multimodal GPT-5 family, and the `-i` channel was proven live — a
+      // model that still cannot see fails the call visibly, never silently.
+      caps.vision = "yes";
+      // A chat CLI reads pictures; it cannot PRODUCE one (the Create shelf's
+      // exclusion reason) — a flat no, not an unknown.
+      caps.imageGeneration = "no";
+      caps.videoGeneration = "no";
       caps.contextWindow = (await deps.codexContextWindow(submodel)) ?? externalMaxContext(decl.id);
       return caps;
     }
+    case "claude-cli": {
+      caps.chat = "yes";
+      // Every model the hardcoded Claude catalog offers reads images
+      // (`modelCatalogSurfaceIpc` says the same), and the stream-json block
+      // channel is live-verified — so this is a fact, not a hope.
+      caps.vision = "yes";
+      caps.imageGeneration = "no";
+      caps.videoGeneration = "no";
+      caps.contextWindow = externalMaxContext(decl.id);
+      return caps;
+    }
     default: {
+      // antigravity-cli: chats, streams, but has no image channel — the
+      // declaration's flat vision "no" stands.
       caps.chat = "yes";
       caps.contextWindow = externalMaxContext(decl.id);
       return caps;
@@ -772,6 +801,13 @@ export async function visionSupport(model: string, deps: VisionSupportDeps): Pro
   const decl = declaredFor(model);
   if (!decl.imageChannel || isEmbeddingModel(model)) {
     return "no";
+  }
+  if (decl.id === "claude-cli" || decl.id === "codex-cli") {
+    // Same answers `capabilitiesFor` gives, without a catalog round trip: both
+    // CLI catalogs serve only multimodal models, and both pixel channels are
+    // live-verified. This is what lets `groundingPick` keep a CLI room's own
+    // engine for image questions instead of falling back to a local model.
+    return "yes";
   }
   if (decl.id === "openrouter") {
     await deps.ensureProviderCatalog(model);

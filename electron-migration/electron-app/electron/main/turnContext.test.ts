@@ -9,10 +9,12 @@ import { describe, expect, it } from "vitest";
 import {
   BASE_SYSTEM_PROMPT,
   DEFAULT_MODEL,
+  NO_TOOLS_NO_SOURCES_SYSTEM_PROMPT,
   advertiseSkills,
   bestDefault,
   buildSystemPrompt,
   explicitSkillRequest,
+  explicitlyProhibitsToolsOrSources,
   explicitlyNamedRoomFiles,
   handoffBudgetBytes,
   historyBudgetBytes,
@@ -26,6 +28,7 @@ import {
   passthroughPrepareImage,
   pixelsReachChatModel,
   requestedFileName,
+  resolveTurnEvidencePolicy,
   roleInstructions,
   splitExternalModel,
   stripStoppedSuffix,
@@ -54,6 +57,37 @@ describe("explicitSkillRequest", () => {
     expect(explicitSkillRequest("/UPPER do it")).toBeNull();
     expect(explicitSkillRequest("/")).toBeNull();
     expect(explicitSkillRequest(`/${"x".repeat(65)} go`)).toBeNull();
+  });
+});
+
+describe("hard no-tools/no-sources policy", () => {
+  it.each([
+    "Do not use tools.",
+    "Answer without any sources",
+    "Never read room files",
+    "Do not read from any additional local files",
+    "No outside sources",
+    "Respond from your own knowledge only",
+    "No web; explain it simply",
+  ])("recognizes the explicit prohibition: %s", (text) => {
+    expect(explicitlyProhibitsToolsOrSources(text)).toBe(true);
+  });
+
+  it("does not close tools merely because a simple question needs none", () => {
+    expect(explicitlyProhibitsToolsOrSources("Explain what a database is.")).toBe(false);
+    expect(resolveTurnEvidencePolicy("Explain it", "Do not read files.")).toBe("no-tools-no-sources");
+  });
+
+  it("uses the minimal system prompt in hard mode", () => {
+    expect(buildSystemPrompt({
+      evidencePolicy: "no-tools-no-sources",
+      webEnabled: true,
+      connectedMcp: ["notion"],
+      inventory: [["secret.txt", "text/plain", "secret"]],
+      roomRoleId: "tutor",
+      responseStyle: "detailed",
+      customInstructions: "Read every file.",
+    })).toBe(NO_TOOLS_NO_SOURCES_SYSTEM_PROMPT);
   });
 });
 
