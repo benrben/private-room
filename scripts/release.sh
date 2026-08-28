@@ -13,15 +13,15 @@ fail() {
 
 ROOT="$(pwd -P)"
 REPO="benrben/private-room"
-APP_DIR="electron-migration/electron-app"
+APP_DIR="apps/desktop"
 VER="$(node -p "require('./${APP_DIR}/package.json').version")"
 TAG="v${VER}"
 RELEASE_NOTES="${RELEASE_NOTES:-}"
 # `npm --prefix` runs the package script from APP_DIR. Keep the defaults
 # absolute so electron-builder does not accidentally resolve them relative to
 # that nested working directory.
-MODELS="${ARCELLE_MODELS_DIR:-${ROOT}/${APP_DIR}/assets/models}"
-SIDECAR="${ARCELLE_SIDECAR_STAGE_DIR:-${ROOT}/sidecar/dist/arcelle-sidecar}"
+MODELS="${ARCELLE_MODELS_DIR:-${ROOT}/${APP_DIR}/resources/models}"
+SIDECAR="${ARCELLE_SIDECAR_STAGE_DIR:-${ROOT}/services/agent-sidecar/dist/arcelle-sidecar}"
 
 [[ -n "$RELEASE_NOTES" ]] || fail "RELEASE_NOTES is required"
 grep -Fq '## Install' <<<"$RELEASE_NOTES" || \
@@ -123,7 +123,7 @@ gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1 && \
 
 echo "release prerequisites passed: signing=$SIGNING_MODE ($DEV_ID); notarization=$NOTARY_METHOD; $TAURI_VERSION"
 scripts/preflight.sh
-./sidecar/build-sidecar.sh
+./services/agent-sidecar/build-sidecar.sh
 [[ -x "$SIDECAR/arcelle-sidecar" ]] || fail "missing built sidecar: $SIDECAR"
 for model in nemo_en_titanet_small.onnx ggml-silero-v5.1.2.bin ggml-large-v3-turbo-q5_0.bin; do
   [[ -s "$MODELS/$model" ]] || fail "missing production model: $MODELS/$model"
@@ -172,8 +172,8 @@ TAURI_SIGNING_PRIVATE_KEY_PASSWORD="$UPDATER_KEY_PASSWORD" \
 ARCELLE_UPDATE_PAYLOAD="$TAR" ARCELLE_UPDATE_SIGNATURE="$TAR.sig" \
 node --input-type=module <<'NODE'
 import { readFileSync } from "node:fs";
-import { verifyManifestSignature } from "./electron-migration/electron-app/dist_package/electron/main/updater/minisignVerify.js";
-import { TAURI_UPDATE_PUBKEY_B64 } from "./electron-migration/electron-app/dist_package/electron/main/updater/tauriUpdater.js";
+import { verifyManifestSignature } from "./apps/desktop/dist_package/src/main/updater/minisignVerify.js";
+import { TAURI_UPDATE_PUBKEY_B64 } from "./apps/desktop/dist_package/src/main/updater/tauriUpdater.js";
 verifyManifestSignature(
   readFileSync(process.env.ARCELLE_UPDATE_PAYLOAD),
   readFileSync(process.env.ARCELLE_UPDATE_SIGNATURE, "utf8").trim(),

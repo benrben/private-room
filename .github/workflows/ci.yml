@@ -14,8 +14,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Renderer + Electron main process. Both package-lock files are installed
-  # because the host keeps its native/build dependencies in the Electron app.
+  # Renderer + Electron main process use one npm workspace and lockfile.
   electron:
     runs-on: macos-14
     steps:
@@ -25,8 +24,6 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-      - run: npm ci
-        working-directory: electron-migration/electron-app
       - run: npm run build
       - run: npm run test:electron
       - run: npm run test:page
@@ -39,7 +36,7 @@ jobs:
     runs-on: macos-14
     defaults:
       run:
-        working-directory: sidecar
+        working-directory: services/agent-sidecar
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5

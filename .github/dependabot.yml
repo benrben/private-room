@@ -18,17 +18,8 @@ updates:
       npm:
         patterns: ["*"]
 
-  - package-ecosystem: npm
-    directory: /electron-migration/electron-app
-    schedule:
-      interval: weekly
-    open-pull-requests-limit: 5
-    groups:
-      electron:
-        patterns: ["*"]
-
   - package-ecosystem: uv
-    directory: /sidecar
+    directory: /services/agent-sidecar
     schedule:
       interval: weekly
     open-pull-requests-limit: 5

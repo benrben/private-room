@@ -9,8 +9,7 @@ on:
   pull_request:
     paths:
       - package-lock.json
-      - electron-migration/electron-app/package-lock.json
-      - sidecar/uv.lock
+      - services/agent-sidecar/uv.lock
   workflow_dispatch:
 
 jobs:
@@ -31,13 +30,9 @@ jobs:
       # see .github/dependabot.yml.
       - name: npm audit (runtime dependencies)
         run: npm audit --omit=dev --audit-level=high
-      - name: npm audit (Electron runtime dependencies)
-        working-directory: electron-migration/electron-app
-        run: npm audit --omit=dev --audit-level=high
-
       - uses: astral-sh/setup-uv@v5
       - name: pip-audit
-        working-directory: sidecar
+        working-directory: services/agent-sidecar
         run: |
           uv export --no-dev --no-emit-project --no-hashes -o requirements.audit.txt
           uvx pip-audit -r requirements.audit.txt

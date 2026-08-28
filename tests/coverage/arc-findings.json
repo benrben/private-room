@@ -1,0 +1,270 @@
+{
+  "schemaVersion": 1,
+  "entries": [
+    {
+      "arc": "ARC-001",
+      "finding": "Missing documented specialists",
+      "tests": [
+        { "framework": "node:test", "file": "tests/contract/arcElectronBoundary.test.mjs", "test": "[ARC-001] canonical roster stays visible with disabled prerequisite rows" },
+        { "framework": "vitest", "file": "apps/desktop/src/main/specialists.test.ts", "test": "preserves canonical disabled-row prerequisites from the sidecar registry" }
+      ]
+    },
+    {
+      "arc": "ARC-002",
+      "finding": "Protected values leak from a local specialist",
+      "tests": [
+        { "framework": "node:test", "file": "tests/contract/arcElectronBoundary.test.mjs", "test": "[ARC-002] final-response redaction is provider-independent" },
+        { "framework": "pytest", "file": "services/agent-sidecar/tests/test_arc_review_e2e.py", "test": "test_e2e_arc_002_006_030_privacy_no_tools_and_no_sources" },
+        { "framework": "pytest", "file": "services/agent-sidecar/tests/test_server.py", "test": "test_run_output_gate_redacts_local_final_and_unmapped_canary" },
+        { "framework": "pytest", "file": "services/agent-sidecar/tests/test_privacy_gate.py", "test": "test_final_output_gate_catches_unmapped_labelled_canaries" }
+      ]
+    },
+    {
+      "arc": "ARC-003",
+      "finding": "Cloud model ID adapter failures",
+      "tests": [
+        { "framework": "node:test", "file": "tests/contract/arcElectronBoundary.test.mjs", "test": "[ARC-003] provider selection preserves and probes exact model IDs" },
+        { "framework": "vitest", "file": "apps/desktop/src/main/providers.test.ts", "test": "posts the exact provider ID with a one-token budget" },
+        { "framework": "vitest", "file": "apps/desktop/src/main/modelCatalogSurfaceIpc.test.ts", "test": "runs one low-token capability probe before enabling a chosen OpenRouter ID" }
+      ]
+    },
+    {
+      "arc": "ARC-004",
+      "finding": "Privacy mode advertises specialists it cannot execute",
+      "tests": [
+        { "framework": "node:test", "file": "tests/contract/arcElectronBoundary.test.mjs", "test": "[ARC-004] effective capabilities disable impossible cloud mutations" },
+        { "framework": "pytest", "file": "services/agent-sidecar/tests/test_arc_review_e2e.py", "test": "test_e2e_arc_004_024_028_capabilities_and_tagged_refusal" },
+        { "framework": "pytest", "file": "services/agent-sidecar/tests/test_specialist_tag.py", "test": "test_cloud_privacy_catalog_keeps_transcript_status_but_hands_video_local" },
+        { "framework": "vitest", "file": "apps/desktop/src/main/bridgeDispatcher.test.ts", "test": "fails closed when batch file tools could bypass a Cloud Privacy mirror" }
+      ]
+    },
+    {
+      "arc": "ARC-005",
+      "finding": "False artifact success and stalled Studio",
+      "tests": [
+        { "framework": "node:test", "file": "tests/contract/arcElectronBoundary.test.mjs", "test": "[ARC-005] artifact success requires a readable mutation receipt" },
+        { "framework": "pytest", "file": "services/agent-sidecar/tests/test_arc_review_e2e.py", "test": "test_e2e_arc_005_023_studio_receipt_and_readback_gate" },
+        { "framework": "pytest", "file": "services/agent-sidecar/tests/test_graphs.py", "test": "test_studio_success_requires_and_accepts_post_commit_readback" },
+        { "framework": "pytest", "file": "services/agent-sidecar/tests/test_graphs.py", "test": "test_studio_receipt_without_post_commit_readback_is_missing" }
+      ]
+    },
+    {
+      "arc": "ARC-006",
+      "finding": "Prohibited source access",
+      "tests": [
+        { "framework": "node:test", "file": "tests/contract/arcElectronBoundary.test.mjs", "test": "[ARC-006] no-tools requests cross the host with no room evidence" },
+        { "framework": "pytest", "file": "services/agent-sidecar/tests/test_arc_review_e2e.py", "test": "test_e2e_arc_002_006_030_privacy_no_tools_and_no_sources" },
+        { "framework": "pytest", "file": "services/agent-sidecar/tests/test_graph.py", "test": "test_hard_no_tools_policy_never_lists_or_offers_tools" }
+      ]
+    },
+    {
+      "arc": "ARC-007",
+      "finding": "Fabricated cross-file comparison",
+      "tests": [
+        { "framework": "node:test", "file": "tests/contract/arcElectronBoundary.test.mjs", "test": "[ARC-007] comparison claims remain scoped to per-file evidence" },
+        { "framework": "pytest", "file": "services/agent-sidecar/tests/test_arc_review_e2e.py", "test": "test_e2e_arc_007_030_comparison_uses_only_opened_sources" },
+        { "framework": "vitest", "file": "apps/desktop/src/main/chatCommandsGenerate.test.ts", "test": "omits a one-file overview even when its quote and another difference are grounded" },
+        { "framework": "pytest", "file": "services/agent-sidecar/tests/test_ai_actions.py", "test": "test_ai_action_compare_requires_per_file_grounding" }
+      ]
+    },
+    {
+      "arc": "ARC-008",
+      "finding": "Build E2E and capture cascade",
+      "tests": [
+        { "framework": "node:test", "file": "tests/contract/arcElectronBoundary.test.mjs", "test": "[ARC-008] build and E2E release gates remain wired" },
+        { "framework": "node:test", "file": "tests/contract/releaseGate.test.mjs", "test": "release.sh gates on the preflight checks" }
+      ]
+    },
+    {
+      "arc": "ARC-009",
+      "finding": "Electron helper import failures",
+      "tests": [
+        { "framework": "node:test", "file": "tests/contract/arcElectronBoundary.test.mjs", "test": "[ARC-009] Electron helper suite remains a release gate" }
+      ]
+    },
+    {
+      "arc": "ARC-010",
+      "finding": "Command errors detach from their turns",
+      "tests": [
+        { "framework": "node:test", "file": "tests/contract/arcElectronBoundary.test.mjs", "test": "[ARC-010] command failures persist as inline turn errors" },
+        { "framework": "vitest", "file": "apps/desktop/src/main/chatCommands.test.ts", "test": "a command with no handler stores an inline error beside the user's line" }
+      ]
+    },
+    {
+      "arc": "ARC-011",
+      "finding": "Inconsistent video interpretation",
+      "tests": [
+        { "framework": "node:test", "file": "tests/contract/arcElectronBoundary.test.mjs", "test": "[ARC-011] video interpretation carries the exact frame receipt" },
+        { "framework": "pytest", "file": "services/agent-sidecar/tests/test_arc_review_e2e.py", "test": "test_e2e_arc_011_024_frame_receipt_and_pixels_reach_model" },
+        { "framework": "vitest", "file": "apps/desktop/src/main/bridgeDispatcher.test.ts", "test": "gives every interpreting provider the same exact frame bytes and SHA-256 receipt" }
+      ]
+    },
+    {
+      "arc": "ARC-012",
+      "finding": "Extraction grammar and translation quality",
+      "tests": [
+        { "framework": "node:test", "file": "tests/contract/arcElectronBoundary.test.mjs", "test": "[ARC-012] extraction fields exclude source residue without truncating prose" },
+        { "framework": "vitest", "file": "apps/desktop/src/main/chatCommandsKnowledge.test.ts", "test": "#extract never leaks a residual source filename into the last field header" },
+        { "framework": "vitest", "file": "apps/desktop/src/main/chatCommandsGenerate.test.ts", "test": "marks a skipped early chunk as partial even when a later chunk succeeds" }
+      ]
+    },
+    {
+      "arc": "ARC-013",
+      "finding": "Private file permissions",
+      "tests": [
+        { "framework": "node:test", "file": "tests/contract/arcElectronBoundary.test.mjs", "test": "[ARC-013] private workspace state is repaired to owner-only permissions" }
+      ]
+    },
+    {
+      "arc": "ARC-014",
+      "finding": "Stale file count after agent actions",
+      "tests": [
+        { "framework": "node:test", "file": "tests/contract/arcElectronBoundary.test.mjs", "test": "[ARC-014] visible file counters share the reconciled public inventory" },
+        { "framework": "node:test", "file": "tests/contract/agentFileRefresh.test.mjs", "test": "an agent-created Sketch refreshes the shared list that drives the workspace footer" }
+      ]
+    },
+    {
+      "arc": "ARC-015",
+      "finding": "Valid PSD is unviewable",
+      "tests": [
+        { "framework": "node:test", "file": "tests/contract/arcElectronBoundary.test.mjs", "test": "[ARC-015] PSD pixels use the initialized decoder path" },
+        { "framework": "node:test", "file": "tests/contract/previewFindings.test.mjs", "test": "the PSD worker installs ag-psd's worker canvas before reading pixels" }
+      ]
+    },
+    {
+      "arc": "ARC-016",
+      "finding": "RAW coverage and derived size are inconsistent",
+      "tests": [
+        { "framework": "node:test", "file": "tests/contract/arcElectronBoundary.test.mjs", "test": "[ARC-016] RAW previews enforce decoded 1000px durable output" },
+        { "framework": "vitest", "file": "apps/desktop/src/main/fileRuntimeSurfaceIpc.test.ts", "test": "stores a full-size RAW Quick Look fallback durably without replacing the export original" }
+      ]
+    },
+    {
+      "arc": "ARC-017",
+      "finding": "iWork and RTFD imports are not atomic or package-aware",
+      "tests": [
+        { "framework": "node:test", "file": "tests/contract/arcElectronBoundary.test.mjs", "test": "[ARC-017] package imports refuse atomically without residue" },
+        { "framework": "vitest", "file": "apps/desktop/src/main/fileRuntimeSurfaceIpc.test.ts", "test": "preflights a whole selection and refuses Finder packages before any import" }
+      ]
+    },
+    {
+      "arc": "ARC-018",
+      "finding": "Planned Office converter path is absent",
+      "tests": [
+        { "framework": "node:test", "file": "tests/contract/arcElectronBoundary.test.mjs", "test": "[ARC-018] Office conversion remains consent-gated and durable" }
+      ]
+    },
+    {
+      "arc": "ARC-019",
+      "finding": "Fallback preview states are misleading or unlabeled",
+      "tests": [
+        { "framework": "node:test", "file": "tests/contract/arcElectronBoundary.test.mjs", "test": "[ARC-019] fallback previews expose persistent honest provenance" },
+        { "framework": "node:test", "file": "tests/contract/derivedPreviewCaption.test.mjs", "test": "stored snapshots distinguish damage from unsupported input without guessing" },
+        { "framework": "vitest", "file": "apps/desktop/src/main/fileRuntimeSurfaceIpc.test.ts", "test": "marks a durable Quick Look image as a snapshot of an unchanged original" }
+      ]
+    },
+    {
+      "arc": "ARC-020",
+      "finding": "Media waveform and automatic transcription miss acceptance criteria",
+      "tests": [
+        { "framework": "node:test", "file": "tests/contract/arcElectronBoundary.test.mjs", "test": "[ARC-020] MKV waveform fallback and FLAC transcription are wired" },
+        { "framework": "vitest", "file": "apps/desktop/src/main/peaksTools.test.ts", "test": "falls back to a system ffmpeg when avconvert cannot demux MKV AAC" },
+        { "framework": "vitest", "file": "apps/desktop/src/main/fileRuntimeSurfaceIpc.test.ts", "test": "automatically transcribes imported FLAC audio, not unrelated files" }
+      ]
+    },
+    {
+      "arc": "ARC-021",
+      "finding": "Book and MSG decoding warnings",
+      "tests": [
+        { "framework": "node:test", "file": "tests/contract/arcElectronBoundary.test.mjs", "test": "[ARC-021] book and MSG warnings stay parser-specific" },
+        { "framework": "node:test", "file": "tests/contract/previewFindings.test.mjs", "test": "MSG bypasses the raw-byte encoding warning used by EML" }
+      ]
+    },
+    {
+      "arc": "ARC-022",
+      "finding": "Archive labels and file counters are ambiguous",
+      "tests": [
+        { "framework": "node:test", "file": "tests/contract/arcElectronBoundary.test.mjs", "test": "[ARC-022] compound archive names and public counts remain unambiguous" },
+        { "framework": "node:test", "file": "tests/contract/previewFindings.test.mjs", "test": "Home and the footer label their public counts consistently as room files" },
+        { "framework": "vitest", "file": "apps/desktop/src/main/moonshotFrontPage.test.ts", "test": "excludes hidden derived previews from both Home count and recent files" }
+      ]
+    },
+    {
+      "arc": "ARC-023",
+      "finding": "Local Studio cannot commit any advertised artifact type",
+      "tests": [
+        { "framework": "node:test", "file": "tests/contract/arcElectronBoundary.test.mjs", "test": "[ARC-023] Studio commits through the live workspace receipt path" },
+        { "framework": "pytest", "file": "services/agent-sidecar/tests/test_arc_review_e2e.py", "test": "test_e2e_arc_005_023_studio_receipt_and_readback_gate" },
+        { "framework": "pytest", "file": "services/agent-sidecar/tests/test_graphs.py", "test": "test_studio_read_before_commit_is_stale_and_does_not_verify" }
+      ]
+    },
+    {
+      "arc": "ARC-024",
+      "finding": "Cloud Video receives metadata receipts without image pixels",
+      "tests": [
+        { "framework": "node:test", "file": "tests/contract/arcElectronBoundary.test.mjs", "test": "[ARC-024] image-blind providers lose Video before dispatch" },
+        { "framework": "pytest", "file": "services/agent-sidecar/tests/test_arc_review_e2e.py", "test": "test_e2e_arc_011_024_frame_receipt_and_pixels_reach_model" },
+        { "framework": "vitest", "file": "apps/desktop/src/main/coreSurfaceIpc.test.ts", "test": "does not advertise pixel tools or the Video specialist to Antigravity's blind transport" },
+        { "framework": "pytest", "file": "services/agent-sidecar/tests/test_external_llm.py", "test": "test_frame_handoff_without_pixels_never_starts_external_engine" }
+      ]
+    },
+    {
+      "arc": "ARC-025",
+      "finding": "Workflow testing is unavailable and privacy labels mismatch enforcement",
+      "tests": [
+        { "framework": "node:test", "file": "tests/contract/arcElectronBoundary.test.mjs", "test": "[ARC-025] workflow mutation and validation obey effective privacy capability" },
+        { "framework": "pytest", "file": "services/agent-sidecar/tests/test_arc_review_e2e.py", "test": "test_e2e_arc_025_workflow_receipt_is_ordered_and_name_bound" },
+        { "framework": "pytest", "file": "services/agent-sidecar/tests/test_graphs.py", "test": "test_workflow_success_requires_validated_yes_receipt" },
+        { "framework": "pytest", "file": "services/agent-sidecar/tests/test_graphs.py", "test": "test_workflow_rejects_validated_receipt_from_before_latest_save" }
+      ]
+    },
+    {
+      "arc": "ARC-026",
+      "finding": "Skills inventory omits a visibly installed draft",
+      "tests": [
+        { "framework": "node:test", "file": "tests/contract/arcElectronBoundary.test.mjs", "test": "[ARC-026] Skills inventory can exactly read cross-assigned drafts" },
+        { "framework": "pytest", "file": "services/agent-sidecar/tests/test_arc_review_e2e.py", "test": "test_e2e_arc_026_named_skill_requires_exact_inventory_row" },
+        { "framework": "vitest", "file": "apps/desktop/src/main/execTool.test.ts", "test": "the Skills specialist inventories and exactly reads a draft assigned to another specialist" }
+      ]
+    },
+    {
+      "arc": "ARC-027",
+      "finding": "Re-transcription returns before its own operation is terminal",
+      "tests": [
+        { "framework": "node:test", "file": "tests/contract/arcElectronBoundary.test.mjs", "test": "[ARC-027] re-transcription returns a durable terminal receipt" },
+        { "framework": "pytest", "file": "services/agent-sidecar/tests/test_arc_review_e2e.py", "test": "test_e2e_arc_027_retranscribe_terminal_and_pending_contract" },
+        { "framework": "pytest", "file": "services/agent-sidecar/tests/test_graphs.py", "test": "test_the_transcribe_agent_reaches_its_action_verb" }
+      ]
+    },
+    {
+      "arc": "ARC-028",
+      "finding": "Online agents are hidden rather than shown with prerequisites",
+      "tests": [
+        { "framework": "node:test", "file": "tests/contract/arcElectronBoundary.test.mjs", "test": "[ARC-028] Web Browse and Connector rows name exact prerequisites" },
+        { "framework": "pytest", "file": "services/agent-sidecar/tests/test_arc_review_e2e.py", "test": "test_e2e_arc_004_024_028_capabilities_and_tagged_refusal" },
+        { "framework": "pytest", "file": "services/agent-sidecar/tests/test_server.py", "test": "test_agents_on_a_bridge_that_served_nothing_returns_the_stable_catalog" }
+      ]
+    },
+    {
+      "arc": "ARC-029",
+      "finding": "Antigravity Connector agent fails reproducibly",
+      "tests": [
+        { "framework": "node:test", "file": "tests/contract/arcElectronBoundary.test.mjs", "test": "[ARC-029] Antigravity empty output gets one bounded diagnostic retry" },
+        { "framework": "pytest", "file": "services/agent-sidecar/tests/test_arc_review_e2e.py", "test": "test_e2e_arc_029_antigravity_empty_success_retries_once" },
+        { "framework": "pytest", "file": "services/agent-sidecar/tests/test_external_llm.py", "test": "test_antigravity_empty_success_retries_once" },
+        { "framework": "pytest", "file": "services/agent-sidecar/tests/test_external_llm.py", "test": "test_antigravity_two_empty_successes_fail_clearly" }
+      ]
+    },
+    {
+      "arc": "ARC-030",
+      "finding": "Specialist answers attach unrelated room sources",
+      "tests": [
+        { "framework": "node:test", "file": "tests/contract/arcElectronBoundary.test.mjs", "test": "[ARC-030] directly tagged specialists do not inherit unrelated sources" },
+        { "framework": "pytest", "file": "services/agent-sidecar/tests/test_arc_review_e2e.py", "test": "test_e2e_arc_002_006_030_privacy_no_tools_and_no_sources" },
+        { "framework": "pytest", "file": "services/agent-sidecar/tests/test_arc_review_e2e.py", "test": "test_e2e_arc_007_030_comparison_uses_only_opened_sources" },
+        { "framework": "vitest", "file": "apps/desktop/src/main/gatherContext.test.ts", "test": "starts directly tagged specialists without unrelated ambient room sources" },
+        { "framework": "vitest", "file": "apps/desktop/src/main/gatherContext.test.ts", "test": "still grounds a tagged specialist in explicitly named files" }
+      ]
+    }
+  ]
+}

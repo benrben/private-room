@@ -5,8 +5,8 @@ cd "$(dirname "$0")/.."
 
 case "${1:-}" in
   --checks)
-    npm --prefix electron-migration/electron-app run check:versions
-    node qa/check-mock-coverage.mjs --bridge=electron
+    npm run check:versions --workspace @arcelle/desktop
+    node tests/support/check-mock-coverage.mjs --bridge=electron
     ;;
   --suites)
     npm run lint
@@ -14,8 +14,8 @@ case "${1:-}" in
     npm run build
     ;;
   "")
-    npm --prefix electron-migration/electron-app run check:versions
-    node qa/check-mock-coverage.mjs --bridge=electron
+    npm run check:versions --workspace @arcelle/desktop
+    node tests/support/check-mock-coverage.mjs --bridge=electron
     npm run lint
     npm test
     npm run build

@@ -17,7 +17,7 @@ ad-hoc distribution path is signed with a stable designated requirement.
   is not available, an intentional ad-hoc release must set
   `ARCELLE_MAC_IDENTITY=-`; the release script never falls back silently.
 - Configure notarization using one complete credential set accepted by
-  [`afterSign.mjs`](electron-migration/electron-app/scripts/afterSign.mjs):
+  [`afterSign.mjs`](apps/desktop/scripts/afterSign.mjs):
   `APPLE_KEYCHAIN_PROFILE`/`APPLE_NOTARY_PROFILE`, Apple ID credentials, or App
   Store Connect API-key credentials. These are required only for Developer ID
   mode because Apple does not notarize ad-hoc builds.
@@ -37,22 +37,23 @@ This keeps private bytes out of command arguments, terminal output, shell
 substitution, and child processes that do not need the key.
 
 Download these production weights into
-`electron-migration/electron-app/assets/models/` (they are gitignored):
+`apps/desktop/resources/models/` (they are gitignored):
 
 ```bash
-mkdir -p electron-migration/electron-app/assets/models
-curl -L -o electron-migration/electron-app/assets/models/ggml-large-v3-turbo-q5_0.bin \
+mkdir -p apps/desktop/resources/models
+curl -L -o apps/desktop/resources/models/ggml-large-v3-turbo-q5_0.bin \
   https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin
-curl -L -o electron-migration/electron-app/assets/models/nemo_en_titanet_small.onnx \
+curl -L -o apps/desktop/resources/models/nemo_en_titanet_small.onnx \
   https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/nemo_en_titanet_small.onnx
-curl -L -o electron-migration/electron-app/assets/models/ggml-silero-v5.1.2.bin \
+curl -L -o apps/desktop/resources/models/ggml-silero-v5.1.2.bin \
   https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin
 ```
 
 ## Cut a release
 
-1. Update the version in the two npm packages and the Python sidecar, refresh
-   both npm lockfiles and `sidecar/uv.lock`, and add the changelog entry.
+1. Update the version in the repository and desktop workspace packages plus
+   the Python sidecar, refresh the root npm lock and
+   `services/agent-sidecar/uv.lock`, and add the changelog entry.
 2. Run `scripts/preflight.sh`.
 3. Confirm that the checkout is clean and the signing prerequisites are ready:
 

@@ -1,0 +1,53 @@
+<svg width="64" height="64" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Arcelle">
+  <title>Arcelle</title>
+  <!--
+    The standalone Arcelle mark: the paper fold-A on the charcoal notebook
+    sheet - a cream ribbon bent into the letter, its bottom edge peeling up
+    to show the plum underside, a gold spark in the counter.
+
+    This is the ONE place besides the application icon where the brand plum
+    (#984D6E) and gold (#E0C180) are correct. The in-app logomark
+    (src/icons/nav.tsx) draws the fold's underside and the spark with the
+    product's own highlighter tokens instead, because the interface carries
+    neither brand colour.
+
+    Everything is a literal colour and a plain path: this file is used as
+    the favicon before any stylesheet has loaded, so it cannot depend on a
+    custom property, an external reference, a filter, or a font.
+
+    The tile is a superellipse (|x/a|^5 + |y/a|^5 = 1) sampled as a polygon
+    rather than a rounded rect, so it matches the macOS icon shape and renders
+    identically in every engine.
+
+    The geometry is shared with the master artwork in assets/brand/appicon.svg and
+    mapped here by scale(0.64). Changing the mark means updating the master
+    artwork first and carrying the paths into src/icons/nav.tsx, index.html,
+    and this file.
+  -->
+  <defs>
+    <clipPath id="arcelle-tile">
+      <path d="M64 32L63.97 42.75L63.89 46.17L63.75 48.64L63.56 50.64L63.31 52.32L63 53.79L62.64 55.09L62.21 56.25L61.72 57.3L61.17 58.24L60.55 59.09L59.86 59.86L59.09 60.55L58.24 61.17L57.3 61.72L56.25 62.21L55.09 62.64L53.79 63L52.32 63.31L50.64 63.56L48.64 63.75L46.17 63.89L42.75 63.97L32 64L21.25 63.97L17.83 63.89L15.36 63.75L13.36 63.56L11.68 63.31L10.21 63L8.91 62.64L7.75 62.21L6.7 61.72L5.76 61.17L4.91 60.55L4.14 59.86L3.45 59.09L2.83 58.24L2.28 57.3L1.79 56.25L1.36 55.09L1 53.79L0.69 52.32L0.44 50.64L0.25 48.64L0.11 46.17L0.03 42.75L0 32L0.03 21.25L0.11 17.83L0.25 15.36L0.44 13.36L0.69 11.68L1 10.21L1.36 8.91L1.79 7.75L2.28 6.7L2.83 5.76L3.45 4.91L4.14 4.14L4.91 3.45L5.76 2.83L6.7 2.28L7.75 1.79L8.91 1.36L10.21 1L11.68 0.69L13.36 0.44L15.36 0.25L17.83 0.11L21.25 0.03L32 0L42.75 0.03L46.17 0.11L48.64 0.25L50.64 0.44L52.32 0.69L53.79 1L55.09 1.36L56.25 1.79L57.3 2.28L58.24 2.83L59.09 3.45L59.86 4.14L60.55 4.91L61.17 5.76L61.72 6.7L62.21 7.75L62.64 8.91L63 10.21L63.31 11.68L63.56 13.36L63.75 15.36L63.89 17.83L63.97 21.25Z"/>
+    </clipPath>
+    <!-- The dotted sheet. Centred on the tile so the grid is symmetrical at
+         every size, and clipped so it never spills past the corner. -->
+    <pattern id="arcelle-grid" x="28" y="28" width="8" height="8" patternUnits="userSpaceOnUse">
+      <circle cx="4" cy="4" r="0.39" fill="#8f8a7c" fill-opacity="0.22"/>
+    </pattern>
+  </defs>
+
+  <path fill="#151716" d="M64 32L63.97 42.75L63.89 46.17L63.75 48.64L63.56 50.64L63.31 52.32L63 53.79L62.64 55.09L62.21 56.25L61.72 57.3L61.17 58.24L60.55 59.09L59.86 59.86L59.09 60.55L58.24 61.17L57.3 61.72L56.25 62.21L55.09 62.64L53.79 63L52.32 63.31L50.64 63.56L48.64 63.75L46.17 63.89L42.75 63.97L32 64L21.25 63.97L17.83 63.89L15.36 63.75L13.36 63.56L11.68 63.31L10.21 63L8.91 62.64L7.75 62.21L6.7 61.72L5.76 61.17L4.91 60.55L4.14 59.86L3.45 59.09L2.83 58.24L2.28 57.3L1.79 56.25L1.36 55.09L1 53.79L0.69 52.32L0.44 50.64L0.25 48.64L0.11 46.17L0.03 42.75L0 32L0.03 21.25L0.11 17.83L0.25 15.36L0.44 13.36L0.69 11.68L1 10.21L1.36 8.91L1.79 7.75L2.28 6.7L2.83 5.76L3.45 4.91L4.14 4.14L4.91 3.45L5.76 2.83L6.7 2.28L7.75 1.79L8.91 1.36L10.21 1L11.68 0.69L13.36 0.44L15.36 0.25L17.83 0.11L21.25 0.03L32 0L42.75 0.03L46.17 0.11L48.64 0.25L50.64 0.44L52.32 0.69L53.79 1L55.09 1.36L56.25 1.79L57.3 2.28L58.24 2.83L59.09 3.45L59.86 4.14L60.55 4.91L61.17 5.76L61.72 6.7L62.21 7.75L62.64 8.91L63 10.21L63.31 11.68L63.56 13.36L63.75 15.36L63.89 17.83L63.97 21.25Z"/>
+  <rect width="64" height="64" fill="url(#arcelle-grid)" clip-path="url(#arcelle-tile)"/>
+
+  <g transform="scale(0.64)">
+    <!-- the plum underside of the fold, drawn first so the ribbon overlaps
+         its top edge and the counter's even-odd hole shows it as the lip -->
+    <path fill="#984d6e"
+          d="M57.6 79.1L40 77.6L32.2 76.8L32.2 76.5L33.6 76.1L35.6 75.5L36.6 75.1L36.9 74.8L38.4 74.3L40.5 73.6L42.4 72.9L44.4 72L47.4 71.2L50.9 70.4L52.4 69.9L52.7 69.6L53.8 69.4L55.7 69.4L58 70L60.7 71.1L63.6 72.6L66.5 74.3L69 76.2L71 78L72.1 79.3L70 79.8Z"/>
+    <!-- the cream ribbon, its counter punched even-odd -->
+    <path fill="#e8decb" fill-rule="evenodd"
+          d="M50.7 17.5L52.2 17.7L53.6 18.2L55.2 19.1L57.4 20.9L60 23.9L62.9 28.7L66.1 34.8L69.2 41.4L72 48.4L74.6 55.4L76.8 62L78.2 66.8L78.7 70.1L78.9 72.4L78.7 73.9L78.3 75.3L77.7 76.7L76.9 77.9L75.8 79.1L74.9 79.8L74.1 80.2L73.6 80.3L73.2 80.2L72.9 79.3L72.5 78.2L71.6 77.7L70.1 77.4L67.7 76L64.5 73.8L61 71.9L57.7 70.4L56.3 69.6L56 69.2L55.2 68.9L53.7 68.5L51.6 68.3L49.2 68.2L47.5 68.4L46.1 68.7L44.2 69.4L41.7 70.4L38.3 72.1L34.5 74.1L31.8 75.3L30.1 75.8L28.7 76L27.6 75.9L26.5 75.7L25.3 75.2L24.4 74.6L23.6 73.8L22.8 72.8L22.2 71.6L21.8 70.3L21.5 69L21.3 67.5L21.4 65.7L21.9 63.1L22.9 59.4L24.8 53.9L27.5 47.3L30.2 41.4L32.8 36.1L35 31.9L37 28.5L39 25.4L41 22.8L42.9 20.8L44.8 19.3L46.9 18.3L49 17.6ZM71.3 77.2L70.5 77L68.9 75.9L66.5 74.2L62.8 72.1L58.6 70.1L56.8 69.1L55.7 68.4L50.8 66.1L43.7 62.9L39.6 60.6L37.8 59L36.8 57.6L36.3 56.2L36.1 54.7L36.1 52.8L36.7 50.1L37.8 46.7L39.5 43.1L41.5 39.5L42.9 37.2L44 36L45.3 34.7L46.8 33.6L48 32.8L49.3 32.4L50.7 32.2L52.2 32.2L53.7 32.7L55 33.5L56.4 34.8L57.8 36.6L59.3 39.3L60.9 43.1L63 48.9L65.6 56.2L68.2 64.3L70.6 71.9L71.7 75.8L71.7 76.8Z"/>
+    <!-- the gold spark in the counter -->
+    <path fill="#e0c180"
+          d="M56.2 48.4Q56.2 50.7 58.5 50.7Q56.2 50.7 56.2 53Q56.2 50.7 53.9 50.7Q56.2 50.7 56.2 48.4Z"/>
+  </g>
+</svg>

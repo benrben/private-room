@@ -1,0 +1,17 @@
+{
+  // Real emit of the desktop main/preload sources, for the one thing that
+  // cannot run from TypeScript directly: launching the actual Electron binary
+  // (`src/main/index.electron.test.ts`). Adds only `noEmit: false` and a
+  // scratch `outDir` on top of the real `tsconfig.json`, so a build failure
+  // here is a build failure of the real source, not of some other config.
+  "extends": "./tsconfig.main.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "composite": false,
+    "declaration": false,
+    "sourceMap": false,
+    "outDir": "dist_boot"
+  },
+  "include": ["src/main/**/*.ts", "src/preload/**/*.ts", "src/shared/**/*.ts"],
+  "exclude": ["src/**/*.test.ts", "src/renderer"]
+}

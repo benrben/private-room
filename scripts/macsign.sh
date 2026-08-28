@@ -4,8 +4,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-APP="${1:-electron-migration/electron-app/release/mac-arm64/Arcelle.app}"
-ENTITLEMENTS="electron-migration/electron-app/scripts/entitlements.mac.plist"
+APP="${1:-apps/desktop/release/mac-arm64/Arcelle.app}"
+ENTITLEMENTS="apps/desktop/scripts/entitlements.mac.plist"
 IDENT="com.benreich.privateroom"
 
 [[ -d "$APP" ]] || { echo "no app bundle at: $APP" >&2; exit 1; }

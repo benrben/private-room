@@ -4,67 +4,67 @@
   "providers": ["codex", "claude", "ollama-local", "ollama-cloud", "openrouter"],
   "features": {
     "normalized-events": {
-      "codex": { "status": "implemented", "evidence": ["electron-migration/electron-app/electron/main/harness/codexAppServer.ts"] },
-      "claude": { "status": "implemented", "evidence": ["electron-migration/electron-app/electron/main/harness/claudeAgentSdk.ts"] },
-      "ollama-local": { "status": "implemented", "evidence": ["electron-migration/electron-app/electron/main/harness/deepAgentRuntime.ts"] },
-      "ollama-cloud": { "status": "implemented", "evidence": ["electron-migration/electron-app/electron/main/harness/deepAgentRuntime.ts"] },
-      "openrouter": { "status": "implemented", "evidence": ["electron-migration/electron-app/electron/main/harness/deepAgentRuntime.ts"] }
+      "codex": { "status": "implemented", "evidence": ["apps/desktop/src/main/harness/codexAppServer.ts"] },
+      "claude": { "status": "implemented", "evidence": ["apps/desktop/src/main/harness/claudeAgentSdk.ts"] },
+      "ollama-local": { "status": "implemented", "evidence": ["apps/desktop/src/main/harness/deepAgentRuntime.ts"] },
+      "ollama-cloud": { "status": "implemented", "evidence": ["apps/desktop/src/main/harness/deepAgentRuntime.ts"] },
+      "openrouter": { "status": "implemented", "evidence": ["apps/desktop/src/main/harness/deepAgentRuntime.ts"] }
     },
     "streaming": {
-      "codex": { "status": "implemented", "evidence": ["electron-migration/electron-app/electron/main/harness/codexAppServer.ts"] },
-      "claude": { "status": "implemented", "evidence": ["electron-migration/electron-app/electron/main/harness/claudeAgentSdk.ts"] },
-      "ollama-local": { "status": "implemented", "evidence": ["sidecar/tests/e2e_live/test_live_deep_harness.py"] },
-      "ollama-cloud": { "status": "implemented", "evidence": ["sidecar/arcelle_sidecar/deep_harness.py"] },
-      "openrouter": { "status": "implemented", "evidence": ["sidecar/arcelle_sidecar/deep_harness.py"] }
+      "codex": { "status": "implemented", "evidence": ["apps/desktop/src/main/harness/codexAppServer.ts"] },
+      "claude": { "status": "implemented", "evidence": ["apps/desktop/src/main/harness/claudeAgentSdk.ts"] },
+      "ollama-local": { "status": "implemented", "evidence": ["services/agent-sidecar/tests/e2e_live/test_live_deep_harness.py"] },
+      "ollama-cloud": { "status": "implemented", "evidence": ["services/agent-sidecar/src/arcelle_sidecar/deep_harness.py"] },
+      "openrouter": { "status": "implemented", "evidence": ["services/agent-sidecar/src/arcelle_sidecar/deep_harness.py"] }
     },
     "cancellation": {
-      "codex": { "status": "implemented", "evidence": ["electron-migration/electron-app/electron/main/harness/codexAppServer.ts"] },
-      "claude": { "status": "implemented", "evidence": ["electron-migration/electron-app/electron/main/harness/claudeAgentSdk.ts"] },
-      "ollama-local": { "status": "implemented", "evidence": ["sidecar/arcelle_sidecar/deep_harness.py"] },
-      "ollama-cloud": { "status": "implemented", "evidence": ["sidecar/arcelle_sidecar/deep_harness.py"] },
-      "openrouter": { "status": "implemented", "evidence": ["sidecar/arcelle_sidecar/deep_harness.py"] }
+      "codex": { "status": "implemented", "evidence": ["apps/desktop/src/main/harness/codexAppServer.ts"] },
+      "claude": { "status": "implemented", "evidence": ["apps/desktop/src/main/harness/claudeAgentSdk.ts"] },
+      "ollama-local": { "status": "implemented", "evidence": ["services/agent-sidecar/src/arcelle_sidecar/deep_harness.py"] },
+      "ollama-cloud": { "status": "implemented", "evidence": ["services/agent-sidecar/src/arcelle_sidecar/deep_harness.py"] },
+      "openrouter": { "status": "implemented", "evidence": ["services/agent-sidecar/src/arcelle_sidecar/deep_harness.py"] }
     },
     "interactive-approvals": {
-      "codex": { "status": "implemented", "evidence": ["electron-migration/electron-app/electron/main/harness/codexAppServer.ts"] },
-      "claude": { "status": "implemented", "evidence": ["electron-migration/electron-app/electron/main/harness/claudeAgentSdk.ts"] },
-      "ollama-local": { "status": "implemented", "evidence": ["electron-migration/electron-app/electron/main/harness/controller.ts", "electron-migration/electron-app/electron/main/harness/deepWorkspaceBridge.ts"] },
-      "ollama-cloud": { "status": "implemented", "evidence": ["electron-migration/electron-app/electron/main/harness/controller.ts", "electron-migration/electron-app/electron/main/harness/deepWorkspaceBridge.ts"] },
-      "openrouter": { "status": "implemented", "evidence": ["electron-migration/electron-app/electron/main/harness/controller.ts", "electron-migration/electron-app/electron/main/harness/deepWorkspaceBridge.ts"] }
+      "codex": { "status": "implemented", "evidence": ["apps/desktop/src/main/harness/codexAppServer.ts"] },
+      "claude": { "status": "implemented", "evidence": ["apps/desktop/src/main/harness/claudeAgentSdk.ts"] },
+      "ollama-local": { "status": "implemented", "evidence": ["apps/desktop/src/main/harness/controller.ts", "apps/desktop/src/main/harness/deepWorkspaceBridge.ts"] },
+      "ollama-cloud": { "status": "implemented", "evidence": ["apps/desktop/src/main/harness/controller.ts", "apps/desktop/src/main/harness/deepWorkspaceBridge.ts"] },
+      "openrouter": { "status": "implemented", "evidence": ["apps/desktop/src/main/harness/controller.ts", "apps/desktop/src/main/harness/deepWorkspaceBridge.ts"] }
     },
     "write-baseline-and-rollback": {
-      "codex": { "status": "implemented", "evidence": ["electron-migration/electron-app/electron/main/harness/runProtection.ts"] },
-      "claude": { "status": "implemented", "evidence": ["electron-migration/electron-app/electron/main/harness/runProtection.ts"] },
-      "ollama-local": { "status": "implemented", "evidence": ["electron-migration/electron-app/electron/main/harness/runProtection.ts", "electron-migration/electron-app/electron/main/harness/deepWorkspaceBridge.ts"] },
-      "ollama-cloud": { "status": "implemented", "evidence": ["electron-migration/electron-app/electron/main/harness/runProtection.ts", "electron-migration/electron-app/electron/main/harness/deepWorkspaceBridge.ts"] },
-      "openrouter": { "status": "implemented", "evidence": ["electron-migration/electron-app/electron/main/harness/runProtection.ts", "electron-migration/electron-app/electron/main/harness/deepWorkspaceBridge.ts"] }
+      "codex": { "status": "implemented", "evidence": ["apps/desktop/src/main/harness/runProtection.ts"] },
+      "claude": { "status": "implemented", "evidence": ["apps/desktop/src/main/harness/runProtection.ts"] },
+      "ollama-local": { "status": "implemented", "evidence": ["apps/desktop/src/main/harness/runProtection.ts", "apps/desktop/src/main/harness/deepWorkspaceBridge.ts"] },
+      "ollama-cloud": { "status": "implemented", "evidence": ["apps/desktop/src/main/harness/runProtection.ts", "apps/desktop/src/main/harness/deepWorkspaceBridge.ts"] },
+      "openrouter": { "status": "implemented", "evidence": ["apps/desktop/src/main/harness/runProtection.ts", "apps/desktop/src/main/harness/deepWorkspaceBridge.ts"] }
     },
     "workspace-isolation": {
-      "codex": { "status": "implemented", "evidence": ["electron-migration/electron-app/electron/main/harness/seatbelt.ts"] },
-      "claude": { "status": "implemented", "evidence": ["electron-migration/electron-app/electron/main/harness/seatbelt.ts"] },
-      "ollama-local": { "status": "implemented", "evidence": ["sidecar/arcelle_sidecar/deep_harness.py"] },
-      "ollama-cloud": { "status": "implemented", "evidence": ["sidecar/arcelle_sidecar/deep_harness.py"] },
-      "openrouter": { "status": "implemented", "evidence": ["sidecar/arcelle_sidecar/deep_harness.py"] }
+      "codex": { "status": "implemented", "evidence": ["apps/desktop/src/main/harness/seatbelt.ts"] },
+      "claude": { "status": "implemented", "evidence": ["apps/desktop/src/main/harness/seatbelt.ts"] },
+      "ollama-local": { "status": "implemented", "evidence": ["services/agent-sidecar/src/arcelle_sidecar/deep_harness.py"] },
+      "ollama-cloud": { "status": "implemented", "evidence": ["services/agent-sidecar/src/arcelle_sidecar/deep_harness.py"] },
+      "openrouter": { "status": "implemented", "evidence": ["services/agent-sidecar/src/arcelle_sidecar/deep_harness.py"] }
     },
     "cloud-redacted-mirror": {
-      "codex": { "status": "implemented", "evidence": ["electron-migration/electron-app/electron/main/harness/cloudMirror.ts"] },
-      "claude": { "status": "implemented", "evidence": ["electron-migration/electron-app/electron/main/harness/cloudMirror.ts"] },
-      "ollama-local": { "status": "not-applicable", "evidence": ["sidecar/arcelle_sidecar/privacy.py"] },
-      "ollama-cloud": { "status": "implemented", "evidence": ["electron-migration/electron-app/electron/main/harness/cloudMirror.ts", "electron-migration/electron-app/electron/main/harness/controller.ts"] },
-      "openrouter": { "status": "implemented", "evidence": ["electron-migration/electron-app/electron/main/harness/cloudMirror.ts", "electron-migration/electron-app/electron/main/harness/controller.ts"] }
+      "codex": { "status": "implemented", "evidence": ["apps/desktop/src/main/harness/cloudMirror.ts"] },
+      "claude": { "status": "implemented", "evidence": ["apps/desktop/src/main/harness/cloudMirror.ts"] },
+      "ollama-local": { "status": "not-applicable", "evidence": ["services/agent-sidecar/src/arcelle_sidecar/privacy.py"] },
+      "ollama-cloud": { "status": "implemented", "evidence": ["apps/desktop/src/main/harness/cloudMirror.ts", "apps/desktop/src/main/harness/controller.ts"] },
+      "openrouter": { "status": "implemented", "evidence": ["apps/desktop/src/main/harness/cloudMirror.ts", "apps/desktop/src/main/harness/controller.ts"] }
     },
     "shared-sixteen-specialists": {
-      "codex": { "status": "implemented", "evidence": ["config/agent-manifest.json", "electron-migration/electron-app/electron/main/harness/agentManifest.ts", "electron-migration/electron-app/electron/main/harness/codexAppServer.ts"] },
-      "claude": { "status": "implemented", "evidence": ["config/agent-manifest.json", "electron-migration/electron-app/electron/main/harness/agentManifest.ts", "electron-migration/electron-app/electron/main/harness/claudeAgentSdk.ts"] },
-      "ollama-local": { "status": "implemented", "evidence": ["sidecar/arcelle_sidecar/deep_harness.py"] },
-      "ollama-cloud": { "status": "implemented", "evidence": ["sidecar/arcelle_sidecar/deep_harness.py"] },
-      "openrouter": { "status": "implemented", "evidence": ["sidecar/arcelle_sidecar/deep_harness.py"] }
+      "codex": { "status": "implemented", "evidence": ["config/agent-manifest.json", "apps/desktop/src/main/harness/agentManifest.ts", "apps/desktop/src/main/harness/codexAppServer.ts"] },
+      "claude": { "status": "implemented", "evidence": ["config/agent-manifest.json", "apps/desktop/src/main/harness/agentManifest.ts", "apps/desktop/src/main/harness/claudeAgentSdk.ts"] },
+      "ollama-local": { "status": "implemented", "evidence": ["services/agent-sidecar/src/arcelle_sidecar/deep_harness.py"] },
+      "ollama-cloud": { "status": "implemented", "evidence": ["services/agent-sidecar/src/arcelle_sidecar/deep_harness.py"] },
+      "openrouter": { "status": "implemented", "evidence": ["services/agent-sidecar/src/arcelle_sidecar/deep_harness.py"] }
     },
     "capability-probe-and-safe-fallback": {
-      "codex": { "status": "implemented", "evidence": ["electron-migration/electron-app/electron/main/harness/controller.ts", "electron-migration/electron-app/electron/main/harness/legacyCli.ts"] },
-      "claude": { "status": "implemented", "evidence": ["electron-migration/electron-app/electron/main/harness/controller.ts", "electron-migration/electron-app/electron/main/harness/legacyCli.ts"] },
-      "ollama-local": { "status": "implemented", "evidence": ["sidecar/arcelle_sidecar/deep_harness.py"] },
-      "ollama-cloud": { "status": "implemented", "evidence": ["sidecar/arcelle_sidecar/deep_harness.py"] },
-      "openrouter": { "status": "implemented", "evidence": ["sidecar/arcelle_sidecar/deep_harness.py"] }
+      "codex": { "status": "implemented", "evidence": ["apps/desktop/src/main/harness/controller.ts", "apps/desktop/src/main/harness/legacyCli.ts"] },
+      "claude": { "status": "implemented", "evidence": ["apps/desktop/src/main/harness/controller.ts", "apps/desktop/src/main/harness/legacyCli.ts"] },
+      "ollama-local": { "status": "implemented", "evidence": ["services/agent-sidecar/src/arcelle_sidecar/deep_harness.py"] },
+      "ollama-cloud": { "status": "implemented", "evidence": ["services/agent-sidecar/src/arcelle_sidecar/deep_harness.py"] },
+      "openrouter": { "status": "implemented", "evidence": ["services/agent-sidecar/src/arcelle_sidecar/deep_harness.py"] }
     }
   }
 }

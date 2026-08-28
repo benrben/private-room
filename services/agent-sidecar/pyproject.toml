@@ -1,0 +1,131 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "arcelle-sidecar"
+version = "0.26.8"
+description = "Arcelle — local LangGraph agent sidecar (the agent brain only; no DB, no keys, no files)"
+readme = "SPEC.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+
+dependencies = [
+    # Pinned to 1.x deliberately. `>=0.2` admitted 0.2.x, where `Checkpoint` still
+    # carries `pending_sends`, `LATEST_VERSION` is 1, and the StateGraph
+    # input_schema=/output_schema= kwargs the per-agent subgraph split needs do
+    # not exist. uv.lock already resolves 1.2.9 — this only forbids a silent
+    # downgrade on a fresh resolve.
+    "langgraph>=1.2,<2",
+    "langgraph-checkpoint>=4.1,<5",
+    "langchain-ollama>=0.2",
+    # The local-model client itself. `llm.py` and `chat.py` import `ollama`
+    # DIRECTLY (AsyncClient / ResponseError), so it is a first-order dependency
+    # of ours — it was only ever present because langchain-ollama happens to
+    # pull it in. The day that transitive edge changes, a fresh `uv sync`
+    # installs cleanly and then every local generation fails on an ImportError
+    # at first use. Declare what we import.
+    "ollama>=0.4",
+    "langchain-core>=1.4,<2",
+    "fastapi>=0.110",
+    # starlette 1.x removed the on_startup kwarg fastapi (< 1.0) still passes;
+    # without this cap uv resolves starlette 1.3.1 and the server cannot start.
+    "starlette>=0.40,<1.0",
+    "uvicorn>=0.27",
+    "httpx>=0.27",
+    "pydantic>=2.6",
+    # MIGRATION Phase 2: image grounding (/vision_locate) reproduces vision.rs
+    # `prepare_image` — decode any PNG/JPEG/WebP and stretch it onto the 1000×1000
+    # grounding canvas — which needs a real image codec. Pillow is the codec; it
+    # is pure-wheel and PyInstaller-bundles cleanly (no system libs required).
+    "pillow>=10.0",
+    # Neural spoken voice (default engine): Edge neural TTS. The only network
+    # call it makes is the user-facing speech synthesis seam in tts.py.
+    "edge-tts>=7.0",
+    # The room's web search (websearch.py) — it scrapes several engines' HTML
+    # result pages, so it needs a real HTML parser, and a blocking HTTP client
+    # (it runs in a worker thread, not on the event loop). Both are pure wheels
+    # that PyInstaller bundles without system libs.
+    "requests>=2.32",
+    "beautifulsoup4>=4.12",
+    "numpy>=2.4.6",
+    "pywhispercpp>=1.5.0",
+    "onnxruntime>=1.29.0",
+    "pyobjc-framework-vision>=12.2.2",
+    "pyobjc-framework-quartz>=12.2.2",
+    "pyobjc-framework-avfoundation>=12.2.2",
+    "pyobjc-framework-coremedia>=12.2.2",
+    "pyobjc-framework-quicklookthumbnailing>=12.2.2",
+    "pymupdf>=1.28.2",
+    "pyobjc-core>=12.2.2",
+    "pyobjc-framework-cocoa>=12.2.2",
+    # docs/xlsx.py: modern .xlsx workbooks (docs/legacy.py covers the pre-2007
+    # .xls/.ods pair below). read_only mode is what lets a sparse sheet cost
+    # its actual cell count rather than its bounding rectangle.
+    "openpyxl>=3.1.5",
+    # docs/legacy.py: pre-2007 .xls (BIFF) only — xlrd 2.x dropped .xlsx
+    # support entirely, which is exactly the split this module wants.
+    "xlrd>=2.0.2",
+    # docs/legacy.py: OpenDocument .ods spreadsheets.
+    "odfpy>=1.4.1",
+    # docs/legacy.py: reads the OLE2/CFB "WordDocument"/"PowerPoint Document"
+    # streams inside a legacy .doc/.ppt (read-only; test fixtures are written
+    # with a small hand-rolled CFB writer, or with dev-only xlwt/odfpy writers
+    # for .xls/.ods).
+    "olefile>=0.47",
+    # docs/text_decode.py (port of src-tauri/src/extraction.rs's encoding
+    # cascade): the ambiguous-single-byte-encoding GUESS step needs a real
+    # detector. It was only ever present transitively (requests/httpx pull
+    # it in for their own response-charset sniffing); we now import it
+    # directly, so declare what we import.
+    "charset-normalizer>=3.4.9",
+    # docs/article.py (port of src-tauri/src/extraction/article.rs's
+    # Readability-scoring extraction): dom_smoothie has no Python equivalent,
+    # so this is the closest actively-maintained, Apache-2.0, lxml-based port
+    # of the Mozilla Readability algorithm. Imported as `readability`.
+    "readability-lxml>=0.8.4.1",
+    "cryptography>=50.0.0",
+    "deepagents>=0.7.8,<0.8",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[project.scripts]
+arcelle-sidecar = "arcelle_sidecar.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["arcelle_sidecar*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["src", "tests"]
+
+# Linting — `npm run lint:py` (uvx ruff check .), and the same command in
+# .github/workflows/ci.yml. Nothing installs a hook: it runs when you run it.
+[tool.ruff]
+line-length = 100
+extend-exclude = [".build-venv", "build", "dist"]
+
+[tool.ruff.lint]
+# The mistake-finding core only — undefined names, unused imports, broken
+# f-strings, shadowed builtins, syntax errors (E4/E7/E9 + pyflakes). Style and
+# opinion rules (import sorting, pyupgrade, string quoting) are deliberately
+# NOT selected: they would flag ~200 places in a tree that reads fine, and a
+# linter nobody can run green is a linter nobody runs. This set passes today.
+select = ["E4", "E7", "E9", "F"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests import a symbol to prove it is exported, and use one-letter loop names
+# in throwaway comprehensions. Both are noise there, not in the package.
+"tests/**" = ["F401", "E741"]
+
+[dependency-groups]
+dev = [
+    "xlwt>=1.3.0",
+]

@@ -2,8 +2,6 @@
 
 <div align="center">
 
-![Arcelle — a private AI workspace sealed inside a single file](docs/banner.png)
-
 # Arcelle
 
 **Using AI shouldn't require giving up your privacy.**
@@ -19,12 +17,7 @@ leaves your Mac unless you say so.
 That's Arcelle: a private AI workspace that lives inside a single file.
 Double-click it, unlock it with your password, and you're in.
 
-<a href="https://github.com/benrben/private-room/releases/latest"><img src="docs/badge-download.svg" alt="Download the latest DMG" height="28"></a>
-<img src="docs/badge-encrypted.svg" alt="Encrypted on your Mac" height="28">
-<img src="docs/badge-offline.svg" alt="Offline-first" height="28">
-<img src="docs/badge-local-ai.svg" alt="Local AI via Ollama" height="28">
-<img src="docs/badge-touchid.svg" alt="Touch ID unlock" height="28">
-<img src="docs/badge-macos.svg" alt="Made for macOS" height="28">
+[Download the latest Arcelle release](https://github.com/benrben/private-room/releases/latest)
 
 [Download](#getting-started) ·
 [Feature tour](#features) ·
@@ -34,13 +27,6 @@ Double-click it, unlock it with your password, and you're in.
 [Request a feature](https://github.com/benrben/private-room/issues/new)
 
 </div>
-
-![The Arcelle workspace: library, document, and AI side by side](docs/screens/workspace.png)
-
-<p align="center">
-  <a href="https://github.com/benrben/private-room/raw/main/art/arcelle-30-second-publish-master.mp4"><img src="docs/video-poster.png" alt="Watch the Arcelle video — work with context" width="720"></a><br>
-  <b>🎬 Watch the video (30 s)</b> — <i>your AI tools are excellent… the handoff is still your job.</i>
-</p>
 
 ---
 
@@ -234,12 +220,8 @@ local or cloud, what's running in the background, and what's waiting for your
 approval. `⌘K` is both room search and a command palette that runs real app
 commands.
 
-![Room home: continue where you left off, with every capability one click away](docs/screens/home.png)
-
 Dark is the default; a full light theme ships too, and every color in the app
 flows through one token system so both are first-class.
-
-![The same workspace in the light theme](docs/screens/workspace-light.png)
 
 ### What's in a room
 
@@ -393,8 +375,6 @@ quick local generation, image grounding boxes, and the UI-driving tools.
 
 ### Cloud privacy, mechanically enforced
 
-![Settings → Cloud privacy: the door, the block list, private topics, and scan status](docs/screens/cloud-privacy.png)
-
 Choosing a cloud engine doesn't have to mean handing over your life. With
 **Hide private details from cloud AI** on (per room, over a global default),
 private details are swapped for stable neutral tags — `[Person A]`,
@@ -419,8 +399,6 @@ room files. Images never leave while the door is on.
 - **Honest limits, stated in-product.** Hiding names can't stop every
   inference from remaining context, and anything already sent to a cloud
   can't be recalled — the Settings page says so.
-
-![Cloud view: the exact redacted document a cloud model would receive](docs/screens/cloud-view.png)
 
 #### The Leash: let outside agents work in your room
 
@@ -488,8 +466,6 @@ Safari renders and costs the app nothing extra in size.
 
 ### Automate the boring parts
 
-![Workflows: describe a pipeline and let the assistant build it](docs/screens/workflows.png)
-
 - **Workflows** chain steps into a pipeline on an animated canvas that lights
   up node by node as a run executes. Beyond the basics — generate, summarize,
   deep full-file pass, run the agent, save a file, condition branch — a step
@@ -530,8 +506,6 @@ Safari renders and costs the app nothing extra in size.
   own name. Recording speaks to an online voice service, so the panel says so
   before the button, not after.
 
-![Scripts: real Python files with explicit inputs, outputs, and consent](docs/screens/scripts.png)
-
 ### Record the meeting, keep the proof
 
 Record your microphone plus the Mac's system audio (ScreenCaptureKit) and
@@ -560,8 +534,6 @@ scripts/accuracy-tests.sh
 ```
 
 ### Memory you can see
-
-![Memory: everything the AI remembers, grouped and editable](docs/screens/memory.png)
 
 Everything the AI remembers about you is a first-class area: browse, add,
 edit, and delete memories grouped by category (Instructions, Preferences,
@@ -753,14 +725,10 @@ one-time fetch, signing, and the full release pipeline.
 
 | Path | What's in it |
 |---|---|
-| [src/](src/) | React + TypeScript shell — panes, viewers, areas, chat |
-| [electron-migration/electron-app/](electron-migration/electron-app/) | Electron main process, preload bridge, packaging, and backend TypeScript |
-| [sidecar/](sidecar/) | Python + LangGraph AI engine (agents, workflows, studios) |
-| [e2e/](e2e/README.md) | End-to-end suites (real app, and browser-hosted UI with mock IPC) |
-| [qa/](qa/) | Manual QA harness and the every-button UA checklist |
-| [pm-request/](pm-request/) | Design documents — why the agent hub, browser, downloads and search are shaped the way they are, and what each one deliberately left undone |
-| [docs/](docs/) | Badges, banner, and product screenshots |
-| [art/](art/README.md) | Master brand artwork and the asset-generation pipeline |
+| [apps/desktop/](apps/desktop/) | Complete desktop app: main, preload, renderer, shared contracts, CLI, and packaging |
+| [services/agent-sidecar/](services/agent-sidecar/) | Python + LangGraph AI engine (agents, workflows, studios) |
+| [tests/](tests/) | Contract, Electron E2E, installed-app, visual, fixture, and manual regression coverage |
+| [assets/brand/](assets/brand/README.md) | Master brand artwork and the asset-generation pipeline |
 | [scripts/](scripts/) | Signing, release automation, and the release preflight |
 
 ### Tests
@@ -769,11 +737,11 @@ one-time fetch, signing, and the full release pipeline.
 npm test                # Electron/TypeScript and Python sidecar suites
 
 npm run test:electron   # Electron main process and backend TypeScript
-npm run test:sidecar    # Python: the AI engine sidecar (2,636 passing locally)
-npm run test:page       # browser page-script + QA-mock contracts (943 tests)
+npm run test:sidecar    # Python: the AI engine sidecar
+npm run test:page       # renderer, source-boundary, and QA-mock contracts
 npm run build           # TypeScript type-check + the production bundle
 npm run e2e:qa          # UI regressions in Chrome against a mock backend
-npm run build && node qa/make-qa.mjs && npx vite preview
+npm run build && node tests/support/make-qa.mjs && npm run preview
                         # → open /qa.html: full UI in a browser w/ mock IPC
 ```
 
@@ -783,27 +751,27 @@ those suites — including version agreement and command-contract drift
 it runs when you run it, never behind your back. `npm run lint` also runs the
 Python checks.
 
-> **Notes.** Running pytest by hand inside `sidecar/` needs `uv run pytest` —
+> **Notes.** Running pytest by hand inside `services/agent-sidecar/` needs `uv run pytest` —
 > a bare `pytest` picks up the wrong environment. The counts above move with
 > every wave of work; the suites are the source of truth, not this table.
 >
 > `npm run e2e` launches the compiled Electron app through Playwright and
 > verifies the real renderer/preload boundary. `npm run e2e:qa` covers the
-> broad visual state matrix against `qa/qa-mock.js`.
-> `node qa/check-mock-coverage.mjs --bridge=electron` reports fixture coverage;
+> broad visual state matrix against `tests/support/qa-mock.js`.
+> `node tests/support/check-mock-coverage.mjs --bridge=electron` reports fixture coverage;
 > registry and allowlist tests enforce complete command-contract coverage.
 > Anything without a usable QA fixture is recorded on
 > `window.__qaUnhandled` and shouted on the page itself, so a list that is
 > empty because the *mock* has no data can never be mistaken for a real empty
 > state. The one thing no harness can show is the browser's page: it is a
 > native webview, so the Browser area renders its chrome, tabs, journal and
-> search over an empty stage. See [e2e/README.md](e2e/README.md).
+> search over an empty stage. See [tests/e2e/README.md](tests/e2e/README.md).
 
 ### Design system
 
 The brand is a violet keyhole-doorway on ink — private, sealed, calm. Every
 color in the app flows through CSS custom properties
-([`src/styles/tokens.css`](src/styles/tokens.css)) with complete dark and
+([`apps/desktop/src/renderer/styles/tokens.css`](apps/desktop/src/renderer/styles/tokens.css)) with complete dark and
 light palettes; the dark accents:
 
 | Token | Hex | Role |
@@ -815,12 +783,12 @@ light palettes; the dark accents:
 | **Violet** | **`#8b7cf6`** | The accent — keyholes, glows, focus |
 | Green / Amber / Red | `#4cc38a` / `#e3b341` / `#e5646c` | Status only |
 
-In-app icons are React components in [`src/icons.tsx`](src/icons.tsx) and
-[`src/icons/shell.tsx`](src/icons/shell.tsx) — one line-icon family (24px grid,
+In-app icons are React components in [`apps/desktop/src/renderer/icons.tsx`](apps/desktop/src/renderer/icons.tsx) and
+[`apps/desktop/src/renderer/icons/shell.tsx`](apps/desktop/src/renderer/icons/shell.tsx) — one line-icon family (24px grid,
 1.6px strokes, `currentColor`) used throughout, with **no native emoji**, so
 the interface stays monochrome and consistent and the violet accent is reserved
 for selected and primary actions. Master artwork and the asset-generation
-pipeline live in [`art/`](art/README.md).
+pipeline live in [`assets/brand/`](assets/brand/README.md).
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
@@ -911,8 +879,8 @@ talk.
 
 Related docs: [RELEASING.md](RELEASING.md) (release pipeline),
 [CHANGELOG.md](CHANGELOG.md) (what shipped when),
-[e2e/README.md](e2e/README.md) (test suites),
-[art/README.md](art/README.md) (brand assets).
+[tests/e2e/README.md](tests/e2e/README.md) (test suites),
+[assets/brand/README.md](assets/brand/README.md) (brand assets).
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 

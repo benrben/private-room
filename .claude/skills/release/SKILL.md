@@ -1,31 +1,39 @@
 ---
 name: release
 description: >-
-  Cut a signed macOS GitHub release of Arcelle: bump the version, write the
-  changelog, build + sign the app, package the DMG and updater payload, publish
-  the GitHub release, and install the built app locally. Use whenever the user
-  asks to release, ship, cut a release, "build re-install and release", publish a
-  new version, or roll a patch/minor of this app. Encodes the verified procedure
-  and its gotchas, and ALWAYS appends the required Install section to the notes.
+  Cut a signed macOS GitHub release of Arcelle (Electron): bump the version,
+  write the changelog, build the sidecar + app, sign, package the DMG and
+  updater payload, publish the GitHub release, and install the built app
+  locally. Also covers a LOCAL REBUILD + REINSTALL without publishing. Use
+  whenever the user asks to release, ship, cut a release, "build re-install and
+  release", publish a new version, roll a patch/minor — or just to "reinstall"
+  / rebuild the app locally after code changes. Encodes the verified
+  post-Tauri-cutover procedure and its gotchas, and ALWAYS appends the required
+  Install section to the notes.
 ---
 
-# Releasing Arcelle
+# Releasing Arcelle (Electron)
 
-Cut a release of this project end to end. `scripts/release.sh` does the heavy
-lifting (sidecar build → app build → sign → DMG + updater tar → minisign →
-`latest.json` → `gh release`); this skill is the checklist around it, plus the
-two things a script can't decide: the version/notes, and the **mandatory Install
-section** below.
+Cut a release end to end. `scripts/release.sh` does the heavy lifting
+(prereq gates → preflight → sidecar build → package + sign → updater tar →
+Tauri-key signature → `latest.json` → `gh release`); this skill is the
+checklist around it, plus the things a script can't decide: the version/notes,
+the **mandatory Install section**, and the local install at the end.
 
-`RELEASING.md` in the repo root is the canonical reference — read it if anything
-here is unclear. This skill is the operational shortcut.
+`RELEASING.md` in the repo root is the canonical reference. **The app is
+Electron now** — there is no `src-tauri/`, no cargo, no `tauri build`. The only
+Tauri thing left is the updater KEY (`~/.tauri/private-room.key`) and the Tauri
+CLI v2 that signs the update payload with it.
+
+For a quick local rebuild without publishing, jump to
+**"Local reinstall (no release)"** at the bottom.
 
 ## ⚠️ ALWAYS: the Install section
 
-Every release's notes MUST end with this exact section, appended after the
-changelog body. Never omit it, never reword the xattr line — the build is
-ad-hoc signed (not notarized), so without it users hit Gatekeeper and can't open
-the app. Show the assembled notes to the user before publishing.
+`release.sh` REFUSES notes that don't contain, verbatim: a `## Install`
+heading, the sentence `The build is ad-hoc signed (not notarized)`, and the
+exact line `/usr/bin/xattr -cr "/Applications/Arcelle.app"`. Append this after
+the changelog body and show the assembled notes to the user before publishing:
 
 ```markdown
 ## Install
@@ -39,94 +47,132 @@ Download the DMG below — macOS 12+, Apple Silicon. The build is ad-hoc signed 
 
 ## Steps
 
+### 0. Room to build
+`df -h /` first. A release needs ~10 GB free: the packaged app + DMG + updater
+tar land in `apps/desktop/release/` (~6.5 GB total). If
+short, two safe reclaims:
+- the `release/` dir from the PREVIOUS release, once `gh release view v<prev>`
+  shows all four assets published;
+- `${HOME}/Arcelle-Developer-Backups/` — the install flow preserves the
+  outgoing `/Applications/Arcelle.app` there, outside the worktree (~1.4 GB
+  per reinstall). Keep the newest backup and prune older copies deliberately;
+  every released version's DMG is on GitHub too. App bundles and user data
+  must never be stored in the repository.
+
+A full disk mid-PyInstaller can leave a truncated sidecar that still LOOKS
+built — see the sidecar boot check in the local-reinstall section.
+
+Also check `ListAgents`/other sessions: `release.sh` requires a clean worktree,
+and the flow may stash concurrent edits ("preserve concurrent … during
+release"). After any release, check `git stash list` before assuming in-flight
+work was lost.
+
 ### 1. Decide the version (semver)
-- Patch (`0.5.0 → 0.5.1`): bug fixes only.
-- Minor (`0.5.0 → 0.6.0`): new user-facing features.
-- Check current: `node -p "require('./src-tauri/tauri.conf.json').version"`.
+- Patch: bug fixes only. Minor: new user-facing features.
+- Current: `node -p "require('./apps/desktop/package.json').version"`
 
-### 2. Bump the version in ALL SIX files (must stay in sync)
-- `package.json` → `version`
-- `src-tauri/tauri.conf.json` → `version`
-- `src-tauri/Cargo.toml` → `[package] version`
-- `sidecar/pyproject.toml` → `version` (the sidecar's `/health` reports it)
-- `sidecar/arcelle_sidecar/__init__.py` → `__version__`
-- **`sidecar/uv.lock`** → the `version` under `name = "arcelle-sidecar"`.
-  This one is easy to miss — it went stale in v0.14.0 and blocked the first
-  v0.17.0 attempt. `(cd sidecar && uv lock)` regenerates it from the
-  already-bumped `pyproject.toml`; if you edit by hand, anchor the regex to
-  the `arcelle-sidecar` stanza, never a bare version replace.
+### 2. Bump every shipping version source (gate: `check:versions`)
+`apps/desktop/package.json` is the SOURCE OF TRUTH
+(electron-builder stamps it into the bundle). The six locations are:
 
-Then refresh the lockfile so the build doesn't rebuild it dirty:
-`(cd src-tauri && cargo update -p arcelle --precise <NEW_VERSION>)`
-(use the repo's cargo, e.g. `/opt/homebrew/bin/cargo` — rustup shims are broken).
+1. `apps/desktop/package.json` → `version` (hand-edit)
+2. `package.json` (repo root, hand-edit)
+3. `package-lock.json` (the only npm lockfile; run
+   `npm install --package-lock-only --ignore-scripts` at the repo root)
+4. `services/agent-sidecar/pyproject.toml` `[project] version` (hand-edit)
+5. `services/agent-sidecar/src/arcelle_sidecar/__init__.py` `__version__` (hand-edit)
+6. `services/agent-sidecar/uv.lock` — regenerate with
+   `(cd services/agent-sidecar && uv lock)`, never by hand.
 
-**Do not rewrite `tauri.conf.json` through a JSON parser** — `json.dumps`
-reformats the whole file (arrays explode onto one line each). Use a targeted
-`sed` on the version line.
+Verify: `npm run check:versions --workspace @arcelle/desktop`.
 
-### 2a. Run preflight BEFORE tagging
-`scripts/preflight.sh --checks` gates all six version files, the changelog
-entry, the bundled model weights and frontend↔host↔qa-mock command drift.
-Running it before the tag is what keeps a bad version off a pushed tag.
-`npm test` is `preflight.sh --suites`; a plain `scripts/preflight.sh` is both.
+### 3. Preflight BEFORE tagging
+`scripts/preflight.sh` = check:versions + mock-coverage drift
+(`--bridge=electron`) + lint + full test suites + build. Run it before the tag
+so a bad version never lands on a pushed tag. (`--checks` = fast gates only;
+`--suites` = lint+test+build only.)
 
-### 3. Write the CHANGELOG
-Add a `## <version> — <YYYY-MM-DD>` section at the top of `CHANGELOG.md` (below
-the header), in the voice of the existing entries: user-facing, plain, what
-changed and why it matters. This is the source of the release notes.
+### 4. CHANGELOG, commit, tag, push
+Add `## <version> — <YYYY-MM-DD>` at the top of `CHANGELOG.md` in the voice of
+the existing entries. Then a fix/feature commit, then a mechanical
+`release Arcelle <version>` commit carrying the version bumps + lockfiles +
+CHANGELOG. **`release.sh` requires HEAD to already carry the tag** and the tree
+to be clean, and refuses if the GitHub release already exists:
 
-### 4. Commit + tag + push
-Convention: a fix/feature commit, then a mechanical `Release <version>` commit
-that carries only the five version bumps + `Cargo.lock` + `CHANGELOG.md`.
 ```sh
-git add <changed source files> && git commit -m "<what changed>"
-git add package.json src-tauri/tauri.conf.json src-tauri/Cargo.toml \
-        src-tauri/Cargo.lock sidecar/pyproject.toml \
-        sidecar/arcelle_sidecar/__init__.py CHANGELOG.md
-git commit -m "Release <version>"
 git tag v<version> && git push origin main v<version>
 ```
-End commit messages with the `Co-Authored-By` trailer per the repo/global rules.
+Repo is PUBLIC — check what `git add -A` would stage before staging it.
 
-### 5. Assemble the release notes
-Extract this version's changelog section, then **append the Install section**:
+### 5. Assemble the notes
 ```sh
 BODY="$(awk '/^## <version>/{f=1;next}/^## /{f=0}f' CHANGELOG.md)"
 RELEASE_NOTES="$BODY
 
-## Install
-
-Download the DMG below — macOS 12+, Apple Silicon. The build is ad-hoc signed (not notarized), so clear quarantine once after installing:
-
-\`\`\`sh
-/usr/bin/xattr -cr \"/Applications/Arcelle.app\"
-\`\`\`"
+<the Install section from above>"
 ```
-`RELEASE_NOTES` feeds BOTH the GitHub release body and `latest.json`. Show it to
-the user before running the release.
+Feeds BOTH the GitHub release body and `latest.json`. Show it to the user.
 
-### 6. Run the release script — with BOTH gotchas
+### 6. Signing mode + updater key (the gates that actually refuse)
+- **Ad-hoc (current shipping mode)**: `export ARCELLE_MAC_IDENTITY=-` — the
+  bundle gets Arcelle's STABLE DESIGNATED REQUIREMENT
+  (`identifier "com.benreich.privateroom"`), which is what lets TCC grants
+  survive reinstalls. This must be explicit; the script never falls back
+  silently.
+- **Developer ID**: leave `ARCELLE_MAC_IDENTITY` unset with a
+  `Developer ID Application` identity in the keychain — but then COMPLETE
+  notarization credentials are required (`APPLE_KEYCHAIN_PROFILE`, or the
+  APPLE_ID triple, or the App Store Connect API-key triple) or the script
+  refuses.
+- **Updater key**: do **NOT** export `TAURI_SIGNING_PRIVATE_KEY` (the contents)
+  — `release.sh` REFUSES it. It reads the key FILE:
+  `TAURI_SIGNING_PRIVATE_KEY_PATH` (default `~/.tauri/private-room.key`), which
+  must be a regular file, owned by you, `chmod 600`. Empty password is fine and
+  needs no export. **Never regenerate this key** — it orphans every installed
+  copy's auto-update. Back it up.
+- Needs: `uv`, `gh` (authenticated), Xcode CLT, and Tauri CLI v2 (updater
+  signer only — `node_modules/.bin/tauri` counts).
+
+### 7. Run it
 ```sh
-rm -rf sidecar/build sidecar/dist                       # gotcha A
-export TAURI_SIGNING_PRIVATE_KEY="$(cat ~/.tauri/private-room.key)"
-export TAURI_SIGNING_PRIVATE_KEY_PASSWORD=""             # gotcha B — MUST be explicit
 RELEASE_NOTES="$RELEASE_NOTES" scripts/release.sh
 ```
-Run it in the background (5–10 min) and wait for completion.
+Background it (10–20 min) and read the `released v<version> — <url>` line.
+Inside it runs: `scripts/preflight.sh` →
+`./services/agent-sidecar/build-sidecar.sh` (staged to
+`services/agent-sidecar/dist/arcelle-sidecar`; PyInstaller runs `--noconfirm`, so a dirty
+`dist/` no longer aborts — but after sidecar code changes prefer
+`--clean` yourself first so no stale cache ships) → checks the three model
+weights exist in `apps/desktop/resources/models/`
+(`nemo_en_titanet_small.onnx`, `ggml-silero-v5.1.2.bin`,
+`ggml-large-v3-turbo-q5_0.bin`) → `npm run package:mac` → signature checks
+(deep verify + stable-DR or notarization+Gatekeeper per mode) → `packTarGz` →
+`tauri signer sign` → verifies the signature with the SAME pinned pubkey the
+installed app uses → `buildLatestManifest` → `gh release create` with the DMG,
+`Arcelle.app.tar.gz`, its `.sig`, and `latest.json`.
 
-- **Gotcha A** — `release.sh` calls `build-sidecar.sh` WITHOUT `--clean`, and
-  PyInstaller aborts on a non-empty `dist/`. Wipe `sidecar/build sidecar/dist`
-  first, or a stale sidecar ships.
-- **Gotcha B** — the updater key has no password. If
-  `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` is UNSET, tauri PROMPTS for one, and in a
-  non-TTY/background shell that dies with `failed to decode secret key … Device
-  not configured (os error 6)`. Export it as an explicit empty string.
-- Exit 0 = released. `✓ Released v<version> — <url>` prints at the end.
+**Quit the installed Arcelle BEFORE packaging** (`osascript -e 'tell
+application "Arcelle" to quit'`) — the test gate's real-Electron-boot tests
+(`index.electron.test.ts`) fail on "Another instance of Arcelle already holds
+the single-instance lock" while any copy runs, including one a Playwright
+installed-app review left open (`pgrep -fl "Arcelle.app/Contents/MacOS"` shows
+`--inspect=0` for those).
 
-### 7. Scrub the log
-`release.sh` passes the private updater key as a CLI arg to `tauri signer sign`,
-so npm echoes it into any captured log. **Delete the release log/task-output
-file** after the run — do not leave the key on disk.
+**One worktree, one builder.** Packaging, `npm run e2e`, and `electron-rebuild`
+all delete-and-recreate the native SQLite binding and the `dist*` trees; a
+concurrent session doing any of them fails this gate with hundreds of
+"Could not locate the bindings file" errors or vanishing stage dirs. Check
+`ListAgents` for peer sessions and ask them to hold builds first.
+
+`package:mac` itself re-runs typecheck + the full Node-ABI test suite, then
+flips `better-sqlite3-multiple-ciphers` to Electron's ABI, packages, proves the
+packaged module loads under the packaged Electron, and flips the ABI back in a
+trap. **If it dies hard, the workspace module is stranded on Electron's ABI and
+every later `test:electron` fails** — fix:
+`npm run build-release --prefix node_modules/better-sqlite3-multiple-ciphers`.
+
+The key never rides argv or logs anymore (the `*_PATH` hand-off), so there is
+no log to scrub — but still avoid capturing env dumps.
 
 ### 8. Verify the published release
 ```sh
@@ -134,39 +180,64 @@ gh release view v<version> --repo benrben/private-room \
   --json tagName,isPrerelease,assets \
   --jq '{tag:.tagName, prerelease:.isPrerelease, assets:[.assets[].name]}'
 curl -sL https://github.com/benrben/private-room/releases/latest/download/latest.json \
-  | python3 -c "import sys,json;d=json.load(sys.stdin);print(d['version'])"
+  | python3 -c "import sys,json;print(json.load(sys.stdin)['version'])"
 ```
-Expect three assets (`.dmg`, `Arcelle.app.tar.gz`, `latest.json`),
-`prerelease:false`, and `latest.json` → the new version. Marking the release
-**Latest** (the default, non-prerelease) is what makes auto-update go live.
+Expect FOUR assets (`.dmg`, `Arcelle.app.tar.gz`, `.tar.gz.sig`,
+`latest.json`), `prerelease:false`, and `latest.json` → the new version.
 
 ### 9. Install the built app locally + verify
 ```sh
-osascript -e 'tell application "Arcelle" to quit'   # quit the running copy
-APP="src-tauri/target/release/bundle/macos/Arcelle.app"
+osascript -e 'tell application "Arcelle" to quit'
+APP="apps/desktop/release/mac-arm64/Arcelle.app"
 codesign --verify --strict "$APP"
-rm -rf "/Applications/Arcelle.app" && ditto "$APP" "/Applications/Arcelle.app"
+BACKUP_DIR="${HOME}/Arcelle-Developer-Backups"
+STAMP="$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$BACKUP_DIR"
+if [[ -d "/Applications/Arcelle.app" ]]; then
+  mv "/Applications/Arcelle.app" "$BACKUP_DIR/Arcelle-before-${STAMP}.app"
+fi
+ditto "$APP" "/Applications/Arcelle.app"
 codesign --verify --strict "/Applications/Arcelle.app"
 /usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" \
-  "/Applications/Arcelle.app/Contents/Info.plist"      # expect the new version
+  "/Applications/Arcelle.app/Contents/Info.plist"
 open -a "Arcelle"
 ```
-`release.sh` already applied the final (ad-hoc, stable-DR) signature, so a
-separate `macsign.sh` run is not needed here — but if you ever rebuild locally
-outside `release.sh`, run `scripts/macsign.sh` or TCC drops the mic/screen
-grants.
+The packaging already applied the final signature (stable-DR ad-hoc or
+notarized Developer ID), so no extra signing step here. `scripts/macsign.sh` is
+only for a bundle produced OUTSIDE `package.sh` — without the stable DR, TCC
+drops the mic/screen grants.
 
 ### 10. Record it in memory
 Update the release-history memory (`private-room-v030-release.md`) and its
-`MEMORY.md` index line with the new version, date, what shipped, and any new
-gotcha. Convert relative dates to absolute.
+`MEMORY.md` index line: version, date, what shipped, new gotchas. Absolute
+dates.
 
-## Notes / invariants
-- **Never regenerate `~/.tauri/private-room.key`** — it is the key of record;
-  regenerating orphans every installed copy's auto-update. Back it up, don't
-  rotate.
-- Keep the five version files and the git tag in lockstep — a crate version
-  mismatch is user-visible (MCP `serverInfo`) and the tag drives the assets.
-- If the key isn't on the machine, cut a **DMG-first** release instead (publish
-  the DMG + unsigned tar now, sign `latest.json` later on a machine with the
-  key) — see RELEASING.md §3.
+## Local reinstall (no release)
+
+For "reinstall" / "rebuild and install" after code changes — no version bump,
+no tag, no publishing. Verified 2026-08-27:
+
+```sh
+df -h /                                     # step 0 applies here too
+./services/agent-sidecar/build-sidecar.sh --clean # only if the sidecar changed
+# Prove the staged sidecar actually boots (a disk-full build can truncate it):
+services/agent-sidecar/dist/arcelle-sidecar/arcelle-sidecar --port 0 & # expect SIDECAR_PORT=<n> within ~30s, then kill it
+
+ARCELLE_MAC_IDENTITY=- ARCELLE_PACKAGE_UNSIGNED_PROOF=0 \
+ARCELLE_MODELS_DIR="$PWD/apps/desktop/resources/models" \
+ARCELLE_SIDECAR_STAGE_DIR="$PWD/services/agent-sidecar/dist/arcelle-sidecar" \
+npm run package:dir
+```
+
+- `ARCELLE_MAC_IDENTITY=-` = the same stable-DR ad-hoc signature the installed
+  app carries → TCC grants survive the swap. Match the installed app's mode
+  (`codesign -dv /Applications/Arcelle.app` — `TeamIdentifier=not set` means
+  ad-hoc).
+- `ARCELLE_PACKAGE_UNSIGNED_PROOF=0` is load-bearing: a bare `--dir` build
+  defaults to an UNSIGNED proof build (`identity: null`), which would nuke TCC
+  on install. Any value except `1` keeps signing on.
+- `package:dir` produces only `release/mac-arm64/Arcelle.app` (no DMG), runs
+  the same typecheck + full-suite + ABI-flip pipeline as `package:mac`.
+
+Then install exactly as step 9 above. The sidecar is spawned ON DEMAND — after
+launch, `pgrep -f arcelle-sidecar` showing nothing is normal.

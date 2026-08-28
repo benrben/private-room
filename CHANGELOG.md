@@ -1736,7 +1736,7 @@ recording, and a redesigned shell to hold it all.
   dead duplicate engines and API wrappers, fixed the MCP initialize handshake
   (standards-strict servers now connect), and added syntax highlighting to
   diff approval cards.
-- **QA harness** — `qa/make-qa.mjs` renders the full UI in a plain browser
+- **QA harness** — `tests/support/make-qa.mjs` renders the full UI in a plain browser
   with mocked IPC for visual QA and screenshots.
 
 ## 0.2.3 — 2026-07-08
