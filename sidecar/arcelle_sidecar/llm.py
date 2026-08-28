@@ -335,6 +335,23 @@ async def capabilities(model: str, base_url: str) -> list[str]:
     return list(resp.capabilities or [])
 
 
+async def probe_model(model: str, base_url: str) -> list[str]:
+    """Strict model-selection probe via Ollama ``/api/show``.
+
+    Capability badges deliberately treat every metadata failure as an empty
+    capability list. A model picker cannot use that contract: a missing tag or
+    unreachable provider must stop before an agent run. Keep this separate so
+    the display path remains best-effort while selection preserves the engine's
+    classified error envelope.
+    """
+    try:
+        client = AsyncClient(host=base_url)
+        resp = await client.show(model)
+    except Exception as exc:  # noqa: BLE001 - classified for the host
+        raise _classify(exc) from exc
+    return list(resp.capabilities or [])
+
+
 async def pull(model: str, base_url: str) -> AsyncIterator[dict[str, Any]]:
     """Stream a model download as ``{status, completed?, total?}`` progress dicts.
 
@@ -364,6 +381,7 @@ __all__ = [
     "generate_stream",
     "delete",
     "list_models",
+    "probe_model",
     "warm",
     "capabilities",
     "pull",

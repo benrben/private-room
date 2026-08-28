@@ -163,7 +163,7 @@ try {
   // native agents otherwise sometimes decide that four completed operations
   // are enough and merely describe the fifth. This directly proves that the
   // provider can discover and execute the recoverable delete tool.
-  const deleteTool = provider === "ollama-local"
+  const deleteTool = provider === "ollama-local" || provider === "ollama-cloud" || provider === "openrouter"
     ? { name: "workspace_delete", arguments: { path: "delete-me.txt" } }
     : { name: "mcp__room__trash_files", arguments: { names: ["delete-me.txt"] } };
   const deleteRun = await runAgent(

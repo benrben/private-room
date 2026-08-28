@@ -3,6 +3,23 @@
 All notable, user-facing changes to Arcelle. Versions follow
 [semver](https://semver.org); dates are the GitHub release dates.
 
+## 0.26.8 — 2026-08-28
+
+Ollama Cloud model names are now canonicalized after installed-catalog
+matching. This fixes hosted models whose local catalog uses display casing,
+such as `Gpt-oss:120b-cloud`, while the cloud service requires the canonical
+lowercase registry tag. Model selection also uses a strict metadata probe, so
+missing or unavailable model IDs are rejected before an agent run begins.
+
+Deep Harness file tools now use the same path arguments for local Ollama,
+Ollama Cloud, and OpenRouter, including safe relative room paths. OpenRouter
+keeps provider model IDs separate from display names and rejects stale display
+labels before a run. Unified-harness output now passes through the protected
+value redaction gate, including values split across streaming chunks.
+
+Legacy conversion and sealed import now force copied private databases to
+owner-only permissions before they are opened or published.
+
 ## 0.26.7 — 2026-08-28
 
 Agent work is now verified from the room, not trusted from model text. Studio

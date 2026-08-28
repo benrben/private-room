@@ -18,7 +18,7 @@ import { createWorkspaceRoom, openWorkspaceRoom } from "../workspace/roomLayout.
 import { WorkspaceService } from "../workspace/workspaceService.js";
 import { HarnessController } from "./controller.js";
 import { RuntimeWithFallback } from "./legacyCli.js";
-import type { HarnessContext, HarnessRun, HarnessRuntime } from "./types.js";
+import type { HarnessContext, HarnessName, HarnessRun, HarnessRuntime } from "./types.js";
 import type { WorkspaceOperationProgressEvent } from "../../shared/workspaceProgress.js";
 
 const roots: string[] = [];
@@ -96,6 +96,25 @@ class CapturingRuntime implements HarnessRuntime {
   }
 }
 
+class SplitProtectedOutputRuntime implements HarnessRuntime {
+  constructor(readonly name: HarnessName) {}
+  async available(): Promise<boolean> { return true; }
+  async startTurn(context: HarnessContext): Promise<HarnessRun> {
+    const harness = this.name;
+    async function* events() {
+      yield { type: "run_started", runId: context.runId, harness } as const;
+      yield { type: "text_delta", runId: context.runId, text: "Call Ben " } as const;
+      yield { type: "text_delta", runId: context.runId, text: "Reich now." } as const;
+      yield { type: "run_completed", runId: context.runId, status: "completed" } as const;
+    }
+    return {
+      events: events(),
+      cancel: async () => undefined,
+      approve: async () => undefined,
+    };
+  }
+}
+
 async function fixture() {
   const root = await mkdtemp(path.join(os.tmpdir(), "arcelle-harness-controller-"));
   roots.push(root);
@@ -118,6 +137,101 @@ async function fixture() {
 }
 
 describe("HarnessController", () => {
+  it.each([
+    {
+      label: "Deep",
+      provider: "ollama-local" as const,
+      harness: "arcelle-deep" as const,
+      model: "qwen3:14b",
+      privacyMode: "local" as const,
+    },
+    {
+      label: "native",
+      provider: "codex" as const,
+      harness: "codex-app-server" as const,
+      model: "test",
+      privacyMode: "cloud-redacted" as const,
+    },
+  ])("stream-redacts protected output split across $label harness deltas", async (row) => {
+    const f = await fixture();
+    let complete!: () => void;
+    const completed = new Promise<void>((resolve) => { complete = resolve; });
+    const visible: string[] = [];
+    try {
+      const runtime = new SplitProtectedOutputRuntime(row.harness);
+      const controller = new HarnessController(f.state, f.root, (event, payload) => {
+        if (event !== "harness-event") return;
+        const item = payload as { type?: string; text?: string };
+        if (item.type === "text_delta") visible.push(item.text ?? "");
+        if (item.type === "run_completed") complete();
+      }, {
+        runtimes: { [row.provider]: runtime },
+        policy: () => ({
+          active: true,
+          rules: RULES,
+          concepts: [],
+          guardModel: "local",
+          redactor: new Redactor(RULES),
+        }),
+        flag: () => true,
+        outsideWorkspaceIsolation: true,
+        verifyExposure: async () => true,
+        listOllamaModels: async () => ["qwen3:14b"],
+      });
+      await controller.start({
+        provider: row.provider,
+        model: row.model,
+        privacyMode: row.privacyMode,
+        writeEnabled: false,
+        text: "review",
+      });
+      await completed;
+      expect(visible.join("")).toBe("Call [Person A] now.");
+      expect(visible.join("")).not.toContain("Ben Reich");
+    } finally {
+      f.created.db.close();
+    }
+  });
+
+  it("keeps protected output unchanged only for explicit cloud-direct harness runs", async () => {
+    const f = await fixture();
+    let complete!: () => void;
+    const completed = new Promise<void>((resolve) => { complete = resolve; });
+    const visible: string[] = [];
+    try {
+      const runtime = new SplitProtectedOutputRuntime("codex-app-server");
+      const controller = new HarnessController(f.state, f.root, (event, payload) => {
+        if (event !== "harness-event") return;
+        const item = payload as { type?: string; text?: string };
+        if (item.type === "text_delta") visible.push(item.text ?? "");
+        if (item.type === "run_completed") complete();
+      }, {
+        runtimes: { codex: runtime },
+        policy: () => ({
+          active: true,
+          rules: RULES,
+          concepts: [],
+          guardModel: "local",
+          redactor: new Redactor(RULES),
+        }),
+        flag: () => true,
+        outsideWorkspaceIsolation: true,
+        verifyExposure: async () => true,
+      });
+      await controller.start({
+        provider: "codex",
+        model: "test",
+        privacyMode: "cloud-direct",
+        writeEnabled: false,
+        text: "review",
+      });
+      await completed;
+      expect(visible.join("")).toBe("Call Ben Reich now.");
+    } finally {
+      f.created.db.close();
+    }
+  });
+
   it.each(["codex", "claude"] as const)(
     "uses the installed %s default when the UI sends its default alias",
     async (provider) => {
@@ -203,10 +317,10 @@ describe("HarnessController", () => {
 
   it.each([
     {
-      name: "uses the Ollama catalog spelling for a cloud model",
+      name: "canonicalizes a cloud model even when the Ollama catalog uses display casing",
       provider: "ollama-cloud" as const,
-      requested: " Gpt-OSS:120B-Cloud ",
-      catalog: ["gpt-oss:120b-cloud"],
+      requested: " gpt-oss:120b-cloud ",
+      catalog: ["Gpt-oss:120b-cloud"],
       expected: "gpt-oss:120b-cloud",
     },
     {

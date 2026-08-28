@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { copyFile, lstat, mkdir, open, rename, rm, writeFile } from "node:fs/promises";
+import { chmod, copyFile, lstat, mkdir, open, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type Database from "better-sqlite3-multiple-ciphers";
 import { migrate } from "../db-host/migrate.js";
@@ -549,6 +549,10 @@ async function importSealedPackageCore(
     await mkdir(path.join(privateRoot, OBJECTS_DIR), { recursive: true, mode: 0o700 });
     await mkdir(path.join(privateRoot, TEMP_DIR), { recursive: true, mode: 0o700 });
     await copyFile(source, dbPath);
+    // A sealed package is private too, but never trust its source mode: copied
+    // files retain it. Tighten the workspace database before opening it and
+    // before the temporary workspace can be published.
+    await chmod(dbPath, 0o600);
     db = openRoom(dbPath, packagePassword);
     migrate(db);
     const files = db.prepare("SELECT file_id, relative_path, size_bytes, sha256 FROM sealed_files ORDER BY relative_path")

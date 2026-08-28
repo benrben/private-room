@@ -133,13 +133,19 @@ async def test_workspace_move_tools_require_write_baseline_and_validate_both_pat
 
     tools = {tool.name: tool for tool in _workspace_mutation_tools(writable)}
     assert set(tools) == {"workspace_delete", "workspace_move", "workspace_rename"}
-    await tools["workspace_delete"].ainvoke({"file_path": "/obsolete.pdf"})
+    assert tools["workspace_delete"].args_schema.model_json_schema()["required"] == ["path"]
+    assert tools["workspace_rename"].args_schema.model_json_schema()["required"] == [
+        "source_path",
+        "new_name",
+    ]
+    await tools["workspace_delete"].ainvoke({"path": "obsolete.pdf"})
     await tools["workspace_move"].ainvoke(
         {"source_path": "/binary.pdf", "destination_path": "/Filed/binary.pdf"}
     )
     await tools["workspace_rename"].ainvoke(
-        {"file_path": "/Filed/binary.pdf", "new_name": "signed.pdf"}
+        {"source_path": "/Filed/binary.pdf", "new_name": "signed.pdf"}
     )
+    assert bridge.calls[0] == ("delete", {"path": "/obsolete.pdf"})
     assert [operation for operation, _arguments in bridge.calls] == ["delete", "move", "rename"]
 
 

@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -165,6 +165,8 @@ describe("sealed workspace packages", () => {
     });
     await expect(async () => inspectSealedPackage(sealedPath, roomPassword)).rejects.toThrow();
     expect((await readFile(sealedPath)).includes(Buffer.from("current normal bytes"))).toBe(false);
+    // Imported workspace permissions must not depend on the package's mode.
+    await chmod(sealedPath, 0o644);
 
     const importedRoot = path.join(root, "Imported Room");
     const importProgress: WorkspaceOperationProgressEvent[] = [];
@@ -185,6 +187,8 @@ describe("sealed workspace packages", () => {
     });
     expect(await readFile(path.join(importedRoot, "Research/notes.txt"), "utf8"))
       .toBe("current normal bytes");
+    expect((await stat(path.join(importedRoot, ".arcelle", "room.db"))).mode & 0o777)
+      .toBe(0o600);
 
     const reopened = openWorkspaceRoom(importedRoot, importedPassword);
     try {

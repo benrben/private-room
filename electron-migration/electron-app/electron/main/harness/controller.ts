@@ -3,6 +3,7 @@ import { mkdir, rm } from "node:fs/promises";
 import path from "node:path";
 import type { EventSender } from "../turn.js";
 import { activePolicy, type PolicyState } from "../privacy.js";
+import { emptyPrivacyReport, type StreamRedactor } from "../privacyRedact.js";
 import type { RoomManagerState } from "../roomManager.js";
 import type { LiveAppServices } from "../liveAppServices.js";
 import { runsOnThisMac } from "../capabilities.js";
@@ -74,6 +75,20 @@ interface MirrorRun {
 
 interface PendingMirrorApproval {
   resolve(approved: boolean): void;
+}
+
+/** Redact provider output at the provider-neutral boundary.
+ *
+ * Native and Deep runtimes stream the same event shape, so enforcing here
+ * prevents a new runtime from bypassing the privacy gate. The stream redactor
+ * deliberately spans delta boundaries ("Ben " + "Reich"). */
+function redactHarnessTextDelta(
+  event: HarnessEvent,
+  redactor: StreamRedactor | null,
+): HarnessEvent | null {
+  if (event.type !== "text_delta" || redactor === null) return event;
+  const text = redactor.feed(event.text);
+  return text === "" ? null : { ...event, text };
 }
 
 export interface HarnessControllerOptions {
@@ -315,11 +330,11 @@ export class HarnessController {
         : [];
       if (exact !== undefined) selectedModel = exact;
       else if (folded.length === 1) selectedModel = folded[0]!;
-      else if (folded.length === 0 && request.provider === "ollama-cloud") {
-        // Ollama Cloud rejects display-case variants of simple registry tags.
-        // Namespaced/custom paths keep their original casing.
-        selectedModel = registryName(selectedModel);
-      }
+      // `/api/tags` may return display casing such as
+      // `Gpt-oss:120b-cloud`, but Ollama Cloud removes `-cloud` and proxies
+      // the remaining name case-sensitively. Canonicalize simple cloud tags
+      // after catalog matching; registryName preserves namespaced paths.
+      if (request.provider === "ollama-cloud") selectedModel = registryName(selectedModel);
     }
     if (!native && (selectedModel === "" || selectedModel.toLowerCase() === "default")) {
       throw new Error(`Choose a specific model for the ${request.provider} harness.`);
@@ -398,6 +413,11 @@ export class HarnessController {
 
     const orchestrator = this.ensureOrchestrator();
     try {
+      // ARC-002: output privacy belongs above provider runtimes. Local models
+      // can echo protected workspace values too; only the user's explicit
+      // cloud-direct choice bypasses this deterministic final-output fence.
+      const outputPolicy = request.privacyMode === "cloud-direct" ? null : this.policy();
+      const outputRedactor = outputPolicy?.redactor.stream(emptyPrivacyReport()) ?? null;
       const started = await orchestrator.start({
         ...request,
         model: selectedModel,
@@ -409,6 +429,7 @@ export class HarnessController {
       });
       const pump = (async () => {
         let terminal: HarnessEvent | null = null;
+        let lastTextEvent: Extract<HarnessEvent, { type: "text_delta" }> | null = null;
         try {
           for await (const event of started.events) {
             if (event.type === "run_started") orchestrator.recordHarness(runId, event.harness);
@@ -417,12 +438,26 @@ export class HarnessController {
             // must already be gone. Buffer the one terminal event until cleanup
             // completes so callers cannot race a room close, test teardown, or
             // the next run against a still-removing runtime tree.
-            if (event.type === "run_completed" || event.type === "run_failed") terminal = event;
-            else this.emit("harness-event", event);
+            if (event.type === "run_completed" || event.type === "run_failed") {
+              terminal = event;
+            } else {
+              if (event.type === "text_delta") lastTextEvent = event;
+              const visible = redactHarnessTextDelta(event, outputRedactor);
+              if (visible !== null) this.emit("harness-event", visible);
+            }
           }
         } finally {
-          await this.removeRunRuntime(runId);
-          this.pumps.delete(runId);
+          try {
+            const tail = outputRedactor?.flush() ?? "";
+            if (tail !== "") {
+              this.emit("harness-event", lastTextEvent === null
+                ? { type: "text_delta", runId, text: tail }
+                : { ...lastTextEvent, text: tail });
+            }
+          } finally {
+            await this.removeRunRuntime(runId);
+            this.pumps.delete(runId);
+          }
         }
         if (terminal !== null) this.emit("harness-event", terminal);
       })();

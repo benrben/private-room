@@ -201,6 +201,9 @@ const modelRuntimeCache = new Map<string, ModelRuntimeFacts>();
 /** Exact IDs in the authenticated, account-scoped chat catalog. Kept separate
  * from display labels and from supplementary public media catalog entries. */
 const selectableProviderModelIds = new Set<string>();
+/** Human-readable catalog names. These are deliberately kept in a separate
+ * set so an old room setting can never be mistaken for a provider model ID. */
+const providerModelDisplayLabels = new Set<string>();
 
 /** Providers whose saved key the provider ITSELF rejected (HTTP 401) at least
  * once this session — `providers.rs`'s `rejected_keys`.
@@ -317,6 +320,7 @@ async function withFetchLock<T>(fn: () => Promise<T>): Promise<T> {
 export function resetProviderStateForTests(): void {
   modelRuntimeCache.clear();
   selectableProviderModelIds.clear();
+  providerModelDisplayLabels.clear();
   rejectedKeys.clear();
   catalogLoaded = false;
   catalogAttemptedAtMs = null;
@@ -834,7 +838,9 @@ async function fetchOpenrouterModels(key: string, fetchJson: FetchJsonLike): Pro
   // sorted — and the picker shows this list verbatim.
   models.sort(byLowercaseLabel);
 
+  providerModelDisplayLabels.clear();
   for (const model of models) {
+    providerModelDisplayLabels.add(model.label);
     modelRuntimeCache.set(model.slug, {
       contextWindow: model.contextWindow,
       tools: model.tools,
@@ -936,13 +942,21 @@ export function providerRuntimeConfig(
   const provider = parts[0] ?? "";
   if (provider !== OPENROUTER_ID) return null;
 
-  // Matches the Rust source exactly: the filter only checks whether the
-  // TRIMMED value is non-empty, but `selected` itself stays UNTRIMMED —
-  // unlike `providerModelFacts`/`ensureProviderCatalog`, which do trim before
-  // their cache lookups.
-  const selected = parts[1];
-  if (selected === undefined || selected.trim() === "") {
+  const rawSelected = parts[1];
+  if (rawSelected === undefined || rawSelected.trim() === "") {
     throw new Error("Choose a specific OpenRouter model first.");
+  }
+  // The provider catalog has two distinct fields: `id` is the wire value and
+  // `name` is presentation only. A pre-fix room could retain a display name
+  // such as "OpenAI: gpt-oss-20b". Once the live catalog identifies that
+  // value as a label, fail locally instead of sending it as an invalid model
+  // ID. Do not guess a slug from a label: labels are not guaranteed unique.
+  const selected = rawSelected.trim();
+  if (!modelRuntimeCache.has(selected) && providerModelDisplayLabels.has(selected)) {
+    throw new Error(
+      `“${selected}” is an OpenRouter display name, not a model ID. ` +
+        "Choose the model again in Settings → Model.",
+    );
   }
 
   const { label, baseUrl } = providerSpec(provider);

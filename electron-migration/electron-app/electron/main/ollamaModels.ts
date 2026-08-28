@@ -274,7 +274,7 @@ export async function ollamaCapabilities(model: string): Promise<string[]> {
  */
 export async function probeOllamaModelSelection(model: string): Promise<{ ok: boolean; detail: string | null }> {
   const outcome = await sidecarJsonCancellable(
-    "/capabilities",
+    "/probe_model",
     { model, base_url: resolvedBaseUrl() },
     new CancelFlag(),
     METADATA_TIMEOUT_MS

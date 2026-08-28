@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -98,6 +98,9 @@ describe("legacy workspace conversion", () => {
     moveFileToFolder(legacy, second.id, folder.id);
     setMeta(legacy, "private_test_state", "kept");
     legacy.close();
+    // Reproduce rooms created by older builds. Conversion must not preserve
+    // this loose mode into the new workspace.
+    await chmod(sourcePath, 0o644);
     const sourceHashBefore = await sha256File(sourcePath);
 
     const progress: WorkspaceOperationProgressEvent[] = [];
@@ -120,6 +123,8 @@ describe("legacy workspace conversion", () => {
       .toBe("first bytes");
     expect(await readFile(path.join(destinationPath, "Research", "notes_ (2).txt"), "utf8"))
       .toBe("second bytes");
+    expect((await stat(path.join(destinationPath, ".arcelle", "room.db"))).mode & 0o777)
+      .toBe(0o600);
 
     const workspace = openWorkspaceRoom(destinationPath, password);
     try {
@@ -182,12 +187,21 @@ describe("legacy workspace conversion", () => {
         if (exported === 1) throw new Error("simulated interruption");
       },
     })).rejects.toThrow(/simulated interruption/);
+    const resumedDb = path.join(
+      root,
+      ".Resumed Room.arcelle-conversion.tmp",
+      ".arcelle",
+      "room.db",
+    );
+    await chmod(resumedDb, 0o644);
     expect(progress.at(-1)).toMatchObject({
       operationId: "convert-failed", operation: "legacy-conversion", phase: "failed", status: "failed",
     });
 
     const report = await convertLegacyRoomToWorkspace(sourcePath, password, destinationPath);
     expect(report.resumed).toBe(true);
+    expect((await stat(path.join(destinationPath, ".arcelle", "room.db"))).mode & 0o777)
+      .toBe(0o600);
     expect(report.convertedFiles).toBe(2);
     expect(await readFile(path.join(destinationPath, "one.txt"), "utf8")).toBe("one");
     expect(await readFile(path.join(destinationPath, "two.txt"), "utf8")).toBe("two");

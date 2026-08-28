@@ -646,6 +646,17 @@ def create_app(
         caps = await llm.capabilities(req.model, req.base_url)
         return {"capabilities": caps}
 
+    @app.post("/probe_model")
+    async def probe_model(req: CapabilitiesRequest) -> Any:
+        # Selection is fail-closed. Unlike /capabilities (best-effort badges),
+        # this route preserves MODEL_MISSING / OLLAMA_DOWN / ENGINE_ERROR so an
+        # invalid exact ID cannot reach a real agent run.
+        try:
+            caps = await llm.probe_model(req.model, req.base_url)
+        except llm.LlmError as exc:
+            return exc.response()
+        return {"capabilities": caps}
+
     @app.post("/agents")
     async def agents(req: SpecialistsRequest) -> Any:
         # The composer's `*` menu — one row per AGENT the room can run, not per

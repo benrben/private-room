@@ -243,8 +243,6 @@ class McpWorkspaceBridge:
 
 
 def _safe_virtual_path(value: str) -> str:
-    if not value.startswith("/"):
-        raise ValueError("Workspace paths must start with '/'.")
     parts = [part for part in value.replace("\\", "/").split("/") if part not in ("", ".")]
     if any(part == ".." for part in parts):
         raise ValueError("Workspace paths cannot leave the room.")
@@ -448,14 +446,14 @@ class ArcelleToolBackend:
 def _workspace_mutation_tools(backend: ArcelleWorkspaceBackend) -> list[BaseTool]:
     """Tools missing from Deep Agents' text-focused filesystem middleware."""
 
-    async def workspace_delete(file_path: str) -> str:
+    async def workspace_delete(path: str) -> str:
         """Move one normal workspace file to recoverable Arcelle Trash.
 
         Use this tool when the user asks to delete a file. Do not simulate a
         deletion by renaming or moving the file to another workspace folder.
         Arcelle permits the operation only after a rollback baseline exists.
         """
-        result = await backend.adelete(file_path)
+        result = await backend.adelete(path)
         return json.dumps(
             {
                 key: value
@@ -467,7 +465,7 @@ def _workspace_mutation_tools(backend: ArcelleWorkspaceBackend) -> list[BaseTool
         )
 
     async def workspace_move(source_path: str, destination_path: str) -> str:
-        """Move or rename a normal workspace file to an exact absolute virtual path.
+        """Move or rename a normal workspace file to an exact virtual path.
 
         This moves the filesystem entry directly, so it also works for PDFs,
         recordings, images, sketches, spreadsheets, and other binary files.
@@ -479,14 +477,14 @@ def _workspace_mutation_tools(backend: ArcelleWorkspaceBackend) -> list[BaseTool
             separators=(",", ":"),
         )
 
-    async def workspace_rename(file_path: str, new_name: str) -> str:
+    async def workspace_rename(source_path: str, new_name: str) -> str:
         """Rename a normal workspace file while keeping it in its current folder.
 
         Give only the new file name, including its extension. Arcelle moves the
         filesystem entry directly and requires an authorized rollback baseline.
         """
         return json.dumps(
-            await backend.arename(file_path, new_name),
+            await backend.arename(source_path, new_name),
             sort_keys=True,
             separators=(",", ":"),
         )

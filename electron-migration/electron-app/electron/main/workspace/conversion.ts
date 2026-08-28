@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import {
+  chmod,
   copyFile,
   lstat,
   mkdir,
@@ -321,6 +322,11 @@ async function convertLegacyRoomToWorkspaceCore(
     await mkdir(path.join(privateRoot, TEMP_DIR), { recursive: true, mode: 0o700 });
     await copyFile(source, dbPath);
   }
+  // copyFile preserves the legacy database's mode. Older rooms may be 0644,
+  // and a resumable conversion may already contain such a copied database.
+  // Repair it before opening any private state and before the workspace can
+  // ever be published.
+  await chmod(dbPath, 0o600);
 
   const db = openRoom(dbPath, password);
   let roomId = getMeta(db, ROOM_ID_META);

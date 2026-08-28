@@ -43,6 +43,7 @@ import {
   pullCancellableAt,
   pullModel,
   pullProgressShouldEmit,
+  probeOllamaModelSelection,
   registerOllamaModelsIpc,
   registryName,
   resetTotalRamCacheForTests,
@@ -355,6 +356,49 @@ describe("ollamaCapabilities", () => {
       res.end(JSON.stringify({ capabilities: "not-an-array" }));
     });
     await expect(ollamaCapabilities("qwen2.5vl")).resolves.toEqual([]);
+  });
+});
+
+describe("probeOllamaModelSelection", () => {
+  it("uses the strict probe route and accepts a validated exact ID", async () => {
+    let requestPath = "";
+    let seen: Record<string, unknown> = {};
+    await sidecarAt(async (req, res) => {
+      requestPath = req.url ?? "";
+      seen = await jsonBody(req);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ capabilities: [] }));
+    });
+
+    await expect(probeOllamaModelSelection("gpt-oss:120b-cloud")).resolves.toEqual({
+      ok: true,
+      detail: null,
+    });
+    expect(requestPath).toBe("/probe_model");
+    expect(seen.model).toBe("gpt-oss:120b-cloud");
+  });
+
+  it("rejects MODEL_MISSING instead of accepting empty badge capabilities", async () => {
+    await sidecarAt((_req, res) => {
+      res.writeHead(502, { "content-type": "application/json" });
+      res.end(JSON.stringify({ code: "MODEL_MISSING", error: "not found" }));
+    });
+
+    await expect(probeOllamaModelSelection("Gpt-oss:120b-cloud")).resolves.toEqual({
+      ok: false,
+      detail: "MODEL_MISSING:Gpt-oss:120b-cloud",
+    });
+  });
+
+  it("rejects provider errors with their classified detail", async () => {
+    await sidecarAt((_req, res) => {
+      res.writeHead(502, { "content-type": "application/json" });
+      res.end(JSON.stringify({ code: "ENGINE_ERROR", error: "cloud relay unavailable" }));
+    });
+
+    const result = await probeOllamaModelSelection("gpt-oss:120b-cloud");
+    expect(result.ok).toBe(false);
+    expect(result.detail).toContain("cloud relay unavailable");
   });
 });
 

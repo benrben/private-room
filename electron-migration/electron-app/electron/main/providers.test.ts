@@ -847,19 +847,41 @@ describe("providerRuntimeConfig", () => {
     });
   });
 
+  it("sends the exact OpenRouter catalog ID and refuses its display label", async () => {
+    const deps = forbiddenDeps({
+      readKey: () => "sk-real",
+      fetchJson: async (url) =>
+        url.endsWith("/models/user")
+          ? jsonResponse(200, {
+              data: [{
+                id: "openai/gpt-oss-20b",
+                name: "OpenAI: gpt-oss-20b",
+                context_length: 131_072,
+                supported_parameters: ["tools"],
+              }],
+            })
+          : jsonResponse(200, { data: [] }),
+    });
+
+    const catalog = await listProviderModels(OPENROUTER_ID, deps);
+    expect(catalog[0]).toMatchObject({
+      slug: "openai/gpt-oss-20b",
+      label: "OpenAI: gpt-oss-20b",
+    });
+    expect(providerRuntimeConfig("openrouter::openai/gpt-oss-20b", deps)?.model)
+      .toBe("openai/gpt-oss-20b");
+    expect(() => providerRuntimeConfig("openrouter::OpenAI: gpt-oss-20b", deps)).toThrow(
+      /display name, not a model ID[\s\S]*Settings → Model/,
+    );
+  });
+
   it("defaults to supportsTools=true and contextWindow=null when the model is not in the cache", () => {
     const config = providerRuntimeConfig("openrouter::vendor/never-fetched", forbiddenDeps({ readKey: () => "sk" }));
     expect(config?.contextWindow).toBeNull();
     expect(config?.supportsTools).toBe(true);
   });
 
-  it("keeps the selected slug UNTRIMMED, unlike providerModelFacts — the Rust asymmetry, pinned", async () => {
-    // Rust's `parts.next().filter(|v| !v.trim().is_empty())` only INSPECTS the
-    // trimmed form; the value it keeps is the original. `provider_model_facts`
-    // by contrast does `.nth(1)?.trim()` before its lookup. Two sites, two
-    // rules — so a padded selection reads the cache successfully through one
-    // and misses it through the other. Pinned because "tidying" either into
-    // agreement silently changes what the sidecar is told the model is called.
+  it("removes only surrounding whitespace and keeps the exact catalog slug", async () => {
     const deps = forbiddenDeps({
       readKey: () => "sk-real",
       fetchJson: async (url) =>
@@ -872,12 +894,9 @@ describe("providerRuntimeConfig", () => {
     await listProviderModels(OPENROUTER_ID, deps);
 
     const config = providerRuntimeConfig("openrouter::  vendor/padded  ", deps);
-    expect(config?.model, "the padding survives into the sidecar's model name").toBe("  vendor/padded  ");
-    // …and because the cache is keyed by the catalog's own slug, the padded
-    // lookup misses and falls back to the unknown defaults.
-    expect(config?.contextWindow).toBeNull();
-    expect(config?.supportsTools).toBe(true);
-    // The other site trims, so it finds the very same model.
+    expect(config?.model).toBe("vendor/padded");
+    expect(config?.contextWindow).toBe(42);
+    expect(config?.supportsTools).toBe(false);
     expect(providerModelFacts("openrouter::  vendor/padded  ")?.contextWindow).toBe(42);
   });
 });

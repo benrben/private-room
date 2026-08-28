@@ -1,5 +1,5 @@
 """The LLM gateway (MIGRATION Phase 1): /embed, /generate, /models, /warm,
-/capabilities, /pull.
+/capabilities, /probe_model, /pull.
 
 No network, no Ollama, no weights: a fake ``ollama.AsyncClient`` is injected and
 we assert the wire behaviour and the error-code contract the Rust gateway relies
@@ -440,6 +440,45 @@ async def test_capabilities_never_fails(fake_client: type[FakeAsyncClient]) -> N
         resp = await c.post("/capabilities", json={"model": "m", "base_url": "http://h:1"})
     assert resp.status_code == 200
     assert resp.json() == {"capabilities": []}
+
+
+async def test_probe_model_returns_declared_capabilities(fake_client: type[FakeAsyncClient]) -> None:
+    fake_client.script["show"] = SimpleNamespace(capabilities=["tools", "vision"])
+    app = create_app()
+    async with client_for(app) as c:
+        resp = await c.post("/probe_model", json={"model": "m", "base_url": "http://h:1"})
+    assert resp.status_code == 200
+    assert resp.json() == {"capabilities": ["tools", "vision"]}
+
+
+async def test_probe_model_preserves_model_missing(fake_client: type[FakeAsyncClient]) -> None:
+    fake_client.script["show"] = ResponseError("model 'Wrong' not found", 404)
+    app = create_app()
+    async with client_for(app) as c:
+        resp = await c.post(
+            "/probe_model",
+            json={"model": "Wrong:cloud", "base_url": "http://h:1"},
+        )
+    assert resp.status_code == 502
+    assert resp.json() == {
+        "code": "MODEL_MISSING",
+        "error": "model 'Wrong' not found",
+    }
+
+
+async def test_probe_model_preserves_provider_failure(fake_client: type[FakeAsyncClient]) -> None:
+    fake_client.script["show"] = ResponseError("cloud relay refused the request", 503)
+    app = create_app()
+    async with client_for(app) as c:
+        resp = await c.post(
+            "/probe_model",
+            json={"model": "gpt-oss:120b-cloud", "base_url": "http://h:1"},
+        )
+    assert resp.status_code == 502
+    assert resp.json() == {
+        "code": "ENGINE_ERROR",
+        "error": "cloud relay refused the request",
+    }
 
 
 # --- /pull ------------------------------------------------------------------
