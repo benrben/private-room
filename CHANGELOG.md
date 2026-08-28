@@ -3,6 +3,28 @@
 All notable, user-facing changes to Arcelle. Versions follow
 [semver](https://semver.org); dates are the GitHub release dates.
 
+## 0.26.7 — 2026-08-28
+
+Agent work is now verified from the room, not trusted from model text. Studio
+and other write tools must return a readable artifact receipt before Arcelle
+reports success. File changes refresh the Library immediately, and failed
+commands show a useful error inside the same conversation turn.
+
+Codex, Claude, Ollama and OpenRouter now share stricter capability checks.
+Provider model IDs are preserved exactly, unavailable specialist actions are
+disabled before a run, and explicit no-tools or no-sources requests are
+enforced by the runtime. Local and cloud answers use the same final privacy
+redaction gate.
+
+Cross-file comparisons require quote-level evidence. Video agents receive the
+same verified frame bytes and hash. Private workspace databases and recovery
+files are repaired to mode 0600, while agent writes remain protected by
+baselines, reconciliation and rollback.
+
+This release also fixes recording playback and microphone constraints, Sketch
+and preview regressions, native build startup, and the complete browser QA and
+screenshot-capture pipeline.
+
 ## 0.26.6 — 2026-08-27
 
 Arcelle now previews substantially more real-world files inside the app. Text
