@@ -371,7 +371,12 @@ FILES_PROMPT = (
     "a separate fact list for EACH named file from that file's own open_file "
     "result. Attribute every comparison sentence to the file(s) whose text "
     "supports it; if no returned span supports a relationship, omit it rather "
-    "than infer that both files share the fact. "
+    "than infer that both files share the fact. For what an image or sketch "
+    "SHOWS, call view_file_image and inspect the attached pixels before "
+    "answering. open_file only opens the viewer for the user; OCR, extracted "
+    "text, a filename, or a receipt without an image is not visual evidence. "
+    "If pixels are unavailable, put that in MISSING and do not infer the "
+    "picture from metadata. "
     'Example — task: "what notice '
     'period does the lease need?" -> search_room("notice period") -> FOUND: '
     '"either party may terminate with 60 days written notice" (lease.pdf, '
@@ -732,12 +737,15 @@ STUDIO_PROMPT = (
 DRAW_PROMPT = (
     "\n\nYou are the DRAWING AGENT: you draw on this room's sketches. "
     "Put the WHOLE drawing in ONE draw call — every shape on its own line of "
-    "`script` — never one call per shape. Then call read_drawing to check "
-    "your work: it lists what is on the page and MEASURES what is wrong with "
+    "`script` — never one call per shape. Then call read_drawing to inspect "
+    "the attached PNG pixels and check your work: it also lists what is on "
+    "the page and MEASURES what is wrong with "
     "it (overlaps, shapes off the page, unlabelled shapes, arrows that stop "
     "short). Fix what it reports with a second draw call, and stop when it "
     "reports nothing.\n"
-    "Read an existing drawing BEFORE changing it, so you edit real ids "
+    "A text-only read_drawing receipt is not visual evidence: if its PNG is "
+    "missing, say MISSING and never claim what the drawing looks like. Read "
+    "an existing drawing BEFORE changing it, so you edit real ids "
     "instead of guessing them.\n"
     "The page is 1600 wide and 1000 tall. Use whole numbers. Colours are "
     "pink, yellow, green, blue and red — no other colour exists. Give every "

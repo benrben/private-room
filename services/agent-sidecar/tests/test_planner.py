@@ -36,7 +36,12 @@ from arcelle_sidecar.agents import (
 )
 from arcelle_sidecar.graph import NOTHING_USABLE_TEXT
 from arcelle_sidecar.manager import resolve_worker
-from arcelle_sidecar.planner import MAX_PLAN_STEPS, build_plan, is_visual_video_intent
+from arcelle_sidecar.planner import (
+    MAX_PLAN_STEPS,
+    build_plan,
+    is_static_visual_intent,
+    is_visual_video_intent,
+)
 
 # The tiers the Rust bridge really serves (room_mcp::ToolScope), same shape as
 # test_capability_truth.py — CloudAdvisor is CORE only, LocalEngine is the lot.
@@ -141,6 +146,45 @@ def test_visual_frame_plan_names_video_unavailable_without_its_pixel_tool() -> N
 
     assert plan.steps == ()
     assert plan.unavailable == (("Video agent", "what you see in frame 6:00 in @video.mp4"),)
+
+
+def test_static_visual_request_plans_file_agent_only_with_pixel_tool() -> None:
+    question = "describe what is shown in @arc-file-pixels.png"
+    assert is_static_visual_intent(question)
+
+    ready = build_plan(question, web_enabled=False, served_names=set(_EVERYTHING))
+    assert [(step.domain, step.worker) for step in ready.steps] == [
+        ("file", "files.read")
+    ]
+    assert ready.steps[0].instruction == question
+
+    blind = build_plan(
+        question,
+        web_enabled=False,
+        served_names=set(_EVERYTHING) - {"view_file_image"},
+    )
+    assert blind.steps == ()
+    assert blind.unavailable == (("File agent", question),)
+
+
+def test_live_e2e_static_pixel_phrase_is_visual_intent() -> None:
+    assert is_static_visual_intent(
+        "*file ARC_FILE_PIXELS inspect @arc-file-pixels.png and report only "
+        "what its visible pixels show"
+    )
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "open photo.png",
+        "rename photo.png",
+        "what is the file size of photo.png",
+        "extract the text from photo.png",
+    ],
+)
+def test_static_visual_planning_does_not_claim_nonvisual_image_work(question: str) -> None:
+    assert not is_static_visual_intent(question)
 
 
 # --------------------------------------------------------------------------- #

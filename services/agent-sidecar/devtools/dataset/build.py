@@ -517,6 +517,9 @@ REPLIES: dict[str, Any] = {
     "ui_act": "clicked mark 5. The panel closed.",
     "view_screenshot": "the Files pane is open, showing six files; no dialog is in front of it.",
     "view_media_frame": "at 00:04:10 a speaker stands beside a slide titled 'Q3 revenue'.",
+    "view_file_image": lambda a: f'Image receipt: "{_a(a, "name", default="diagram.png")}"; '
+    "SHA-256 0c4a7f82737a7a155821afbab1dadb57bcee5decc9e06f64a0ec9f210a3c5a9d; "
+    "1280×720 PNG.",
     # --- transcription -----------------------------------------------------
     "stt_status": "speech model ready (whisper-large-v3, on this Mac).",
     "retranscribe_file": lambda a: f"re-transcribing {_a(a, 'name', default='talk.mp4')} on this "

@@ -54,6 +54,9 @@ describe("specialist roster bridge catalog", () => {
     );
     expect(names).not.toContain("view_media_frame");
     expect(names).not.toContain("view_screenshot");
+    expect(names).not.toContain("view_file_image");
+    expect(names).not.toContain("read_drawing");
+    expect(names).not.toContain("browse_look");
     expect(names).toContain("ui_snapshot");
   });
 
@@ -61,7 +64,9 @@ describe("specialist roster bridge catalog", () => {
     const cloud = specialistEffectiveToolNames("minimax-m3:cloud", true, [], true);
     expect(cloud).not.toContain("draw");
     expect(cloud).not.toContain("organize_files");
-    expect(cloud).toContain("read_drawing");
+    expect(cloud).not.toContain("read_drawing");
+    expect(cloud).not.toContain("view_file_image");
+    expect(cloud).not.toContain("browse_look");
     expect(cloud).not.toContain("view_media_frame");
     expect(cloud).not.toContain("view_screenshot");
     expect(cloud).toContain("ui_snapshot");

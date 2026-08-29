@@ -227,6 +227,9 @@ export function roomServerDispatcherFactory(
      */
     workspaceWriteEnabled?: boolean;
     privacyBypass?: boolean;
+    /** Run-scoped effects for the owning chat turn. Persistent room servers
+     * omit this and keep their existing throwaway-effects posture. */
+    sharedEffects?: RoomToolDispatcherOptions["sharedEffects"];
   },
 ) => ToolDispatcher {
   const readLiveLanes = (): WebLanes =>
@@ -242,7 +245,7 @@ export function roomServerDispatcherFactory(
       routes,
       advisor: null,
       runCancel: null,
-      sharedEffects: null,
+      sharedEffects: runOptions.sharedEffects ?? null,
       privacyBypass: runOptions.privacyBypass ?? false,
       activePolicy: realActivePolicy,
       webThrottle: createWebThrottle(),

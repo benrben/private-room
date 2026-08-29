@@ -16,6 +16,7 @@ import { activePolicy } from "./privacy.js";
 import { embedQuestion } from "./retrievalBackfill.js";
 import { listModels } from "./engineRouting.js";
 import { groundPreparedImage, prepareImage } from "./visionTools.js";
+import { createToolEffects } from "./execTool.js";
 import { webAccessEnabled } from "./browser/webAccess.js";
 import { WEB_LANES_ALL } from "./toolSpecs.js";
 import type { McpRuntime } from "./mcpSurfaceIpc.js";
@@ -86,6 +87,10 @@ export function registerChatTurnSurfaceIpc(
       ? { kind: "LocalEngine" as const }
       : { kind: "CloudEngine" as const };
     const online = webAccessEnabled(open.conn);
+    // The sidecar calls room tools over this bridge, while turnEngine owns the
+    // provider-bound image queue. They must share one sink or a successful
+    // read_drawing/view_file_image call loses its PNG at the bridge boundary.
+    const effects = createToolEffects();
     // This bridge exists only for this user-started chat turn. Workspace
     // writes still go through the path-safe, atomic WorkspaceService and the
     // factory clamps the grant off when another process owns the room lease.
@@ -97,7 +102,10 @@ export function registerChatTurnSurfaceIpc(
           online,
           scope,
           WEB_LANES_ALL,
-          chatTurnBridgeRunOptions(open, request.privacyBypass),
+          {
+            ...chatTurnBridgeRunOptions(open, request.privacyBypass),
+            sharedEffects: effects,
+          },
         );
     let bridge: RunningBridge | null = null;
     try {
@@ -120,6 +128,7 @@ export function registerChatTurnSurfaceIpc(
         privacyActive: () => activePolicy() !== null,
         privacyPolicy: activePolicy,
         chatModelSeesImages,
+        effects,
         groundingPass: async ({ model: chatModel, question, image }) => {
           const models = await listModels();
           const visionModel = await groundingPick(models, chatModel);

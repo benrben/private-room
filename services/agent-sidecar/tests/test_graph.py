@@ -39,6 +39,7 @@ from arcelle_sidecar.graph import (
     NOTHING_USABLE_TEXT,
     PROGRESS_ELIDED,
     PROGRESS_NOTE_LINES,
+    PIXEL_EVIDENCE_MISSING,
     ROUND_BUDGET_STEP,
     VIDEO_FRAME_MISSING,
     VIDEO_FRAME_REQUIRED,
@@ -1329,6 +1330,92 @@ async def test_frame_receipt_without_pixels_fails_closed() -> None:
     assert not any(m.get("content") == IMAGE_HANDOFF for m in out.messages)
 
 
+async def test_static_image_receipt_without_pixels_fails_closed() -> None:
+    chat = FakeChatModel(
+        [
+            Round(calls=[call("view_file_image", name="photo.png")]),
+            Round(content="The OCR says it is a receipt."),
+            Round(content="I still only have OCR."),
+        ]
+    )
+    mcp = FakeMCP(
+        tools=specs(["list_room_files", "search_room", "open_file", "view_file_image"]),
+        results={
+            "view_file_image": ToolResult(
+                text='Image receipt: "photo.png"; SHA-256 deadbeef; 1×1 PNG.'
+            )
+        },
+    )
+    out = await drive_worker(
+        make_request("describe what is shown in photo.png", max_rounds=9),
+        chat,
+        mcp,
+        agent_id="files.read",
+    )
+
+    assert [event["ok"] for event in out.of("step_status")] == [False]
+    assert out.final == PIXEL_EVIDENCE_MISSING
+    assert not any(m.get("content") == IMAGE_HANDOFF for m in out.messages)
+
+
+async def test_repeated_pixel_receipt_without_pixels_stops_after_one_retry() -> None:
+    """A blind bridge cannot turn the 10,000-round backstop into a retry loop."""
+    chat = FakeChatModel(
+        [
+            Round(calls=[call("view_file_image", name="photo.png")])
+            for _ in range(6)
+        ]
+    )
+    mcp = FakeMCP(
+        tools=specs(["list_room_files", "search_room", "open_file", "view_file_image"]),
+        results={
+            "view_file_image": ToolResult(
+                text='Image receipt: "photo.png"; SHA-256 deadbeef; 1×1 PNG.'
+            )
+        },
+    )
+    out = await drive_worker(
+        make_request("describe what is shown in photo.png", max_rounds=9),
+        chat,
+        mcp,
+        agent_id="files.read",
+    )
+
+    assert [name for name, _args in mcp.calls] == [
+        "view_file_image",
+        "view_file_image",
+    ]
+    assert out.final == PIXEL_EVIDENCE_MISSING
+
+
+async def test_static_visual_worker_accepts_answer_only_after_pixel_handoff() -> None:
+    pixel = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB"
+    chat = FakeChatModel(
+        [
+            Round(calls=[call("view_file_image", name="photo.png")]),
+            Round(content="FOUND: the photo shows a red square."),
+        ]
+    )
+    mcp = FakeMCP(
+        tools=specs(["list_room_files", "search_room", "open_file", "view_file_image"]),
+        results={
+            "view_file_image": ToolResult(
+                text='Image receipt: "photo.png"; SHA-256 abc; 1×1 PNG.',
+                images=[pixel],
+            )
+        },
+    )
+    out = await drive_worker(
+        make_request("describe what is shown in photo.png", max_rounds=9),
+        chat,
+        mcp,
+        agent_id="files.read",
+    )
+
+    assert out.final == "FOUND: the photo shows a red square."
+    assert any(message.get("images") == [pixel] for message in out.messages)
+
+
 async def test_visual_video_worker_cannot_finish_from_transcript_only() -> None:
     """A transcript locates the frame; it is not evidence of its pixels."""
     question = "what you see in frame 6:00 in @video.mp4"
@@ -1462,6 +1549,39 @@ async def test_exact_visual_prompt_is_delegated_before_main_can_answer_transcrip
         if entry.get("agent") == "media.video"
     ]
     assert video_entries and video_entries[-1]["instruction"] == question
+
+
+async def test_main_cannot_replace_a_failed_visual_child_with_transcript_prose() -> None:
+    """The exact installed-app failure: child misses pixels, Main sees text."""
+    question = "what you see in frame 6:00 in @video.mp4"
+    chat = FakeChatModel(
+        [
+            Round(calls=[call("search_room", query="video.mp4 6:00")]),
+            Round(content="FOUND: the transcript says Uncle Bob discusses CRAP."),
+            Round(content="FOUND: I still only have the transcript."),
+            # Main's synthesis round receives both that transcript context and
+            # the child's MISSING report. This plausible answer must be thrown
+            # away by the evidence gate.
+            Round(content="At 6:00 Uncle Bob is discussing the CRAP metric."),
+        ]
+    )
+    mcp = FakeMCP(
+        tools=specs(
+            ["list_room_files", "search_room", "open_file", "view_media_frame"]
+        ),
+        results={
+            "search_room": ToolResult(
+                text="[6:00] Uncle Bob discusses the CRAP metric."
+            )
+        },
+    )
+
+    out = await drive(make_request(question, max_rounds=9), chat, mcp)
+
+    assert out.final == VIDEO_FRAME_MISSING
+    assert "CRAP metric" not in out.final
+    assert mcp.calls == [("search_room", {"query": "video.mp4 6:00"})]
+    assert len(chat.seen_messages) == 4, "Main still receives one synthesis round"
 
 
 async def test_prepared_visual_step_does_not_swallow_later_mixed_request() -> None:

@@ -69,7 +69,7 @@ export function specialistServedToolNames(
   );
   return declaredFor(model).imageChannel
     ? names
-    : names.filter((name) => name !== "view_media_frame" && name !== "view_screenshot");
+    : names.filter((name) => !["view_media_frame", "view_screenshot", "view_file_image", "read_drawing", "browse_look"].includes(name));
 }
 
 /** The discovery catalog after the same Cloud Privacy door as tools/list. */
@@ -88,7 +88,7 @@ export function specialistEffectiveToolNames(
   );
   return declaredFor(model).imageChannel
     ? names
-    : names.filter((name) => name !== "view_media_frame" && name !== "view_screenshot");
+    : names.filter((name) => !["view_media_frame", "view_screenshot", "view_file_image", "read_drawing", "browse_look"].includes(name));
 }
 
 /** Resolve connector routes lazily from the manager owned by app bootstrap. */

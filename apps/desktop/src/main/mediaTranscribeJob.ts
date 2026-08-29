@@ -123,6 +123,7 @@ import type { RoomManagerState } from "./roomManager.js";
 import { authedHeaders, busy, ensureUp, splitCompleteLines } from "./sidecar.js";
 import { sttEffectiveModel } from "./sttTools.js";
 import type { EventSender } from "./turn.js";
+import type { VideoVisualIndexClient } from "./videoVisualIndex.js";
 
 // =============================================================================
 // ---- the diarize weights ----------------------------------------------------
@@ -432,6 +433,34 @@ export interface MediaTranscribeDeps {
    * transcript is durable. Optional and swallowed, like every other
    * `onIndexed`/`notifyFilesChanged` seam in this tree. */
   onIndexed?: (roomPath: string) => void;
+  /** Best-effort local derived-pixel cache. Called only for ordinary
+   * workspace-backed videos, never for sealed/legacy embedded room blobs. */
+  warmVisualIndex?: VideoVisualIndexClient["warm"];
+}
+
+async function warmWorkspaceVideoWithoutSpeechModel(
+  open: NonNullable<RoomManagerState["room"]>,
+  fileId: string,
+  extension: string,
+  sourceSha256: string,
+  warm: VideoVisualIndexClient["warm"],
+): Promise<void> {
+  if (open.workspace === undefined) return;
+  const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "arcelle-visual-index-")).catch(() => null);
+  if (tempDir === null) return;
+  const staged = path.join(tempDir, `source.${extension || "bin"}`);
+  try {
+    await pipeline(
+      open.workspace.readStream(fileId),
+      fs.createWriteStream(staged, { flags: "wx", mode: 0o600 }),
+    );
+    await warm(staged, sourceSha256);
+  } catch {
+    // A derived visual cache is an acceleration. It must never turn a valid
+    // import into a failed media job or weaken the ordinary renderer fallback.
+  } finally {
+    await fs.promises.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+  }
 }
 
 /**
@@ -562,8 +591,27 @@ export async function transcribeMediaWithSpeakers(
   if (bytes === null && open.workspace === undefined) {
     return fail("this recording has no stored audio");
   }
+  const visualSourceSha256 = kind === "video" && open.workspace !== undefined
+    ? (open.conn.prepare(
+      `SELECT content_sha256 FROM files
+       WHERE id = ? AND storage_kind = 'workspace' AND trashed_at IS NULL`,
+    ).get(fileId) as { content_sha256: string | null } | undefined)?.content_sha256 ?? null
+    : null;
   const modelPath = sttEffectiveModel(deps.userDataDir, deps.resourcesPath);
   if (modelPath === null) {
+    if (
+      visualSourceSha256 !== null
+      && open.workspace !== undefined
+      && deps.warmVisualIndex !== undefined
+    ) {
+      await warmWorkspaceVideoWithoutSpeechModel(
+        open,
+        fileId,
+        extension,
+        visualSourceSha256,
+        deps.warmVisualIndex,
+      );
+    }
     deps.emit("stt-progress", [name, "model-missing"]);
     return null;
   }
@@ -604,6 +652,16 @@ export async function transcribeMediaWithSpeakers(
         open.workspace.readStream(fileId),
         fs.createWriteStream(staged, { flags: "wx", mode: 0o600 }),
       );
+    }
+
+    if (
+      visualSourceSha256 !== null
+      && open.workspace !== undefined
+      && deps.warmVisualIndex !== undefined
+    ) {
+      // Reuse the same private staged source the speech rebuild already owns.
+      // Warm failures are cache misses, not transcription failures.
+      await deps.warmVisualIndex(staged, visualSourceSha256).catch(() => null);
     }
 
     // The meta as it was when the rebuild started: the sidecar needs the names

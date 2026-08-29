@@ -83,7 +83,7 @@ export async function runArcLiveRegression({ window, invoke, waitFor, temp, log 
   const videoChat = await invoke(window, "create_chat");
   const videoAnswer = await invoke(window, "ask", {
     chatId: videoChat.id,
-    question: "ARC_GOLDEN_VIDEO inspect ARC Golden Video/timestamp-colors.mp4 at 1.05 seconds and report what color fills the visible frame.",
+    question: "ARC_GOLDEN_VIDEO inspect @ARC Golden Video/timestamp-colors.mp4 at 1.05 seconds and report what color fills the visible frame.",
     attachments: [],
     askId: `arc-011-${Date.now()}`,
     viewing: null,
@@ -132,6 +132,76 @@ export async function runArcLiveRegression({ window, invoke, waitFor, temp, log 
     });
   }
   log("ARC-024: Main refused blind-model video perception before any frame, image payload, or File substitution");
+
+  // ARC-031: sketches already have their own exact vector/layout report, but a
+  // vision-capable sketch specialist must also receive the real raster. Drive
+  // both model tool rounds and let the Ollama double decode the provider-bound
+  // PNG rather than accepting read_drawing's text as visual proof.
+  const sketchChat = await invoke(window, "create_chat");
+  const sketchAnswer = await invoke(window, "ask", {
+    chatId: sketchChat.id,
+    question: "*sketch ARC_SKETCH_PIXELS draw a blue full-page sketch, then look at the finished drawing and report its visible pixels.",
+    attachments: [],
+    askId: `arc-031-${Date.now()}`,
+    viewing: null,
+    privacyBypass: null,
+  });
+  const sketchMatch = (sketchAnswer.content ?? "").match(
+    /ARC_SKETCH_PIXELS_OK sha256=([a-f0-9]{64}) dimensions=(\d+)x(\d+) center=(\d+),(\d+),(\d+)/,
+  );
+  assert(sketchMatch, `ARC-031 sketch specialist did not inspect its real raster: ${sketchAnswer.content ?? ""}`);
+  assert.equal(Number(sketchMatch[2]), 1024);
+  assert.equal(Number(sketchMatch[3]), 640);
+  assert(Number(sketchMatch[4]) >= 190 && Number(sketchMatch[4]) <= 235);
+  assert(Number(sketchMatch[5]) >= 205 && Number(sketchMatch[5]) <= 245);
+  assert(Number(sketchMatch[6]) >= 235 && Number(sketchMatch[6]) > Number(sketchMatch[5]));
+  log("ARC-031: Sketch agent drew, rasterized, attached, and inspected a real blue 1024x640 PNG");
+
+  const fileSketchChat = await invoke(window, "create_chat");
+  const fileSketchAnswer = await invoke(window, "ask", {
+    chatId: fileSketchChat.id,
+    question: "*file ARC_FILE_SKETCH_PIXELS inspect @ARC Pixel Sketch.sketch and report only what its visible pixels show.",
+    attachments: [],
+    askId: `arc-032-sketch-${Date.now()}`,
+    viewing: null,
+    privacyBypass: null,
+  });
+  const fileSketchMatch = (fileSketchAnswer.content ?? "").match(
+    /ARC_FILE_SKETCH_PIXELS_OK sha256=([a-f0-9]{64}) dimensions=(\d+)x(\d+) center=(\d+),(\d+),(\d+)/,
+  );
+  assert(fileSketchMatch, `ARC-032 File specialist did not inspect real sketch pixels: ${fileSketchAnswer.content ?? ""}`);
+  assert.equal(Number(fileSketchMatch[2]), 1024);
+  assert.equal(Number(fileSketchMatch[3]), 640);
+  log("ARC-032: File agent inspected the Drawing agent's exact sketch PNG through the shared raster path");
+
+  // ARC-032: import a normal image and require the direct File specialist to
+  // use its pixel tool. The mock provider validates both the PNG's centre
+  // colour and the receipt hash/dimensions against the bytes it received.
+  const fileImagePath = path.join(temp, "arc-file-pixels.png");
+  const fileImagePng = await sharp({
+    create: { width: 320, height: 180, channels: 3, background: { r: 20, g: 210, b: 50 } },
+  }).png().toBuffer();
+  await writeFile(fileImagePath, fileImagePng);
+  const fileImageReport = await invoke(window, "import_files", { paths: [fileImagePath] });
+  assert.equal(fileImageReport.errors.length, 0);
+  assert.equal(fileImageReport.imported.length, 1);
+  const fileImageChat = await invoke(window, "create_chat");
+  const fileImageAnswer = await invoke(window, "ask", {
+    chatId: fileImageChat.id,
+    question: "*file ARC_FILE_PIXELS inspect @arc-file-pixels.png and report only what its visible pixels show.",
+    attachments: [],
+    askId: `arc-032-${Date.now()}`,
+    viewing: null,
+    privacyBypass: null,
+  });
+  const fileImageMatch = (fileImageAnswer.content ?? "").match(
+    /ARC_FILE_PIXELS_OK sha256=([a-f0-9]{64}) dimensions=(\d+)x(\d+) center=(\d+),(\d+),(\d+)/,
+  );
+  assert(fileImageMatch, `ARC-032 File specialist did not inspect real image pixels: ${fileImageAnswer.content ?? ""}`);
+  assert.equal(Number(fileImageMatch[2]), 320);
+  assert.equal(Number(fileImageMatch[3]), 180);
+  assert(Number(fileImageMatch[4]) < 80 && Number(fileImageMatch[5]) > 170 && Number(fileImageMatch[6]) < 100);
+  log("ARC-032: File agent decoded a real green PNG with hash-pinned pixel evidence");
 
   // ARC-006: a slash skill that explicitly closes tools/files crosses the host
   // with an empty source set, even though the room contains a tempting match.
@@ -280,4 +350,6 @@ export async function runArcLiveRegression({ window, invoke, waitFor, temp, log 
   assert.match(skillsAnswer.content, /ARC_SKILL_FOUND:arc-cross-assigned/);
   assert.deepEqual(skillsAnswer.sources ?? [], []);
   log("ARC-005/023/026/030: Studio receipt and cross-assigned source-free Skills turn passed");
+
+  return { goldenSource };
 }

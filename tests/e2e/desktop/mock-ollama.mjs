@@ -188,6 +188,16 @@ function messageImages(messages) {
     .filter((image) => typeof image === "string" && image.length > 0);
 }
 
+function isSketchBlueFill(image) {
+  // Arcelle's sketch palette deliberately renders filled blue shapes as a
+  // light paper-safe wash (#d8e5f5), with dark blue reserved for their ink.
+  return image.red >= 190 && image.red <= 235
+    && image.green >= 205 && image.green <= 245
+    && image.blue >= 235
+    && image.blue > image.green
+    && image.green > image.red;
+}
+
 const server = http.createServer(async (req, res) => {
   const url = req.url || "";
 
@@ -249,6 +259,7 @@ const server = http.createServer(async (req, res) => {
     // provider independently verifies its PNG, and Main receives that child's
     // PIXELS_OK report for synthesis.
     if (allText.includes("ARC_GOLDEN_VIDEO")) {
+      const cacheMode = allText.includes("ARC_GOLDEN_VIDEO_CACHE");
       const toolTexts = messages
         .filter((message) => message?.role === "tool" && typeof message.content === "string")
         .map((message) => message.content);
@@ -276,12 +287,12 @@ const server = http.createServer(async (req, res) => {
           return answer(res, "ARC_GOLDEN_VIDEO_FAIL Main did not receive a verified Video child report", streams);
         }
         return toolCall(res, "ask_file_agent", {
-          instruction: "ARC_GOLDEN_VIDEO inspect ARC Golden Video/timestamp-colors.mp4 at 1.05 seconds and report what color fills the visible frame.",
+          instruction: `${cacheMode ? "ARC_GOLDEN_VIDEO_CACHE" : "ARC_GOLDEN_VIDEO"} inspect @ARC Golden Video/timestamp-colors.mp4 at 1.05 seconds and report what color fills the visible frame.`,
         });
       }
       if (!receipt && offered.has("view_media_frame")) {
         return toolCall(res, "view_media_frame", {
-          name: "ARC Golden Video/timestamp-colors.mp4",
+          name: "@ARC Golden Video/timestamp-colors.mp4",
           at: "1.05",
         });
       }
@@ -309,8 +320,10 @@ const server = http.createServer(async (req, res) => {
         if (receiptWidth !== frame.width || receiptHeight !== frame.height) {
           throw new Error(`receipt dimensions ${receiptWidth}x${receiptHeight} did not bind ${frame.width}x${frame.height}`);
         }
-        if (frame.width !== 1280 || frame.height !== 720) {
-          throw new Error(`expected capped 1280x720 PNG, received ${frame.width}x${frame.height}`);
+        const expectedWidth = cacheMode ? 320 : 1280;
+        const expectedHeight = cacheMode ? 180 : 720;
+        if (frame.width !== expectedWidth || frame.height !== expectedHeight) {
+          throw new Error(`expected ${expectedWidth}x${expectedHeight} PNG, received ${frame.width}x${frame.height}`);
         }
         if (Math.abs(actualSeconds - 1.05) > 0.35) {
           throw new Error(`presented timestamp ${actualSeconds}s was outside codec tolerance`);
@@ -363,6 +376,125 @@ const server = http.createServer(async (req, res) => {
       return toolCall(res, "ask_file_agent", {
         instruction: "ARC_BLIND_VIDEO inspect ARC Golden Video/timestamp-colors.mp4 at 1.05 seconds and describe only the visible frame.",
       });
+    }
+
+    // ARC-031: a sketch specialist must inspect the raster it just created,
+    // not merely repeat draw's command text. The provider independently
+    // decodes read_drawing's attached PNG and accepts the run only when the
+    // visible centre pixel is the requested blue page.
+    if (allText.includes("ARC_SKETCH_PIXELS")) {
+      const images = messageImages(messages);
+      if (process.env.ARCELLE_E2E_VERBOSE === "1") {
+        const roles = messages.map((message) => ({
+          role: message?.role,
+          content: typeof message?.content === "string" ? message.content.slice(0, 180) : "",
+          images: Array.isArray(message?.images) ? message.images.length : 0,
+        }));
+        process.stderr.write(`[mock-ollama ARC_SKETCH_PIXELS] ${JSON.stringify({ offered: [...offered], roles })}\n`);
+      }
+      if (images.length > 0) {
+        try {
+          if (images.length !== 1) throw new Error(`expected one provider image, received ${images.length}`);
+          const drawing = decodePngCenter(images[0]);
+          if (!isSketchBlueFill(drawing)) {
+            throw new Error(`expected a blue centre, got ${drawing.red},${drawing.green},${drawing.blue}`);
+          }
+          const hash = createHash("sha256").update(drawing.bytes).digest("hex");
+          return answer(
+            res,
+            `ARC_SKETCH_PIXELS_OK sha256=${hash} dimensions=${drawing.width}x${drawing.height} center=${drawing.red},${drawing.green},${drawing.blue}`,
+            streams,
+          );
+        } catch (error) {
+          return answer(res, `ARC_SKETCH_PIXELS_FAIL ${error?.message ?? error}`, streams);
+        }
+      }
+      // This isolated chat's first tool is the draw call emitted immediately
+      // below. Do not key the next round to optional wording in its receipt: a
+      // clean drawing intentionally omits the layout-warning follow-up.
+      if (!toolAlreadyRan && offered.has("draw")) {
+        return toolCall(res, "draw", {
+          name: "ARC Pixel Sketch",
+          script: "rect 0 0 1600 1000 blue fill",
+        });
+      }
+      if (toolAlreadyRan && offered.has("read_drawing")) {
+        return toolCall(res, "read_drawing", { name: "ARC Pixel Sketch" });
+      }
+      return answer(res, "ARC_SKETCH_PIXELS_FAIL missing draw/read_drawing pixel path", streams);
+    }
+
+    // ARC-032: the File specialist must use the SAME sketch raster as the
+    // Drawing specialist. This branch reads the sketch created by ARC-031
+    // through view_file_image and validates its provider-bound PNG.
+    if (allText.includes("ARC_FILE_SKETCH_PIXELS")) {
+      const receipt = messages
+        .filter((message) => message?.role === "tool" && typeof message.content === "string")
+        .map((message) => message.content)
+        .find((content) => content.includes("Image receipt:"));
+      if (!receipt && offered.has("view_file_image")) {
+        return toolCall(res, "view_file_image", { name: "@ARC Pixel Sketch.sketch" });
+      }
+      if (!receipt) return answer(res, "ARC_FILE_SKETCH_PIXELS_FAIL view_file_image was unavailable", streams);
+      try {
+        const images = messageImages(messages);
+        if (images.length !== 1) throw new Error(`expected one provider image, received ${images.length}`);
+        const image = decodePngCenter(images[0]);
+        if (!isSketchBlueFill(image)) {
+          throw new Error(`expected a blue centre, got ${image.red},${image.green},${image.blue}`);
+        }
+        const actualHash = createHash("sha256").update(image.bytes).digest("hex");
+        const pinned = receipt.match(/SHA-256 ([a-f0-9]{64}); (\d+)×(\d+) PNG/);
+        if (!pinned || pinned[1] !== actualHash) throw new Error("sketch receipt did not pin the attached PNG");
+        if (Number(pinned[2]) !== image.width || Number(pinned[3]) !== image.height) {
+          throw new Error("sketch receipt dimensions did not bind the attached PNG");
+        }
+        return answer(
+          res,
+          `ARC_FILE_SKETCH_PIXELS_OK sha256=${actualHash} dimensions=${image.width}x${image.height} center=${image.red},${image.green},${image.blue}`,
+          streams,
+        );
+      } catch (error) {
+        return answer(res, `ARC_FILE_SKETCH_PIXELS_FAIL ${error?.message ?? error}`, streams);
+      }
+    }
+
+    // ARC-032: the File specialist's static-media reader must deliver real
+    // pixels and a receipt pinned to those exact bytes. A textual open_file
+    // result cannot satisfy this branch because there is no image to decode.
+    if (allText.includes("ARC_FILE_PIXELS")) {
+      const receipt = messages
+        .filter((message) => message?.role === "tool" && typeof message.content === "string")
+        .map((message) => message.content)
+        .find((content) => content.includes("Image receipt:"));
+      if (!receipt && offered.has("view_file_image")) {
+        return toolCall(res, "view_file_image", { name: "@arc-file-pixels.png" });
+      }
+      if (!receipt) {
+        return answer(res, "ARC_FILE_PIXELS_FAIL view_file_image was unavailable", streams);
+      }
+      try {
+        const images = messageImages(messages);
+        if (images.length !== 1) throw new Error(`expected one provider image, received ${images.length}`);
+        const image = decodePngCenter(images[0]);
+        if (!(image.red < 80 && image.green > 170 && image.blue < 100)) {
+          throw new Error(`expected a green centre, got ${image.red},${image.green},${image.blue}`);
+        }
+        const actualHash = createHash("sha256").update(image.bytes).digest("hex");
+        const pinned = receipt.match(/SHA-256 ([a-f0-9]{64}); (\d+)×(\d+) PNG/);
+        if (!pinned) throw new Error("image receipt was malformed");
+        if (pinned[1] !== actualHash) throw new Error(`receipt hash ${pinned[1]} did not match ${actualHash}`);
+        if (Number(pinned[2]) !== image.width || Number(pinned[3]) !== image.height) {
+          throw new Error(`receipt dimensions ${pinned[2]}x${pinned[3]} did not match ${image.width}x${image.height}`);
+        }
+        return answer(
+          res,
+          `ARC_FILE_PIXELS_OK sha256=${actualHash} dimensions=${image.width}x${image.height} center=${image.red},${image.green},${image.blue}`,
+          streams,
+        );
+      } catch (error) {
+        return answer(res, `ARC_FILE_PIXELS_FAIL ${error?.message ?? error}`, streams);
+      }
     }
 
     // ARC-005/023: the live Electron regression asks the Studio specialist to

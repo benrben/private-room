@@ -116,6 +116,20 @@ _VISUAL_WORDS_RE = re.compile(
     r"\b(?:on screen|which slide is (?:up|visible|shown))\b)"
 )
 
+_STATIC_VISUAL_ANCHOR_RE = re.compile(
+    r"(?i)(?:\.(?:png|jpe?g|gif|webp|avif|heic|heif|tiff?|svg|sketch)\b|"
+    r"\b(?:image|photo|picture|screenshot|sketch|drawing|diagram|chart|canvas)\b)"
+)
+_STATIC_VISUAL_WORDS_RE = re.compile(
+    r"(?i)(?:\bwhat\b.{0,56}\b(?:see|visible|shown|written|depicted|pictured)\b|"
+    r"\b(?:describe|inspect|look at)\b.{0,80}(?:"
+    r"\.(?:png|jpe?g|gif|webp|avif|heic|heif|tiff?|svg|sketch)\b|"
+    r"\b(?:image|photo|picture|screenshot|sketch|drawing|diagram|chart|canvas)\b)|"
+    r"\bwhat does\b.{0,56}\b(?:look like|say|show)\b|"
+    r"\b(?:colour|color|layout|arrangement)\b.{0,40}"
+    r"\b(?:image|photo|picture|screenshot|sketch|drawing|diagram|chart|canvas)\b)"
+)
+
 
 def is_visual_video_intent(question: str) -> bool:
     """Whether ``question`` unambiguously asks for video pixels.
@@ -134,6 +148,16 @@ def is_visual_video_intent(question: str) -> bool:
     if _TRANSCRIPT_RE.search(q) and not frame:
         return False
     return (frame and timestamp) or (timestamp and visual) or (medium and visual)
+
+
+def is_static_visual_intent(question: str) -> bool:
+    """Whether the request needs pixels from a still image or sketch."""
+    q = " ".join(question.split())
+    if is_visual_video_intent(q):
+        return False
+    return bool(
+        _STATIC_VISUAL_ANCHOR_RE.search(q) and _STATIC_VISUAL_WORDS_RE.search(q)
+    )
 
 #: Separators a USER typed. Deliberately conservative: no bare "and" (it joins
 #: two halves of one errand far more often than two errands — "find the rent and
@@ -329,6 +353,18 @@ def _pick(
             return ("domain", normalize_domain_key(video.id) or "file")
         return ("unavailable", video.label)
 
+    # `files.read` is core-capable, so ordinary reachability would still call
+    # it available after a blind provider or Cloud Privacy removed its pixels.
+    if is_static_visual_intent(clause):
+        file_agent = get_agent("files.read")
+        if "view_file_image" in served_names and worker_reachable(
+            file_agent,
+            web_enabled=web_enabled,
+            served_names=served_names,
+        ):
+            return ("domain", normalize_domain_key(file_agent.id) or "file")
+        return ("unavailable", file_agent.label)
+
     q = clause.lower()
     best: tuple[str, AgentSpec] | None = None
     best_rank = (0, False, 0)
@@ -448,11 +484,15 @@ def build_plan(
         # The CONCRETE worker comes from the dispatcher itself, so the label in
         # the plan is the label that will actually light up. Re-deriving it here
         # would be a second answer to a question `resolve_worker` already owns.
-        worker = resolve_worker(
-            DOMAIN_KEYS[key],
-            instruction,
-            served_names=served_names,
-            web_enabled=web_enabled,
+        worker = (
+            "files.read"
+            if is_static_visual_intent(instruction)
+            else resolve_worker(
+                DOMAIN_KEYS[key],
+                instruction,
+                served_names=served_names,
+                web_enabled=web_enabled,
+            )
         )
         steps.append(
             PlanStep(
@@ -484,5 +524,6 @@ __all__ = [
     "Plan",
     "PlanStep",
     "build_plan",
+    "is_static_visual_intent",
     "is_visual_video_intent",
 ]

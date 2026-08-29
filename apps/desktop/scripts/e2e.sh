@@ -2,7 +2,7 @@
 # The deep test opens a real encrypted room under Electron, so its native DB
 # addon must target Electron's ABI during the run. Always restore Node's ABI on
 # exit because Vitest loads the same addon directly.
-set -uo pipefail
+set -euo pipefail
 cd "$(dirname "$0")/.."
 
 NATIVE_MODULE="better-sqlite3-multiple-ciphers"

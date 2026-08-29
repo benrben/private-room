@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readdir, rm } from "node:fs/promises";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -198,7 +198,7 @@ try {
     process.exitCode = 0;
   } else {
 
-  await runArcLiveRegression({ window, invoke, waitFor, temp, log });
+  const arcFixtures = await runArcLiveRegression({ window, invoke, waitFor, temp, log });
 
   // GH #32: moving a window from a large display to a laptop-sized one sends
   // a native resize, not a route change. Prove the live BrowserWindow crosses
@@ -494,6 +494,53 @@ try {
   assert(totalGrowth <= MAX_MEMORY_GROWTH_MB, `Electron memory grew ${totalGrowth.toFixed(1)} MB`);
   assert(tailGrowth <= MAX_MEMORY_GROWTH_MB / 2, `Electron memory kept growing in the tail (${tailGrowth.toFixed(1)} MB)`);
   assert(memoryAfter.processes <= memoryBefore.processes + 1, "Electron leaked child processes during repeated journeys");
+
+  // ARC-033: finish in a disposable workspace room so the exact Electron →
+  // sidecar → exact capture + persistent 1-FPS cache → MCP image → provider
+  // route runs end to end. The earlier sealed-room frame is deliberately
+  // 1280x720 (renderer fallback); this workspace frame must be the cache's
+  // pinned 320x180 profile, which prevents a passing renderer fallback from
+  // masquerading as cache coverage.
+  const cacheRoomPath = path.join(temp, "arc-visual-cache-workspace");
+  const cacheRoom = await invoke(window, "create_room", {
+    path: cacheRoomPath,
+    password: "public-e2e-password",
+    name: "ARC Visual Cache E2E",
+    format: "workspace-folder",
+  });
+  assert.equal(cacheRoom.name, "ARC Visual Cache E2E");
+  const cachedImport = await invoke(window, "import_files", { paths: [arcFixtures.goldenSource] });
+  assert.equal(cachedImport.errors.length, 0);
+  assert.equal(cachedImport.imported.length, 1);
+  const cachedFolder = await invoke(window, "create_folder", { name: "ARC Golden Video" });
+  await invoke(window, "move_file_to_folder", {
+    fileId: cachedImport.imported[0].id,
+    folderId: cachedFolder.id,
+  });
+  const cacheChat = await invoke(window, "create_chat");
+  const cacheAnswer = await invoke(window, "ask", {
+    chatId: cacheChat.id,
+    question: "ARC_GOLDEN_VIDEO_CACHE inspect @ARC Golden Video/timestamp-colors.mp4 at 1.05 seconds and report what color fills the visible frame.",
+    attachments: [],
+    askId: `arc-033-${Date.now()}`,
+    viewing: null,
+    privacyBypass: null,
+  });
+  const cacheMatch = (cacheAnswer.content ?? "").match(
+    /ARC_GOLDEN_VIDEO_MAIN_OK timestamp=([0-9.]+) sha256=([a-f0-9]{64}) dimensions=(\d+)x(\d+) center=(\d+),(\d+),(\d+)/,
+  );
+  assert(cacheMatch, `ARC-033 cached frame did not reach the model: ${cacheAnswer.content ?? ""}`);
+  assert.equal(Number(cacheMatch[3]), 320);
+  assert.equal(Number(cacheMatch[4]), 180);
+  assert(Number(cacheMatch[5]) < 60 && Number(cacheMatch[6]) < 60 && Number(cacheMatch[7]) > 190);
+  const cacheRoot = path.join(temp, "user-data", "visual-index-v1");
+  await waitFor(async () => {
+    const cachedEntries = await readdir(cacheRoot, { withFileTypes: true }).catch(() => []);
+    return cachedEntries.some((entry) =>
+      entry.isDirectory() && /^[a-f0-9]{64}\.jpeg-320-1fps-q42-v1$/.test(entry.name));
+  }, "ARC-033 persistent visual index", STEP_TIMEOUT_MS);
+  log("ARC-033: cold workspace video built and served a persistent 320x180 1-FPS visual index through the real agent path");
+
   const stats = await mockStats();
   assert.equal(stats.activeStalls, 0);
   assert.equal(stats.unknownRequests, 0, "the model double received an endpoint with no fixture");

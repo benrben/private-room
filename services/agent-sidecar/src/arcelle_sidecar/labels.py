@@ -37,6 +37,7 @@ _LABELS: dict[str, str] = {
     "list_room_files": "Listed the room's files",
     "search_room": "Searched the room",
     "open_file": "Opened a file",
+    "view_file_image": "Looked at an image",
     "mark_image": "Marked an image",
     "annotate_file": "Highlighted a passage",
     "create_file": "Created a file",

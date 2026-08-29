@@ -96,6 +96,7 @@ export const BUILTIN_TOOL_NAMES: readonly string[] = [
   "list_room_files",
   "search_room",
   "open_file",
+  "view_file_image",
   "mark_image",
   "annotate_file",
   "create_file",
@@ -865,6 +866,21 @@ export function toolsCatalog(webEnabled: boolean): OllamaToolSpec[] {
     {
       type: "function",
       function: {
+        name: "view_file_image",
+        description:
+          "Attach the real pixels of an image or .sketch file in this room so you can visually inspect it. Use this before answering what is shown, visible, written, colored, arranged, or depicted; open_file only opens the viewer for the user and is not visual evidence.",
+        parameters: {
+          type: "object",
+          properties: {
+            name: { type: "string", description: "Image or .sketch file name, or a distinctive part of it" },
+          },
+          required: ["name"],
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
         name: "mark_image",
         description: "Draw labeled boxes on an image in the room showing where something is.",
         parameters: {
@@ -1602,7 +1618,7 @@ export function drawToolsSpecs(): OllamaToolSpec[] {
       function: {
         name: "read_drawing",
         description:
-          "Look at a sketch: every shape with its id, position and label in draw's own commands, plus measured problems — overlaps, shapes off the page, unlabelled shapes, arrows that stop short. Use it before changing existing work, and again after drawing to check yourself.",
+          "Look at a sketch through its real PNG pixels, plus every shape with its id, position and label in draw's own commands and measured problems — overlaps, shapes off the page, unlabelled shapes, arrows that stop short. Use it before changing existing work, and again after drawing to check yourself.",
         parameters: {
           type: "object",
           properties: { name: { type: "string", description: "Which sketch; omit if the room has one" } },

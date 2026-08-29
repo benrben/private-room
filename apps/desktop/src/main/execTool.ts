@@ -126,6 +126,7 @@ import {
   execReadDrawingInRoom,
   type SketchRoom,
 } from "./sketchCommands.js";
+import { execViewFileImage } from "./staticVisualTools.js";
 import {
   agentDeleteMcp,
   agentListMcps,
@@ -1673,6 +1674,11 @@ export async function execTool(
     case "open_file": {
       const room = requireRoom(deps);
       return room.ok ? execOpenFile(room.db, args, deps.emit) : fail(room.error);
+    }
+    case "view_file_image": {
+      const room = requireRoom(deps);
+      if (!room.ok) return fail(room.error);
+      return execViewFileImage(room.room ?? { db: room.db, path: "" }, args, effects);
     }
     case "annotate_file": {
       const room = requireRoom(deps);

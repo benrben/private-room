@@ -117,7 +117,7 @@ from .messages import (
     tool_message,
     user_message,
 )
-from .planner import build_plan, is_visual_video_intent
+from .planner import build_plan, is_static_visual_intent, is_visual_video_intent
 from .privacy import cloud_privacy_tool_allowed, is_nonlocal_model
 from .prompts import (
     DIRECT_SPECIALIST_NOTE,
@@ -161,8 +161,16 @@ MAIN_NODE_KEY = "main"
 
 #: Room tools whose successful result is raw pixels that must reach the model
 #: through a real image channel. Metadata/text inspection tools stay available
-#: to blind providers; these two cannot honestly degrade to a text receipt.
-PIXEL_RESULT_TOOLS = frozenset({"view_media_frame", "view_screenshot"})
+#: to blind providers; these cannot honestly degrade to a text receipt.
+PIXEL_RESULT_TOOLS = frozenset(
+    {
+        "view_media_frame",
+        "view_screenshot",
+        "view_file_image",
+        "read_drawing",
+        "browse_look",
+    }
+)
 
 # A transcript is useful for locating a moment, but it is not evidence of what
 # was visible there.  This correction is injected once when the Video worker
@@ -177,6 +185,28 @@ VIDEO_FRAME_MISSING = (
     "successful pixel-bearing frame capture was available. I will not infer "
     "what was visible from the transcript."
 )
+
+PIXEL_EVIDENCE_MISSING = (
+    "MISSING: I could not inspect the requested pixels because no successful "
+    "pixel-bearing capture was available. I will not infer visual details "
+    "from OCR, extracted text, filenames, transcripts, shape metadata, or a "
+    "text-only receipt."
+)
+
+
+def _required_pixel_tool(agent_id: str, question: str) -> str:
+    """The pixel verb that must evidence this worker's visual answer."""
+    if agent_id == "media.video" and is_visual_video_intent(question):
+        return "view_media_frame"
+    if agent_id == "creator.draw":
+        return "read_drawing"
+    if not is_static_visual_intent(question):
+        return ""
+    return {
+        "files.read": "view_file_image",
+        "app.ui": "view_screenshot",
+        "chat.browse": "browse_look",
+    }.get(agent_id, "")
 
 #: Shown in the step strip when the turn-wide round budget runs out. The user
 #: gets an answer either way; this says the answer came from what was already
@@ -591,9 +621,13 @@ class AgentState(TypedDict, total=False):
     #: `repair_cap` a boolean: the two agents declaring 2 were given 1. The node
     #: owns the decision now and the router only reads it.
     repair_needed: bool
-    #: One bounded retry after media.video tried to answer a visual request
-    #: without successful ``view_media_frame`` evidence.
+    #: One bounded retry after a visual worker tried to answer without its
+    #: successful pixel-bearing evidence tool.
     video_evidence_retries: int
+    #: The planner found one visual-only clause and structurally delegated it.
+    #: If that child returns the deterministic no-pixels verdict, Main cannot
+    #: replace it with ambient transcript/OCR prose during synthesis.
+    terminal_visual_evidence: bool
     cancelled: bool
     #: The verb `route_action` narrowed this turn to ("" = it abstained).
     routed: str
@@ -1014,13 +1048,13 @@ async def prepare(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
         )
     )
 
-    # Visual frames are the narrow case where Arcelle already knows the exact
+    # Visual evidence is the narrow case where Arcelle already knows the exact
     # specialist and has every slot verbatim in the planned clause. Run the
-    # first independent Video step structurally before Main's first model
-    # round; otherwise an attached transcript lets Main answer textually despite
-    # the advisory plan.  Use the step instruction, not the whole question: a
-    # mixed request must leave its remaining clauses for Main to dispatch after
-    # the Video report instead of handing unrelated work to the Video worker.
+    # first independent visual step structurally before Main's first model
+    # round; otherwise attached OCR/transcript text lets Main answer textually
+    # despite the advisory plan. Use the step instruction, not the whole
+    # question: a mixed request must leave its remaining clauses for Main to
+    # dispatch after the visual report instead of handing unrelated work to it.
     # The ordinary execute_tools path still owns reachability, privacy refusal,
     # roster events and the worker sub-loop — this is not a direct/tagged bypass.
     prepared_calls: list[ToolCall] = []
@@ -1031,9 +1065,12 @@ async def prepare(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
         and plan is not None
         and plan.reason == "planned"
         and bool(plan.steps)
-        and plan.steps[0].worker == "media.video"
+        and plan.steps[0].worker in {"media.video", "files.read"}
         and not plan.steps[0].needs_previous
-        and is_visual_video_intent(plan.steps[0].instruction)
+        and (
+            is_visual_video_intent(plan.steps[0].instruction)
+            or is_static_visual_intent(plan.steps[0].instruction)
+        )
         and "ask_file_agent" in offered
     ):
         prepared_visual_instruction = plan.steps[0].instruction
@@ -1045,11 +1082,14 @@ async def prepare(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
         and not plan.steps
         and len(plan.unavailable) == 1
         and not plan.unplanned
-        and is_visual_video_intent(plan.unavailable[0][1])
+        and (
+            is_visual_video_intent(plan.unavailable[0][1])
+            or is_static_visual_intent(plan.unavailable[0][1])
+        )
         and "ask_file_agent" in offered
     ):
-        # A single Video-only request can be unavailable because Cloud Privacy
-        # removed the pixel tool or the selected model has no image transport.
+        # A single visual-only request can be unavailable because Cloud Privacy
+        # removed its pixel tool or the selected model has no image transport.
         # Still send that exact clause through the normal delegation guard so
         # Main receives the deterministic refusal and the privacy valve gets
         # its blocked-image receipt.  This deliberately excludes mixed plans.
@@ -1059,9 +1099,18 @@ async def prepare(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
             ToolCall(
                 name="ask_file_agent",
                 arguments={"instruction": prepared_visual_instruction},
-                id="arcelle-visual-video",
+                id="arcelle-visual-evidence",
             )
         ]
+
+    terminal_visual_evidence = bool(
+        prepared_calls
+        and plan is not None
+        and plan.reason == "planned"
+        and len(plan.steps) == 1
+        and not plan.unplanned
+        and not plan.unavailable
+    )
 
     return {
         "tools": tools,
@@ -1078,6 +1127,13 @@ async def prepare(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
         "final_text": "",
         "progress": [],
         "video_evidence_retries": 0,
+        # For a visual-only turn, a child that returns the deterministic
+        # no-pixels verdict is the end of the evidence chain. Main still gets
+        # one synthesis round for normal successful reports and privacy
+        # refusals, but it may not overwrite this verdict with transcript/OCR
+        # prose from the ambient room context (the exact live regression that
+        # originally produced a plausible answer after frame capture failed).
+        "terminal_visual_evidence": terminal_visual_evidence,
         "synth": bool(prepared_calls),
         "cancelled": deps.cancel.cancelled,
         "stop": False,
@@ -1227,46 +1283,111 @@ async def call_model(state: AgentState, config: RunnableConfig) -> dict[str, Any
 
     cancelled = deps.cancel.cancelled
 
-    # A successful frame event can exist only after _ToolPass received image
+    if (
+        get_agent(str(state.get("agent_id", ""))).main
+        and bool(state.get("terminal_visual_evidence", False))
+    ):
+        message_text = "\n".join(
+            str(message.get("content") or "") for message in messages
+        )
+        terminal_missing = next(
+            (
+                verdict
+                for verdict in (VIDEO_FRAME_MISSING, PIXEL_EVIDENCE_MISSING)
+                if verdict in message_text
+            ),
+            "",
+        )
+        if terminal_missing:
+            # The synthesis model has already run, so provider accounting and
+            # the live-area lifecycle above remain exact. Only its unsupported
+            # prose is discarded; no further delegation can manufacture the
+            # pixels the specialist proved were absent.
+            return {
+                "messages": messages,
+                "final_text": terminal_missing,
+                "calls": [],
+                "cancelled": cancelled,
+                "stop": True,
+                "video_evidence_retries": int(
+                    state.get("video_evidence_retries", 0)
+                ),
+            }
+
+    # A successful pixel event can exist only after _ToolPass received image
     # bytes: metadata-only receipts are converted to errors before tool_events
     # is appended.  Therefore this is both the action receipt and the pixel
-    # receipt.  A Video worker may use transcript search to LOCATE the moment,
-    # but it cannot terminate a visual ask on those words alone.
+    # receipt. A worker may use OCR/search/metadata to LOCATE the relevant
+    # artifact, but it cannot terminate a visual ask on those words alone.
     agent_id = str(state.get("agent_id", ""))
-    visual_video = agent_id == "media.video" and is_visual_video_intent(
-        str(state.get("question") or "")
+    required_pixel_tool = _required_pixel_tool(
+        agent_id, str(state.get("question") or "")
     )
-    frame_evidence = any(
-        str(event.get("name") or "") == "view_media_frame"
+    pixel_evidence = any(
+        str(event.get("name") or "") == required_pixel_tool
+        and not bool(event.get("error", False))
         for event in state.get("tool_events", [])
+    )
+    pixel_failures = sum(
+        1
+        for event in state.get("tool_events", [])
+        if str(event.get("name") or "") == required_pixel_tool
+        and bool(event.get("error", False))
+    )
+    pixel_correction = (
+        VIDEO_FRAME_REQUIRED
+        if required_pixel_tool == "view_media_frame"
+        else (
+            "This request requires real pixels. Call "
+            f"{required_pixel_tool} and inspect its attached image before answering; "
+            "text, OCR, metadata, or a receipt alone is not visual evidence."
+        )
     )
     corrections_update: list[str] | None = None
     video_retries = int(state.get("video_evidence_retries", 0))
-    if visual_video and not frame_evidence and not calls and not cancelled:
+    if (
+        required_pixel_tool
+        and not pixel_evidence
+        and pixel_failures >= 2
+        and not cancelled
+    ):
+        # A perception capture may be retried once for a transient renderer or
+        # bridge failure. After two pixel-less/error results, do not let a model
+        # hammer the same tool until the 10,000-round runaway backstop.
+        content = (
+            VIDEO_FRAME_MISSING
+            if required_pixel_tool == "view_media_frame"
+            else PIXEL_EVIDENCE_MISSING
+        )
+        calls = []
+        stop = True
+    elif required_pixel_tool and not pixel_evidence and not calls and not cancelled:
         if not last and video_retries < 1:
             # `route_after_model` normally treats no calls as terminal. Keep it
             # in the loop once: execute_tools records the model's premature
             # answer, then the next model round receives this evidence-backed
             # correction with the frame tool still offered.
-            corrections_update = list(
-                dict.fromkeys([*corrections, VIDEO_FRAME_REQUIRED])
-            )
+            corrections_update = list(dict.fromkeys([*corrections, pixel_correction]))
             video_retries += 1
             stop = False
         else:
             # One ignored correction, an exhausted round budget, or a second
             # metadata/error receipt ends deterministically — never by passing
             # through the transcript-derived claim the gate just rejected.
-            content = VIDEO_FRAME_MISSING
+            content = (
+                VIDEO_FRAME_MISSING
+                if required_pixel_tool == "view_media_frame"
+                else PIXEL_EVIDENCE_MISSING
+            )
             corrections_update = [
-                note for note in corrections if note != VIDEO_FRAME_REQUIRED
+                note for note in corrections if note != pixel_correction
             ]
             stop = True
     else:
         stop = last or cancelled or not calls
-        if frame_evidence and VIDEO_FRAME_REQUIRED in corrections:
+        if pixel_evidence and pixel_correction in corrections:
             corrections_update = [
-                note for note in corrections if note != VIDEO_FRAME_REQUIRED
+                note for note in corrections if note != pixel_correction
             ]
 
     update: dict[str, Any] = {
@@ -2921,7 +3042,7 @@ class _ToolPass:
         # fail closed here.  (The external-engine adapter independently rejects a
         # metadata-only IMAGE_HANDOFF before spawning a CLI.)
         if (
-            call.name in {"view_media_frame", "view_screenshot"}
+            call.name in PIXEL_RESULT_TOOLS
             and not outcome.is_error
             and not outcome.images
         ):
@@ -2984,6 +3105,20 @@ class _ToolPass:
                         )
         else:
             result = f"Tool error: {outcome.text}"
+            if call.name in PIXEL_RESULT_TOOLS:
+                self.tool_events.append(
+                    {
+                        "name": call.name,
+                        "arguments": {
+                            name: str(call.arguments[name])[:512]
+                            for name in ("name", "name_or_id", "job_id", "id")
+                            if name in (call.arguments or {})
+                            and isinstance(call.arguments[name], (str, int))
+                        },
+                        "result": outcome.text[-4096:],
+                        "error": True,
+                    }
+                )
         self.progress.append(
             f"{call.name}({_args_summary(call.arguments)}) -> {'ok' if ok else 'error'}"
         )

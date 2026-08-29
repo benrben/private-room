@@ -27,11 +27,12 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import * as http from "node:http";
 import type { AddressInfo } from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { Readable } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type Database from "better-sqlite3-multiple-ciphers";
 
@@ -55,6 +56,8 @@ import {
 import { createRoomManagerState, type RoomManagerState } from "./roomManager.js";
 import { ensureUp } from "./sidecar.js";
 import { MODEL_FILE } from "./sttTools.js";
+import { createWorkspaceRoom } from "./workspace/roomLayout.js";
+import { WorkspaceService } from "./workspace/workspaceService.js";
 import {
   DIARIZE_MODEL_FILE,
   bundledDiarizeModelPath,
@@ -533,6 +536,46 @@ describe("transcribeMediaWithSpeakers", () => {
     expect(await transcribeMediaWithSpeakers(h.deps, id)).toBeNull();
     expect(stageFor(h.events, "Team sync.m4a")).toEqual(["model-missing"]);
     expect(getRecMeta(h.db, id)).toBeNull();
+  });
+
+  it("still warms a workspace video's visual index when speech weights are missing", async () => {
+    tmpDir = mkdtempSync(path.join(os.tmpdir(), "mediaTranscribeVisual-"));
+    const roomPath = path.join(tmpDir, "Room");
+    const created = createWorkspaceRoom(roomPath, "correct horse battery staple", "Video Room");
+    const workspace = new WorkspaceService(created.db, roomPath);
+    const source = Buffer.from("video source for visual cache");
+    const entry = await workspace.createFile("talk.mp4", Readable.from([source]), "import");
+    created.db.prepare("UPDATE files SET mime_type = 'video/mp4' WHERE id = ?").run(entry.fileId);
+    const hash = (created.db.prepare("SELECT content_sha256 FROM files WHERE id = ?").get(entry.fileId) as {
+      content_sha256: string;
+    }).content_sha256;
+    const state = createRoomManagerState();
+    state.room = {
+      conn: created.db,
+      path: roomPath,
+      name: "Video Room",
+      password: "correct horse battery staple",
+      workspace,
+    };
+    const events: Array<[string, unknown]> = [];
+    const warmVisualIndex = vi.fn(async (stagedPath: string, expectedSha?: string) => {
+      expect(path.basename(path.dirname(stagedPath))).toMatch(/^arcelle-visual-index-/);
+      expect(readFileSync(stagedPath)).toEqual(source);
+      expect(expectedSha).toBe(hash);
+      return null;
+    });
+
+    expect(await transcribeMediaWithSpeakers({
+      state,
+      userDataDir: path.join(tmpDir, "no-models"),
+      resourcesPath: null,
+      emit: (event, payload) => events.push([event, payload]),
+      warmVisualIndex,
+    }, entry.fileId)).toBeNull();
+
+    expect(warmVisualIndex).toHaveBeenCalledTimes(1);
+    expect(stageFor(events, "talk.mp4")).toEqual(["model-missing"]);
+    created.db.close();
   });
 
   it("writes NOTHING when the rebuild fails, is stopped, or is truncated", async () => {

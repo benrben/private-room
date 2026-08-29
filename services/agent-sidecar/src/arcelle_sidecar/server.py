@@ -96,6 +96,7 @@ from .stt.dictation import register_dict_routes
 from .stt import engine as stt_engine
 from .media.decode import MediaKind as SttMediaKind, decode_to_pcm
 from .media.quicklook import preview_png as quicklook_preview_png
+from .media.visual_index import register_visual_index_routes
 
 log = logging.getLogger("arcelle_sidecar")
 
@@ -388,6 +389,10 @@ def create_app(
     # routes above — its own module owns every decision, and it needs no token
     # of its own.
     register_dict_routes(app)
+    # Persistent, content-addressed 1-fps JPEG indexes for timestamped video
+    # questions. The module owns its staged-path boundary and cache format;
+    # this registration is its entire footprint in the general server.
+    register_visual_index_routes(app)
     registry = RunRegistry()
     app.state.registry = registry
 

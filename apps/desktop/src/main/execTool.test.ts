@@ -192,6 +192,7 @@ describe("exhaustive tool-arm coverage — the single most valuable test in this
       // other real arm, which is the shape this test discriminates on. Its
       // partial-ness is pinned in organizeTools.test.ts instead.
       "mark_image",
+      "view_file_image",
       "create_file",
       "rename_file",
       "move_file",

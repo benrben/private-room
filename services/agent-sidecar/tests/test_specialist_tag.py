@@ -43,6 +43,7 @@ from conftest import (
     specs,
 )
 from arcelle_sidecar.messages import ToolCall
+from arcelle_sidecar.graph import PIXEL_EVIDENCE_MISSING
 from arcelle_sidecar.routing import BROWSE_TOOL_NAMES
 from arcelle_sidecar.agents import (
     ALL_REGISTRY_TOOLS,
@@ -432,6 +433,25 @@ async def test_a_tagged_video_turn_is_refused_when_the_model_has_no_image_input(
     assert mcp.calls == []
     assert "*video isn't a specialist this room has" in out.final
     assert "On this Mac" in out.final
+
+
+async def test_a_blind_tagged_file_turn_cannot_claim_static_visual_details() -> None:
+    req = make_request("*file describe what is shown in photo.png").model_copy(
+        update={"supports_vision": False, "max_rounds": 5}
+    )
+    chat = FakeChatModel(
+        [
+            Round(content="The OCR says invoice."),
+            Round(content="I infer it is an invoice."),
+        ]
+    )
+    mcp = FakeMCP(specs(sorted(ALL_REGISTRY_TOOLS)))
+
+    out = await drive(req, chat, mcp)
+
+    assert all("view_file_image" not in names for names in chat.offered_names)
+    assert mcp.calls == []
+    assert out.final == PIXEL_EVIDENCE_MISSING
 
 
 async def test_a_tagged_turn_draws_ONE_node_and_it_is_the_specialist() -> None:

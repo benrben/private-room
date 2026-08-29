@@ -160,6 +160,7 @@ export function arcelleToolAnnotations(name: string): Record<string, boolean> | 
     case "list_room_files":
     case "search_room":
     case "open_file":
+    case "view_file_image":
     case "mark_image":
     case "annotate_file":
     case "list_memories":
@@ -1075,10 +1076,13 @@ const MIRROR_UNROUTED_WORKSPACE_MUTATIONS = new Set([
   "local_generate",
   "ui_act",
   // Pixel results cannot pass through the text redaction mirror. Advertising
-  // either tool under Cloud Privacy guarantees a result whose image block is
+  // any of these tools under Cloud Privacy guarantees a result whose image block is
   // stripped before the provider can inspect it.
   "view_media_frame",
   "view_screenshot",
+  "view_file_image",
+  "read_drawing",
+  "browse_look",
 ]);
 
 /**

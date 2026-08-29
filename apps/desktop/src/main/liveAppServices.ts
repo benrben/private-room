@@ -1,4 +1,8 @@
 import { randomUUID } from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { pipeline } from "node:stream/promises";
 import type { RoomManagerDeps, RoomManagerState } from "./roomManager.js";
 import type { EventSender } from "./turn.js";
 import type { McpRuntime } from "./mcpSurfaceIpc.js";
@@ -31,6 +35,47 @@ import type { RunStudioDeps } from "./studiosCmds.js";
 import type { Browser } from "./browser/browser.js";
 import type { SttModelState } from "./sttTools.js";
 import { createLiveRuntimeTool } from "./liveRuntimeTools.js";
+import {
+  videoVisualIndex,
+  VIDEO_VISUAL_WARM_TIMEOUT_MS,
+  type CachedVisualFrame,
+  type VideoVisualIndexClient,
+} from "./videoVisualIndex.js";
+
+/** A cold interactive lookup may do one bounded local index build, but never
+ * hold an agent tool call for the background transcription lane's full 120s. */
+export const INTERACTIVE_VISUAL_INDEX_BUDGET_MS = 30_000;
+
+type BeforeDeadline<T> =
+  | { timedOut: false; value: T }
+  | { timedOut: true };
+
+async function beforeDeadline<T>(operation: Promise<T | null>, deadline: number): Promise<BeforeDeadline<T | null>> {
+  const remaining = Math.max(0, deadline - Date.now());
+  if (remaining === 0) return { timedOut: true };
+  return new Promise((resolve) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      resolve({ timedOut: true });
+    }, remaining);
+    operation.then(
+      (value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve({ timedOut: false, value });
+      },
+      () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve({ timedOut: false, value: null });
+      },
+    );
+  });
+}
 
 export interface LiveAppServices {
   roomDeps: RoomManagerDeps;
@@ -79,6 +124,81 @@ export function playableVideoMime(name: string, storedMime: string): string | nu
   return sourceMime === null ? null : playableMediaMime(sourceMime, extension, true);
 }
 
+/** Resolve a media mention without treating the chat mention sigil as part of
+ * the filename. Try the literal spelling first so a real file whose name
+ * begins with `@` remains addressable; only then retry without the sigil. */
+export function findMentionedMediaFile(
+  conn: Parameters<typeof findFileLikeQualified>[0],
+  rawName: unknown,
+): [string, string] {
+  const requested = typeof rawName === "string" ? rawName.trim() : "";
+  try {
+    return findFileLikeQualified(conn, requested);
+  } catch (literalError) {
+    if (!requested.startsWith("@") || requested.slice(1).trim() === "") throw literalError;
+    try {
+      return findFileLikeQualified(conn, requested.slice(1).trim());
+    } catch {
+      throw literalError;
+    }
+  }
+}
+
+async function coldWorkspaceVisualFrame(
+  openRoom: NonNullable<RoomManagerState["room"]>,
+  fileId: string,
+  sourceSha256: string,
+  extension: string,
+  seconds: number,
+  visualIndex: Pick<VideoVisualIndexClient, "capture" | "frame" | "warm">,
+  deadline: number,
+): Promise<CachedVisualFrame | null> {
+  if (openRoom.workspace === undefined) return null;
+  const remaining = (): number => Math.max(0, deadline - Date.now());
+  if (remaining() === 0) return null;
+  const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "arcelle-visual-index-")).catch(() => null);
+  if (tempDir === null) return null;
+  const staged = path.join(tempDir, `source.${extension || "bin"}`);
+  const controller = new AbortController();
+  const budget = setTimeout(() => controller.abort(), remaining());
+  let cleanupDeferred = false;
+  const cleanup = async (): Promise<void> => {
+    await fs.promises.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+  };
+  try {
+    await pipeline(
+      openRoom.workspace.readStream(fileId),
+      fs.createWriteStream(staged, { flags: "wx", mode: 0o600 }),
+      { signal: controller.signal },
+    );
+    if (remaining() === 0) return null;
+    // The exact 56m production fixture needs ~55s for a full 1-FPS cold
+    // index. Build that under the background 120s budget for later requests,
+    // while the latency-critical endpoint captures only this exact second for
+    // the current answer. Both share this one private staged source.
+    const warmOperation = visualIndex.warm(
+      staged,
+      sourceSha256,
+      VIDEO_VISUAL_WARM_TIMEOUT_MS,
+    );
+    const captureOperation = visualIndex.capture(staged, seconds, remaining());
+    // Deleting after the fast capture alone would make the full warm's
+    // post-capture source re-hash fail. Retain staging until BOTH settle.
+    cleanupDeferred = true;
+    void Promise.allSettled([warmOperation, captureOperation]).then(cleanup);
+    const captureBeforeDeadline = await beforeDeadline(
+      captureOperation,
+      deadline,
+    );
+    return captureBeforeDeadline.timedOut ? null : captureBeforeDeadline.value;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(budget);
+    if (!cleanupDeferred) await cleanup();
+  }
+}
+
 /** Resolve, stage and ask the live renderer for one video frame.
  *
  * Kept as a narrow exported seam so the real qualified-name lookup,
@@ -91,21 +211,48 @@ export async function requestLiveMediaFrame(
   agentUi: AgentUiRuntime,
   emit: EventSender,
   args: Record<string, unknown>,
+  visualIndex: Pick<VideoVisualIndexClient, "capture" | "frame" | "warm"> = videoVisualIndex,
 ): Promise<unknown> {
   if (state.room === null) throw new Error("No room is open.");
-  const [id] = findFileLikeQualified(state.room.conn, String(args.name ?? ""));
+  const [id] = findMentionedMediaFile(state.room.conn, args.name);
   const meta = getFileMeta(state.room.conn, id);
   const streamMime = playableVideoMime(meta.name, meta.mimeType);
   if (streamMime === null) {
     throw new Error(`“${meta.name}” is not a supported video file.`);
   }
 
+  const seconds = parseTimestamp(args.at);
   let token: string;
   if (state.room.workspace !== undefined) {
     const row = state.room.conn.prepare(
-      "SELECT size_bytes FROM files WHERE id = ? AND storage_kind = 'workspace' AND trashed_at IS NULL",
-    ).get(id) as { size_bytes: number } | undefined;
+      `SELECT size_bytes, content_sha256 FROM files
+       WHERE id = ? AND storage_kind = 'workspace' AND trashed_at IS NULL`,
+    ).get(id) as { size_bytes: number; content_sha256: string | null } | undefined;
     if (row === undefined) throw new Error("That video is unavailable in the workspace.");
+    // Cache hits return the exact same renderer response shape, so the MCP
+    // bridge's SHA verification, pending-image drain and Cloud Privacy image
+    // valve remain unchanged. A missing, stale or corrupt derived entry is
+    // only a miss; the ordinary hidden renderer remains the source of truth.
+    if (row.content_sha256 !== null) {
+      const deadline = Date.now() + INTERACTIVE_VISUAL_INDEX_BUDGET_MS;
+      const hit = await beforeDeadline(
+        visualIndex.frame(row.content_sha256, seconds, deadline - Date.now()),
+        deadline,
+      );
+      let cached = hit.timedOut ? null : hit.value;
+      if (cached === null) {
+        cached = await coldWorkspaceVisualFrame(
+          state.room,
+          id,
+          row.content_sha256,
+          extensionOf(meta.name),
+          seconds,
+          visualIndex,
+          deadline,
+        );
+      }
+      if (cached !== null) return cached;
+    }
     const openRoom = state.room;
     token = stageMediaStream(
       files.mediaStreams,
@@ -123,7 +270,7 @@ export async function requestLiveMediaFrame(
   return requestAgentUi(agentUi, emit, "media_frame", {
     token,
     mime: streamMime,
-    seconds: parseTimestamp(args.at),
+    seconds,
   });
 }
 

@@ -75,7 +75,8 @@ CLOUD_PRIVACY_BLOCKED_TOOLS: frozenset[str] = frozenset(
         # receipt and invite fabricated visual interpretation, so hand Video to
         # a local engine instead.
         "delete_mcp", "run_mcp_tool", "retranscribe_file", "read_recording",
-        "view_media_frame", "view_screenshot",
+        "view_media_frame", "view_screenshot", "view_file_image",
+        "read_drawing", "browse_look",
         "studio_flashcards", "studio_mindmap", "generate_podcast_script", "draw",
     }
 )

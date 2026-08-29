@@ -44,6 +44,7 @@ import {
 import { createWorkspaceRoom } from "./workspace/roomLayout.js";
 import { WorkspaceService } from "./workspace/workspaceService.js";
 import { WEB_LANES_ALL } from "./toolSpecs.js";
+import { createToolEffects } from "./execTool.js";
 
 const PASSWORD = "correct horse battery staple";
 
@@ -229,6 +230,29 @@ describe("main Assistant workspace write grant", () => {
     });
     expect(written.isError).not.toBe(true);
     expect(readFileSync(path.join(root, "Organized", "assistant.txt"), "utf8")).toBe("assistant write\n");
+  });
+
+  it("shares the owning turn's pixel sink with drawing tools", async () => {
+    const dir = freshDir();
+    const { state } = fixtureRoom(dir);
+    const effects = createToolEffects();
+    effects.visionChat = true;
+    const dispatcher = roomServerDispatcherFactory(state, vi.fn())(
+      false,
+      localScope,
+      WEB_LANES_ALL,
+      { sharedEffects: effects, workspaceWriteEnabled: true },
+    );
+
+    const drawn = await dispatcher.callTool(localScope, "draw", {
+      name: "Pixel proof",
+      script: 'rect 0 0 1600 1000 blue "Blue page"',
+    });
+    expect(drawn.isError, JSON.stringify(drawn)).not.toBe(true);
+    const looked = await dispatcher.callTool(localScope, "read_drawing", { name: "Pixel proof" });
+    expect(looked.isError).not.toBe(true);
+    expect(looked.content.some((item) => item.type === "image")).toBe(true);
+    expect(effects.pendingImages).toEqual([]);
   });
 
   it("cannot grant writes to a read-only room and exposes no workspace backend for sealed or locked rooms", async () => {

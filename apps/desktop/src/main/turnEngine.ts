@@ -617,6 +617,10 @@ export interface AskDeps {
    * describe the capture instead, so no perception is lost — only speed).
    */
   chatModelSeesImages?: (model: string) => Promise<boolean>;
+  /** The exact per-turn effects sink also owned by the short-lived room MCP
+   * bridge. Supplying it keeps image attachments and action receipts on one
+   * run-scoped object; omitted callers receive a fresh sink as before. */
+  effects?: ToolEffects;
   /** `commands::runs_on_this_mac` — see `turnContext.ts`'s
    * {@link pixelsReachChatModel}. Default `false`. */
   runsOnThisMac?: (model: string) => boolean;
@@ -751,7 +755,7 @@ export async function ask(req: AskRequest, deps: AskDeps): Promise<Message> {
     // CHG-19: the "where is X?" grounding pass is DEFERRED to after the answer
     // (nothing in the reply depends on the boxes), so the warm chat model
     // streams its first token instead of waiting on a vision-model load.
-    const effects = createToolEffects();
+    const effects = deps.effects ?? createToolEffects();
     // ADD-25: perception tools attach pixels only when the chat model can read
     // them AND the privacy door would not strip them; otherwise they fall back
     // to a local vision-model description.

@@ -157,6 +157,9 @@ def test_cloud_privacy_allows_safe_media_and_transcript_inspection_only() -> Non
     # model can see them, so perception must hand off to local.
     assert not privacy.cloud_privacy_tool_allowed("view_media_frame")
     assert not privacy.cloud_privacy_tool_allowed("view_screenshot")
+    assert not privacy.cloud_privacy_tool_allowed("view_file_image")
+    assert not privacy.cloud_privacy_tool_allowed("read_drawing")
+    assert not privacy.cloud_privacy_tool_allowed("browse_look")
 
 
 def test_guard_open_for_local_model_and_inactive_policy() -> None:

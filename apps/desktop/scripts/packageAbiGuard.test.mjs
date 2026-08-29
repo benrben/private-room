@@ -47,6 +47,7 @@ describe("package.sh native-module ABI guard", () => {
     const privacyTest = e2eScript.indexOf("cloud-video-privacy.e2e.mjs");
 
     expect(trap).toBeGreaterThanOrEqual(0);
+    expect(e2eScript).toMatch(/^set -euo pipefail$/m);
     expect(forcedElectronRebuild).toBeGreaterThan(trap);
     expect(deepTest).toBeGreaterThan(forcedElectronRebuild);
     expect(qaEntry).toBeGreaterThan(deepTest);

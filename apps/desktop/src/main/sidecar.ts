@@ -59,8 +59,17 @@ const RUN_STREAM_DISPATCHER = new UndiciAgent({ bodyTimeout: 0, headersTimeout: 
 
 /** The environment variable the sidecar reads its shared secret from. */
 export const TOKEN_ENV = "ARCELLE_SIDECAR_TOKEN";
+export const VISUAL_INDEX_DIR_ENV = "ARCELLE_VISUAL_INDEX_DIR";
 
 let cachedToken: string | null = null;
+let configuredVisualIndexDir: string | null = null;
+
+/** Pin the derived visual cache under Electron's trusted app-data root. The
+ * sidecar API deliberately accepts no caller-selected cache path; only this
+ * launch-time environment value can choose it. */
+export function configureVisualIndexDir(userDataDir: string): void {
+  configuredVisualIndexDir = path.join(path.resolve(userDataDir), "visual-index-v1");
+}
 
 /**
  * The shared secret every sidecar this app process spawns is given, and
@@ -662,7 +671,13 @@ export async function spawnAndWait(startTimeoutMs: number): Promise<string> {
 
   const child = spawn(launch.command, launch.args, {
     cwd: launch.cwd,
-    env: { ...process.env, [TOKEN_ENV]: authToken() },
+    env: {
+      ...process.env,
+      [TOKEN_ENV]: authToken(),
+      ...(configuredVisualIndexDir === null
+        ? {}
+        : { [VISUAL_INDEX_DIR_ENV]: configuredVisualIndexDir }),
+    },
     stdio: ["ignore", "pipe", "pipe"],
   });
 

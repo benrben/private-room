@@ -1239,12 +1239,14 @@ describe("ask", () => {
     const chat = createChat(db);
     const room = makeRoomSource({ db, path: "/rooms/a.roomai" });
     const chatModelSeesImages = vi.fn(async () => true);
+    const effects = createToolEffects();
     let request: RunViaSidecarRequest | null = null;
 
     await ask(
       { askId: "ask-vision", chatId: chat.id, question: "hi", attachments: [], viewing: null, privacyBypass: false },
       askDeps(room, createCancelState(), () => {}, {
         chatModelSeesImages,
+        effects,
         runViaSidecar: async (value) => {
           request = value;
           return fakeOutcome({ kind: "done", text: "ok" });
@@ -1253,6 +1255,7 @@ describe("ask", () => {
     );
     expect(chatModelSeesImages).toHaveBeenCalledTimes(1);
     expect(chatModelSeesImages).toHaveBeenCalledWith("claude-cli::opus");
+    expect(effects.visionChat).toBe(true);
     expect((request as RunViaSidecarRequest | null)?.supportsVision).toBe(true);
   });
 });

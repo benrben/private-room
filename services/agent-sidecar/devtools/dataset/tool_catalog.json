@@ -1723,6 +1723,28 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
+    "description": "Attach the real pixels of an image or .sketch file in this room so you can visually inspect it. Use this before answering what is shown, visible, written, colored, arranged, or depicted; open_file only opens the viewer for the user and is not visual evidence.",
+    "inputSchema": {
+      "properties": {
+        "name": {
+          "description": "Image or .sketch file name, or a distinctive part of it",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "name": "view_file_image"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
     "description": "Grab one frame from a video file in the room at a timestamp and look at it. Pair with the transcript's [m:ss] stamps to inspect the exact moment. Example: {\"name\": \"lecture.mp4\", \"at\": \"12:34\"}",
     "inputSchema": {
       "properties": {

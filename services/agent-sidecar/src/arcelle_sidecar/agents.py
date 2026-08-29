@@ -496,7 +496,7 @@ REGISTRY: tuple[AgentSpec, ...] = (
         # simply gets a File agent without them: `toolbox_for` intersects the
         # box with what the host serves, so the box degrades rather than
         # advertising a verb the bridge would then refuse.
-        tools=ORGANIZE_TOOL_NAMES,
+        tools=(*ORGANIZE_TOOL_NAMES, "view_file_image"),
         # Reading and editing this room's files is the job; organizing them is
         # an addition. Without this the File agent — the room's DEFAULT worker —
         # would go unreachable on any tier that withholds the organize box.
@@ -1113,10 +1113,10 @@ REGISTRY: tuple[AgentSpec, ...] = (
             "measures its own work and corrects it."
         ),
         tools=DRAW_TOOL_NAMES,
-        # Cloud Privacy permits read_drawing but blocks the mutating draw verb.
-        # Reading alone cannot fulfil the Drawing specialist's advertised job,
-        # so fail capability discovery before dispatch and offer local handoff.
-        requires=("draw",),
+        # A drawing is not complete until the agent has inspected its raster.
+        # A blind provider can emit coordinates but cannot honestly verify the
+        # visual result, so discovery hides the whole specialist.
+        requires=("draw", "read_drawing"),
         prompt=DRAW_PROMPT,
         # Anchored to the ARTIFACT, not to the verb. "draw" alone is an
         # ordinary English word for describing anything ("draw a conclusion",

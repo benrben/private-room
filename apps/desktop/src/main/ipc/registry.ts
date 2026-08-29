@@ -208,6 +208,8 @@ import { startRecRead } from "../recRead.js";
 import { listModels } from "../engineRouting.js";
 import { bestLocalDefault } from "../ollamaModels.js";
 import { runsOnThisMac } from "../capabilities.js";
+import { configureVisualIndexDir } from "../sidecar.js";
+import { videoVisualIndex } from "../videoVisualIndex.js";
 import { createSchedulerState, startWorkflowRunNotImplemented } from "../jobScheduler.js";
 import type { JobProgressPayload } from "../jobs.js";
 import {
@@ -687,6 +689,11 @@ export function createLiveRoomManagerDeps(
 export function registerAllIpc(opts: RegisterAllIpcOptions): RegisterAllIpcResult {
   const { state, deps, emit, host, dialog, shell, userDataDir, resourcesPath } = opts;
 
+  // Configure before any registered handler can lazily start the sidecar.
+  // The sidecar accepts no cache path over HTTP, so untrusted tool arguments
+  // can never redirect plaintext derived video pixels elsewhere.
+  configureVisualIndexDir(userDataDir);
+
   const registeredChannels = new Set<string>();
   const recordingIpcMain: Pick<IpcMain, "handle"> = {
     handle(
@@ -740,6 +747,8 @@ export function registerAllIpc(opts: RegisterAllIpcOptions): RegisterAllIpcResul
     resourcesPath,
     emit,
     onIndexed: (roomPath: string): void => deps.scheduleAutoIndex?.(roomPath),
+    warmVisualIndex: (stagedPath, expectedSourceSha256, timeoutMs) =>
+      videoVisualIndex.warm(stagedPath, expectedSourceSha256, timeoutMs),
   };
 
   // ---- room lifecycle + checkpoints + chat — the real RoomManagerState ----
