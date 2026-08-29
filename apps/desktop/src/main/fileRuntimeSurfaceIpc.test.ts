@@ -8,6 +8,7 @@ import {
   registerFileRuntimeSurfaceIpc,
   shouldAutoTranscribeImport,
   snapshotRawFallback,
+  transcribeEligibleImport,
   viewerKind,
   viewerKindIsEditable,
   viewerKindReadsRawText,
@@ -65,10 +66,58 @@ describe("file viewer routing", () => {
     expect(viewerKindIsEditable("notebook")).toBe(true);
   });
 
-  it("automatically transcribes imported FLAC audio, not unrelated files", () => {
+  it("treats every audio and video container as eligible to be transcribed, not just FLAC", () => {
+    for (const [name, mime] of [
+      ["meeting.flac", "audio/flac"],
+      ["interview.mp3", "audio/mpeg"],
+      ["memo.m4a", "audio/mp4"],
+      ["talk.mp4", "video/mp4"],
+      // No `guessDownloadMime` entry, so these import as octet-stream. The
+      // extension arm of `mediaKind` is the only thing that saves them from
+      // BinaryView, which offers no Transcribe button at all.
+      ["voice.aac", "application/octet-stream"],
+      ["tape.aiff", "application/octet-stream"],
+      ["capture.caf", "application/octet-stream"],
+      ["clip.m4v", "application/octet-stream"],
+    ] as const) {
+      expect(transcribeEligibleImport(name, mime), name).toBe(true);
+    }
+    expect(transcribeEligibleImport("notes.txt", "text/plain")).toBe(false);
+    expect(transcribeEligibleImport("scan.pdf", "application/pdf")).toBe(false);
+  });
+
+  it("routes every eligible container to the media viewer that owns the Transcribe button", () => {
+    for (const [name, expected] of [
+      ["voice.aac", "audio"],
+      ["tape.aiff", "audio"],
+      ["memo.aif", "audio"],
+      ["capture.caf", "audio"],
+      ["clip.m4v", "video"],
+    ] as const) {
+      expect(viewerKind(name, "application/octet-stream"), name).toBe(expected);
+    }
+  });
+
+  it("still runs itself for an imported FLAC only — eligibility is an offer, not a trigger", () => {
     expect(shouldAutoTranscribeImport("meeting.flac", "audio/flac")).toBe(true);
-    expect(shouldAutoTranscribeImport("meeting.wav", "audio/wav")).toBe(false);
-    expect(shouldAutoTranscribeImport("notes.flac", "application/octet-stream")).toBe(false);
+    // Eligible, and offered the button — but a bulk drop of these must never
+    // queue hours of decoding nobody asked for, so none of them auto-run.
+    for (const [name, mime] of [
+      ["meeting.wav", "audio/wav"],
+      ["interview.mp3", "audio/mpeg"],
+      ["talk.mp4", "video/mp4"],
+      ["voice.aac", "application/octet-stream"],
+    ] as const) {
+      expect(transcribeEligibleImport(name, mime), name).toBe(true);
+      expect(shouldAutoTranscribeImport(name, mime), name).toBe(false);
+    }
+    expect(shouldAutoTranscribeImport("notes.txt", "text/plain")).toBe(false);
+    // Deliberate change from the old `mime.startsWith("audio/")` spelling: a
+    // `.flac` whose MIME arrived generic is still a FLAC. `import_files`
+    // derives the MIME from the name (`guessDownloadMime` maps flac ->
+    // audio/flac), so this case cannot actually reach the auto path there —
+    // and where it can be reached, answering "not audio" would be a lie.
+    expect(shouldAutoTranscribeImport("notes.flac", "application/octet-stream")).toBe(true);
   });
 
   it.each([

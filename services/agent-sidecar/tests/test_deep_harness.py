@@ -297,10 +297,16 @@ def test_deep_specialists_do_not_inherit_network_or_connector_access() -> None:
         write_enabled=False,
         max_rounds=4,
         small_model=True,
+        image_input_available=False,
+        privacy_restricted=True,
     )
     assert state["web_enabled"] is False
     assert state["advisors"] is False
     assert state["write"] is False
     assert state["small_model"] is True
+    # ARC-024: a deep child must not regain pixel tools which its parent
+    # provider or Cloud Privacy lane could not safely receive.
+    assert state["image_input_available"] is False
+    assert state["privacy_restricted"] is True
     assert is_small_parameter_model("qwen3.5:4b-mlx")
     assert not is_small_parameter_model("qwen3:14b")

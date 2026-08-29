@@ -110,6 +110,23 @@
  *     (`gatherContext.ts`'s `modelSetting`), so `ai_status`/`warm_model`/
  *     `grounding_model_for_room` answer for the room the user actually has
  *     open rather than always falling back to a global default.
+ *   - `diarizeModelPath` (see {@link createLiveRecBridgeCtx}) resolves the
+ *     BUNDLED TitaNet speaker model. Omitted — which is how this shipped —
+ *     every live recording POSTs `diarizeModelPath: null`, the sidecar
+ *     silently substitutes a 21-dim DSP embedding, and saved-voice enrollment
+ *     plus cross-recording recognition cannot work at all while Settings
+ *     still shows their UI.
+ *   - `enqueueStt` reaches `chatCmds.ts` (pasted/imported audio) AND
+ *     `videoTools.ts` (a trimmed clip). Both are optional, so an unwired one
+ *     costs a transcript rather than failing anything: `videoTools.ts` swallows
+ *     it in a `try`/`catch`, and `chatCmds.ts` falls back to
+ *     `enqueueSttNotImplemented`, which logs loudly to the console and nowhere
+ *     the user can see. `videoTools.ts`'s was in fact unwired.
+ *   - `resourcesPath` on `registerMediaDownloadSurfaceIpc` is the sixth
+ *     positional argument and DEFAULTS to `null`. Omitted, a packaged build's
+ *     downloads never find the bundled speech/speaker weights and every
+ *     downloaded podcast answers `model-missing` — while Settings, which reads
+ *     the same weights through `resourcesPath`, says the model is installed.
  *
  * Optional dependency seams retain explicit defaults for isolated unit tests.
  * The production bootstrap overlays the live room server, backfill, STT, job,
@@ -177,7 +194,11 @@ import type { SafetyOpenRoom, SafetyRoomSource } from "../safetyTools.js";
 import type { EventSender } from "../turn.js";
 import { modelSetting } from "../gatherContext.js";
 import { SttModelState, sttEffectiveModel } from "../sttTools.js";
-import { retranscribeFile } from "../speechSttSurfaceIpc.js";
+import {
+  diarizeEffectiveModel,
+  transcribeMediaWithSpeakers,
+  type MediaTranscribeDeps,
+} from "../mediaTranscribeJob.js";
 import { createPeakCache } from "../peaksTools.js";
 import { createSlideCache } from "../officeTools.js";
 import { createRecBridgeCtx, recStop, type RecBridgeCtx } from "../recBridge.js";
@@ -545,7 +566,27 @@ export interface RegisterAllIpcResult {
 }
 
 /** Production recording context. Kept as a named factory so the critical
- * Settings/recording STT resolver wiring is directly regression-testable. */
+ * Settings/recording STT resolver wiring is directly regression-testable.
+ *
+ * BOTH model resolvers are wired here, and for the same reason: `recBridge.ts`
+ * declares each as an OPTIONAL dep with an honest `null` default, so omitting
+ * one compiles, boots, records, and silently degrades.
+ *
+ *   - `resolveSttModel` — omitted, every `rec_start` answers STT_MODEL_MISSING
+ *     while Settings cheerfully says "Voice model installed".
+ *   - `diarizeModelPath` — omitted, `/rec/start` is POSTed
+ *     `diarizeModelPath: null` (recBridge.ts's `?? null`), the sidecar falls
+ *     back to its 21-dim DSP embedding, `identityPrint` (which needs the
+ *     192-dim TitaNet vector) returns null, `learnVoice` early-returns, and
+ *     saved-voice enrollment plus cross-recording recognition never work at
+ *     all. That was the shipped state: the 40MB TitaNet model is bundled in
+ *     `resources/models/`, and nothing ever loaded it. Settings > Saved voices
+ *     and the "?" guessed-name affordance were dead UI on a dead pipeline.
+ *
+ * Neither failure raises anything anywhere — which is exactly why this factory
+ * exists as a named, exported seam with its own test rather than as an inline
+ * object literal at the one call site.
+ */
 export function createLiveRecBridgeCtx(
   currentRoom: () => OpenRoom | null,
   userDataDir: string,
@@ -554,6 +595,7 @@ export function createLiveRecBridgeCtx(
   return createRecBridgeCtx({
     currentRoom,
     resolveSttModel: () => sttEffectiveModel(userDataDir, resourcesPath),
+    diarizeModelPath: () => diarizeEffectiveModel(userDataDir, resourcesPath),
   });
 }
 
@@ -671,13 +713,64 @@ export function registerAllIpc(opts: RegisterAllIpcOptions): RegisterAllIpcResul
    * see the module doc's "BEST-EFFORT DEPS". */
   const isRollingBack = (): boolean => state.rollingBack;
 
+  /**
+   * ONE speaker-aware transcription lane, shared by every route into it — chat
+   * paste/import (`registerChatIpc`'s `enqueueStt`), file import
+   * (`retranscribeImportedFile`), a trimmed video clip (`registerVideoIpc`'s
+   * `enqueueStt`) and the explicit `rec_retranscribe` button.
+   *
+   * THREE of those four previously called `speechSttSurfaceIpc.ts`'s
+   * `retranscribeFile` (the video one called nothing at all — `enqueueStt` was
+   * simply never passed to `registerVideoIpc`). `retranscribeFile`
+   * writes FLAT text into `files.extracted_text` and nothing else. That
+   * left every one of them speakerless, and — because
+   * `fileRuntimeSurfaceIpc.ts` picks the viewer by DATA (`getRecMeta(...) !==
+   * null ? "recording" : viewerKind(...)`) — it also left them opening in the
+   * plain audio viewer forever. `transcribeMediaWithSpeakers` writes the
+   * `recordings` row as well, so the same file lands in the full
+   * speaker-aware RecordingView with no new component involved.
+   *
+   * `onIndexed` is a live lookup, not a captured function: `deps.scheduleAutoIndex`
+   * is assigned further down in this same function (after the surfaces that
+   * need it are registered), so capturing it here would pin `undefined`.
+   */
+  const mediaTranscribe: MediaTranscribeDeps = {
+    state,
+    userDataDir,
+    resourcesPath,
+    emit,
+    onIndexed: (roomPath: string): void => deps.scheduleAutoIndex?.(roomPath),
+  };
+
   // ---- room lifecycle + checkpoints + chat — the real RoomManagerState ----
   registerRoomManagerIpc(recordingIpcMain, state, deps);
   registerRoomCheckpointsIpc(recordingIpcMain, state, deps);
   registerChatIpc(recordingIpcMain, state, {
+    // Rust's `enqueue_stt` is fire-and-forget, so this stays `void`-and-catch:
+    // a paste that landed as a real room file must not be reported as failed
+    // because the transcription behind it did.
     enqueueStt: (job) => {
-      void retranscribeFile(state, userDataDir, resourcesPath, emit, job.id, (roomPath) => deps.scheduleAutoIndex?.(roomPath)).catch((error) =>
-        emit("stt-progress", [job.id, error instanceof Error ? error.message : String(error)]));
+      void transcribeMediaWithSpeakers(mediaTranscribe, job.id).catch((error) =>
+        // A LAST-RESORT net, not the reporter. `transcribeMediaWithSpeakers`
+        // catches everything internally and answers `null`, emitting its own
+        // `[name, "failed: …"]` on the way — so in normal operation this
+        // handler never runs. It exists so that an unexpected throw becomes a
+        // named event instead of an unhandled rejection on a `void`ed promise.
+        //
+        // Keyed by NAME, with the `failed: ` prefix, because that is the only
+        // shape the consumers read: `state.ts`'s `sttStatus` map is keyed by
+        // the event's first element (which `ViewerRouter`/`RecordingsPage`
+        // then look up by file name), and `viewers/util.ts`'s `sttFailure`
+        // recognises a failure only by `STT_FAILED_PREFIX`. This site used to
+        // emit `[job.id, message]`, which landed in that map under a key
+        // nothing looks up and in a shape `sttFailure` reads as "not a
+        // failure" — a wasted entry, though not a lost message: the old
+        // `retranscribeFile` had already emitted the correct name-keyed
+        // `failed: …` for anything that threw past its staging step.
+        emit("stt-progress", [
+          job.name,
+          `failed: ${error instanceof Error ? error.message : String(error)}`,
+        ]));
     },
   });
 
@@ -743,22 +836,34 @@ export function registerAllIpc(opts: RegisterAllIpcOptions): RegisterAllIpcResul
     emit,
     host,
     {
-      retranscribeImportedFile: (fileId) => retranscribeFile(
-        state,
-        userDataDir,
-        resourcesPath,
-        emit,
-        fileId,
-        (roomPath) => deps.scheduleAutoIndex?.(roomPath),
-      ),
+      // An imported recording gets the SAME treatment a live one does — a
+      // `recordings` row with real speaker turns, not just flat text — so it
+      // opens in RecordingView with chips you can name. `FileRuntimeActions`
+      // declares this seam as `Promise<void>` and its caller already discards
+      // the result (`void actions.retranscribeImportedFile?.(id).catch(...)`),
+      // so the meta is dropped here deliberately rather than widening a
+      // contract nobody reads through.
+      retranscribeImportedFile: (fileId) =>
+        transcribeMediaWithSpeakers(mediaTranscribe, fileId).then(() => undefined),
     },
   );
+  // `resourcesPath` is the SIXTH argument and it defaults to `null`, so
+  // omitting it compiles, boots and downloads — and then every downloaded
+  // podcast reports `model-missing` on the `stt-progress` lane in a packaged
+  // build, because the bundled weights live under `process.resourcesPath` and
+  // nothing else looks there. That is the same silent-degradation shape as
+  // `diarizeModelPath` above (see the module doc's "BEST-EFFORT DEPS"), and it
+  // would make `download_media`'s own tool description — "the file is
+  // transcribed on this Mac with speakers separated … not at all if no speech
+  // model is installed" — untrue for the default install, where the model IS
+  // installed and Settings says so.
   registerMediaDownloadSurfaceIpc(
     recordingIpcMain,
     state,
     deps,
     userDataDir,
     emit,
+    resourcesPath,
   );
   const liveServices: LiveAppServices = {
     roomDeps: deps,
@@ -832,7 +937,22 @@ export function registerAllIpc(opts: RegisterAllIpcOptions): RegisterAllIpcResul
   registerSkillsIpc(recordingIpcMain, roomSource, emit, { isRollingBack });
   registerSpreadsheetIpc(recordingIpcMain, roomSource, emit);
   registerStoryIpc(recordingIpcMain, roomSource);
-  registerVideoIpc(recordingIpcMain, roomSource, { emit });
+  // `videoTools.ts` declares `enqueueStt` optional so a trim never fails just
+  // because the side channel is unwired — but unwired is what it was, so a
+  // clip the user cut out of a video landed in the room permanently
+  // transcript-less while every other import route got one. `video_trim`
+  // wraps its own call in try/catch and swallows, matching Rust; the
+  // `.catch` here is for the async half that try/catch cannot see.
+  registerVideoIpc(recordingIpcMain, roomSource, {
+    emit,
+    enqueueStt: (job) => {
+      void transcribeMediaWithSpeakers(mediaTranscribe, job.id).catch((error) =>
+        emit("stt-progress", [
+          job.name,
+          `failed: ${error instanceof Error ? error.message : String(error)}`,
+        ]));
+    },
+  });
   registerVisionIpc(recordingIpcMain, roomSource);
   registerWorkflowComposeIpc(recordingIpcMain, roomSource, {
     isRollingBack,
@@ -880,8 +1000,29 @@ export function registerAllIpc(opts: RegisterAllIpcOptions): RegisterAllIpcResul
         onReadDone: (event) => emit("rec-read-done", event),
       }, id);
     },
+    /**
+     * `rec_retranscribe`. `ipc-contract.ts` declares the result as `RecMeta`
+     * and `RecordingView.tsx`'s `runRetranscribe` reads `updated.durationCs`
+     * the statement after awaiting it — so the previous override, which
+     * awaited `retranscribeFile` and returned `undefined`, made the button
+     * throw a TypeError on the renderer side EVERY time, on top of rewriting
+     * `files.extracted_text` with flat text while leaving `recordings.meta`
+     * untouched (orphaning the segments, speakers, words, cuts and notes the
+     * screen was still drawing from).
+     *
+     * Decided failure behavior: REFUSE on `null`. `transcribeMediaWithSpeakers`
+     * answers `null` for a file it will not transcribe (not media, or the
+     * sidecar refused). Returning that through would satisfy the compiler and
+     * hand the renderer exactly the same `null.durationCs` crash this is
+     * fixing, so it is turned into a real, catchable message the toast can
+     * show instead.
+     */
     retranscribe: async (_db, _ctx, id) => {
-      await retranscribeFile(state, userDataDir, resourcesPath, emit, id, (roomPath) => deps.scheduleAutoIndex?.(roomPath));
+      const meta = await transcribeMediaWithSpeakers(mediaTranscribe, id);
+      if (meta === null) {
+        throw new Error("This recording could not be transcribed — nothing was changed.");
+      }
+      return meta;
     },
   });
 

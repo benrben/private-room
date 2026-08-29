@@ -520,10 +520,14 @@ def _subagent_initial_state(
     write_enabled: bool,
     max_rounds: int,
     small_model: bool,
+    image_input_available: bool = True,
+    privacy_restricted: bool = False,
 ) -> dict[str, Any]:
     """Build a specialist state with no ambient network or connector access."""
     return {
         "question": question,
+        "privacy_restricted": privacy_restricted,
+        "image_input_available": image_input_available,
         # Deep Harness grants workspace tools only. Browser, advisor, connector
         # and shell access must be explicitly mediated by Arcelle.
         "web_enabled": False,
@@ -564,6 +568,8 @@ class ArcelleCompiledSubAgentAdapter:
     write_enabled: bool
     max_rounds: int
     small_model: bool = False
+    image_input_available: bool = True
+    privacy_restricted: bool = False
 
     def compile(self, agent_id: str) -> CompiledSubAgent:
         spec = get_agent(agent_id)
@@ -581,6 +587,8 @@ class ArcelleCompiledSubAgentAdapter:
                 write_enabled=self.write_enabled,
                 max_rounds=self.max_rounds,
                 small_model=self.small_model,
+                image_input_available=self.image_input_available,
+                privacy_restricted=self.privacy_restricted,
             )
             final = await graph_for(spec.id).ainvoke(
                 initial,
@@ -604,6 +612,8 @@ def build_deep_agent(
     write_enabled: bool,
     max_rounds: int,
     small_model: bool = False,
+    image_input_available: bool = True,
+    privacy_restricted: bool = False,
 ) -> Any:
     """Build the provider-neutral Deep Agent for Ollama/OpenRouter runs."""
     if deps.mcp is None:
@@ -613,7 +623,14 @@ def build_deep_agent(
         write_enabled=write_enabled,
         cancel=deps.cancel,
     )
-    adapter = ArcelleCompiledSubAgentAdapter(deps, write_enabled, max_rounds, small_model)
+    adapter = ArcelleCompiledSubAgentAdapter(
+        deps,
+        write_enabled,
+        max_rounds,
+        small_model,
+        image_input_available,
+        privacy_restricted,
+    )
     subagents = [adapter.compile(spec.id) for spec in REGISTRY if spec.id != "chat.answer"]
     permissions = [
         FilesystemPermission(operations=["read"], paths=["/.arcelle/**"], mode="deny"),
@@ -637,6 +654,8 @@ async def run_deep_agent(
     write_enabled: bool,
     max_rounds: int,
     small_model: bool = False,
+    image_input_available: bool = True,
+    privacy_restricted: bool = False,
 ) -> str:
     """Run one Deep Harness turn while keeping Arcelle's existing event wire."""
     await deps.emit({"t": "step", "v": "Deep Harness started"})
@@ -645,6 +664,8 @@ async def run_deep_agent(
         write_enabled=write_enabled,
         max_rounds=max_rounds,
         small_model=small_model,
+        image_input_available=image_input_available,
+        privacy_restricted=privacy_restricted,
     )
     result = await agent.ainvoke(
         {"messages": [HumanMessage(content=question)]},

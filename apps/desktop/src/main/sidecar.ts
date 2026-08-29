@@ -871,6 +871,9 @@ export interface RunViaSidecarRequest {
    * banner. `null` means the door is open (the ordinary local-model case). */
   privacy?: Record<string, unknown> | null;
   provider?: Record<string, unknown> | null;
+  /** Host-resolved per-model image-input support. `null`/omitted means the
+   * catalog was unavailable; an explicit false is authoritative. */
+  supportsVision?: boolean | null;
   maxContext?: number | null;
   /** Defaults to `[]` on the wire, matching `RunRequest.advisors`'s own
    * `Field(default_factory=list)`. */
@@ -916,6 +919,7 @@ export function buildRunRequestBody(req: RunViaSidecarRequest): Record<string, u
     run_id: req.runId,
     privacy: req.privacy ?? null,
     provider: req.provider ?? null,
+    supports_vision: req.supportsVision ?? null,
     max_context: req.maxContext ?? null,
     advisors: req.advisors ?? [],
   };

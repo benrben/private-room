@@ -679,7 +679,7 @@ export function downloadToolsSpecs(): OllamaToolSpec[] {
       function: {
         name: "download_media",
         description:
-          "Download the video/audio from a media page (YouTube and most video sites) into this room as a background job. Returns the job id — track it with job_status. The file is transcribed automatically after it arrives.",
+          "Download the video/audio from a media page (YouTube and most video sites) into this room as a background job. Returns the job id — track it with job_status. After it arrives the file is transcribed on this Mac with speakers separated; that is a second pass, so the transcript appears on the file some minutes after the job ends, and not at all if no speech model is installed.",
         parameters: {
           type: "object",
           properties: { url: { type: "string", description: "Full http(s) URL of the video page" } },

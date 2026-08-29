@@ -294,6 +294,9 @@ export interface StreamAnswerRequest {
    * reported usage/plan. See this file's module doc for what this port cannot
    * set (`wrote`/`boxes`/`annotation`/`editOutcomes`). */
   effects: ToolEffects;
+  /** The host catalog's answer for this exact model. `null`/omitted means the
+   * capability could not be resolved, not that the model is known blind. */
+  supportsVision?: boolean | null;
   webEnabled: boolean;
   advisorsOn: boolean;
   /** Omitted by non-chat callers, which retain the normal tool policy. */
@@ -479,6 +482,7 @@ export async function streamAnswer(req: StreamAnswerRequest, deps: StreamAnswerD
           privacyPolicy !== null && !req.privacyBypass
             ? policyPayload(privacyPolicy)
             : null,
+        supportsVision: req.supportsVision ?? null,
         advisors,
       },
       { turn: req.turn, onEvent: visibleSend, signal: bridge.signal }
@@ -751,10 +755,17 @@ export async function ask(req: AskRequest, deps: AskDeps): Promise<Message> {
     // ADD-25: perception tools attach pixels only when the chat model can read
     // them AND the privacy door would not strip them; otherwise they fall back
     // to a local vision-model description.
+    const modelSeesImages = deps.chatModelSeesImages
+      ? await deps.chatModelSeesImages(model)
+      : null;
     effects.visionChat = pixelsReachChatModel(
       model,
-      deps.chatModelSeesImages ? await deps.chatModelSeesImages(model) : false,
-      { runsOnThisMac: deps.runsOnThisMac ?? (() => false), privacyActive: deps.privacyActive ?? (() => false) }
+      modelSeesImages === true,
+      {
+        runsOnThisMac: deps.runsOnThisMac ?? (() => false),
+        // The privacy valve grants this one retry permission to send pixels.
+        privacyActive: () => !req.privacyBypass && (deps.privacyActive?.() ?? false),
+      }
     );
 
     // Phase 2 (unlocked): answer.
@@ -765,6 +776,7 @@ export async function ask(req: AskRequest, deps: AskDeps): Promise<Message> {
         chatMessages: ctx.chatMessages,
         temperature: ctx.temperature,
         effects,
+        supportsVision: modelSeesImages,
         webEnabled: ctx.webEnabled,
         advisorsOn: ctx.advisorsOn,
         evidencePolicy: ctx.evidencePolicy,

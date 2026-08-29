@@ -33,7 +33,9 @@ runs on every one of these, only the C decode itself is faked.
 
 from __future__ import annotations
 
+import os
 import subprocess
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -46,18 +48,32 @@ from arcelle_sidecar.media.decode import MediaKind, decode_to_pcm
 from arcelle_sidecar.stt import engine
 from arcelle_sidecar.stt import live
 
-# The model for on-device tests: the user-downloaded copy if present, else
-# the repo's bundled-resource copy — port of `stt.rs`'s own `test_model()`
-# helper (lines 674-685).
-_DOWNLOADED_MODEL = (
-    Path.home()
-    / "Library/Application Support/com.benreich.privateroom/models"
-    / "ggml-large-v3-turbo-q5_0.bin"
-)
-_BUNDLED_MODEL = Path(
-    "/Users/benreich/private-room/apps/desktop/assets/models/ggml-large-v3-turbo-q5_0.bin"
-)
-MODEL_PATH = str(_DOWNLOADED_MODEL if _DOWNLOADED_MODEL.exists() else _BUNDLED_MODEL)
+# The model for on-device tests: an explicit CI fixture, the user-downloaded
+# copy, or the resource in this checkout — port of `stt.rs`'s `test_model()`.
+_MODEL_ENV = "ARCELLE_TEST_WHISPER_MODEL"
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
+
+def _resolve_whisper_model() -> Path:
+    if override := os.environ.get(_MODEL_ENV):
+        path = Path(override).expanduser().resolve()
+        if not path.is_file():
+            raise FileNotFoundError(f"{_MODEL_ENV} does not name a file: {path}")
+        return path
+
+    downloaded = (
+        Path.home()
+        / "Library/Application Support/com.benreich.privateroom/models"
+        / "ggml-large-v3-turbo-q5_0.bin"
+    )
+    bundled = (
+        _REPO_ROOT / "apps/desktop/resources/models/ggml-large-v3-turbo-q5_0.bin",
+        _REPO_ROOT / "apps/desktop/assets/models/ggml-large-v3-turbo-q5_0.bin",
+    )
+    return next((path for path in (downloaded, *bundled) if path.is_file()), bundled[0])
+
+
+MODEL_PATH = str(_resolve_whisper_model())
 _HAS_MODEL = Path(MODEL_PATH).exists()
 _HAS_SAY = Path("/usr/bin/say").exists()
 _HAS_AFCONVERT = Path("/usr/bin/afconvert").exists()
@@ -65,7 +81,7 @@ _HAS_MODEL_AND_TOOLS = _HAS_MODEL and _HAS_SAY and _HAS_AFCONVERT
 
 requires_model = pytest.mark.skipif(
     not _HAS_MODEL_AND_TOOLS,
-    reason=f"requires the downloaded model at {MODEL_PATH} + macOS `say`/`afconvert`",
+    reason=f"requires a Whisper model ({_MODEL_ENV}) + macOS `say`/`afconvert`",
 )
 
 
@@ -298,6 +314,96 @@ def test_transcribe_segments_under_3200_samples_returns_empty_without_touching_m
 
     assert calls["n"] == 0, "sub-3200-sample audio touched the model"
     assert engine._cache is None
+
+
+def test_shared_cached_model_serializes_whole_file_and_live_decode_overlap(
+    fake_model: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rebuild/import and live phrase share one mutable whisper context.
+
+    Drive both paths from real threads and make the second lock acquisition
+    observable before it blocks. The whole-file decode has already returned
+    and is deliberately paused while reading its token results, proving the
+    guard covers result readback as well as ``Model.transcribe`` itself. This
+    avoids timing-based sleeps entirely.
+    """
+
+    class _TrackedDecodeLock:
+        def __init__(self) -> None:
+            self._lock = threading.Lock()
+            self.contended = threading.Event()
+
+        def acquire(self) -> bool:
+            if self._lock.locked():
+                self.contended.set()
+            return self._lock.acquire()
+
+        def release(self) -> None:
+            self._lock.release()
+
+    path = "/fake/shared-concurrent-model.bin"
+    entry = engine._checkout_locked(path, bump=False)
+    tracked_lock = _TrackedDecodeLock()
+    entry.decode_lock = tracked_lock
+
+    readback_started = threading.Event()
+    release_readback = threading.Event()
+    live_started = threading.Event()
+
+    def fake_whole_transcribe(*_args, **_kwargs):
+        return [SimpleNamespace(text="Thank you.", t0=0)]
+
+    def fake_mean_probability(_ctx, _segment_index):
+        readback_started.set()
+        assert release_readback.wait(timeout=5), "test never released context readback"
+        return 1.0
+
+    monkeypatch.setattr(entry.model, "transcribe", fake_whole_transcribe, raising=False)
+    monkeypatch.setattr(engine, "_segment_mean_p", fake_mean_probability)
+    _install_fake_pw(monkeypatch, [])
+    untracked_live_decode = live._pw.whisper_full
+
+    def tracked_live_decode(*args, **kwargs):
+        live_started.set()
+        return untracked_live_decode(*args, **kwargs)
+
+    monkeypatch.setattr(live._pw, "whisper_full", tracked_live_decode)
+
+    pcm = np.ones(4000, dtype=np.float32)
+    results: dict[str, object] = {}
+    errors: list[Exception] = []
+
+    def run_whole() -> None:
+        try:
+            results["whole"] = engine.transcribe(path, pcm, False)
+        except Exception as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    def run_live() -> None:
+        try:
+            results["live"] = live.transcribe_segments(path, pcm, 0, live.Auto())
+        except Exception as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    whole_thread = threading.Thread(target=run_whole)
+    live_thread = threading.Thread(target=run_live)
+    whole_thread.start()
+    try:
+        assert readback_started.wait(timeout=5), "whole-file result readback never began"
+        live_thread.start()
+        assert tracked_lock.contended.wait(timeout=5), "live decode never reached shared lock"
+        assert not live_started.is_set(), "live whisper_full overlapped context result readback"
+    finally:
+        release_readback.set()
+        whole_thread.join(timeout=5)
+        if live_thread.ident is not None:
+            live_thread.join(timeout=5)
+
+    assert not whole_thread.is_alive()
+    assert not live_thread.is_alive()
+    assert errors == []
+    assert results == {"whole": "Thank you.", "live": live.PhraseOut()}
+    assert live_started.is_set()
 
 
 # --------------------------------------------------- (b) stock hallucination vs confidence

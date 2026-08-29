@@ -192,8 +192,16 @@ test("the capture settings are relocated, not deleted, and written once", () => 
     const hits = VIEW.split(label).length - 1;
     assert.equal(hits, 1, `"${label}" is drawn ${hits} times, not once`);
   }
-  assert.match(VIEW, /\{showsChoicesInline\(stage\) && \(/, "the inline row is gated by the stage");
-  assert.match(VIEW, /\{needsPreflight\(stage\) && preflight && \(/);
+  // `capturable` joined this gate when imported and downloaded media started
+  // getting a `recordings` row of their own (see the capture-controls test
+  // below): the stage says WHEN these are drawn, and `capturable` says whether
+  // this file has a capture to configure at all.
+  assert.match(
+    VIEW,
+    /\{capturable && showsChoicesInline\(stage\) && \(/,
+    "the inline row is gated by the stage",
+  );
+  assert.match(VIEW, /\{capturable && needsPreflight\(stage\) && preflight && \(/);
   assert.match(VIEW, /\{captureChoices\}/);
 });
 
@@ -209,13 +217,66 @@ test("the record button says it is a disclosure when that is what it is", () => 
 test("live and paused keep every control they had", () => {
   // The fix moved settings off the REVIEW screen. A live meeting still needs
   // its live-transcription toggle and its live-translate box mid-flight.
-  const options = VIEW.slice(
-    VIEW.indexOf("{showsChoicesInline(stage) && ("),
-    VIEW.indexOf("{needsPreflight(stage) && preflight && ("),
-  );
+  const from = VIEW.indexOf("{capturable && showsChoicesInline(stage) && (");
+  const to = VIEW.indexOf("{capturable && needsPreflight(stage) && preflight && (");
+  // Both ends must be FOUND: `String.slice` reads a -1 from a renamed gate as
+  // "one from the end", which would quietly widen this slice to the whole file
+  // and leave every assertion below passing on some other part of the page.
+  assert.ok(from > 0 && to > from, "the two gates this slice is bounded by");
+  const options = VIEW.slice(from, to);
   assert.match(options, /\{isLive && \(/);
   assert.match(options, /Live transcription/);
   assert.match(options, /\{liveTranslateOpt\}/);
+});
+
+test("a file this app cannot record into is never offered a record button", () => {
+  // A `recordings` row stopped being proof that Arcelle MADE the file: an
+  // imported or downloaded media file gets one too, so it opens in this
+  // speaker-aware view instead of the plain player. Everything on this page
+  // carries over to such a file except capture — `rec_start` splices the new
+  // audio onto samples it decodes out of the stored file with `decodeWav`, so
+  // "Continue recording" on an imported .mp3 is the page's one red primary
+  // button offering an act whose only possible answer is the engine's error
+  // string, above a preflight promising "nothing already recorded is lost"
+  // about a file nothing ever recorded into.
+  //
+  // Every branch of the rule is pinned, because each one is a decision: a live
+  // session on this file is proof by demonstration; a name that has not arrived
+  // (or a `rec_get` that failed) and a name with no extension at all are both
+  // UNKNOWN and keep the control, since losing the record button on a real
+  // recording is a far worse failure than an error toast on an import. Only a
+  // name positively stating some other container takes the cluster away.
+  assert.match(
+    VIEW,
+    /const capturable = isLive \|\| container === null \|\| !NO_CAPTURE_CONTAINERS\.has\(container\);/,
+    "the container the name claims decides it",
+  );
+  // A LIST of containers, never `!== "wav"`. A file's name is free text a
+  // person types: "Dr. Cohen call", "Q3 kickoff v1.2" and "2026.08.28 standup"
+  // all end in a dotted token, and reading those as containers ("cohen call",
+  // "2", "28 standup") took the record button off three perfectly ordinary
+  // recordings — the failure this whole rule calls the worse one.
+  const containers = VIEW.slice(
+    VIEW.indexOf("const NO_CAPTURE_CONTAINERS"),
+    VIEW.indexOf("]);", VIEW.indexOf("const NO_CAPTURE_CONTAINERS")),
+  );
+  assert.ok(containers.length > 0, "the list is still there to be read");
+  assert.match(containers, /"mp3"/, "an imported podcast cannot be recorded into");
+  assert.match(containers, /"mp4"/, "nor a downloaded video");
+  assert.doesNotMatch(
+    containers,
+    /"wav"/,
+    "WAV is the one container rec_start's decoder can continue",
+  );
+  // Read off the name `rec_get` was already returning and the view was
+  // throwing away — no new IPC, no new field on RecMeta.
+  assert.match(VIEW, /setFileName\(r\.name\)/);
+  assert.match(VIEW, /\{status !== "saving" && capturable && \(/, "the record button");
+  assert.match(VIEW, /\{capturable && showsChoicesInline\(stage\) && \(/, "the capture settings");
+  // …and the copy that points at them: the "fresh" empty state is one long
+  // instruction to press a record button that is not there.
+  assert.match(VIEW, /\{stage === "fresh" && capturable \? \(/);
+  assert.match(VIEW, /\) : stage === "finished" \|\| !capturable \? \(/);
 });
 
 /* =====================================================================
@@ -291,6 +352,32 @@ test("the transcript is a line per phrase, each with its own time and its own pl
   assert.match(list, /activeSeg === seg\.id \? " is-active" : ""/);
   // The speaker is still said once per turn, not once per line.
   assert.equal(list.split("<SpeakerChip").length - 1, 1);
+});
+
+test("the rename hint is said DURING a live meeting, not only after one", () => {
+  // THE DEFECT. Naming a voice is the one edit whose whole affordance is a
+  // tooltip on the chip, and the paragraph that says so out loud hung off
+  // `!isLive` — so it was invisible for exactly as long as the meeting lasted,
+  // which is when a person actually knows who is talking. Nothing about
+  // renaming is gated on the session: the same chip is drawn either way, and
+  // `rename_speaker` is one of the live-safe ops the session socket accepts.
+  const at = VIEW.indexOf('<p className="rec-read-note">');
+  assert.ok(at > 0, "the hint is still on the page");
+  const gate = VIEW.slice(Math.max(0, at - 200), at);
+  assert.match(gate, /\{segments\.length > 0 && \(/, "drawn as soon as there are words");
+  assert.doesNotMatch(gate, /isLive/, "a live session must not hide the rename hint");
+  const note = VIEW.slice(at, VIEW.indexOf("</p>", at));
+  assert.match(note, /Click a speaker’s name to say who they were\./);
+  // The OTHER half of the same paragraph keeps its gate, and must: the backend
+  // refuses rec_delete_range and rec_correct_range while the file has a live
+  // session, so the selection bar this sentence points at never appears. One
+  // paragraph, two different claims — un-gating both would trade an invisible
+  // affordance for an advertised one that does nothing.
+  assert.match(
+    note,
+    /\{canEdit &&\s*" Select words above to correct them, or to delete them from the recording\."\}/,
+    "the editing half stays behind canEdit",
+  );
 });
 
 test("selecting words to correct or delete still works on a line", () => {

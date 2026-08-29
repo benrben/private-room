@@ -321,6 +321,7 @@ class OllamaChatModel:
         num_ctx: int | None = None,
         num_predict: int | None = None,
         keep_alive: str = KEEP_ALIVE_WARM,
+        supports_vision: bool | None = None,
     ) -> None:
         self.model = model
         self.base_url = base_url
@@ -334,6 +335,10 @@ class OllamaChatModel:
         # Optional output-token cap. None = no app-level cap.
         self.num_predict = num_predict
         self.keep_alive = keep_alive
+        # Host-resolved per-model capability. None is the compatibility state
+        # for an older host; explicit false refuses image-bearing requests
+        # before Ollama can ignore them or return an opaque model error.
+        self.supports_vision = supports_vision
         # The window the LAST call actually requested — the truthful
         # ``max_context`` for the token bar (the native length is a capability
         # ceiling, not what the running request can actually hold).
@@ -341,6 +346,22 @@ class OllamaChatModel:
         # PRIV-1: the /run handler attaches the room's resolved policy here; the
         # agent loop then talks to a ``:cloud`` model only through the door.
         self.privacy: PrivacyPolicy | None = None
+
+    def _require_image_input(
+        self, messages: list[Message], images: list[str] | None = None
+    ) -> None:
+        if self.supports_vision is not False:
+            return
+        if not images and not any(message.get("images") for message in messages):
+            return
+        from .llm import LlmError
+
+        raise LlmError(
+            "ENGINE_ERROR",
+            "The selected Ollama model does not support image input, so it "
+            "cannot inspect the captured frame. Choose a model with Vision "
+            "capability.",
+        )
 
     @staticmethod
     def _payload_bytes(
@@ -430,6 +451,7 @@ class OllamaChatModel:
         """
         from ollama import AsyncClient
 
+        self._require_image_input(messages, images)
         options: dict[str, Any] = {}
         # What the payload costs BESIDES the messages: the grammar and any
         # top-level images. Both ride the same window, and neither can be cut,
@@ -545,6 +567,7 @@ class OllamaChatModel:
         """
         from ollama import AsyncClient
 
+        self._require_image_input(messages, images)
         options: dict[str, Any] = {}
         reserved = self._payload_bytes([], format, images)
         num_ctx = await self._resolve_num_ctx(
@@ -608,6 +631,7 @@ class OllamaChatModel:
         # redacted for a non-local model, and the reply deltas are restored so
         # the user (and the locally-running tools) see real values.
         send, _, engaged = guard_outbound(self.model, messages, self.privacy)
+        self._require_image_input(send)
         restorer = engaged.restorer() if engaged else None
 
         reserved = json_chars(tools) if tools else 0

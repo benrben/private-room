@@ -96,6 +96,7 @@ describe("buildRunRequestBody", () => {
       run_id: "run-1",
       privacy: null,
       provider: null,
+      supports_vision: null,
       max_context: null,
       advisors: [],
     });
@@ -123,6 +124,7 @@ describe("buildRunRequestBody", () => {
       advisors: ["memory"],
       privacy: { active: true },
       provider: { id: "openrouter" },
+      supportsVision: false,
     });
     expect(body).toEqual({
       model: "qwen3.5:9b",
@@ -146,6 +148,7 @@ describe("buildRunRequestBody", () => {
       run_id: "run-1",
       privacy: { active: true },
       provider: { id: "openrouter" },
+      supports_vision: false,
       max_context: 8192,
       advisors: ["memory"],
     });

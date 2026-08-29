@@ -96,6 +96,11 @@ class ProviderConfig(BaseModel):
     model: str
     context_window: int | None = None
     supports_tools: bool = True
+    #: The provider catalog's per-model vision bit. ``None`` means an older
+    #: host did not send the fact, so the adapter preserves compatibility and
+    #: lets the provider decide. An explicit ``False`` is authoritative: image
+    #: tools are not routed and image-bearing payloads fail before network I/O.
+    supports_vision: bool | None = None
 
 
 class Routing(BaseModel):
@@ -146,6 +151,10 @@ class RunRequest(BaseModel):
     #: shape). Engages only when ``model`` is non-local; None/absent = door open.
     privacy: dict[str, Any] | None = None
     provider: ProviderConfig | None = None
+    #: Per-model image-input capability for Ollama/local relay models. API
+    #: providers carry the same fact inside ``provider``. Absent is compatible
+    #: with older hosts; explicit false is a fail-closed routing boundary.
+    supports_vision: bool | None = None
     #: Display-only context window for the token bar, resolved by the host
     #: (live from the Codex catalog for ``codex-cli``). NOT a cap — nothing in
     #: the sidecar truncates or refuses on its account; a cloud CLI owns its
@@ -155,6 +164,26 @@ class RunRequest(BaseModel):
     #: Which advisor connectors the room has installed. Only the emptiness of
     #: this list is read (``graph.py`` gates the ``consult_advisor`` tool on it).
     advisors: list[str] = Field(default_factory=list)
+
+    def image_input_available(self) -> bool:
+        """Whether this run may dispatch tools whose result is raw pixels.
+
+        This combines transport truth with the host's live per-model catalog.
+        Antigravity's print-mode adapter has no image argument at all, so it is
+        always false even if a stale caller claims otherwise. Unknown remains
+        allowed solely for backward compatibility with hosts predating the
+        capability field; once a host sends false it is authoritative.
+        """
+        # Split at the first colon without spelling the IPv6 wildcard token;
+        # the package-wide bind audit deliberately rejects that literal in
+        # every source file. This handles both ``engine::model`` and Ollama's
+        # ordinary ``model:tag`` shape.
+        engine = self.model.partition(":")[0]
+        if engine == "antigravity-cli":
+            return False
+        if self.provider is not None:
+            return self.provider.supports_vision is not False
+        return self.supports_vision is not False
 
     def resolved_tool_policy(self) -> Literal["auto", "none"]:
         """The host boundary plus a narrow fallback for explicit prohibitions.

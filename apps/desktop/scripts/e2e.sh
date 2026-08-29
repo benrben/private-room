@@ -35,3 +35,15 @@ if ! ELECTRON_RUN_AS_NODE=1 npx --no-install electron -e \
 fi
 
 node ../../tests/e2e/desktop/electron-deep.mjs
+
+# The deep run proves the provider/Sidecar frame boundary, but it invokes ask
+# through preload and therefore cannot prove ChatPane exposes the human-owned
+# one-turn image valve. Run exactly that renderer spec under the normal E2E
+# release gate. Reuse the renderer build the deep test already required; only
+# generate the QA entrypoint here, rather than rebuilding or running the broad
+# visual QA suite.
+(
+  cd ../..
+  node tests/support/make-qa.mjs
+  SKIP_BUILD=1 npm run e2e:qa -- --spec tests/e2e/qa/cloud-video-privacy.e2e.mjs
+)

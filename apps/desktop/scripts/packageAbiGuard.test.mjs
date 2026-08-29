@@ -39,14 +39,21 @@ describe("package.sh native-module ABI guard", () => {
     expect(builderConfig).not.toMatch(/npmRebuild:\s*true/);
   });
 
-  it("runs deep Electron E2E on Electron's ABI and always restores Node's ABI", () => {
+  it("runs deep Electron plus the focused privacy renderer E2E and always restores Node's ABI", () => {
     const trap = e2eScript.indexOf("trap restore_node_abi EXIT");
     const forcedElectronRebuild = e2eScript.indexOf("electron-rebuild -f -w");
     const deepTest = e2eScript.indexOf("electron-deep.mjs");
+    const qaEntry = e2eScript.indexOf("make-qa.mjs");
+    const privacyTest = e2eScript.indexOf("cloud-video-privacy.e2e.mjs");
 
     expect(trap).toBeGreaterThanOrEqual(0);
     expect(forcedElectronRebuild).toBeGreaterThan(trap);
     expect(deepTest).toBeGreaterThan(forcedElectronRebuild);
+    expect(qaEntry).toBeGreaterThan(deepTest);
+    expect(privacyTest).toBeGreaterThan(qaEntry);
+    expect(e2eScript).toContain(
+      "SKIP_BUILD=1 npm run e2e:qa -- --spec tests/e2e/qa/cloud-video-privacy.e2e.mjs",
+    );
     expect(e2eScript).toContain(
       'npm run build-release --prefix "../../node_modules/${NATIVE_MODULE}"',
     );

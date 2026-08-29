@@ -73,12 +73,14 @@ concurrent decodes on the same model are safe and were the whole point of the
 `full()` once stalled a live meeting's transcript behind a 45-minute import).
 `pywhispercpp.Model.transcribe()` has no equivalent "create a fresh decode
 state" call in its public API: it mutates `self._params`/`self._ctx` directly
-on every `.transcribe()` call. Concurrent `.transcribe()` calls on the SAME
-`Model` instance are therefore NOT safe here the way they are in Rust — a
-real, library-shape-forced divergence, not an oversight. Nothing in this
-sidecar currently calls `.transcribe()` from two threads on the same model at
-once, so it is not exercised in practice, but a future caller must not assume
-Rust's parallel-decode guarantee holds on this side.
+on every `.transcribe()` call, and low-level live decoding mutates that same
+context. Concurrent decodes on the SAME `Model` instance are therefore NOT
+safe here the way they are in Rust — a real, library-shape-forced divergence,
+not an oversight. `_CacheEntry.decode_lock` serializes the entire mutation and
+all immediate result reads for one shared context. It is deliberately separate
+from the cache bookkeeping lock: model lookup/refcounts remain short critical
+sections, while only callers sharing the exact context wait for its current
+decode to finish.
 
 What IS preserved exactly is the *bookkeeping* contract around that shared
 `Model`: `_checkout`/`_checkin` below increment/decrement a reference count on
@@ -93,7 +95,7 @@ from __future__ import annotations
 
 import os
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 import numpy as np
@@ -108,6 +110,8 @@ from arcelle_sidecar.stt.hallucination import (
     is_junk_segment,
     is_stock_hallucination,
 )
+
+
 def format_stamp(cs: int) -> str:
     """The "[m:ss]" (or "[h:mm:ss]" past an hour) transcript stamp.
 
@@ -154,15 +158,18 @@ class _CacheEntry:
     path: str
     model: Model
     refs: int = 0
+    # whisper_full is explicitly not thread-safe for one context. This lock
+    # covers both the decode and all result reads from ``model._ctx``: another
+    # decode would overwrite those results even after ``transcribe`` returned.
+    decode_lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
 
 # whisper.cpp mmaps the weights, so keeping the context loaded costs address
 # space, not resident RAM the OS can't reclaim — and saves the multi-second
 # reload on every dictation. The lock below covers the LOOKUP/construction
-# (and, in `_checkout`, the ref-count bump) only, never a decode itself: held
-# across a whole transcription, this one lock would serialize every speech
-# job in the app exactly as Rust's `CTX` doc comment describes — a 45-minute
-# import parking a live recording's decoder thread.
+# (and, in `_checkout`, the ref-count bump) only, never a decode itself. Decode
+# serialization belongs to each entry's ``decode_lock`` so this global cache
+# lock never stays held for the length of a recording or import.
 _lock = threading.Lock()
 _cache: Optional[_CacheEntry] = None
 
@@ -326,11 +333,15 @@ def transcribe(model_path: str, pcm: np.ndarray, timestamps: bool) -> str:
     pcm32 = np.asarray(pcm, dtype=np.float32)
     threads = _n_threads()
 
-    # The lock ends inside `_checkout`: a whole-file import must not park the
-    # live recording's decoder thread for the length of the file (see the
-    # `_lock` doc comment above).
+    # The global cache lock ends inside `_checkout`. The per-context lock below
+    # must span BOTH ``Model.transcribe`` and every ``_ctx`` result read: the
+    # model mutates that context and a second decode would replace its result
+    # tables before this caller had finished walking them.
     entry = _checkout(model_path)
+    decode_acquired = False
     try:
+        entry.decode_lock.acquire()
+        decode_acquired = True
         segments = entry.model.transcribe(
             pcm32,
             language="auto",
@@ -373,4 +384,6 @@ def transcribe(model_path: str, pcm: np.ndarray, timestamps: bool) -> str:
                 lines.append(text)
         return "\n".join(lines) if timestamps else " ".join(lines)
     finally:
+        if decode_acquired:
+            entry.decode_lock.release()
         _checkin(entry)

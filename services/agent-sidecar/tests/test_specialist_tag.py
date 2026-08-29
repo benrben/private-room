@@ -418,6 +418,22 @@ async def test_a_tagged_turn_runs_the_SPECIALIST_and_no_hub_round() -> None:
     assert out.final == "the lease needs 60 days notice"
 
 
+async def test_a_tagged_video_turn_is_refused_when_the_model_has_no_image_input() -> None:
+    """ARC-024: an explicit tag cannot bypass the provider capability gate."""
+    req = make_request("*video describe the frame at 1:05").model_copy(
+        update={"supports_vision": False}
+    )
+    chat = FakeChatModel([Round(content="I saw the pixels anyway")])
+    mcp = FakeMCP(specs(sorted(ALL_REGISTRY_TOOLS)))
+
+    out = await drive(req, chat, mcp)
+
+    assert chat.offered_names == []
+    assert mcp.calls == []
+    assert "*video isn't a specialist this room has" in out.final
+    assert "On this Mac" in out.final
+
+
 async def test_a_tagged_turn_draws_ONE_node_and_it_is_the_specialist() -> None:
     """Requirement 4: the diagram shows what actually happened.
 

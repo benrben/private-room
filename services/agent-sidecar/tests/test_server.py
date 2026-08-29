@@ -15,6 +15,7 @@ from arcelle_sidecar.chat import RoundUsage, StreamStalled
 from arcelle_sidecar.config import (
     AGENT_ROUND_BACKSTOP,
     CLOUD_WORKER_PARALLEL,
+    ProviderConfig,
     RunRequest,
     TtsRequest,
 )
@@ -492,6 +493,52 @@ def test_run_request_defaults_and_routing_fallback() -> None:
 
     req2 = RunRequest(model="m", question="what is the rent", web_enabled=True, max_rounds=24)
     assert req2.resolved_max_rounds() == 24
+
+
+def test_image_input_capability_is_fail_closed_only_when_authoritative() -> None:
+    """Old hosts omit the bit; explicit model/transport false must win."""
+    assert RunRequest(model="qwen-vl", question="look").image_input_available()
+    assert RunRequest(
+        model="qwen-vl", question="look", supports_vision=True
+    ).image_input_available()
+    assert not RunRequest(
+        model="qwen-text", question="look", supports_vision=False
+    ).image_input_available()
+
+    provider = ProviderConfig(
+        id="openrouter",
+        api_key="secret",
+        base_url="https://openrouter.ai/api/v1",
+        model="vendor/text-only",
+        supports_vision=False,
+    )
+    assert not RunRequest(
+        model="openrouter::vendor/text-only",
+        question="look",
+        provider=provider,
+    ).image_input_available()
+    # Antigravity has no image argument in print mode. Transport truth beats a
+    # stale positive model capability claim.
+    assert not RunRequest(
+        model="antigravity-cli::gemini-3.7-flash-high",
+        question="look",
+        supports_vision=True,
+    ).image_input_available()
+
+
+def test_default_ollama_model_receives_the_host_vision_capability() -> None:
+    """The routing bit and transport guard must describe the same model."""
+    from arcelle_sidecar.chat import OllamaChatModel
+
+    req = RunRequest(
+        model="vendor/text-only",
+        question="look at the frame",
+        supports_vision=False,
+    )
+    model = server._default_chat_model(req)
+
+    assert isinstance(model, OllamaChatModel)
+    assert model.supports_vision is False
 
 
 @pytest.mark.parametrize(

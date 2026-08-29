@@ -80,21 +80,26 @@
  * clip's own codec could not be read back afterwards.
  *
  * `enqueue_stt`/`JobMeta`/`OCR_TX`/`STT_TX`/`run_stt_job` (`commands/files.rs`
- * lines ~360-472) are a THIRD, unrelated gap: a whole background worker-lane
- * subsystem (an mpsc channel draining into a dedicated OS thread) that has NO
- * Electron port anywhere in this tree — confirmed by grep (only
- * `autoIndex.ts`'s own doc comment names `run_stt_job` in passing, as a
- * FUTURE caller of a `schedule_auto_index`-shaped hook, not a real
- * implementation). Unlike the two gaps above, this one is NOT the point of
- * `video_trim` — the trim has already fully succeeded (cut, staged, inserted)
- * by the moment Rust calls `enqueue_stt`, and Rust's own call cannot fail
- * (its internal channel-send failure is swallowed with `let _ =`). Making a
- * real, successful trim throw because a transcription-scheduling side
- * channel is not wired up would be strictly worse than Rust's own behaviour,
- * so {@link videoTrim} takes it as an OPTIONAL {@link EnqueueSttFn} dep,
- * called best-effort: with none supplied (the default), a trimmed clip lands
- * in the room but is not automatically queued for transcription — an honest,
- * narrow gap, not a fabricated queue.
+ * lines ~360-472) were a THIRD, unrelated gap: a whole background worker-lane
+ * subsystem (an mpsc channel draining into a dedicated OS thread) with no
+ * Electron port anywhere in this tree. THAT GAP IS CLOSED — `ipc/registry.ts`
+ * now supplies a real {@link EnqueueSttFn} that hands `job.id` to
+ * `mediaTranscribeJob.ts`'s speaker-aware pass, so a clip cut out of a video
+ * is transcribed like every other media file in the room instead of landing
+ * permanently transcript-less. Rust's mpsc-channel-into-an-OS-thread is NOT
+ * reproduced: that pass excludes a second rebuild of the SAME file and
+ * nothing wider, so this seam is for the one clip a person just cut, never
+ * for feeding work in bulk.
+ *
+ * The dep stays OPTIONAL, and that is not a leftover. Unlike the two gaps
+ * above, this one is NOT the point of `video_trim` — the trim has already
+ * fully succeeded (cut, staged, inserted) by the moment Rust calls
+ * `enqueue_stt`, and Rust's own call cannot fail (its internal channel-send
+ * failure is swallowed with `let _ =`). Making a real, successful trim throw
+ * because a transcription side channel is missing would be strictly worse
+ * than Rust's own behaviour, so {@link videoTrim} still calls it
+ * best-effort, and a test (or any caller with no transcriber) still gets a
+ * real clip with no queued job rather than a fabricated queue.
  *
  * ROOM-PIN DISCIPLINE — `commands/video.rs` does NOT import `agent.rs`'s
  * `RoomPin` struct (checked by grep: zero hits in this file). It re-derives
@@ -114,14 +119,28 @@
  * them defers a write across an `await`), so its own {@link RoomSource} is
  * one method wider.
  *
- * NO IPC WIRING in this batch, same as `dictStopTimeout.ts`/`recIpc.ts`/
- * `peaksTools.ts`/`previewTools.ts`: Phase 2 (renderer/preload) needs an
- * explicit owner go-ahead. {@link registerVideoIpc} exists, ready to be
- * wired, under the exact three channel names `src/api.ts`'s
- * `probeVideoMeta`/`videoTrim`/`saveVideoFrame` already `invoke()` (checked
- * against that file) — `probe_video_meta`, `video_trim`, `save_video_frame` —
- * with the exact same argument shapes (`{ id }`, `{ id, startSecs, endSecs }`,
- * `{ id, pngB64, atSecs }`), so a future renderer/preload needs no rename.
+ * IPC IS WIRED. The go-ahead this doc used to be waiting on has been given:
+ * `ipc/registry.ts` calls {@link registerVideoIpc} with a real `emit` and a
+ * real {@link EnqueueSttFn}, under the exact three channel names
+ * `renderer/api.ts`'s `probeVideoMeta`/`videoTrim`/`saveVideoFrame` already
+ * `invoke()` — `probe_video_meta`, `video_trim`, `save_video_frame` — with the
+ * exact same argument shapes (`{ id }`, `{ id, startSecs, endSecs }`,
+ * `{ id, pngB64, atSecs }`), so nothing was renamed to connect them.
+ *
+ * WHAT {@link videoTrim} HANDS THE STT SEAM, and why each field is the one it
+ * is (checked against the insert directly above the call):
+ *   - `id`/`name` — the NEW clip's, from the `createRoomFile` result. The
+ *     source video is never re-transcribed; the clip is the thing with no
+ *     transcript.
+ *   - `mime`/`ext` — the SOURCE's staged values, which is correct rather than
+ *     lazy: the clip is stored under `staged.mime` verbatim, and
+ *     {@link trimmedName} keeps the source's extension, so these describe the
+ *     stored clip exactly. `takeMediaBytes` has already refused anything
+ *     `mediaKind` does not call video, so an eligible pair is guaranteed.
+ *   - `roomPath`/`epoch` — the pin captured before the cut, re-proved current
+ *     by the by-hand room-pin recheck immediately above the insert. A consumer
+ *     that defers work can compare them; the registry's consumer instead
+ *     re-checks the live room itself inside the transcription pass.
  */
 
 import { execFile } from "node:child_process";
@@ -560,9 +579,10 @@ function emitSafely(emit: EmitFn | undefined, event: string, payload: unknown): 
   }
 }
 
-/** `commands/files.rs`'s `JobMeta` — see this module's doc for why the
- * OCR/STT worker-lane subsystem it belongs to has no port here yet. Field
- * names match the Rust struct's own, camelCased. */
+/** `commands/files.rs`'s `JobMeta` — the queue entry the STT lane consumes.
+ * Field names match the Rust struct's own, camelCased. Exported because the
+ * caller that supplies {@link EnqueueSttFn} has to name this shape; see this
+ * module's doc for which value each field carries for a trimmed clip. */
 export interface JobMeta {
   id: string;
   name: string;
@@ -573,7 +593,14 @@ export interface JobMeta {
 }
 
 /** `enqueue_stt(&app, job)`'s seam — see this module's doc. Optional: a
- * real trim must not fail just because this side channel is not wired up. */
+ * real trim must not fail just because this side channel is not wired up.
+ *
+ * Returns `void` deliberately, matching Rust's own fire-and-forget channel
+ * send: the trim has already succeeded and does not wait for, or learn the
+ * outcome of, the transcription. An implementation that starts async work
+ * (the live one starts a whole transcription pass) therefore owns its own
+ * failure reporting — `(job) => { void run(job).catch(report); }` satisfies
+ * this type exactly, and a promise-returning function does too. */
 export type EnqueueSttFn = (job: JobMeta) => void;
 
 /** Every optional native/side-effect dependency `video_trim` and
@@ -906,9 +933,10 @@ export async function saveVideoFrameInRoom(
  * without importing it at runtime, matching `registerPeaksIpc`/
  * `registerPreviewIpc`.
  *
- * Exported and directly testable, but — same as those two — NOT called from
- * any live main-process entrypoint by this batch. Wiring it in is Phase 2
- * work pending an explicit owner go-ahead.
+ * LIVE: `ipc/registry.ts` calls this with a real `emit` and a real
+ * {@link EnqueueSttFn}, so a trimmed clip is queued for transcription like
+ * any other media file. `deps` stays optional so a test can drive the three
+ * handlers with nothing injected.
  */
 export function registerVideoIpc(
   ipcMain: Pick<IpcMain, "handle">,

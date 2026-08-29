@@ -1,4 +1,50 @@
-/** Neural speech commands and the whole-file on-device transcription lane. */
+/**
+ * Neural speech commands, and the routing half of the whole-file on-device
+ * transcription lane.
+ *
+ * ============================================================================
+ * THE `retranscribe_file` CHANNEL ROUTES; IT NO LONGER TRANSCRIBES
+ * ============================================================================
+ *
+ * `AudioView`'s "Transcribe" button and the room's import sweep both land on
+ * this channel. It used to call {@link retranscribeFile} unconditionally: one
+ * `POST /stt/transcribe_file`, one flat string, one write into
+ * `files.extracted_text`. That produced a transcript with NO SPEAKERS and no
+ * `recordings` row — and because `fileRuntimeSurfaceIpc.ts` picks the viewer
+ * by DATA (`getRecMeta(conn, id) !== null ? "recording" : viewerKind(…)`), a
+ * file transcribed that way could never afterwards open in `RecordingView`.
+ * The speaker-aware viewer was reachable only by recording INSIDE the app.
+ *
+ * Media now goes to `mediaTranscribeJob.ts::transcribeMediaWithSpeakers`,
+ * which drives the sidecar's diarizing rebuild and writes `recordings.meta`
+ * alongside the text. Nothing in the renderer changed: the same button, on the
+ * same channel, now produces a file that opens with speaker chips you can
+ * name. {@link retranscribeFile} stays for genuinely non-media files, whose
+ * refusal sentence it owns, and for `liveRuntimeTools.ts`'s own seam.
+ *
+ * ============================================================================
+ * A SILENT SUCCESS THAT WAS NOT ONE
+ * ============================================================================
+ *
+ * {@link retranscribeFile} answers a missing speech model by emitting
+ * `stt-progress` `"model-missing"` and RETURNING — so `await
+ * api.retranscribeFile(id)` resolved, and every awaiting caller read that as
+ * "transcribed". The viewer only noticed because it happens to branch on the
+ * stage. {@link retranscribeFileRouted} keeps the event (the viewer's
+ * "No speech model is installed" hint hangs off it) and then THROWS, so the
+ * promise says what happened too.
+ *
+ * ============================================================================
+ * A NOTE FOR WHOEVER READS `sttTools.ts` NEXT
+ * ============================================================================
+ *
+ * That module's header still says "`server.py` mounts no `/transcribe` of any
+ * kind (checked against the full route table)". That was already false —
+ * `/stt/transcribe_file` is what {@link retranscribeFile} has been calling —
+ * and `POST /rec/retranscribe` makes it doubly so. The claim is load-bearing
+ * for its own scope argument, so it is flagged here rather than quietly
+ * patched from a module that does not own it.
+ */
 
 import fs from "node:fs";
 import os from "node:os";
@@ -9,8 +55,9 @@ import type { NeuralVoiceInfo } from "../shared/apiTypes.js";
 import type { RoomManagerState } from "./roomManager.js";
 import type { EventSender } from "./turn.js";
 import { CancelFlag } from "./cancel.js";
-import { getFileFull, setFileExtractedText } from "./db-host/files.js";
+import { getFileFull, getFileMeta, setFileExtractedText } from "./db-host/files.js";
 import { setSetting } from "./db-host/settings.js";
+import { transcribeMediaWithSpeakers, type MediaTranscribeDeps } from "./mediaTranscribeJob.js";
 import { mediaKind } from "./peaksTools.js";
 import { sidecarJsonCancellable } from "./sidecarJsonCancellable.js";
 import { speakOne } from "./studiosPodcastAudio.js";
@@ -66,9 +113,81 @@ export function registerSpeechSttSurfaceIpc(
     return voices;
   });
   ipcMain.handle("retranscribe_file", (_event: IpcMainInvokeEvent, raw: unknown) =>
-    retranscribeFile(state, userDataDir, resourcesPath, emit, String(object(raw).fileId ?? ""), onIndexed));
+    retranscribeFileRouted(
+      { state, userDataDir, resourcesPath, emit, onIndexed },
+      String(object(raw).fileId ?? ""),
+    ));
 }
 
+/**
+ * `retranscribe_file`: send media to the speaker-aware job, everything else to
+ * the text-only helper that owns the "this isn't audio or video" refusal.
+ *
+ * Media-ness is decided HERE, before either call, rather than by trying the
+ * speaker-aware job and falling back on its `null`. `null` means "not media OR
+ * the engine refused", and a fallback on the second case would run a second
+ * full decode of a file that just failed one — minutes of work to reach the
+ * same failure.
+ *
+ * DECIDED FAILURE BEHAVIOUR — this handler is awaited by a user who pressed a
+ * button, so every way it declines to transcribe REJECTS:
+ *   - no room / no such file  -> the DB read throws, unchanged;
+ *   - no speech model         -> `stt-progress` `"model-missing"` (the stage
+ *     the viewer's hint hangs off) AND a rejection naming where to fix it;
+ *   - the job answered `null` -> a rejection. The job has already emitted a
+ *     `"failed: …"` stage carrying the real reason, so this message says only
+ *     the one thing the promise must not leave ambiguous: nothing changed.
+ */
+export async function retranscribeFileRouted(
+  deps: MediaTranscribeDeps,
+  fileId: string,
+): Promise<void> {
+  const open = deps.state.room;
+  if (!open) throw new Error("No room is open.");
+  // `getFileMeta`, not `getFileFull`: routing needs a name and a mime type,
+  // and `getFileFull` would pull a whole video's bytes into memory to get them.
+  const file = getFileMeta(open.conn, fileId);
+  const extension = path.extname(file.name).slice(1).toLowerCase();
+  if (mediaKind(file.mimeType, extension) === null) {
+    await retranscribeFile(deps.state, deps.userDataDir, deps.resourcesPath, deps.emit, fileId, deps.onIndexed);
+    return;
+  }
+  if (sttEffectiveModel(deps.userDataDir, deps.resourcesPath) === null) {
+    // Checked here as well as inside the job because only this path has an
+    // awaiting caller to be honest to; the job keeps its own check for the
+    // import/download callers, which are fire-and-forget and read the stage.
+    deps.emit("stt-progress", [file.name, "model-missing"]);
+    throw new Error(
+      "No speech model is installed, so nothing could be transcribed. " +
+        "Download it in Settings → Dictation, then try again.",
+    );
+  }
+  const meta = await transcribeMediaWithSpeakers(deps, fileId);
+  if (meta === null) {
+    throw new Error("This file could not be transcribed — nothing was changed.");
+  }
+}
+
+/**
+ * The TEXT-ONLY lane: one `POST /stt/transcribe_file`, one flat string, into
+ * `files.extracted_text`. No speakers, no `recordings` row.
+ *
+ * Still here, and still exported, for three honest reasons — not as a leftover:
+ *   1. it owns the "this file isn't audio or video" refusal, which is the only
+ *      thing {@link retranscribeFileRouted} has to say about a non-media file;
+ *   2. `liveRuntimeTools.ts` injects it by TYPE (`retranscribe?: typeof
+ *      retranscribeFile`), so its signature is a published seam;
+ *   3. it is the fallback if the diarizing route is ever unavailable — a flat
+ *      transcript is worth more than none.
+ *
+ * Prefer `mediaTranscribeJob.ts::transcribeMediaWithSpeakers` for anything that
+ * IS media: this function's output can never open in `RecordingView`.
+ *
+ * NOTE the model-missing branch below: it emits and RETURNS, so an awaiting
+ * caller sees a resolved promise. That is preserved because `AudioView` reads
+ * the stage, and changing it would change three existing call sites' contract;
+ * {@link retranscribeFileRouted} is where the honest rejection was added.
+ */
 export async function retranscribeFile(
   state: RoomManagerState,
   userDataDir: string,

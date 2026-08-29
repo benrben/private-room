@@ -55,6 +55,7 @@ import {
 } from "./mediaTools.js";
 import { searchWeb } from "./webSearch.js";
 import { isOcrCandidate, OCR_TEXT_PREFIX, recognize, recognizeViaSidecar } from "./ocrTools.js";
+import { mediaKind } from "./peaksTools.js";
 import { getRecMeta } from "./db-host/recordings.js";
 import { logDir } from "./obs.js";
 import { isCodeTextExtension } from "../shared/fileExtensions.js";
@@ -75,7 +76,12 @@ export interface FileRuntimeStores {
 
 export interface FileRuntimeActions {
   /** Starts durable on-device transcription after a media original has been
-   * committed. The import response does not wait for the long-running job. */
+   * committed. The import response does not wait for the long-running job.
+   *
+   * Fired for {@link shouldAutoTranscribeImport} only — NOT for every media
+   * import. An eligible file that is not in that narrow set is offered the
+   * media viewer's Transcribe button instead, which runs the same pass
+   * through `retranscribe_file` when the person asks for it. */
   retranscribeImportedFile?(fileId: string): Promise<void>;
 }
 
@@ -109,8 +115,23 @@ export function viewerKind(name: string, mime: string): ViewerKind {
   if (e === "ai" || e === "pdf") return "pdf";
   if (e === "svg") return "svg";
   if (mime.startsWith("image/")) return "image";
-  if (mime.startsWith("audio/")) return "audio";
-  if (mime.startsWith("video/")) return "video";
+  // Audio and video are resolved by the SAME `mediaKind` the transcriber
+  // itself gates on (`retranscribeFile`), not by a second rule that could
+  // drift away from it. It answers on the MIME first — so this is identical
+  // to the `audio/*` / `video/*` prefix tests it replaces — and falls back to
+  // the container extension, which is the part that matters: `.aac`, `.aiff`,
+  // `.aif`, `.caf` and `.m4v` have no entry in `guessDownloadMime`'s table, so
+  // they import as `application/octet-stream` and used to land in BinaryView.
+  // BinaryView offers no Transcribe button, so those files could not be
+  // transcribed at all — the media viewer is how the offer reaches the person.
+  //
+  // Chromium may still be unable to play `.caf`/`.aiff`/`.aif`, but AudioView
+  // deliberately keeps its on-device Transcribe action available after a
+  // media-element error.  The route here is therefore useful even when the
+  // built-in player cannot decode the container; AudioView's CAF regression
+  // pins that cross-process contract.
+  const media = mediaKind(mime, e);
+  if (media !== null) return media;
   if (e === "docx") return "docx";
   if (e === "doc") return "worddoc";
   if (["xlsx", "xls", "ods"].includes(e)) return "sheet";
@@ -132,8 +153,50 @@ export function viewerKind(name: string, mime: string): ViewerKind {
   return "binary";
 }
 
+/**
+ * Whether an imported file is ELIGIBLE for on-device transcription: audio or
+ * video, decided by the same {@link mediaKind} resolver `retranscribeFile`
+ * gates on, never by a second extension list that could drift away from it.
+ *
+ * ELIGIBILITY IS NOT A TRIGGER, and the difference is the owner's decision:
+ * drag-dropped imports stay ON-DEMAND, because dropping a folder of two
+ * hundred podcasts must not pin this Mac's CPU for hours without anyone
+ * asking. What eligibility buys is the OFFER and the handling:
+ *
+ *  - {@link viewerKind} routes an eligible file to the media viewer, whose
+ *    "Transcribe" button runs the speaker-aware pass on the one file the
+ *    person actually wants. That is the on-demand affordance; before this,
+ *    a `.aac`/`.aiff`/`.caf`/`.m4v` import reached BinaryView, which has no
+ *    such button, so those files had no way to be transcribed at all. The
+ *    routing is only half the offer: see {@link viewerKind}'s own note for the
+ *    renderer guard that still hides that button on a container the media
+ *    element cannot decode (`.caf`/`.aiff`/`.aif` today).
+ *  - `import_files` streams an eligible original into the workspace instead
+ *    of reading it whole into the main-process heap and running document
+ *    extraction and OCR over video bytes.
+ *
+ * {@link shouldAutoTranscribeImport} is the narrower question — "run it now,
+ * unasked" — and answers yes for far less than this.
+ */
+export function transcribeEligibleImport(name: string, mime: string): boolean {
+  return mediaKind(mime, ext(name)) !== null;
+}
+
+/**
+ * The one import that still transcribes itself without being asked: lossless
+ * `.flac` audio, which nothing in Arcelle produces — it is a file somebody
+ * deliberately kept uncompressed, and it has been auto-transcribed on import
+ * since before this eligibility split existed.
+ *
+ * DELIBERATELY NOT `transcribeEligibleImport`. Widening this to every media
+ * container is exactly what the owner refused: a bulk drop would queue every
+ * file behind the single-job transcriber and run for hours. Everything else
+ * eligible gets the button, not the job. If the auto case should go away
+ * entirely, this function is the only thing to delete — the offer does not
+ * depend on it.
+ */
 export function shouldAutoTranscribeImport(name: string, mime: string): boolean {
-  return ext(name) === "flac" && mime.startsWith("audio/");
+  return transcribeEligibleImport(name, mime) && ext(name) === "flac";
 }
 
 const RAW_TEXT_VIEWER_KINDS: ReadonlySet<ViewerKind> = new Set([
@@ -363,10 +426,17 @@ export function registerFileRuntimeSurfaceIpc(
         const mime = guessDownloadMime(name);
         let meta: ReturnType<typeof insertFile>;
         let importedBytes: Buffer | null = null;
-        if (open.workspace !== undefined && (mime.startsWith("audio/") || mime.startsWith("video/"))) {
+        if (open.workspace !== undefined && transcribeEligibleImport(name, mime)) {
           // Media has no document text to extract and is not an OCR candidate.
           // Import it directly as a stream instead of allocating the entire
           // recording or video in the Electron main-process heap.
+          //
+          // Gated by the transcriber's own kind resolver rather than a MIME
+          // prefix: `.aac`/`.aiff`/`.caf`/`.m4v` arrive as
+          // `application/octet-stream`, and a gigabyte of video read into the
+          // heap — then handed to document extraction and Quick Look — is the
+          // same mistake for those containers as for the ones whose MIME the
+          // table happens to know.
           meta = await open.workspace.importFile(filePath, name).then((entry) => {
             open.conn.prepare(
               "UPDATE files SET mime_type = ? WHERE id = ?",
@@ -392,6 +462,10 @@ export function registerFileRuntimeSurfaceIpc(
           const extracted = open.conn.prepare("SELECT extracted_text FROM files WHERE id = ?").get(meta.id) as { extracted_text: string | null };
           await deriveImportedPreview(open, meta.id, name, mime, importedBytes, extracted.extracted_text).catch(() => undefined);
         }
+        // Only the narrow auto case runs itself (see
+        // {@link shouldAutoTranscribeImport}). Every other eligible media file
+        // is offered the media viewer's Transcribe button instead, so a bulk
+        // drop cannot queue hours of decoding nobody asked for.
         if (shouldAutoTranscribeImport(name, mime)) {
           void actions.retranscribeImportedFile?.(meta.id).catch(() => undefined);
         }

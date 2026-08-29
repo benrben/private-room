@@ -31,6 +31,7 @@ from arcelle_sidecar.config import (
     AGENT_ROUND_BACKSTOP,
     CLOUD_WORKER_PARALLEL,
     NO_PROGRESS_ROUNDS,
+    ProviderConfig,
     TURN_ROUND_BACKSTOP,
 )
 from arcelle_sidecar.graph import (
@@ -39,6 +40,8 @@ from arcelle_sidecar.graph import (
     PROGRESS_ELIDED,
     PROGRESS_NOTE_LINES,
     ROUND_BUDGET_STEP,
+    VIDEO_FRAME_MISSING,
+    VIDEO_FRAME_REQUIRED,
     CancelToken,
     Deps,
     Event,
@@ -54,6 +57,7 @@ from arcelle_sidecar.graph import (
 from arcelle_sidecar.graphs import MAIN_GRAPH
 from arcelle_sidecar.mcp_client import ToolResult
 from arcelle_sidecar.messages import Message, ToolCall
+from arcelle_sidecar.privacy import PrivacyPolicy
 from arcelle_sidecar.prompts import (
     CONNECTORS_ADMIN_PROMPT,
     SKILLS_NOTE,
@@ -1325,6 +1329,202 @@ async def test_frame_receipt_without_pixels_fails_closed() -> None:
     assert not any(m.get("content") == IMAGE_HANDOFF for m in out.messages)
 
 
+async def test_visual_video_worker_cannot_finish_from_transcript_only() -> None:
+    """A transcript locates the frame; it is not evidence of its pixels."""
+    question = "what you see in frame 6:00 in @video.mp4"
+    chat = FakeChatModel(
+        [
+            Round(calls=[call("search_room", query="video.mp4 6:00")]),
+            Round(content="FOUND: the transcript discusses budgets at 6:00."),
+            Round(content="FOUND: the transcript still only discusses budgets."),
+        ]
+    )
+    mcp = FakeMCP(
+        tools=specs(["search_room", "open_file", "view_media_frame"]),
+        results={
+            "search_room": ToolResult(text="[6:00] We now discuss budgets.")
+        },
+    )
+
+    out = await drive_worker(
+        make_request(question, max_rounds=9),
+        chat,
+        mcp,
+        agent_id="media.video",
+    )
+
+    assert mcp.calls == [("search_room", {"query": "video.mp4 6:00"})]
+    assert out.final == VIDEO_FRAME_MISSING
+    assert VIDEO_FRAME_REQUIRED in "\n".join(
+        str(message.get("content") or "")
+        for message in chat.seen_messages[2]
+    )
+
+
+async def test_visual_video_worker_accepts_answer_after_corrected_frame_capture() -> None:
+    question = "what you see in frame 6:00 in @video.mp4"
+    pixel = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB"
+    chat = FakeChatModel(
+        [
+            Round(calls=[call("search_room", query="video.mp4 6:00")]),
+            Round(content="The transcript says budget."),
+            Round(
+                calls=[
+                    call(
+                        "view_media_frame",
+                        name="video.mp4",
+                        timestamp="6:00",
+                    )
+                ]
+            ),
+            Round(content="FOUND: the frame shows a budget chart."),
+        ]
+    )
+    mcp = FakeMCP(
+        tools=specs(["search_room", "open_file", "view_media_frame"]),
+        results={
+            "search_room": ToolResult(text="[6:00] We now discuss budgets."),
+            "view_media_frame": ToolResult(
+                text="FRAME timestamp=360s sha256=abc",
+                images=[pixel],
+            ),
+        },
+    )
+
+    out = await drive_worker(
+        make_request(question, max_rounds=9),
+        chat,
+        mcp,
+        agent_id="media.video",
+    )
+
+    assert out.final == "FOUND: the frame shows a budget chart."
+    assert mcp.calls[-1] == (
+        "view_media_frame",
+        {"name": "video.mp4", "timestamp": "6:00"},
+    )
+    assert any(
+        message.get("images") == [pixel]
+        for message in chat.seen_messages[-1]
+    )
+
+
+async def test_exact_visual_prompt_is_delegated_before_main_can_answer_transcript() -> None:
+    """Main executes the verbatim Video plan before its first model round."""
+    question = "what you see in frame 6:00 in @video.mp4"
+    pixel = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB"
+    chat = FakeChatModel(
+        [
+            Round(
+                calls=[
+                    call(
+                        "view_media_frame",
+                        name="video.mp4",
+                        timestamp="6:00",
+                    )
+                ]
+            ),
+            Round(content="FOUND: a budget chart is visible at 6:00."),
+            Round(content="A budget chart is visible at 6:00."),
+        ]
+    )
+    mcp = FakeMCP(
+        tools=specs(["list_room_files", "search_room", "open_file", "view_media_frame"]),
+        results={
+            "view_media_frame": ToolResult(
+                text="FRAME timestamp=360s sha256=abc",
+                images=[pixel],
+            )
+        },
+    )
+
+    out = await drive(make_request(question), chat, mcp)
+
+    assert out.final == "A budget chart is visible at 6:00."
+    assert mcp.calls == [
+        (
+            "view_media_frame",
+            {"name": "video.mp4", "timestamp": "6:00"},
+        )
+    ]
+    # The first model round belongs to the Video child, proving Main did not
+    # get a chance to answer from transcript context before delegation.
+    assert "view_media_frame" in chat.offered_names[0]
+    assert "ask_file_agent" not in chat.offered_names[0]
+    handoff = "\n".join(
+        str(message.get("content") or "") for message in chat.seen_messages[0]
+    )
+    assert question in handoff
+    video_entries = [
+        entry
+        for event in out.of("plan")
+        for entry in event["v"]
+        if entry.get("agent") == "media.video"
+    ]
+    assert video_entries and video_entries[-1]["instruction"] == question
+
+
+async def test_prepared_visual_step_does_not_swallow_later_mixed_request() -> None:
+    """Only the planned visual clause is sent to Video; Main keeps the rest."""
+    visual = "what is visible at 6:00 in @video.mp4"
+    question = f"{visual}; search the web for Arcelle"
+    pixel = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB"
+    chat = FakeChatModel(
+        [
+            Round(
+                calls=[
+                    call(
+                        "view_media_frame",
+                        name="video.mp4",
+                        timestamp="6:00",
+                    )
+                ]
+            ),
+            Round(content="FOUND: a title slide is visible at 6:00."),
+            Round(calls=[call("ask_web_agent", instruction="search the web for Arcelle")]),
+            Round(calls=[call("web_search", query="Arcelle")]),
+            Round(calls=[call("fetch_page", url="https://example.test/arcelle")]),
+            Round(content="FOUND: the web search completed."),
+            Round(content="The frame shows a title slide, and the web search completed."),
+        ]
+    )
+    mcp = FakeMCP(
+        tools=specs(
+            [
+                "list_room_files",
+                "search_room",
+                "open_file",
+                "view_media_frame",
+                "web_search",
+                "fetch_page",
+            ]
+        ),
+        results={
+            "view_media_frame": ToolResult(
+                text="FRAME timestamp=360s sha256=abc",
+                images=[pixel],
+            ),
+            "web_search": ToolResult(text="Arcelle result: https://example.test/arcelle"),
+            "fetch_page": ToolResult(text="Arcelle source page"),
+        },
+    )
+
+    out = await drive(make_request(question, web_enabled=True, model="qwen3:cloud"), chat, mcp)
+
+    assert out.final == "The frame shows a title slide, and the web search completed."
+    assert mcp.calls == [
+        ("view_media_frame", {"name": "video.mp4", "timestamp": "6:00"}),
+        ("web_search", {"query": "Arcelle"}),
+        ("fetch_page", {"url": "https://example.test/arcelle"}),
+    ]
+    first_handoff = "\n".join(
+        str(message.get("content") or "") for message in chat.seen_messages[0]
+    )
+    assert f"Do exactly this: {visual}\n" in first_handoff
+    assert f"Do exactly this: {question}" not in first_handoff
+    assert "ask_web_agent" in chat.offered_names[2]
+
+
 # --------------------------------------------------------------------------- #
 # cancellation
 # --------------------------------------------------------------------------- #
@@ -2552,6 +2752,180 @@ async def test_a_partial_batch_is_memoised_and_its_findings_reach_the_next_round
         if "Progress this turn" in (m.get("content") or "")
     ]
     assert any("ask_agents(2 tasks) -> reports received" in n for n in notes), notes
+
+
+async def test_protected_cloud_video_delegation_refuses_instead_of_running_file_agent() -> None:
+    """A live file domain must not hide an unavailable Video specialist.
+
+    Cloud Privacy removes ``view_media_frame`` but leaves ordinary file reads,
+    so the domain-level guard still sees ``ask_file_agent`` as reachable. The
+    filtered resolver used to replace the video-specific worker with
+    ``files.read`` and hand it a frame question. Refuse before any child or MCP
+    call, name the local recovery, and record a blocked image so the existing
+    one-turn privacy valve can be offered.
+    """
+    chat = FakeChatModel(
+        [
+            Round(content="Cloud Privacy kept that frame on this Mac."),
+        ]
+    )
+    chat.privacy = PrivacyPolicy(active=True)  # type: ignore[attr-defined]
+    req = make_request(
+        "show me the frame at 1:05 of lecture.mp4",
+        model="minimax-m3:cloud",
+    )
+    req.privacy = {"active": True}
+    mcp = FakeMCP()
+
+    out = await drive(req, chat, mcp)
+
+    assert out.final == "Cloud Privacy kept that frame on this Mac."
+    assert mcp.calls == []
+    assert chat.n == 1, "privacy refusal should precede Main's first model round"
+    assert all(
+        any(tool["function"]["name"].startswith("ask_") for tool in offered)
+        for offered in chat.offered
+    ), "a File worker was launched despite the video refusal"
+    refusal = next(
+        str(message.get("content") or "")
+        for message in chat.seen_messages[-1]
+        if message.get("role") == "tool"
+        and message.get("tool_name") == "ask_file_agent"
+    )
+    assert "Video agent cannot inspect that frame" in refusal
+    assert "Cloud Privacy" in refusal
+    assert "Switch to On this Mac" in refusal
+    assert "one-turn approval" in refusal
+    assert "Do not substitute the File agent" in refusal
+    failed = [
+        entry
+        for event in out.of("plan")
+        for entry in event["v"]
+        if entry.get("agent") == "media.video"
+    ]
+    assert failed and failed[-1]["status"] == "failed"
+    assert chat.privacy.report.images_blocked == 1  # type: ignore[attr-defined]
+
+
+async def test_protected_cloud_video_batch_task_refuses_without_file_substitution() -> None:
+    """The same member-level guard applies inside ``ask_agents`` fan-out."""
+    plan = [
+        {
+            "agent": "file",
+            "instruction": "describe the scene at 0:10 of demo.mp4",
+        }
+    ]
+    chat = FakeChatModel(
+        [
+            Round(calls=[call("ask_agents", tasks=plan)]),
+            Round(content="I cannot inspect that protected frame from this cloud turn."),
+        ]
+    )
+    chat.privacy = PrivacyPolicy(active=True)  # type: ignore[attr-defined]
+    req = make_request(
+        "handle the queued room task",
+        model="minimax-m3:cloud",
+    )
+    req.privacy = {"active": True}
+    mcp = FakeMCP()
+
+    out = await drive(req, chat, mcp)
+
+    assert out.final
+    assert mcp.calls == []
+    assert chat.n == 2, "the batch substituted a File worker for Video"
+    batch_result = next(
+        str(message.get("content") or "")
+        for message in chat.seen_messages[-1]
+        if message.get("role") == "tool"
+        and message.get("tool_name") == "ask_agents"
+    )
+    assert "Task 0 could not run" in batch_result
+    assert "Video agent cannot inspect that frame" in batch_result
+    assert "Cloud Privacy" in batch_result
+    assert "Switch to On this Mac" in batch_result
+    failed = [
+        entry
+        for event in out.of("plan")
+        for entry in event["v"]
+        if entry.get("agent") == "media.video"
+    ]
+    assert failed and failed[-1]["status"] == "failed"
+    assert chat.privacy.report.images_blocked == 1  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize(
+    "req",
+    [
+        pytest.param(
+            make_request(
+                "show me the frame at 1:05 of lecture.mp4",
+                model="antigravity-cli::gemini-3.7-flash-high",
+            ),
+            id="antigravity-no-image-transport",
+        ),
+        pytest.param(
+            make_request(
+                "show me the frame at 1:05 of lecture.mp4",
+                model="qwen3.5:4b",
+            ).model_copy(update={"supports_vision": False}),
+            id="ollama-model-vision-false",
+        ),
+        pytest.param(
+            make_request(
+                "show me the frame at 1:05 of lecture.mp4",
+                model="openrouter::vendor/text-only",
+            ).model_copy(
+                update={
+                    "provider": ProviderConfig(
+                        id="openrouter",
+                        api_key="secret",
+                        base_url="https://openrouter.ai/api/v1",
+                        model="vendor/text-only",
+                        supports_vision=False,
+                    )
+                }
+            ),
+            id="openrouter-model-vision-false",
+        ),
+    ],
+)
+async def test_blind_model_never_routes_video_pixels_or_falls_back_to_file_agent(
+    req: Any,
+) -> None:
+    """Transport/model capability filters run before specialist resolution."""
+    chat = FakeChatModel(
+        [
+            Round(content="This selected model cannot inspect video frames."),
+        ]
+    )
+    mcp = FakeMCP()
+
+    out = await drive(req, chat, mcp)
+
+    assert out.final
+    assert mcp.calls == []
+    assert chat.n == 1, "blind-provider refusal should precede Main's first round"
+    assert all(
+        any(tool["function"]["name"].startswith("ask_") for tool in offered)
+        for offered in chat.offered
+    )
+    refusal = next(
+        str(message.get("content") or "")
+        for message in chat.seen_messages[-1]
+        if message.get("role") == "tool"
+        and message.get("tool_name") == "ask_file_agent"
+    )
+    assert "Video agent cannot inspect that frame" in refusal
+    assert "no usable video-image channel" in refusal
+    assert "Do not substitute the File agent" in refusal
+    failed = [
+        entry
+        for event in out.of("plan")
+        for entry in event["v"]
+        if entry.get("agent") == "media.video"
+    ]
+    assert failed and failed[-1]["status"] == "failed"
 
 
 async def test_an_unusable_plan_gets_a_corrective_note_not_silence() -> None:

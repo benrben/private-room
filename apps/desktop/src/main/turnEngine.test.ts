@@ -1239,13 +1239,21 @@ describe("ask", () => {
     const chat = createChat(db);
     const room = makeRoomSource({ db, path: "/rooms/a.roomai" });
     const chatModelSeesImages = vi.fn(async () => true);
+    let request: RunViaSidecarRequest | null = null;
 
     await ask(
       { askId: "ask-vision", chatId: chat.id, question: "hi", attachments: [], viewing: null, privacyBypass: false },
-      askDeps(room, createCancelState(), () => {}, { chatModelSeesImages })
+      askDeps(room, createCancelState(), () => {}, {
+        chatModelSeesImages,
+        runViaSidecar: async (value) => {
+          request = value;
+          return fakeOutcome({ kind: "done", text: "ok" });
+        },
+      })
     );
     expect(chatModelSeesImages).toHaveBeenCalledTimes(1);
     expect(chatModelSeesImages).toHaveBeenCalledWith("claude-cli::opus");
+    expect((request as RunViaSidecarRequest | null)?.supportsVision).toBe(true);
   });
 });
 

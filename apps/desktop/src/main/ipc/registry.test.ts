@@ -229,6 +229,46 @@ describe("registerAllIpc — registration", () => {
     );
   });
 
+  it("gives the recording bridge the SPEAKER model too, not just the STT model", () => {
+    // The P0 this test exists for: `createLiveRecBridgeCtx` supplied only
+    // `currentRoom` + `resolveSttModel`. `recBridge.ts` declares
+    // `diarizeModelPath` as an OPTIONAL dep and reads it as
+    // `ctx.deps.diarizeModelPath?.() ?? null`, so the omission compiled, booted
+    // and recorded — every `/rec/start` just POSTed `diarizeModelPath: null`.
+    // Downstream of that null the sidecar substitutes a 21-dim DSP embedding,
+    // `identityPrint` (192-dim TitaNet) returns null, `learnVoice`
+    // early-returns, and saved-voice enrollment plus cross-recording
+    // recognition have never worked in a shipped build — with the 40MB model
+    // sitting bundled in `resources/models/` the whole time. Nothing throws
+    // anywhere along that chain, which is exactly why it needs a test rather
+    // than a code reading.
+    const built = build();
+    const modelDir = path.join(built.userDataDir, "models");
+    mkdirSync(modelDir, { recursive: true });
+    // The file name is spelled out rather than imported from the
+    // implementation on purpose: a test that borrows the constant it is
+    // checking cannot catch the constant changing out from under the bundled
+    // `resources/models/` file.
+    const titanet = path.join(modelDir, "nemo_en_titanet_small.onnx");
+    writeFileSync(titanet, "titanet-test-model");
+
+    const recCtx = createLiveRecBridgeCtx(() => null, built.userDataDir, null);
+    // The RESOLVED PATH is the assertion that carries the regression, not the
+    // presence of the field. `createRecBridgeCtx` now fills an omitted
+    // `diarizeModelPath` with an explicit `() => null` of its own, so a
+    // registry that supplies nothing still hands back a function here — it
+    // just answers `null`, which is the silent-degradation state this test
+    // exists to catch. The typeof check below is kept only so a future
+    // `diarizeModelPath?: string` shape change fails loudly instead of
+    // comparing a string to a path.
+    expect(typeof recCtx.deps.diarizeModelPath).toBe("function");
+    expect(
+      recCtx.deps.diarizeModelPath?.(),
+      "createLiveRecBridgeCtx resolved no TitaNet path — recBridge then POSTs " +
+        "`diarizeModelPath: null` and speaker recognition is silently off",
+    ).toBe(titanet);
+  });
+
   it("records exactly the channels the underlying ipcMain received", () => {
     const { registeredChannels, calls } = build();
     expect(new Set(calls).size).toBe(calls.length);
@@ -253,6 +293,35 @@ describe("registerAllIpc — registration", () => {
     const source = readFileSync(path.join(here, "registry.ts"), "utf8");
     const callSites = source.match(/^ {2}register[A-Za-z]*Ipc\(\s*$|^ {2}register[A-Za-z]*Ipc\(/gm) ?? [];
     expect(callSites.length).toBe(WIRED_MODULE_COUNT);
+  });
+
+  it("hands the media-download surface the real resourcesPath, not its null default", () => {
+    // `registerMediaDownloadSurfaceIpc`'s sixth parameter is
+    // `resourcesPath: string | null = null`. A DEFAULTED parameter is the one
+    // kind of missing dependency the compiler cannot report: this call site
+    // omitted it and typechecked clean, which in a packaged build means every
+    // downloaded podcast resolves no bundled speech model, answers
+    // `model-missing`, and silently arrives with no transcript — while
+    // Settings, reading the same weights through the real `resourcesPath`,
+    // says the model is installed. It is also the exact promise
+    // `download_media`'s tool description makes to the model.
+    //
+    // Scanned from the source rather than asserted on behavior: the download
+    // engine's deps are built inside the registrar with no seam to observe,
+    // and this catches the whole failure (the argument being absent), which is
+    // how it actually shipped. It cannot catch the WRONG value being passed —
+    // `mediaDownloadSurfaceIpc.ts`'s own tests own that half.
+    const here = path.dirname(fileURLToPath(import.meta.url));
+    const source = readFileSync(path.join(here, "registry.ts"), "utf8");
+    const call = /\n {2}registerMediaDownloadSurfaceIpc\(([^;]*?)\n {2}\);/.exec(source);
+    expect(call, "registerMediaDownloadSurfaceIpc call site not found — did it get reformatted?")
+      .not.toBeNull();
+    const args = call![1].split(",").map((arg) => arg.trim()).filter((arg) => arg !== "");
+    expect(
+      args,
+      "registerMediaDownloadSurfaceIpc was called without resourcesPath, so it fell back " +
+        "to its `= null` default and downloads cannot see the bundled models",
+    ).toContain("resourcesPath");
   });
 });
 
@@ -554,6 +623,39 @@ describe("registerAllIpc — dependency seams this registry owns", () => {
     await handlers.get("create_sketch")!(fakeEvent, { name: "emit probe" });
 
     expect(emitted.slice(before).map(([event]) => event)).toContain("room-files-changed");
+  });
+
+  it("rec_retranscribe refuses in words rather than resolving to something the renderer dereferences", async () => {
+    // `ipc-contract.ts` declares `rec_retranscribe -> RecMeta`, and
+    // `RecordingView.tsx`'s `runRetranscribe` reads `updated.durationCs` the
+    // statement after the await. The registry's override used to `await` a
+    // text-only helper and return `undefined`, so the button threw a TypeError
+    // in the renderer on EVERY press. The replacement returns the real
+    // `RecMeta` — and when the transcription lane declines the file it answers
+    // `null`, which would land the renderer in the identical crash, so the
+    // registry converts that into a catchable message the toast can show.
+    //
+    // A `.txt` is the one refusal reachable with no sidecar: the lane
+    // recognises it as non-media and declines locally, before staging or any
+    // HTTP call.
+    const { handlers, state, userDataDir } = build();
+    await handlers.get("create_room")!(fakeEvent, {
+      path: path.join(userDataDir, `pr-retrans-${randomUUID()}.roomai`),
+      password: "correct horse battery staple",
+      name: null,
+    });
+    const file = insertFile(
+      state.room!.conn,
+      "not-audio.txt",
+      "text/plain",
+      Buffer.from("just words"),
+      "just words",
+      "import",
+    );
+
+    await expect(
+      Promise.resolve().then(() => handlers.get("rec_retranscribe")!(fakeEvent, { id: file.id })),
+    ).rejects.toThrow("could not be transcribed");
   });
 
   it("explicitModel reads the OPEN ROOM's own model setting, not a constant null", async () => {

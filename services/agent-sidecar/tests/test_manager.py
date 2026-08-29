@@ -762,6 +762,7 @@ def test_watching_a_video_reaches_the_video_agent_not_the_transcriber() -> None:
     picture.
     """
     for instruction in (
+        "what you see in frame 6:00 in @LIVE： Uncle Bob on Software Fundamentals in the Age of AI.mp4",
         "what's on screen at 3:20 of talk.mp4",
         # The medium has to be NAMED — "which slide is up when he mentions the
         # budget" carries no video vocabulary at all and stays with the default

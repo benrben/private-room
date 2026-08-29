@@ -276,8 +276,8 @@ function noteLine(n: RecNote): string {
  * `_apply_add_*`, Rust's own commands) sorts on write, so re-sorting here would
  * only change the output for input Rust itself renders unsorted.
  */
-export function transcriptText(meta: RecMeta): string {
-  let out = "(live recording)\n";
+export function transcriptText(meta: RecMeta, header = "(live recording)"): string {
+  let out = `${header}\n`;
   const { chapters, notes } = meta;
   let ci = 0;
   let ni = 0;

@@ -14,55 +14,113 @@
  * resolution.
  */
 
+export interface DrawnPng {
+  imageB64: string;
+  width: number;
+  height: number;
+}
+
+/** Exact canvas dimensions used by {@link drawToPng}. Kept pure so the receipt
+ * sizing rule can be pinned without pretending source-video dimensions describe
+ * a resized PNG. */
+export function frameOutputDimensions(
+  srcW: number,
+  srcH: number,
+  maxWidth: number,
+): { width: number; height: number } {
+  const scale = Math.min(1, maxWidth / srcW);
+  return {
+    width: Math.max(1, Math.round(srcW * scale)),
+    height: Math.max(1, Math.round(srcH * scale)),
+  };
+}
+
 /** Draw a source into an offscreen canvas and return bare base64 (no `data:`
- * prefix). `maxWidth` caps the long edge; pass the source width for 1:1. */
+ * prefix) together with the exact encoded PNG dimensions. */
+export function drawToPng(
+  source: CanvasImageSource,
+  srcW: number,
+  srcH: number,
+  maxWidth: number,
+): DrawnPng {
+  const dimensions = frameOutputDimensions(srcW, srcH, maxWidth);
+  const canvas = document.createElement("canvas");
+  canvas.width = dimensions.width;
+  canvas.height = dimensions.height;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("Couldn't create a 2D canvas context.");
+  ctx.drawImage(source, 0, 0, canvas.width, canvas.height);
+  const url = canvas.toDataURL("image/png");
+  return { imageB64: url.slice(url.indexOf(",") + 1), ...dimensions };
+}
+
+/** Compatibility wrapper for screenshot callers that only need the pixels. */
 export function drawToPngB64(
   source: CanvasImageSource,
   srcW: number,
   srcH: number,
   maxWidth: number,
 ): string {
-  const scale = Math.min(1, maxWidth / srcW);
-  const canvas = document.createElement("canvas");
-  canvas.width = Math.max(1, Math.round(srcW * scale));
-  canvas.height = Math.max(1, Math.round(srcH * scale));
-  const ctx = canvas.getContext("2d");
-  if (!ctx) throw new Error("Couldn't create a 2D canvas context.");
-  ctx.drawImage(source, 0, 0, canvas.width, canvas.height);
-  const url = canvas.toDataURL("image/png");
-  return url.slice(url.indexOf(",") + 1);
+  return drawToPng(source, srcW, srcH, maxWidth).imageB64;
 }
 
 /** Resolve once the video has actually PRESENTED a frame (safe to draw).
  * requestVideoFrameCallback fires per composited frame; on a paused,
  * just-seeked pipeline it can stall, so after 300ms a muted play/pause forces
- * a frame through the decoder. Always resolves by timeoutMs — a black frame
- * beats a hung tool call. */
+ * a frame through the decoder. A bounded wait that sees no callback is an
+ * honest timeout, never permission to attach a possibly black or stale canvas. */
 export function presentedFrame(
   video: HTMLVideoElement,
   timeoutMs: number,
-): Promise<void> {
+): Promise<
+  | { status: "presented"; mediaTime: number }
+  | { status: "invalid-timestamp" }
+  | { status: "timeout" }
+> {
   return new Promise((resolve) => {
     let settled = false;
-    const done = () => {
+    let nudgeTimer = 0;
+    let timeoutTimer = 0;
+    const done = (result:
+      | { status: "presented"; mediaTime: number }
+      | { status: "invalid-timestamp" }
+      | { status: "timeout" }) => {
       if (!settled) {
         settled = true;
+        window.clearTimeout(nudgeTimer);
+        window.clearTimeout(timeoutTimer);
         video.pause();
-        resolve();
+        resolve(result);
       }
     };
     const v = video as HTMLVideoElement & {
-      requestVideoFrameCallback?: (cb: () => void) => number;
+      requestVideoFrameCallback?: (
+        cb: (now: number, metadata: { mediaTime?: number }) => void,
+      ) => number;
     };
     if (typeof v.requestVideoFrameCallback === "function") {
-      v.requestVideoFrameCallback(() => done());
-      window.setTimeout(() => {
-        if (!settled) void video.play().catch(() => done());
-      }, 300);
-    } else {
-      requestAnimationFrame(() => requestAnimationFrame(done));
+      v.requestVideoFrameCallback((_now, metadata) => {
+        // mediaTime names the exact media frame Chromium presented. Reading
+        // video.currentTime after the play/pause nudge can observe the playback
+        // clock after it advanced or wrapped, producing a receipt for 0.002s
+        // alongside pixels actually decoded at 1.05s.
+        if (typeof metadata.mediaTime !== "number" || !Number.isFinite(metadata.mediaTime)) {
+          done({ status: "invalid-timestamp" });
+          return;
+        }
+        done({ status: "presented", mediaTime: metadata.mediaTime });
+      });
     }
-    window.setTimeout(done, timeoutMs);
+    // Engines without requestVideoFrameCallback have no trustworthy paint
+    // receipt. Nudge their decoder too, but never promote an animation-frame
+    // guess to success; if no real callback exists, the bounded timeout below
+    // returns an honest failure instead of attaching an unproven canvas.
+    nudgeTimer = window.setTimeout(() => {
+      // A rejected nudge is not evidence that a frame was painted. Leave the
+      // request alive until the bounded timeout reports the honest failure.
+      if (!settled) void video.play().catch(() => {});
+    }, 300);
+    timeoutTimer = window.setTimeout(() => done({ status: "timeout" }), timeoutMs);
   });
 }
 
@@ -86,6 +144,15 @@ export function mediaEvent(
     el.addEventListener(event, onOk, { once: true });
     el.addEventListener("error", onErr, { once: true });
   });
+}
+
+/** Turn the two distinct media-load failures into claims the app can support.
+ * An `error` event usually means Chromium rejected the container/codec; it is
+ * not a timeout and must not be reported as one. */
+export function mediaLoadFailure(result: "error" | "timeout"): string {
+  return result === "error"
+    ? "That video couldn't be decoded for a frame grab. Its codec or container may not be supported."
+    : "That video couldn't be loaded for a frame grab (timed out).";
 }
 
 /** One grabbed still, or the reason there isn't one. Never both, and never a
@@ -143,10 +210,9 @@ export async function grabFrame(
     document.body.appendChild(video);
     video.load();
 
-    if ((await mediaEvent(video, "loadedmetadata", 8000)) !== "ok") {
-      return {
-        error: "That video couldn't be loaded for a frame grab (timed out).",
-      };
+    const loaded = await mediaEvent(video, "loadedmetadata", 8000);
+    if (loaded !== "ok") {
+      return { error: mediaLoadFailure(loaded) };
     }
     if (!video.videoWidth || !video.videoHeight) {
       return { error: "That file has no video track." };
@@ -165,22 +231,32 @@ export async function grabFrame(
     // WKWebView fires "seeked" before the decoder has PAINTED the new frame —
     // drawing immediately captures a black canvas (the model then honestly
     // reports "a completely black screen").
-    await presentedFrame(video, 2500);
+    const presented = await presentedFrame(video, 2500);
+    if (presented.status === "invalid-timestamp") {
+      return {
+        error: "That video presented a frame without a verifiable media timestamp, so no pixels were attached.",
+      };
+    }
+    if (presented.status !== "presented") {
+      return {
+        error: "That video did not present the requested frame before the frame-grab timeout.",
+      };
+    }
 
     try {
-      const imageB64 = drawToPngB64(video, video.videoWidth, video.videoHeight, maxWidth);
+      const png = drawToPng(video, video.videoWidth, video.videoHeight, maxWidth);
       return {
-        imageB64,
-        width: video.videoWidth,
-        height: video.videoHeight,
+        imageB64: png.imageB64,
+        width: png.width,
+        height: png.height,
         // The time actually PRESENTED, not the one asked for. A request past
         // the end clamps to `duration`, and `presentedFrame`'s play/pause nudge
         // advances the pipeline — so the two can differ, and a caption that
         // asserted the requested time either way would be quietly wrong.
-        atSeconds: video.currentTime,
+        atSeconds: presented.mediaTime,
         // Hash the exact PNG attached to the model. The Electron host verifies
         // this receipt again before accepting the frame into tool provenance.
-        sha256: await frameSha256(imageB64),
+        sha256: await frameSha256(png.imageB64),
       };
     } catch {
       return { error: "That video's frames couldn't be exported to an image." };

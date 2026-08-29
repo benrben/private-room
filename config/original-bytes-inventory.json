@@ -42,6 +42,13 @@
       "note": "Legacy blob version snapshots read this column. WorkspaceService uses encrypted content objects instead."
     },
     {
+      "path": "apps/desktop/src/main/mediaTranscribeJob.ts",
+      "access": ["documentation-reference"],
+      "category": "hybrid-transcription-abstraction",
+      "workspaceCurrentBytesAllowed": false,
+      "note": "The re-transcription history path documents that legacy rooms snapshot their blob while workspace rooms use encrypted content objects; it never reads or writes the legacy column directly."
+    },
+    {
       "path": "apps/desktop/src/main/recBridge.ts",
       "access": ["documentation-reference"],
       "category": "hybrid-recording-abstraction",

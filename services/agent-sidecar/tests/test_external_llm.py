@@ -7,6 +7,7 @@ llm.generate / summarize-client routing seams (subprocess mocked)."""
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import re
@@ -1292,9 +1293,13 @@ def test_the_hub_only_list_names_every_tool_the_bridge_cannot_serve() -> None:
 
 # ---------------------------------------------------- images (the pixel lanes)
 
-# A strictly valid base64 PNG header — enough for the validation seams, which
-# never decode pixels.
-_PNG = "iVBORw0KGgo="
+# A complete, decodable 1×1 PNG. Adapter regressions compare these exact bytes
+# at the provider boundary, so a header-only fixture would overstate what the
+# test proves about genuine vision input.
+_PNG = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8A"
+    "AQUBAScY42YAAAAASUVORK5CYII="
+)
 
 
 def test_message_images_validates_and_caps() -> None:
@@ -1816,6 +1821,163 @@ async def test_agent_frame_pixels_reach_every_external_image_channel(
     assert calls == []
     assert seen["images"] == [_PNG]
     assert "attached to this request" in str(seen["prompt"])
+
+
+@pytest.mark.asyncio
+async def test_codex_agent_attaches_exact_frame_bytes_with_real_image_flag_and_cleans_up(
+    monkeypatch,
+) -> None:
+    """The agent adapter must invoke Codex vision, not narrate a temp path."""
+    seen: dict[str, object] = {}
+    codex_reply = (
+        json.dumps(
+            {
+                "type": "item.completed",
+                "item": {"type": "agent_message", "text": "blue frame"},
+            }
+        )
+        + "\n"
+        + json.dumps({"type": "turn.completed", "usage": {"input_tokens": 3}})
+        + "\n"
+    ).encode()
+
+    async def fake_exec(*argv, **kwargs):
+        seen["argv"] = argv
+        paths = re.findall(r"-i '([^']+)'", argv[2])
+        assert len(paths) == 1
+        path = paths[0]
+        seen["path"] = path
+        with open(path, "rb") as fh:
+            seen["bytes"] = fh.read()
+        proc = _FakeProc(codex_reply)
+        seen["proc"] = proc
+        return proc
+
+    monkeypatch.setattr(external_llm.asyncio, "create_subprocess_exec", fake_exec)
+
+    async def on_delta(_delta: str) -> None:
+        return None
+
+    content, calls, _usage = await _model("codex-cli").stream(
+        [
+            {
+                "role": "user",
+                "content": external_llm.IMAGE_HANDOFF,
+                "images": [_PNG],
+            }
+        ],
+        [],
+        on_delta,
+    )
+
+    assert content == "blue frame"
+    assert calls == []
+    assert seen["bytes"] == base64.b64decode(_PNG, validate=True)
+    command = str(seen["argv"][2])
+    assert "codex exec" in command
+    assert " -i '" in command
+    path = str(seen["path"])
+    # The path is a CLI attachment argument only. Stdin tells Codex an image is
+    # attached but never asks it to read a narrated local filename.
+    stdin = seen["proc"].stdin_payload.decode()
+    assert path not in stdin
+    assert "attached to this request" in stdin
+    assert not os.path.exists(path)
+
+
+@pytest.mark.asyncio
+async def test_codex_agent_never_spawns_when_frame_staging_fails(monkeypatch) -> None:
+    spawned = False
+
+    monkeypatch.setattr(external_llm, "_stage_image_files", lambda _images: [])
+
+    async def fake_exec(*argv, **kwargs):
+        nonlocal spawned
+        spawned = True
+        return _FakeProc(b"")
+
+    monkeypatch.setattr(external_llm.asyncio, "create_subprocess_exec", fake_exec)
+
+    async def on_delta(_delta: str) -> None:
+        return None
+
+    with pytest.raises(llm.LlmError, match="could not be staged"):
+        await _model("codex-cli").stream(
+            [
+                {
+                    "role": "user",
+                    "content": external_llm.IMAGE_HANDOFF,
+                    "images": [_PNG],
+                }
+            ],
+            [],
+            on_delta,
+        )
+    assert spawned is False
+
+
+@pytest.mark.asyncio
+async def test_claude_agent_privacy_blocks_then_approved_bypass_sends_exact_image_block(
+    monkeypatch,
+) -> None:
+    """A protected frame never leaves; approval uses Claude's real vision wire."""
+    from arcelle_sidecar import privacy
+
+    seen: dict[str, object] = {"spawns": 0}
+
+    async def fake_exec(*argv, **kwargs):
+        seen["spawns"] = int(seen["spawns"]) + 1
+        seen["argv"] = argv
+        proc = _FakeProc(_envelope("blue frame"))
+        seen["proc"] = proc
+        return proc
+
+    async def on_delta(_delta: str) -> None:
+        return None
+
+    monkeypatch.setattr(external_llm.asyncio, "create_subprocess_exec", fake_exec)
+    model = _model("claude-cli")
+    model.privacy = privacy.policy_from_payload({"active": True, "rules": []})
+    turn = [
+        {
+            "role": "user",
+            "content": external_llm.IMAGE_HANDOFF,
+            "images": [_PNG],
+        }
+    ]
+
+    with pytest.raises(llm.LlmError, match="withheld by Cloud Privacy"):
+        await model.stream(turn, [], on_delta)
+    assert seen["spawns"] == 0
+
+    # The user-approved protected-cloud bypass is represented by omitting the
+    # active privacy policy for this attempt. Exercise the complete agent seam,
+    # including its real _run/_spawn serialization, rather than mocking _run.
+    model.privacy = None
+    content, calls, _usage = await model.stream(turn, [], on_delta)
+
+    assert content == "blue frame"
+    assert calls == []
+    assert seen["spawns"] == 1
+    command = str(seen["argv"][2])
+    assert "claude -p" in command
+    assert "--input-format stream-json" in command
+    assert " -i " not in command
+    event = json.loads(seen["proc"].stdin_payload.decode())
+    blocks = event["message"]["content"]
+    image_blocks = [block for block in blocks if block.get("type") == "image"]
+    assert len(image_blocks) == 1
+    source = image_blocks[0]["source"]
+    assert source == {
+        "type": "base64",
+        "media_type": "image/png",
+        "data": _PNG,
+    }
+    assert base64.b64decode(source["data"], validate=True) == base64.b64decode(
+        _PNG, validate=True
+    )
+    # Claude receives pixels in NDJSON, never a narrated temp-file pathname.
+    assert "arcelle-img-" not in seen["proc"].stdin_payload.decode()
 
 
 @pytest.mark.asyncio

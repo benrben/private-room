@@ -102,6 +102,7 @@ from .agents import (
     specialist_workers,
     tagged_specialist,
     toolbox_for,
+    worker_reachable,
 )
 from .budget import byte_len, json_chars
 from .chat import ChatModel
@@ -116,7 +117,7 @@ from .messages import (
     tool_message,
     user_message,
 )
-from .planner import build_plan
+from .planner import build_plan, is_visual_video_intent
 from .privacy import cloud_privacy_tool_allowed, is_nonlocal_model
 from .prompts import (
     DIRECT_SPECIALIST_NOTE,
@@ -157,6 +158,25 @@ Emit = Callable[[Event], Awaitable[None]]
 #: ``AgentState.node_key``). Workers get ``"<agent_id>#<pipeline slot>"``; the
 #: hub is a singleton, so it gets a fixed name the UI can root the graph on.
 MAIN_NODE_KEY = "main"
+
+#: Room tools whose successful result is raw pixels that must reach the model
+#: through a real image channel. Metadata/text inspection tools stay available
+#: to blind providers; these two cannot honestly degrade to a text receipt.
+PIXEL_RESULT_TOOLS = frozenset({"view_media_frame", "view_screenshot"})
+
+# A transcript is useful for locating a moment, but it is not evidence of what
+# was visible there.  This correction is injected once when the Video worker
+# tries to finish a visual ask without a successful pixel-bearing frame call.
+VIDEO_FRAME_REQUIRED = (
+    "This is a visual-video request. A transcript or search result cannot show "
+    "what was visible. Call view_media_frame for the requested moment before "
+    "answering."
+)
+VIDEO_FRAME_MISSING = (
+    "MISSING: I could not inspect the requested video frame because no "
+    "successful pixel-bearing frame capture was available. I will not infer "
+    "what was visible from the transcript."
+)
 
 #: Shown in the step strip when the turn-wide round budget runs out. The user
 #: gets an answer either way; this says the answer came from what was already
@@ -423,6 +443,11 @@ class AgentState(TypedDict, total=False):
     #: Defense-in-depth capability boundary for a non-local model while the
     #: room's Cloud Privacy policy is active.  Inherited by every worker.
     privacy_restricted: bool
+    #: The chosen provider/model has an actual channel for raw image input.
+    #: False removes pixel-returning tools before routing, so an unavailable
+    #: Video specialist cannot degrade into the File agent or capture pixels a
+    #: blind adapter will later discard.
+    image_input_available: bool
     web_enabled: bool
     write: bool
     advisors: bool
@@ -566,6 +591,9 @@ class AgentState(TypedDict, total=False):
     #: `repair_cap` a boolean: the two agents declaring 2 were given 1. The node
     #: owns the decision now and the router only reads it.
     repair_needed: bool
+    #: One bounded retry after media.video tried to answer a visual request
+    #: without successful ``view_media_frame`` evidence.
+    video_evidence_retries: int
     cancelled: bool
     #: The verb `route_action` narrowed this turn to ("" = it abstained).
     routed: str
@@ -814,6 +842,8 @@ async def prepare(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
     served = [] if no_tools else await _list_tools(deps)
     if state.get("privacy_restricted", False):
         served = [s for s in served if cloud_privacy_tool_allowed(s.name)]
+    if not state.get("image_input_available", True):
+        served = [s for s in served if s.name not in PIXEL_RESULT_TOOLS]
     served_specs = [s.to_ollama() for s in served]
     served_names = {s.get("function", {}).get("name") for s in served_specs}
     # Hub v3: the MAIN agent's only tools are its specialists — the
@@ -984,6 +1014,55 @@ async def prepare(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
         )
     )
 
+    # Visual frames are the narrow case where Arcelle already knows the exact
+    # specialist and has every slot verbatim in the planned clause. Run the
+    # first independent Video step structurally before Main's first model
+    # round; otherwise an attached transcript lets Main answer textually despite
+    # the advisory plan.  Use the step instruction, not the whole question: a
+    # mixed request must leave its remaining clauses for Main to dispatch after
+    # the Video report instead of handing unrelated work to the Video worker.
+    # The ordinary execute_tools path still owns reachability, privacy refusal,
+    # roster events and the worker sub-loop — this is not a direct/tagged bypass.
+    prepared_calls: list[ToolCall] = []
+    prepared_visual_instruction = ""
+    if (
+        agent.main
+        and not no_tools
+        and plan is not None
+        and plan.reason == "planned"
+        and bool(plan.steps)
+        and plan.steps[0].worker == "media.video"
+        and not plan.steps[0].needs_previous
+        and is_visual_video_intent(plan.steps[0].instruction)
+        and "ask_file_agent" in offered
+    ):
+        prepared_visual_instruction = plan.steps[0].instruction
+    elif (
+        agent.main
+        and not no_tools
+        and plan is not None
+        and plan.reason == "planned"
+        and not plan.steps
+        and len(plan.unavailable) == 1
+        and not plan.unplanned
+        and is_visual_video_intent(plan.unavailable[0][1])
+        and "ask_file_agent" in offered
+    ):
+        # A single Video-only request can be unavailable because Cloud Privacy
+        # removed the pixel tool or the selected model has no image transport.
+        # Still send that exact clause through the normal delegation guard so
+        # Main receives the deterministic refusal and the privacy valve gets
+        # its blocked-image receipt.  This deliberately excludes mixed plans.
+        prepared_visual_instruction = plan.unavailable[0][1]
+    if prepared_visual_instruction:
+        prepared_calls = [
+            ToolCall(
+                name="ask_file_agent",
+                arguments={"instruction": prepared_visual_instruction},
+                id="arcelle-visual-video",
+            )
+        ]
+
     return {
         "tools": tools,
         "served_specs": served_specs,
@@ -994,10 +1073,12 @@ async def prepare(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
         "force_synthesis": False,
         "stalls": 0,
         "round": 0,
-        "calls": [],
+        "calls": prepared_calls,
         "pending_images": [],
         "final_text": "",
         "progress": [],
+        "video_evidence_retries": 0,
+        "synth": bool(prepared_calls),
         "cancelled": deps.cancel.cancelled,
         "stop": False,
     }
@@ -1145,14 +1226,60 @@ async def call_model(state: AgentState, config: RunnableConfig) -> dict[str, Any
         calls = _dedupe_hub_delegations(calls)
 
     cancelled = deps.cancel.cancelled
-    stop = last or cancelled or not calls
-    return {
+
+    # A successful frame event can exist only after _ToolPass received image
+    # bytes: metadata-only receipts are converted to errors before tool_events
+    # is appended.  Therefore this is both the action receipt and the pixel
+    # receipt.  A Video worker may use transcript search to LOCATE the moment,
+    # but it cannot terminate a visual ask on those words alone.
+    agent_id = str(state.get("agent_id", ""))
+    visual_video = agent_id == "media.video" and is_visual_video_intent(
+        str(state.get("question") or "")
+    )
+    frame_evidence = any(
+        str(event.get("name") or "") == "view_media_frame"
+        for event in state.get("tool_events", [])
+    )
+    corrections_update: list[str] | None = None
+    video_retries = int(state.get("video_evidence_retries", 0))
+    if visual_video and not frame_evidence and not calls and not cancelled:
+        if not last and video_retries < 1:
+            # `route_after_model` normally treats no calls as terminal. Keep it
+            # in the loop once: execute_tools records the model's premature
+            # answer, then the next model round receives this evidence-backed
+            # correction with the frame tool still offered.
+            corrections_update = list(
+                dict.fromkeys([*corrections, VIDEO_FRAME_REQUIRED])
+            )
+            video_retries += 1
+            stop = False
+        else:
+            # One ignored correction, an exhausted round budget, or a second
+            # metadata/error receipt ends deterministically — never by passing
+            # through the transcript-derived claim the gate just rejected.
+            content = VIDEO_FRAME_MISSING
+            corrections_update = [
+                note for note in corrections if note != VIDEO_FRAME_REQUIRED
+            ]
+            stop = True
+    else:
+        stop = last or cancelled or not calls
+        if frame_evidence and VIDEO_FRAME_REQUIRED in corrections:
+            corrections_update = [
+                note for note in corrections if note != VIDEO_FRAME_REQUIRED
+            ]
+
+    update: dict[str, Any] = {
         "messages": messages,
         "final_text": content,
         "calls": [] if stop else calls,
         "cancelled": cancelled,
         "stop": stop,
+        "video_evidence_retries": video_retries,
     }
+    if corrections_update is not None:
+        update["corrections"] = corrections_update
+    return update
 
 
 async def _run_one_tool(deps: Deps, call: ToolCall) -> ToolResult:
@@ -1478,6 +1605,36 @@ def _unavailable_note(key: str, available: list[str]) -> str:
     )
 
 
+def _video_unavailable_note(*, privacy_restricted: bool) -> str:
+    """Fail closed when a file-domain request really needs video pixels.
+
+    ``ask_file_agent`` is intentionally a broad domain tool: ordinary file
+    reads remain reachable while Cloud Privacy removes ``view_media_frame``.
+    That means a domain-only availability check is insufficient. Resolving the
+    instruction against the filtered catalog silently changes the intended
+    ``media.video`` worker into the domain default (``files.read``), which then
+    receives a frame question it cannot answer. Name the blocked capability
+    and the user's recovery path instead.
+    """
+    if privacy_restricted:
+        reason = (
+            "Cloud Privacy keeps the requested video pixels on this Mac in this "
+            "protected-cloud turn"
+        )
+        recovery = (
+            "Switch to On this Mac, or use the app's one-turn approval to send "
+            "this question again with the blocked image"
+        )
+    else:
+        reason = "the selected model or provider has no usable video-image channel"
+        recovery = "Switch to an image-capable model or to On this Mac"
+    return (
+        f"The Video agent cannot inspect that frame because {reason}. MISSING: "
+        f"{recovery}. Do not substitute the File agent or infer the frame from "
+        "a transcript or text receipt."
+    )
+
+
 #: Ceiling on a report as SHOWN in the agent diagram. The report itself is
 #: never touched — this bounds only the copy that travels to the UI, because a
 #: file-reading specialist can hand back a whole book and the inspector is a
@@ -1551,6 +1708,7 @@ async def _run_worker(
         "question": instruction,
         "tool_policy": str(state.get("tool_policy", "auto")),
         "privacy_restricted": bool(state.get("privacy_restricted", False)),
+        "image_input_available": bool(state.get("image_input_available", True)),
         "web_enabled": bool(state.get("web_enabled", False)),
         "write": bool(state.get("write", False)),
         "advisors": bool(state.get("advisors", False)),
@@ -1888,16 +2046,44 @@ class _Delegator:
         self.pipeline.append(entry)
         return entry
 
-    def unavailable(self, domain_key: str | None) -> str | None:
-        """The refusal for a domain this room cannot serve, else ``None``.
+    def unavailable(
+        self, domain_key: str | None, instruction: str = ""
+    ) -> str | None:
+        """The refusal for work this room cannot serve, else ``None``.
 
         ``None`` for an UNRECOGNISED name keeps the tolerant fallback a garbled
         key has always had: `resolve_worker` lands on the default worker.
-        Recognised-but-unavailable is the case this refuses.
+        Recognised-but-unavailable is the first case this refuses.
+
+        The second is an unavailable *member* of an otherwise-live domain.
+        Most sibling domains intentionally fall back to a reachable member
+        (Browser to Web search, for example). Video perception may not: a frame
+        request resolved as ``media.video`` must never become ``files.read``
+        merely because Cloud Privacy removed its pixel tools.
         """
-        if domain_key is None or domain_key in self.live_domain_keys:
+        if domain_key is None:
             return None
-        return _unavailable_note(domain_key, self.live_domain_keys)
+        if domain_key not in self.live_domain_keys:
+            return _unavailable_note(domain_key, self.live_domain_keys)
+        if not instruction:
+            return None
+        domain_tool = DOMAIN_KEYS.get(domain_key, "")
+        intended = resolve_worker(
+            domain_tool,
+            instruction,
+            web_enabled=bool(self.state.get("web_enabled", False)),
+        )
+        if intended != "media.video":
+            return None
+        if worker_reachable(
+            get_agent(intended),
+            web_enabled=bool(self.state.get("web_enabled", False)),
+            served_names=self.served_names,
+        ):
+            return None
+        return _video_unavailable_note(
+            privacy_restricted=bool(self.state.get("privacy_restricted", False))
+        )
 
     def register_unavailable(
         self, tool: str, instruction: str, batch: int, refusal: str = ""
@@ -1920,6 +2106,19 @@ class _Delegator:
         entry["status"] = "failed"
         if refusal:
             entry["report"] = refusal
+        # The server emits this policy-owned aggregate after the graph finishes.
+        # A protected-cloud frame was withheld before capture (the safe
+        # pre-dispatch boundary), so ``redact_messages`` never sees image bytes
+        # to count. Record the refused frame here so the existing one-turn
+        # privacy valve is offered without weakening the tool gate.
+        if (
+            entry["agent"] == "media.video"
+            and bool(self.state.get("privacy_restricted", False))
+        ):
+            policy = getattr(self.deps.chat, "privacy", None)
+            report = getattr(policy, "report", None)
+            if report is not None and hasattr(report, "images_blocked"):
+                report.images_blocked += 1
         return entry
 
     async def tracked(
@@ -2046,6 +2245,7 @@ class _Delegator:
         for idx in wave:
             task_spec = plan[idx]
             key = str(task_spec.get("agent", ""))
+            instruction = str(task_spec["instruction"])
             # Accept any spelling of a domain a small model might emit —
             # short key, full tool name, or a member worker id.
             norm = normalize_domain_key(key)
@@ -2057,7 +2257,7 @@ class _Delegator:
             # weather question from room content. Report MISSING instead.
             # Belt to the braces of the generated enum + description: even
             # if that ever drifts again, this cannot become a fabrication.
-            refusal = self.unavailable(norm)
+            refusal = self.unavailable(norm, instruction)
             if refusal is not None:
                 batch.reports[idx] = f"Task {idx} could not run. {refusal}"
                 batch.task_ok[idx] = False
@@ -2066,7 +2266,7 @@ class _Delegator:
                 # the assistant is told about it in text.
                 self.register_unavailable(
                     DOMAIN_KEYS.get(norm or "", ""),
-                    str(task_spec["instruction"]),
+                    instruction,
                     band,
                     refusal,
                 )
@@ -2182,12 +2382,12 @@ class _Delegator:
             # path uses (`_ToolPass._delegation`). Launching it would hand the
             # ask to `resolve_worker`'s DEFAULT specialist under the label of
             # the one the model asked for.
-            if self.unavailable(normalize_domain_key(call.name)) is not None:
-                continue
-            self.launched.add(key)
             instruction = str(
                 (call.arguments or {}).get("instruction") or self.state.get("question", "")
             )
+            if self.unavailable(normalize_domain_key(call.name), instruction) is not None:
+                continue
+            self.launched.add(key)
             # Resolve HERE, not inside the worker: the pipeline roster has to be
             # registered in call order before anything runs concurrently.
             worker_id = resolve_worker(
@@ -2602,7 +2802,9 @@ class _ToolPass:
         # worker instead, so "ask the Web agent what the weather is" in a
         # web-off room was answered out of the user's own files under the File
         # agent's label. Same note as the batch path, and no worker runs.
-        refusal = self.delegator.unavailable(normalize_domain_key(call.name))
+        refusal = self.delegator.unavailable(
+            normalize_domain_key(call.name), instruction
+        )
         if refusal is not None:
             self.delegator.register_unavailable(
                 call.name, instruction, self.delegator.batch, refusal
@@ -2987,7 +3189,13 @@ def _fallback_answer(final: AgentState, *, cancelled: bool) -> str:
     return NOTHING_TEXT
 
 
-async def _refuse_tag(deps: Deps, tag: str, available: list[str]) -> str:
+async def _refuse_tag(
+    deps: Deps,
+    tag: str,
+    available: list[str],
+    *,
+    capability_reason: str = "",
+) -> str:
     """Answer a ``*`` tag this room cannot serve — and run nothing.
 
     NO MODEL, NO WORKER, NO FALLBACK. The three ways a tag can be unservable —
@@ -3007,6 +3215,8 @@ async def _refuse_tag(deps: Deps, tag: str, available: list[str]) -> str:
     the cause and the answer carries the refusal.
     """
     answer = tag_unavailable_answer(tag, available)
+    if capability_reason:
+        answer = f"{answer}\n\n{capability_reason}"
     await deps.emit({"t": "step", "v": f"No *{tag} specialist in this room"})
     await deps.emit({"t": "step_status", "ok": False})
     await deps.emit({"t": "final", "v": answer})
@@ -3057,6 +3267,8 @@ async def _run_tagged(
     served = await _list_tools(deps)
     if req.cloud_privacy_restricted():
         served = [s for s in served if cloud_privacy_tool_allowed(s.name)]
+    if not req.image_input_available():
+        served = [s for s in served if s.name not in PIXEL_RESULT_TOOLS]
     served_names = {s.name for s in served}
     # THE routing table, and the same one the `*` menu is drawn from: a tag the
     # menu offered is a tag this resolves, and a tag it did not is refused. No
@@ -3066,7 +3278,25 @@ async def _run_tagged(
     live = specialist_workers(web_enabled=req.web_enabled, served_names=served_names)
     worker_id = live.get(tag)
     if worker_id is None:
-        return await _refuse_tag(deps, tag, list(live))
+        capability_reason = ""
+        if tag == "video" and req.cloud_privacy_restricted():
+            capability_reason = (
+                "The Video agent cannot inspect pixels while Cloud Privacy is "
+                "protecting this cloud turn. Switch to On this Mac or use the "
+                "one-turn privacy bypass to inspect the frame."
+            )
+        elif tag == "video" and not req.image_input_available():
+            capability_reason = (
+                "The Video agent cannot inspect frames because the selected "
+                "model has no usable image-input channel. Choose a model with "
+                "Vision capability, including an On this Mac vision model."
+            )
+        return await _refuse_tag(
+            deps,
+            tag,
+            list(live),
+            capability_reason=capability_reason,
+        )
 
     worker = get_agent(worker_id)
     # The turn's ONE node, and it is the specialist — not a Main agent that
@@ -3108,6 +3338,7 @@ async def _run_tagged(
         "question": ask,
         "tool_policy": req.resolved_tool_policy(),
         "privacy_restricted": req.cloud_privacy_restricted(),
+        "image_input_available": req.image_input_available(),
         "web_enabled": req.web_enabled,
         "write": write,
         "advisors": bool(req.advisors),
@@ -3296,6 +3527,7 @@ async def run_agent(req: RunRequest, deps: Deps) -> str:
         "question": req.question,
         "tool_policy": tool_policy,
         "privacy_restricted": req.cloud_privacy_restricted(),
+        "image_input_available": req.image_input_available(),
         "web_enabled": req.web_enabled,
         "write": write,
         "advisors": bool(req.advisors),
@@ -3381,6 +3613,8 @@ async def stream_events(req: RunRequest, deps_factory: Callable[[Emit], Deps]):
                         write_enabled=write_enabled,
                         max_rounds=req.resolved_max_rounds(),
                         small_model=decision.small_model,
+                        image_input_available=req.image_input_available(),
+                        privacy_restricted=req.cloud_privacy_restricted(),
                     )
                 else:
                     await deps.emit(

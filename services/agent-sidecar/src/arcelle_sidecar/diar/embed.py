@@ -61,6 +61,7 @@ responsibility and is out of scope here.
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -226,24 +227,89 @@ EMB_DIM: int = 192
 MODEL_FILE: str = "nemo_en_titanet_small.onnx"
 
 # One onnxruntime session per model path, loaded once and reused. Mirrors
-# the Rust `OnceLock<Mutex<HashMap<PathBuf, Option<Model>>>>` cache,
-# including caching a FAILED load as "no model" so a missing file isn't
-# retried every phrase. The sidecar is single-process asyncio (no threads
-# call this concurrently), so a plain module-level dict needs no lock.
-_MODEL_CACHE: dict[str, ort.InferenceSession | None] = {}
+# the Rust `OnceLock<Mutex<HashMap<PathBuf, Option<Model>>>>` cache, minus the
+# mutex: embedding runs on worker threads (the live engine's decode task and
+# the offline rebuild both reach here through `asyncio.to_thread`, and the two
+# can overlap), but every operation below is a single atomic dict get/set/pop.
+# The only thing a race can cost is one duplicated load whose loser is dropped
+# -- wasteful, never wrong -- and an onnxruntime session is itself safe to
+# `run()` from several threads.
+#
+# SUCCESSES only. The Rust cache also stored a FAILED load, as `None`, and
+# this port used to do the same with a `path in _MODEL_CACHE` membership
+# test -- which made ONE failure permanent for the life of the process: a
+# model file that was still being copied into place, a path the host had not
+# finished resolving, or a transient onnxruntime error during the very first
+# phrase of the very first recording silently downgraded EVERY later phrase,
+# in every later recording, to the 21-dim DSP print. That is not a cosmetic
+# regression: `identity_print` needs 192 dims, so cross-recording recognition
+# and saved-voice enrollment stop working entirely, with nothing in the UI to
+# say why, until the app is restarted. Failures are now retryable.
+_MODEL_CACHE: dict[str, ort.InferenceSession] = {}
+
+#: When the most recent load attempt for a path FAILED (``time.monotonic()``),
+#: so the retry above can be rate-limited.
+_MODEL_FAILED_AT: dict[str, float] = {}
+
+#: How long a failed load suppresses the next attempt for that same path.
+#:
+#: The reason the old cache existed at all is real and is preserved here:
+#: :func:`_model_for` sits on a per-phrase hot path (:func:`titanet_embed`
+#: runs it for every 2 s window), and retrying a missing or corrupt 40 MB
+#: ONNX file on every window would burn real time to fail the same way.
+#: A window of this length costs at most one failed load attempt per half
+#: minute of audio -- unmeasurable next to the decode -- while a model that
+#: appears (or a path that becomes readable) is picked up within the same
+#: recording instead of never.
+MODEL_RETRY_SECS: float = 30.0
 
 
 def _model_for(path: str) -> ort.InferenceSession | None:
-    if path in _MODEL_CACHE:
-        return _MODEL_CACHE[path]
+    """The loaded ONNX session for `path`, or ``None`` when it cannot be
+    loaded right now.
+
+    Never raises: every caller here is infallible-by-``None`` and a broken
+    model must degrade to the DSP print, never break a recording.
+    """
+    session = _MODEL_CACHE.get(path)
+    if session is not None:
+        return session
+    failed_at = _MODEL_FAILED_AT.get(path)
+    if failed_at is not None and time.monotonic() - failed_at < MODEL_RETRY_SECS:
+        return None
     try:
-        session: ort.InferenceSession | None = ort.InferenceSession(
-            path, providers=["CPUExecutionProvider"]
-        )
+        session = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
     except Exception:
-        session = None
+        # Stamped AFTER the attempt, not before it: a slow failure (a large
+        # corrupt file onnxruntime chews on for seconds) must still leave a
+        # full quiet window behind it, or a hot path could spend most of its
+        # time inside failing loads.
+        _MODEL_FAILED_AT[path] = time.monotonic()
+        return None
     _MODEL_CACHE[path] = session
+    _MODEL_FAILED_AT.pop(path, None)
     return session
+
+
+def neural_ready(model_path: str) -> bool:
+    """Whether NEURAL embedding is actually active for `model_path` right now.
+
+    :func:`is_neural` answers a different question -- which space a vector
+    that already exists lives in -- and cannot be asked before there is a
+    vector, or when a phrase was silent. This one asks the model-load state
+    directly, which is what a caller needs in order to tell the user whether
+    the speakers it just derived carry a real voiceprint (192-dim TitaNet,
+    comparable across recordings) or the DSP fallback (which cannot be
+    enrolled or recognised later).
+
+    Loads the model if it is not loaded yet -- so ask it once per job, never
+    per phrase -- and answers ``False`` for an empty path, a missing file, or
+    a path whose last load failed inside :data:`MODEL_RETRY_SECS`. Never
+    raises.
+    """
+    if not model_path:
+        return False
+    return _model_for(model_path) is not None
 
 
 # One shared Fbank instance (mirrors the Rust `static FBANK: OnceLock<Fbank>`

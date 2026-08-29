@@ -9,7 +9,7 @@
     "dev": "node scripts/dev.mjs",
     "dev:renderer": "vite --host 127.0.0.1 --port 1420 --strictPort",
     "preview": "vite preview",
-    "test": "vitest run",
+    "test": "vitest run --maxWorkers 4",
     "test:packaging": "vitest run --config scripts/vitest.config.mjs",
     "test:watch": "vitest",
     "e2e": "scripts/e2e.sh",

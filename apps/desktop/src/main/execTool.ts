@@ -1442,8 +1442,10 @@ async function execDownloadMedia(
   try {
     const jobId = startDownloadJobInner(deps.downloadJob, url, DOWNLOAD_ENGINE_MEDIA);
     return ok(
-      `Downloading the media as background job ${jobId} — track it with job_status. The file will ` +
-        "be transcribed automatically after it arrives."
+      `Downloading the media as background job ${jobId} — track it with job_status. Once it ` +
+        "arrives the file is transcribed on this Mac with speakers separated; that pass starts " +
+        "after the job ends, so the transcript appears on the file some minutes later — and not " +
+        "at all if no speech model is installed."
     );
   } catch (e) {
     return fail(errMessage(e));

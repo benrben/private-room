@@ -13,7 +13,9 @@ for, mounted onto the sidecar's existing FastAPI app by
 =============================================================================
 
 ``/rec/start`` / ``/rec/pause`` / ``/rec/resume`` / ``/rec/set_live_stt`` /
-``/rec/set_live_translate`` / ``/rec/edit_meta`` / ``/rec/stop``.
+``/rec/set_live_translate`` / ``/rec/edit_meta`` / ``/rec/stop``. (There is an
+eighth POST route, ``/rec/retranscribe``, which is NOT one of these: it drives
+no live session at all and has its own section, §7.)
 
 ONE live session at a time -- Rust's ``RecState`` single slot
 (:class:`RecSessionManager`, held on ``app.state.rec_manager``, so two apps in
@@ -274,6 +276,94 @@ guard automatically instead of having to remember it. The header-based branch
 for every HTTP route is untouched.
 
 =============================================================================
+7. POST /rec/retranscribe -- the offline rebuild (no session at all)
+=============================================================================
+
+The one route in this module with no :class:`LiveSession` behind it. It takes a
+host-staged media FILE and streams back a freshly derived
+:class:`~arcelle_sidecar.rec.meta.RecMeta` -- the offline twin of the live
+engine, reached through the pure module-level
+:func:`~arcelle_sidecar.rec.engine.retranscribe` (which writes nothing and owns
+no state). It is not routed through :class:`RecSessionManager`: the single-slot
+invariant that manager exists for is about the CAPTURE side -- one engine, one
+lane pair, one spool, one socket -- and a rebuild has none of those, so two
+rebuilds of two different files are two ordinary requests as far as this module
+is concerned.
+
+Concurrent requests are allowed, but concurrent mutation of one shared Whisper
+context is not. ``stt/engine.py`` keeps the global cache lookup/refcount lock
+short-lived, then serializes the actual decode and its result readback on the
+cached entry's per-context lock. A rebuild, live recording and
+``/stt/transcribe_file`` therefore cannot overlap inside ``whisper_full`` when
+they share the model context, while this route still needs no second single-slot
+manager of its own.
+
+It lives here rather than in ``server.py`` because everything it needs is
+already here: the camelCase ``/rec/*`` body convention, :class:`KnownVoiceIn`,
+``RecMeta``. Auth is inherited from ``TokenAuthMiddleware``'s ordinary
+``Authorization``-header branch, like every other HTTP route in this file.
+
+Request (camelCase, :class:`RetranscribeRequest`)::
+
+    {"filePath", "modelPath", "diarizeModelPath"|null, "maxSpeakers",
+     "knownVoices": [{"name", "vec", "rejects"}], "prior": {"speakerNames",
+     "recognized", "cuts": [{"t0","t1"}]}|null,
+     "kind": "audio"|"video"|omitted}
+
+``prior.cuts`` is the one part of the prior meta that a host cannot restore
+afterwards: ``retranscribe`` re-marks every freshly derived word inside a cut
+as deleted, and a cut list pasted onto the returned meta leaves those words
+readable in the transcript, the search index and every AI prompt. A rebuild of
+an edited recording that omits them silently un-deletes what the user cut.
+
+``kind`` is the one field a caller can leave out and still be right: omitted, the
+suffix decides (:func:`_media_kind_for`). It matters because a video's audio has
+to be lifted out of its container first -- getting it wrong on an ``.mkv`` is not
+a slower decode, it is "no readable audio track" on a file that plays fine.
+
+Response: ``application/x-ndjson``, one JSON object per line ::
+
+    {"kind":"progress","doneCs":N,"totalCs":M}        # zero or more
+    {"kind":"done","meta":{...},"neural":true|false}  # exactly one of these
+    {"kind":"stopped"}                                #   three terminal lines
+    {"kind":"error","code":"REC_...","error":"..."}
+
+**Two failure channels, because HTTP forces two.** A refusal decided before the
+first byte -- a staged path outside the allowlist, a missing file or model, a
+negative ``maxSpeakers`` -- is a 400 with the ordinary ``{"error", "code"}``
+body. Anything that goes wrong after the 200 is committed can only be a
+terminal ``error`` line: ``REC_DECODE_FAILED`` (the file held no readable
+audio) or ``REC_RETRANSCRIBE_FAILED`` (``retranscribe``'s own "Transcribing at
+m:ss failed" -- a broken or missing whisper model, which is an ERROR and never
+a silently empty transcript). The 400 body carries ``"kind": "error"`` too, so
+one parser reads both.
+
+**``neural``** is the honest answer to "can these speakers be recognised
+again": ``true`` only when the TitaNet model actually loaded
+(:func:`~arcelle_sidecar.diar.embed.neural_ready`), ``false`` when the rebuild
+fell back to the 21-dim DSP voiceprint -- which cannot be enrolled as a saved
+voice or matched across recordings. A missing ``diarizeModelPath`` DEGRADES the
+rebuild rather than refusing it (a transcript is worth having without speaker
+identity), but it must never be able to pass itself off as the real thing.
+
+**Stop is the caller hanging up** -- there is no cancel endpoint, exactly as
+for the one-shot routes ``server.until_hangup`` guards, and for a stronger
+reason: a rebuild is minutes of whisper decode that nobody will read once the
+host is gone. Two signals drive the same flag, because which one fires depends
+on the ASGI spec version the server advertises: this route polls
+``request.is_disconnected()`` once a second (the ``until_hangup`` idiom), and
+the response generator's own teardown sets the flag as well -- which is the one
+that actually fires under the pinned uvicorn 0.51 / starlette 0.52, where a
+disconnect cancels the body iterator outright. ``retranscribe`` polls the flag
+between phrases and once more before the speaker pass, raises
+``RetranscribeStopped``, and writes nothing (it never writes anything: PERSISTING
+the returned meta is Electron's job, so a stopped rebuild leaves the stored
+transcript untouched by construction). The ``stopped`` line is emitted whenever
+the worker unwinds while the stream is still open; on the cancel path there is
+usually nobody left to read it, which is fine -- the property that matters is
+that the CPU stops.
+
+=============================================================================
 JUDGE NOTE: this file merges two independent candidate implementations
 =============================================================================
 
@@ -324,20 +414,24 @@ import json
 import logging
 import os
 import struct
+import tempfile
+import threading
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, AsyncIterator, Callable
 
 import numpy as np
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
 
 from arcelle_sidecar import llm
+from arcelle_sidecar.diar.embed import neural_ready
 from arcelle_sidecar.diar.recognize import KnownVoice
+from arcelle_sidecar.media.decode import MediaKind, decode_to_pcm
 from arcelle_sidecar.messages import compact_json, user_message
 from arcelle_sidecar.model_text import strip_think_spans
 from arcelle_sidecar.rec.engine import (
@@ -353,12 +447,23 @@ from arcelle_sidecar.rec.engine import (
     MsgStop,
     MsgSysTapResult,
     PersistFailed,
+    RetranscribeStopped,
     RoomClosed,
     Save,
     create_engine,
+    retranscribe,
 )
 from arcelle_sidecar.rec.lanes import Source
-from arcelle_sidecar.rec.meta import By, NoteKind, RecChapter, RecHighlight, RecMeta, RecNote
+from arcelle_sidecar.rec.meta import (
+    By,
+    NoteKind,
+    RecChapter,
+    RecCut,
+    RecHighlight,
+    RecMeta,
+    RecNote,
+    cs_of_samples,
+)
 
 log = logging.getLogger("arcelle_sidecar.rec.session_ws")
 
@@ -376,6 +481,16 @@ PERSIST_TIMEOUT: float = 15.0
 #: still applies it. Unlike ``/rec/stop`` there is no Rust "no deadline"
 #: precedent here.
 EDIT_META_TIMEOUT: float = 10.0
+
+#: How often the streaming ``/rec/retranscribe`` rebuild looks up to ask
+#: whether its caller is still on the line -- the same idiom as
+#: ``server.until_hangup``, for the same reason (a rebuild is minutes of CPU
+#: nobody will ever read once the caller is gone), deliberately looser than
+#: that function's 0.25 s: it guards a model call holding the one resident
+#: model slot, while this guards a job whose own unit of work -- one decoded
+#: phrase -- is already about a second long. Also the granularity at which
+#: queued progress lines are flushed.
+RETRANSCRIBE_POLL_SECS: float = 1.0
 
 #: The Rust source's own live-translation call shape (``recording.rs``'s
 #: ``spawn_live_translator``), reused verbatim rather than re-derived.
@@ -496,6 +611,77 @@ class EditMetaRequest(FileIdBody):
     chapter_id: str | None = None
     item_kind: str | None = None
     item_id: str | None = None
+
+
+class CutIn(_CamelModel):
+    """One studio deletion on the recording's timeline, ``{"t0", "t1"}`` in
+    centiseconds -- the wire shape of :class:`~arcelle_sidecar.rec.meta.RecCut`
+    (``RecCut.to_dict()``), so a host can post back exactly what it stored."""
+
+    t0: int
+    t1: int
+
+
+class PriorNamingIn(_CamelModel):
+    """What a rebuild inherits from the recording it is replacing (§7).
+
+    The naming overlay AND the studio deletions -- everything anchored on the
+    TIMELINE rather than on the old transcript. The transcript, its segments
+    and its word timings are about to be derived again from the audio, so
+    nothing anchored on THEM survives; the audio itself is unchanged, so
+    ``cuts`` are still exactly true.
+
+    ``speakerNames`` is the label -> name overlay the user typed, and
+    ``recognized`` says which of those names the app GUESSED from a saved
+    voice -- ``retranscribe`` drops the guesses (a guess must not outlive the
+    label it was made about) and keeps the typed ones.
+
+    ``cuts`` is load-bearing and NOT merely carried through: ``retranscribe``
+    re-marks every freshly derived word that falls inside one as deleted, which
+    is the only reason content the user cut does not resurface in the
+    transcript, in ``files.extracted_text`` (and therefore in search and in
+    every AI prompt), or in an exported copy. A host that keeps its own copy of
+    the cut list and pastes it back onto the returned meta gets the spans
+    without the marking -- the waveform skips the audio while the words are
+    still there to read. Send them.
+
+    Omitted entirely for a file that was never a recording: an import has no
+    prior naming and no cuts at all, which is not an error, just an empty
+    overlay.
+    """
+
+    speaker_names: dict[str, str] = Field(default_factory=dict)
+    recognized: list[str] = Field(default_factory=list)
+    cuts: list[CutIn] = Field(default_factory=list)
+
+
+class RetranscribeRequest(_CamelModel):
+    """``POST /rec/retranscribe`` -- see §7."""
+
+    #: The host-staged decrypted media file. Refused unless it sits directly
+    #: inside an ``arcelle-stt-*`` directory under the OS temp root (see
+    #: :func:`_staged_media_path`).
+    file_path: str
+    #: The whisper weights, already resolved by Electron -- same contract as
+    #: :class:`StartSessionRequest`.
+    model_path: str
+    #: The TitaNet ONNX weights, or ``None`` when the host found none. A
+    #: missing diarize model DEGRADES the rebuild to the DSP voiceprint rather
+    #: than refusing it; the terminal ``done`` line's ``neural`` flag says
+    #: which of the two actually happened.
+    diarize_model_path: str | None = None
+    #: 0 (the normal value) discovers however many voices are in the file; a
+    #: positive value pins the count. Negative is refused, not clamped.
+    max_speakers: int = 0
+    known_voices: list[KnownVoiceIn] = Field(default_factory=list)
+    prior: PriorNamingIn | None = None
+    #: ``"audio"`` | ``"video"``, the same knob ``/stt/transcribe_file`` takes:
+    #: a video has to have its audio track extracted before the decoder can see
+    #: it. OMITTED is the normal case and is not a synonym for ``"audio"`` --
+    #: it means "you work it out", and :func:`_media_kind_for` reads the
+    #: suffix. A value that is neither word is refused rather than quietly read
+    #: as audio, which is how a video would decode to nothing at all.
+    kind: str | None = None
 
 
 def _decode_base_samples(b64: str | None) -> np.ndarray:
@@ -1265,6 +1451,100 @@ async def _pump_session_socket(ws: Any, queue: "asyncio.Queue[str]") -> None:
 
 
 # =============================================================================
+# ---- /rec/retranscribe helpers ----------------------------------------------
+# =============================================================================
+
+
+def _ndjson_line(event: dict[str, Any]) -> bytes:
+    """One NDJSON stream line, the shape ``server.py``'s streaming routes use."""
+    return (compact_json(event) + "\n").encode("utf-8")
+
+
+def _staged_media_path(raw: str) -> Path | None:
+    """The host-staged media file `raw` names, or ``None`` when it is refused.
+
+    The SAME rule ``/stt/transcribe_file`` applies, deliberately duplicated
+    rather than loosened: the authenticated Electron host decrypts a room file
+    into a private ``arcelle-stt-*`` directory directly under the OS temp root
+    and deletes it after the call, so the resolved path's parent must be such
+    a directory and its grandparent must be the temp root itself. Refusing
+    every other path is what keeps this local endpoint from becoming a generic
+    file reader if the process token were ever disclosed -- and this route is
+    the more attractive of the two to point somewhere else, since it hands
+    back a whole transcript.
+
+    ``resolve()`` runs before the check, so ``..`` cannot walk out of the
+    staging directory and back in. A path the OS cannot even resolve (an
+    embedded NUL) is a refusal, not a 500 -- ``/stt/transcribe_file`` lets
+    that one raise, which is a difference in blast radius only.
+    """
+    try:
+        staged = Path(raw).resolve()
+    except (OSError, ValueError):
+        return None
+    temp_root = Path(tempfile.gettempdir()).resolve()
+    if staged.parent.parent != temp_root or not staged.parent.name.startswith("arcelle-stt-"):
+        return None
+    return staged
+
+
+#: Suffixes whose audio has to be lifted out of a video container (avconvert)
+#: before the audio decoder can read it. Deliberately generous: guessing VIDEO
+#: for a file that turns out to be plain audio still decodes correctly, while
+#: guessing AUDIO for a real video is how a whole meeting recording decodes to
+#: "no readable audio track". The list mirrors what the host's own media viewer
+#: is willing to open; a caller that KNOWS may send ``kind`` and skip the guess.
+_VIDEO_SUFFIXES: frozenset[str] = frozenset(
+    {
+        ".mp4", ".m4v", ".mov", ".qt", ".mkv", ".webm", ".avi", ".wmv", ".flv",
+        ".mpg", ".mpeg", ".m2v", ".ts", ".mts", ".m2ts", ".3gp", ".3g2", ".ogv",
+    }
+)
+
+
+def _media_kind_for(staged: Path, declared: str | None) -> MediaKind | None:
+    """Which of ``decode_to_pcm``'s two paths this file needs.
+
+    ``declared`` wins when the caller sent one -- it knows the room file's real
+    type, which a suffix only approximates. ``None`` means "you work it out",
+    and the suffix is all this process has to work with: the sidecar never sees
+    the room's file table. Returns ``None`` for a ``kind`` that is neither
+    word, which the route turns into a refusal: silently reading an unknown
+    value as "audio" is exactly the coercion that would make a video rebuild
+    fail for a reason nobody could see.
+    """
+    if declared is not None:
+        if declared == "video":
+            return MediaKind.VIDEO
+        if declared == "audio":
+            return MediaKind.AUDIO
+        return None
+    return MediaKind.VIDEO if staged.suffix.lower() in _VIDEO_SUFFIXES else MediaKind.AUDIO
+
+
+def _retranscribe_refused(message: str) -> JSONResponse:
+    """A rebuild refused BEFORE the stream starts: a 400 with the ``{"error",
+    "code"}`` body every other ``/rec/*`` route answers with.
+
+    The body also carries ``"kind": "error"`` so it is simultaneously a valid
+    single-line NDJSON error event. That is not decoration: the caller streams
+    this endpoint, and without it a refusal would need a second, differently
+    shaped parser on the host side for exactly the failures that are easiest
+    to hit while wiring the thing up.
+    """
+    return JSONResponse(
+        {"kind": "error", "code": "REC_BAD_REQUEST", "error": message}, status_code=400
+    )
+
+
+def _swallow_outcome(task: "asyncio.Future[Any]") -> None:
+    """Consume an abandoned rebuild's result so asyncio does not log an
+    'exception was never retrieved' for a task we deliberately gave up on."""
+    with contextlib.suppress(Exception, asyncio.CancelledError):
+        task.result()
+
+
+# =============================================================================
 # ---- route registration -------------------------------------------------------
 # =============================================================================
 
@@ -1432,6 +1712,201 @@ def register_rec_routes(app: FastAPI) -> RecSessionManager:
             await session.run_task
         await manager.finalize(session)
         return result
+
+    @app.post("/rec/retranscribe")
+    async def rec_retranscribe(req: RetranscribeRequest, request: Request) -> Any:
+        """Rebuild one host-staged media file's transcript offline (§7).
+
+        The ONE route here with no :class:`LiveSession` behind it: there is no
+        engine, no lanes, no spool and no socket -- just the pure
+        :func:`~arcelle_sidecar.rec.engine.retranscribe` pass over a decoded
+        file, streamed. It is mounted here rather than in ``server.py``
+        because everything it needs (the camelCase ``/rec/*`` body convention,
+        :class:`KnownVoiceIn`, ``RecMeta``) already lives in this module, and
+        because a caller reading ``/rec/*`` should find every recording verb
+        in one place.
+
+        Failures split by WHEN they happen, which is forced by HTTP: a refusal
+        decided before the first byte is a 400 (:func:`_retranscribe_refused`),
+        while anything that goes wrong once the 200 is committed can only be a
+        terminal ``error`` line. Both bodies carry the same ``{"kind": "error",
+        "code", "error"}`` keys so the host parses one shape.
+        """
+        staged = _staged_media_path(req.file_path)
+        if staged is None:
+            return _retranscribe_refused("the staged audio path was refused")
+        try:
+            model_path = Path(req.model_path).resolve()
+        except (OSError, ValueError):
+            return _retranscribe_refused("the speech model path was refused")
+        if not staged.is_file() or not model_path.is_file():
+            return _retranscribe_refused("the audio file or speech model is missing")
+        if req.max_speakers < 0:
+            return _retranscribe_refused("maxSpeakers must be 0 (discover) or a positive count")
+        media_kind = _media_kind_for(staged, req.kind)
+        if media_kind is None:
+            return _retranscribe_refused('kind must be "audio", "video", or omitted')
+
+        # The prior meta a rebuild carries forward. A file that was never a
+        # recording simply has none -- an empty RecMeta, not a refusal.
+        #
+        # `duration_cs` is deliberately left at 0 because `retranscribe`
+        # recomputes it from the samples it is about to decode. `chapters` /
+        # `highlights` / `notes` are pure carry-through -- `retranscribe` deep
+        # copies them and reads nothing off them -- so the host restoring them
+        # onto the returned meta is exactly equivalent, and the wire stays
+        # narrow. `cuts` are NOT in that class and must come across: the pass
+        # re-marks every freshly derived word inside a cut as deleted, and no
+        # host-side paste of the cut list can do that after the fact. Without
+        # them, pressing "Transcribe again" on an edited recording puts the
+        # deleted words back into the transcript, the search index and every
+        # AI prompt, silently. (rec/engine.py's own
+        # `test_retranscribe_marks_every_word_inside_a_carried_over_cut_as_deleted`
+        # is the promise this wiring keeps.)
+        prior = RecMeta(
+            max_speakers=req.max_speakers,
+            speaker_names=dict(req.prior.speaker_names) if req.prior else {},
+            recognized=set(req.prior.recognized) if req.prior else set(),
+            cuts=[RecCut(t0=c.t0, t1=c.t1) for c in req.prior.cuts] if req.prior else [],
+        )
+        known = [kv.to_known_voice() for kv in req.known_voices]
+        diarize_path = req.diarize_model_path or None
+
+        async def body() -> AsyncIterator[bytes]:
+            loop = asyncio.get_running_loop()
+            updates: "asyncio.Queue[tuple[int, int]]" = asyncio.Queue()
+            #: Read by the worker thread, set by this coroutine -- hence a
+            #: threading.Event and not an asyncio one.
+            stop_flag = threading.Event()
+
+            def on_progress(done_cs: int, total_cs: int) -> None:
+                # Runs ON THE WORKER THREAD, once per decoded phrase, and must
+                # never raise: `retranscribe` calls it unguarded, so an
+                # exception here would surface as "Transcribing at ... failed"
+                # and throw away a rebuild that was going fine. The only way
+                # `call_soon_threadsafe` fails is a closed loop (the sidecar is
+                # shutting down), which is exactly a case where the line has
+                # nowhere to go anyway.
+                with contextlib.suppress(RuntimeError):
+                    loop.call_soon_threadsafe(updates.put_nowait, (done_cs, total_cs))
+
+            def should_stop() -> bool:
+                return stop_flag.is_set()
+
+            def drain() -> list[bytes]:
+                lines: list[bytes] = []
+                while not updates.empty():
+                    done_cs, total_cs = updates.get_nowait()
+                    lines.append(
+                        _ndjson_line(
+                            {"kind": "progress", "doneCs": done_cs, "totalCs": total_cs}
+                        )
+                    )
+                return lines
+
+            work: "asyncio.Future[RecMeta] | None" = None
+            try:
+                # Decoding happens INSIDE the stream, not before it: on a long
+                # meeting it is a minute of afconvert on its own, and doing it
+                # before the response starts would leave the host staring at a
+                # request that has not even been accepted yet -- with no way to
+                # cancel, because cancellation here IS hanging up. The cost is
+                # that a decode failure can only be a terminal error line.
+                try:
+                    samples = await asyncio.to_thread(decode_to_pcm, staged, media_kind)
+                except (OSError, RuntimeError, ValueError) as exc:
+                    yield _ndjson_line(
+                        {"kind": "error", "code": "REC_DECODE_FAILED", "error": str(exc)}
+                    )
+                    return
+                # The duration, as early as it is known: the host draws a real
+                # progress bar from the first line instead of an unbounded
+                # spinner until the first phrase closes.
+                yield _ndjson_line(
+                    {"kind": "progress", "doneCs": 0, "totalCs": cs_of_samples(len(samples))}
+                )
+
+                work = asyncio.ensure_future(
+                    asyncio.to_thread(
+                        retranscribe,
+                        str(model_path),
+                        samples,
+                        prior,
+                        known,
+                        diarize_path,
+                        on_progress,
+                        should_stop,
+                    )
+                )
+                while True:
+                    done, _pending = await asyncio.wait(
+                        {work}, timeout=RETRANSCRIBE_POLL_SECS
+                    )
+                    # Drained AFTER the wait in both cases. `to_thread` resolves
+                    # its future through the same `call_soon_threadsafe` queue
+                    # `on_progress` posts to, and the worker's last progress
+                    # call happens before it returns -- so when `done` is set,
+                    # every progress line it ever produced is already here.
+                    for line in drain():
+                        yield line
+                    if done:
+                        break
+                    if await request.is_disconnected():
+                        # One of the two hang-up signals; see §7. Setting the
+                        # flag rather than breaking out lets the worker unwind
+                        # cleanly and produce the `stopped` line below.
+                        stop_flag.set()
+
+                try:
+                    meta = work.result()
+                except RetranscribeStopped:
+                    yield _ndjson_line({"kind": "stopped"})
+                    return
+                except Exception as exc:  # noqa: BLE001 -- `retranscribe`'s RuntimeError
+                    log.exception("rec/retranscribe: the rebuild failed")
+                    yield _ndjson_line(
+                        {
+                            "kind": "error",
+                            "code": "REC_RETRANSCRIBE_FAILED",
+                            "error": str(exc),
+                        }
+                    )
+                    return
+                # Asked after the pass, on the same cache the pass used, so a
+                # model that never loaded answers False without a reload.
+                #
+                # HONEST LIMIT, because this flag is a claim about the vectors
+                # that were just derived: `neural_ready` reports LOAD state, and
+                # `embed.MODEL_RETRY_SECS` is 30 s, so on a rebuild longer than
+                # that a model which failed at the start and became loadable
+                # later can answer True here even though early phrases got the
+                # DSP print. Nothing downstream trusts this flag over the
+                # vectors themselves -- `identity_print` re-checks the 192 dims
+                # before enrolling anyone -- so the worst case is an over-
+                # optimistic diagnostic, never a 21-dim print enrolled as a
+                # saved voice.
+                neural = await asyncio.to_thread(neural_ready, diarize_path or "")
+                yield _ndjson_line(
+                    {"kind": "done", "meta": meta.to_dict(), "neural": neural}
+                )
+            finally:
+                # The other hang-up signal, and the one that actually fires
+                # under the pinned uvicorn/starlette (see §7). Nothing is
+                # awaited here: this runs while the generator is being closed,
+                # where an await is not allowed to suspend. The flag alone is
+                # enough -- `retranscribe` polls it about once a second and
+                # then raises, so the worker thread winds itself down whether
+                # anyone is left to read the result or not.
+                stop_flag.set()
+                if work is not None and not work.done():
+                    work.cancel()
+                    work.add_done_callback(_swallow_outcome)
+
+        return StreamingResponse(
+            body(),
+            media_type="application/x-ndjson",
+            headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+        )
 
     @app.websocket("/rec/session")
     async def rec_session_ws(websocket: WebSocket) -> None:

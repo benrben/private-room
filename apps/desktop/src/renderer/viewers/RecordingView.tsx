@@ -127,6 +127,26 @@ const LANGS = [
   "Українська (Ukrainian)", "Nederlands (Dutch)", "Polski (Polish)", "Türkçe (Turkish)",
 ];
 
+/**
+ * Containers a capture session can NOT be written into — read by `capturable`
+ * below, which is where the whole rule is argued.
+ *
+ * The media containers the room imports and downloads, minus `wav`: WAV is the
+ * one format `rec_start`'s splice decodes (`decodeWav`), so it is the one a
+ * recording can be continued into. Mirrors main's `AUDIO_EXTENSIONS` /
+ * `VIDEO_EXTENSIONS` (peaksTools.ts) — the renderer cannot import from main, so
+ * this is a deliberate second copy, widened by the containers a download can
+ * arrive as. Being a list and not "anything but wav" is load-bearing: a name is
+ * free text, and a file called "Dr. Cohen call" must not be read as a container.
+ */
+const NO_CAPTURE_CONTAINERS: ReadonlySet<string> = new Set([
+  // audio
+  "m4a", "m4b", "mp3", "aac", "flac", "aiff", "aif", "caf", "ogg", "oga",
+  "opus", "wma", "amr", "alac",
+  // video
+  "mp4", "mov", "m4v", "webm", "mkv", "avi", "mpg", "mpeg", "3gp", "ts",
+]);
+
 /** The reading tabs. All four read one `RecMeta`: Transcript draws its
  * segments, and the other three are one `ReadPanel` over the notes, highlights
  * and chapters the `rec_read` job writes. Each tab states its own count, so
@@ -618,6 +638,12 @@ export default function RecordingView({
   onStop,
 }: RecordingViewProps) {
   const [meta, setMeta] = useState<RecMeta | null>(null);
+  /** The file's own name, exactly as `rec_get` reports it beside the meta.
+   * Never drawn — the viewer header already says the name — and read for one
+   * decision only: which CONTAINER this file holds, which is what `capturable`
+   * below turns into an answer. Null until the first `rec_get` answers, and
+   * null for ever if it failed; both mean "not known", never "not a WAV". */
+  const [fileName, setFileName] = useState<string | null>(null);
   const [partials, setPartials] = useState<{ mic?: string; sys?: string }>({});
   const [levels, setLevels] = useState<{ mic: number; sys: number }>({ mic: 0, sys: 0 });
   const [durationCs, setDurationCs] = useState(0);
@@ -725,6 +751,10 @@ export default function RecordingView({
         if (!dead) {
           setMeta(r.meta);
           setDurationCs(r.meta.durationCs);
+          // The other two `recGet` calls below refresh the meta of a file that
+          // is already open; only this one can learn its name for the first
+          // time, and a rename never changes the bytes `capturable` is about.
+          setFileName(r.name);
         }
       })
       .catch((e) => pushToast("error", String(e)));
@@ -1615,6 +1645,45 @@ export default function RecordingView({
   // file has a live session — even paused, the engine's in-memory meta would
   // overwrite the edit on its next flush.
   const canEdit = !isLive;
+  /** The container this file's name claims, lower-cased — "" when the name
+   * carries no extension at all, and null while the name is unknown. */
+  const dot = fileName === null ? -1 : fileName.lastIndexOf(".");
+  const container =
+    fileName === null ? null : dot > 0 ? fileName.slice(dot + 1).toLowerCase() : "";
+  /**
+   * Can a capture session write into THIS file?
+   *
+   * A `recordings` row used to be proof that Arcelle made the file. It is not
+   * any more: an imported or downloaded media file gets one too, so that it
+   * opens in this view — speaker chips, click-to-rename, the waveform's lanes —
+   * instead of the plain player. Capture is the one thing that does NOT carry
+   * over. `rec_start` splices the new audio onto the samples it decodes out of
+   * the stored file, and that decoder (`decodeWav`) reads WAV and nothing else,
+   * so "Continue recording" on an imported .mp3 is the page's one red primary
+   * button offering an act whose only possible answer is the engine's error
+   * string — over a preflight that promises "nothing already recorded is lost"
+   * about a file nothing ever recorded into.
+   *
+   * The name is the only container signal this view is handed (`rec_get`
+   * returns it beside the meta), and it is read the way the rest of the app
+   * reads a container: by extension. Every unknown defaults toward KEEPING the
+   * control, because losing the record button on a real recording is a far
+   * worse failure than an error toast on an import:
+   *   - the name has not arrived, or `rec_get` failed  → unknown, keep it;
+   *   - the name has no extension (a recording someone renamed to "Standup")
+   *     → unknown, keep it;
+   *   - the name ends in something that is not a container this app knows
+   *     → unknown, keep it. This is the list and not `!== "wav"` for a reason:
+   *     a file's name is free text a person types, so "Dr. Cohen call",
+   *     "Q3 kickoff v1.2" and "2026.08.28 standup" all end in a dotted token,
+   *     and reading those as containers called "cohen call", "2" and
+   *     "28 standup" took the record button off three perfectly ordinary
+   *     recordings — the very failure this note calls the worse one.
+   * Only a name positively stating some OTHER container takes the capture
+   * cluster away. And a live session on this very file is proof by
+   * demonstration that capture works here, whatever the name says.
+   */
+  const capturable = isLive || container === null || !NO_CAPTURE_CONTAINERS.has(container);
   const hasWords = segments.some((s) => s.words.length > 0);
   // Anything actually cut. `hasWords` is true of every word-timed transcript,
   // edited or not, so gating "Show deleted" on it put a permanent checkbox
@@ -1876,7 +1945,10 @@ export default function RecordingView({
                 <PlayIcon size={14} />
               </button>
             )}
-            {status !== "saving" && (
+            {/* `capturable`: a file this app cannot record into is not offered
+                a record button. See the note on the constant — the backend
+                refuses, so the only thing drawing it buys is the refusal. */}
+            {status !== "saving" && capturable && (
               <button
                 className={primary.cls}
                 title={primary.title}
@@ -2025,8 +2097,11 @@ export default function RecordingView({
             opens, so the settings appear exactly where they are about to be
             used. A file that has never been recorded still shows them here —
             there is nothing else on that page to bury them under, and they are
-            the only thing it is asking for. */}
-        {showsChoicesInline(stage) && (
+            the only thing it is asking for.
+
+            …and not at all on a file no capture can write into: every control
+            in this row configures a session that file will never have. */}
+        {capturable && showsChoicesInline(stage) && (
           <div className="rec-options">
             {status === "idle" && captureChoices}
             {isLive && (
@@ -2049,8 +2124,17 @@ export default function RecordingView({
         {/* The preflight: the same choices, at the moment they mean something.
             It is opened by "Continue recording" and its own button is what
             actually starts the session, so the settings above it are read
-            after they have been seen rather than before. */}
-        {needsPreflight(stage) && preflight && (
+            after they have been seen rather than before.
+
+            On `capturable` like the button that opens it, and not because the
+            two are the same condition: `preflight` is STATE, and the file's
+            name — the only thing that can answer `capturable` — arrives after
+            the first paint. A press in that window (the duration comes from the
+            media element, which can beat `rec_get`) leaves this panel open on a
+            file the name then rules out, promising "nothing already recorded is
+            lost" over an import, with a live start button under it. Reading
+            `capturable` here closes it the moment the answer arrives. */}
+        {capturable && needsPreflight(stage) && preflight && (
           <div className="rec-preflight" id="rec-preflight" data-testid="rec-preflight">
             <p className="rec-preflight-lead">
               Continue recording into this file — nothing already recorded is
@@ -2317,8 +2401,14 @@ export default function RecordingView({
                       has a closed microphone, and a FINISHED recording holding
                       an hour of audio and no words was told the answer was to
                       record more into it — with the control that actually
-                      rescues it shut inside a drawer named after exports. */}
-                  {stage === "fresh" ? (
+                      rescues it shut inside a drawer named after exports.
+
+                      …and on `capturable` too: the "fresh" copy is one long
+                      instruction to press a record button, which a file no
+                      capture can write into does not have. Such a file reads
+                      as finished whatever its length says, because it is —
+                      nothing more is ever going to be recorded into it. */}
+                  {stage === "fresh" && capturable ? (
                     <>
                       <p className="rec-empty-lead">
                         <strong>This file records and understands speech — live.</strong>
@@ -2337,7 +2427,7 @@ export default function RecordingView({
                         trust chip in the status bar says whether that one is local or in the cloud.
                       </p>
                     </>
-                  ) : stage === "finished" ? (
+                  ) : stage === "finished" || !capturable ? (
                     <>
                       <p className="rec-empty-lead">
                         <strong>
@@ -2345,11 +2435,25 @@ export default function RecordingView({
                           up yet.
                         </strong>
                       </p>
-                      <p>
-                        Live transcription may have been off while it was made, or the speech
-                        model missing at the time. Writing it up rebuilds the words from the
-                        audio this file already holds — on this Mac, and the audio is untouched.
-                      </p>
+                      {capturable ? (
+                        <p>
+                          Live transcription may have been off while it was made, or the speech
+                          model missing at the time. Writing it up rebuilds the words from the
+                          audio this file already holds — on this Mac, and the audio is untouched.
+                        </p>
+                      ) : (
+                        /* This file was never captured here — it is an import or
+                           a download, which lands in this view because it carries
+                           a recording's meta — so there was no live-transcription
+                           setting to have been off, and blaming one would be an
+                           invented history of a file this app has never recorded.
+                           The offer below is the same one, and it is the only
+                           half of that paragraph that was ever about this file. */
+                        <p>
+                          Writing it up reads the words out of the audio this file already
+                          holds — on this Mac, and the audio is untouched.
+                        </p>
+                      )}
                       {canRetranscribe && (
                         <button
                           className="nb-btn"
@@ -2532,12 +2636,30 @@ export default function RecordingView({
                   </div>
                 </div>
               ))}
-              {!isLive && segments.length > 0 && (
+              {segments.length > 0 && (
                 <p className="rec-read-note">
                   {/* Naming a voice was the one edit nothing on screen named:
-                      the chip's whole affordance was a tooltip. */}
-                  Click a speaker’s name to say who they were. Select words
-                  above to correct them, or to delete them from the recording.
+                      the chip's whole affordance was a tooltip.
+
+                      That fault was fixed for a FINISHED recording and left
+                      standing for a live one, because the whole paragraph hung
+                      off `!isLive`. Nothing about renaming is gated on the
+                      session: the same SpeakerChip is drawn either way, and
+                      `rename_speaker` is one of the live-safe ops the session
+                      socket accepts (recBridge's `RecEditOp`) — so mid-meeting
+                      the affordance was real, worked, and was invisible, which
+                      is precisely the fault, for exactly as long as the meeting
+                      lasted. Naming voices as people introduce themselves is
+                      also when a person actually knows who is talking. */}
+                  Click a speaker’s name to say who they were.
+                  {/* The other half is NOT live-safe and keeps its gate: the
+                      backend refuses rec_delete_range / rec_correct_range while
+                      the file has a live session, so the selection bar never
+                      appears (`canEdit`) and inviting the act would describe
+                      one that produces nothing. Same rule as the transcript's
+                      aria-label above. */}
+                  {canEdit &&
+                    " Select words above to correct them, or to delete them from the recording."}
                 </p>
               )}
               <div ref={listEndRef} />

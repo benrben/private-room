@@ -36,7 +36,7 @@ from arcelle_sidecar.agents import (
 )
 from arcelle_sidecar.graph import NOTHING_USABLE_TEXT
 from arcelle_sidecar.manager import resolve_worker
-from arcelle_sidecar.planner import MAX_PLAN_STEPS, build_plan
+from arcelle_sidecar.planner import MAX_PLAN_STEPS, build_plan, is_visual_video_intent
 
 # The tiers the Rust bridge really serves (room_mcp::ToolScope), same shape as
 # test_capability_truth.py — CloudAdvisor is CORE only, LocalEngine is the lot.
@@ -97,6 +97,50 @@ def test_broad_mutation_verbs_do_not_force_the_file_domain(question: str) -> Non
     plan = build_plan(question, web_enabled=True, served_names=set(_EVERYTHING))
 
     assert not plan.steps or plan.steps[0].domain != "file"
+
+
+def test_exact_visual_frame_request_plans_video_with_verbatim_instruction() -> None:
+    question = "what you see in frame 6:00 in @video.mp4"
+
+    plan = build_plan(
+        question,
+        web_enabled=False,
+        served_names=set(_EVERYTHING),
+    )
+
+    assert plan.reason == "planned"
+    assert [(step.domain, step.worker) for step in plan.steps] == [
+        ("file", "media.video")
+    ]
+    assert plan.steps[0].instruction == question
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "transcribe video.mp4",
+        "show me the transcript of video.mp4",
+        "describe the video transcript",
+        "explain video codecs",
+        "summarize the framework document",
+        "tell me the frame rate of video.mp4",
+    ],
+)
+def test_visual_video_planning_does_not_claim_text_or_metadata_asks(
+    question: str,
+) -> None:
+    assert not is_visual_video_intent(question)
+
+
+def test_visual_frame_plan_names_video_unavailable_without_its_pixel_tool() -> None:
+    plan = build_plan(
+        "what you see in frame 6:00 in @video.mp4",
+        web_enabled=False,
+        served_names=set(CORE_TOOLS),
+    )
+
+    assert plan.steps == ()
+    assert plan.unavailable == (("Video agent", "what you see in frame 6:00 in @video.mp4"),)
 
 
 # --------------------------------------------------------------------------- #

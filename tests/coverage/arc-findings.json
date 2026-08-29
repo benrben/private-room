@@ -169,7 +169,7 @@
       "tests": [
         { "framework": "node:test", "file": "tests/contract/arcElectronBoundary.test.mjs", "test": "[ARC-020] MKV waveform fallback and FLAC transcription are wired" },
         { "framework": "vitest", "file": "apps/desktop/src/main/peaksTools.test.ts", "test": "falls back to a system ffmpeg when avconvert cannot demux MKV AAC" },
-        { "framework": "vitest", "file": "apps/desktop/src/main/fileRuntimeSurfaceIpc.test.ts", "test": "automatically transcribes imported FLAC audio, not unrelated files" }
+        { "framework": "vitest", "file": "apps/desktop/src/main/fileRuntimeSurfaceIpc.test.ts", "test": "still runs itself for an imported FLAC only — eligibility is an offer, not a trigger" }
       ]
     },
     {

@@ -19,6 +19,7 @@ reload-vs-cache-hit behavior need a known starting state each time.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import threading
 from pathlib import Path
@@ -30,7 +31,30 @@ from arcelle_sidecar.media.decode import MediaKind, decode_to_pcm
 from arcelle_sidecar.stt import engine
 from pywhispercpp.model import Model
 
-MODEL_PATH = "/Users/benreich/private-room/apps/desktop/assets/models/ggml-large-v3-turbo-q5_0.bin"
+_MODEL_ENV = "ARCELLE_TEST_WHISPER_MODEL"
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
+
+def _resolve_whisper_model() -> Path:
+    if override := os.environ.get(_MODEL_ENV):
+        path = Path(override).expanduser().resolve()
+        if not path.is_file():
+            raise FileNotFoundError(f"{_MODEL_ENV} does not name a file: {path}")
+        return path
+
+    downloaded = (
+        Path.home()
+        / "Library/Application Support/com.benreich.privateroom/models"
+        / "ggml-large-v3-turbo-q5_0.bin"
+    )
+    bundled = (
+        _REPO_ROOT / "apps/desktop/resources/models/ggml-large-v3-turbo-q5_0.bin",
+        _REPO_ROOT / "apps/desktop/assets/models/ggml-large-v3-turbo-q5_0.bin",
+    )
+    return next((path for path in (downloaded, *bundled) if path.is_file()), bundled[0])
+
+
+MODEL_PATH = str(_resolve_whisper_model())
 _HAS_MODEL = Path(MODEL_PATH).exists()
 _HAS_SAY = Path("/usr/bin/say").exists()
 _HAS_AFCONVERT = Path("/usr/bin/afconvert").exists()
@@ -38,7 +62,7 @@ _HAS_MODEL_AND_TOOLS = _HAS_MODEL and _HAS_SAY and _HAS_AFCONVERT
 
 requires_model = pytest.mark.skipif(
     not _HAS_MODEL_AND_TOOLS,
-    reason=f"requires the downloaded model at {MODEL_PATH} + macOS `say`/`afconvert`",
+    reason=f"requires a Whisper model ({_MODEL_ENV}) + macOS `say`/`afconvert`",
 )
 
 

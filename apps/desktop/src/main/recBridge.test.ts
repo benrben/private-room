@@ -38,20 +38,25 @@ import type { OpenRoom } from "./turnEngine.js";
 import {
   RecControlError,
   attachHostWs,
+  beginRetranscribe,
   buildTranslatePrompt,
   buildTranslatedDocument,
   coerceRecMeta,
   correctWords,
   createRecBridgeCtx,
   decryptSpoolFrame,
+  endRetranscribe,
   handlePersistRequest,
+  isRetranscribing,
   noteLiveSessionEnded,
   parseRecMeta,
   readSpoolFrame,
   recChapterAdd,
   recChapterSet,
   recCorrectRange,
+  recCorrectRangeHybrid,
   recDeleteRange,
+  recDeleteRangeHybrid,
   recExportClean,
   recGet,
   recHighlightAdd,
@@ -1584,8 +1589,102 @@ describe("out-of-scope commands", () => {
     const ctx = makeCtx(db);
     await expect(recPushAudio(48_000, "AAAA")).rejects.toThrowError(/WS \/rec\/session/);
     await expect(recReadStart(db, ctx, "x")).rejects.toThrowError(/background AI job/);
-    await expect(recRetranscribe(db, ctx, "x")).rejects.toThrowError(/no HTTP route mounted/);
-    // The follow-up must not silently drop the guard set that goes with it.
-    await expect(recRetranscribe(db, ctx, "x")).rejects.toThrowError(/retranscribing/);
+    // `recRetranscribe` is now only the DEFAULT behind `recIpc.ts`'s
+    // `live.retranscribe ?? …` seam, so its refusal must name the real
+    // implementation rather than the old (and now false) "no route exists".
+    const why = await recRetranscribe(db, ctx, "x").then(
+      () => "resolved",
+      (e: unknown) => String(e),
+    );
+    expect(why).toContain("transcribeMediaWithSpeakers");
+    expect(why).not.toContain("no HTTP route mounted");
+  });
+});
+
+// ============================================== the `retranscribing` guard set
+
+describe("the retranscribing guard set (recording_cmds.rs:12-15)", () => {
+  it("blocks the three commands Rust blocks, and only while a rebuild is claimed", async () => {
+    const db = freshRoom();
+    const ctx = makeCtx(db, {
+      sidecarPost: fakePost({
+        "/rec/start": (body) => ({
+          status: 200,
+          json: { ok: true, fileId: (body as { fileId: string }).fileId, spoolKey: "a2V5", spoolPath: "/tmp/x.spool" },
+        }),
+      }),
+      connectHostWs: () => fakeHostWs(),
+    });
+    const id = addRecording(db, "call.wav", {
+      ...defaultRecMeta(),
+      durationCs: 1000,
+      segments: [phrase([word("keep", 0, 100), word("cut", 100, 200)])],
+    });
+
+    expect(beginRetranscribe(id)).toBe(true);
+    // A second claim on the same file is refused — one rebuild at a time.
+    expect(beginRetranscribe(id)).toBe(false);
+    expect(isRetranscribing(id)).toBe(true);
+
+    const refusal = /being re-transcribed/;
+    expect(() => recDeleteRange(db, ctx, id, 0, 100)).toThrowError(refusal);
+    expect(() => recCorrectRange(db, ctx, id, 0, 100, "x")).toThrowError(refusal);
+    // RESUMING this file appends audio the in-flight rebuild has never seen,
+    // so every timestamp past the join would be wrong.
+    await expect(recStart(db, ctx, { fileId: id, systemAudio: false })).rejects.toThrowError(refusal);
+    // …but a BRAND-NEW recording shares nothing with it and must still start.
+    await expect(recStart(db, ctx, { systemAudio: false })).resolves.toMatchObject({ name: expect.any(String) });
+
+    endRetranscribe(id);
+    ctx.state.liveFileId = null;
+    expect(isRetranscribing(id)).toBe(false);
+    expect(recDeleteRange(db, ctx, id, 0, 100).cuts).toEqual([{ t0: 0, t1: 100 }]);
+  });
+
+  it("refuses a workspace-room edit BEFORE it spends a History version on it", async () => {
+    // `recDeleteRangeHybrid`/`recCorrectRangeHybrid` snapshot first and edit
+    // second, so a guard that only lives inside the inner function still costs
+    // the file one of its ten kept versions for an edit that never happened.
+    const db = freshRoom();
+    const id = addRecording(db, "call.wav", {
+      ...defaultRecMeta(),
+      durationCs: 1000,
+      segments: [phrase([word("keep", 0, 100), word("cut", 100, 200)])],
+    });
+    let snapshots = 0;
+    const ctx = makeCtx(db, {
+      currentRoom: (): OpenRoom | null => ({
+        db,
+        path: roomPath,
+        workspace: {
+          snapshotVersion: async (): Promise<string> => {
+            snapshots += 1;
+            return "version-id";
+          },
+        } as unknown as NonNullable<OpenRoom["workspace"]>,
+      }),
+    });
+
+    expect(beginRetranscribe(id)).toBe(true);
+    try {
+      await expect(recDeleteRangeHybrid(db, ctx, id, 0, 100)).rejects.toThrowError(/being re-transcribed/);
+      await expect(recCorrectRangeHybrid(db, ctx, id, 0, 100, "x")).rejects.toThrowError(/being re-transcribed/);
+      expect(snapshots).toBe(0);
+    } finally {
+      endRetranscribe(id);
+    }
+    // Released, the same call snapshots and edits as it always did.
+    await expect(recDeleteRangeHybrid(db, ctx, id, 0, 100)).resolves.toMatchObject({
+      cuts: [{ t0: 0, t1: 100 }],
+    });
+    expect(snapshots).toBe(1);
+  });
+
+  it("endRetranscribe is idempotent, so a doubly-released claim cannot wedge a file", () => {
+    endRetranscribe("never-claimed");
+    expect(beginRetranscribe("never-claimed")).toBe(true);
+    endRetranscribe("never-claimed");
+    endRetranscribe("never-claimed");
+    expect(isRetranscribing("never-claimed")).toBe(false);
   });
 });

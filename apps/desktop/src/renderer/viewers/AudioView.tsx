@@ -159,9 +159,10 @@ export default function AudioView({
       setRetranscribeErr(String(e));
     }
   }
-  // A file the decoder rejects (empty, truncated, unsupported codec) must say
-  // so — "No transcript yet" on a 0-duration recording reads as "keep waiting"
-  // for audio that will never play or transcribe.
+  // A file the PLAYER rejects (empty, truncated, or a codec Chromium does not
+  // support) must say so — but that says nothing about the separate on-device
+  // transcription decoder. In particular CAF/AIFF/AIF can fail here while the
+  // transcription lane can still read their audio.
   const [mediaDead, setMediaDead] = useState(false);
   // Real playback duration in seconds once known, or null while unknown. A
   // streamed source often reports Infinity until forced (see onMediaMeta).
@@ -471,9 +472,9 @@ export default function AudioView({
       )}
       {/* Transcript readiness is a first-class state, named right under the
           player — scanning it must never require reading the empty-hint prose.
-          The strip is ALWAYS drawn: hiding it until a length was known also
-          hid the Transcribe button on every file whose duration the decoder
-          can't work out, leaving no way to run the transcriber at all. */}
+          The strip and button are ALWAYS drawn: browser playback and the
+          on-device transcriber use different decoders, so a media `error`
+          must not remove the one action that can still recover CAF/AIFF/AIF. */}
       <div className="audio-meta">
         <span>
           {kind !== "video" && dur != null && (
@@ -498,27 +499,25 @@ export default function AudioView({
                         ? "No speech detected"
                         : "No transcript yet"}
         </span>
-        {!mediaDead && (
-          <button
-            className="btn-ic audio-retranscribe"
-            disabled={busy}
-            onClick={() => void retranscribe()}
-            title={
-              hasSpeech
-                ? "Run the on-device transcriber again, replacing this transcript"
-                : "Run the on-device transcriber on this file"
-            }
-          >
-            <RefreshIcon size={12} className={transcribing ? "spin" : undefined} />
-            {queued
-              ? "Queued…"
-              : transcribing
-                ? "Transcribing…"
-                : hasSpeech
-                  ? "Re-transcribe"
-                  : "Transcribe"}
-          </button>
-        )}
+        <button
+          className="btn-ic audio-retranscribe"
+          disabled={busy}
+          onClick={() => void retranscribe()}
+          title={
+            hasSpeech
+              ? "Run the on-device transcriber again, replacing this transcript"
+              : "Run the on-device transcriber on this file"
+          }
+        >
+          <RefreshIcon size={12} className={transcribing ? "spin" : undefined} />
+          {queued
+            ? "Queued…"
+            : transcribing
+              ? "Transcribing…"
+              : hasSpeech
+                ? "Re-transcribe"
+                : "Transcribe"}
+        </button>
       </div>
       {retranscribeErr && <div className="gate-error">{retranscribeErr}</div>}
       {/* Trim and stills. Both WRITE A NEW FILE — the video you are watching is
@@ -611,9 +610,11 @@ export default function AudioView({
         </div>
       ) : mediaDead ? (
         <div className="empty-hint">
-          This {kind === "video" ? "video" : "recording"} couldn't be decoded —
-          the file appears to be empty or in a format this Mac can't play, so
-          there is no audio to transcribe. Try re-importing the original file.
+          This {kind === "video" ? "video" : "recording"} couldn't be played in
+          the built-in player. Playback and on-device transcription use different
+          decoders, so Transcribe above may still read its audio. If that fails,
+          convert it to {kind === "video" ? "MP4" : "M4A, MP3 or WAV"} and import
+          it again.
         </div>
       ) : rows.length > 0 ? (
         // Rows exist but none carry words (a lone "." or silence markers) — the

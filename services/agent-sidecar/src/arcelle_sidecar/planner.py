@@ -77,6 +77,7 @@ from .agents import (
     get_agent,
     normalize_domain_key,
     reachable_domain_keys,
+    worker_reachable,
 )
 from .manager import rank_worker, resolve_worker
 from .prompts import no_plan_note, plan_note
@@ -101,6 +102,38 @@ MIN_CLAIM_SCORE = 2
 #: both are worse than saying "I could not plan this one", which is a state this
 #: module already has a truthful answer for.
 MAX_PLAN_STEPS = 6
+
+
+_VIDEO_FILE_RE = re.compile(r"(?i)\.(?:mp4|mov|m4v|webm)\b")
+_VIDEO_MEDIUM_RE = re.compile(r"(?i)\b(?:video|footage|clip|recording)\b")
+_FRAME_RE = re.compile(r"(?i)\bframe\b")
+_TRANSCRIPT_RE = re.compile(r"(?i)\btranscri(?:be|bed|bing|pt|ption)\b")
+_TIMESTAMP_RE = re.compile(r"(?<!\d)\d{1,2}:\d{2}(?::\d{2})?(?!\d)")
+_VISUAL_WORDS_RE = re.compile(
+    r"(?i)(?:\bwhat\b.{0,48}\b(?:see|visible|shown)\b|"
+    r"\b(?:show|describe|inspect|look at|watch)\b.{0,48}"
+    r"\b(?:frame|scene|screen|video|footage|clip|recording)\b|"
+    r"\b(?:on screen|which slide is (?:up|visible|shown))\b)"
+)
+
+
+def is_visual_video_intent(question: str) -> bool:
+    """Whether ``question`` unambiguously asks for video pixels.
+
+    This is deliberately narrower than the Video specialist's sibling-routing
+    vocabulary.  A bare ``video`` can mean transcription, file management or a
+    question about codecs; deterministically opening pixels is justified only
+    when visual language is paired with a video/file anchor, or when a frame is
+    paired with a timestamp.  The original words remain the delegation's slots.
+    """
+    q = " ".join(question.split())
+    frame = bool(_FRAME_RE.search(q))
+    timestamp = bool(_TIMESTAMP_RE.search(q))
+    medium = bool(_VIDEO_FILE_RE.search(q) or _VIDEO_MEDIUM_RE.search(q))
+    visual = bool(_VISUAL_WORDS_RE.search(q))
+    if _TRANSCRIPT_RE.search(q) and not frame:
+        return False
+    return (frame and timestamp) or (timestamp and visual) or (medium and visual)
 
 #: Separators a USER typed. Deliberately conservative: no bare "and" (it joins
 #: two halves of one errand far more often than two errands — "find the rent and
@@ -262,7 +295,11 @@ _DOMAIN_VOCABULARY: tuple[tuple[str, AgentSpec], ...] = tuple(
 
 
 def _pick(
-    clause: str, *, web_enabled: bool, live: list[str]
+    clause: str,
+    *,
+    web_enabled: bool,
+    live: list[str],
+    served_names: set[str],
 ) -> tuple[str, str]:
     """Which domain this clause names: ``("domain"|"unavailable"|"none", v)``.
 
@@ -276,6 +313,22 @@ def _pick(
     Strictly-greater keeps :data:`.agents.AGENT_TOOL_DOMAINS` order on a tie, so
     the pick is a pure function of the clause — never of set iteration order.
     """
+    # A visual-video request is a high-confidence NON-DEFAULT member of the
+    # broad File domain.  The generic planner intentionally scores only domain
+    # defaults because sibling vocabularies such as Browser's ``open`` are too
+    # broad cross-domain.  Keeping this one receipt-critical exception explicit
+    # prevents ``frame 6:00 in @video.mp4`` from becoming an abstained plan and
+    # leaving Main free to answer from an attached transcript.
+    if is_visual_video_intent(clause):
+        video = get_agent("media.video")
+        if worker_reachable(
+            video,
+            web_enabled=web_enabled,
+            served_names=served_names,
+        ):
+            return ("domain", normalize_domain_key(video.id) or "file")
+        return ("unavailable", video.label)
+
     q = clause.lower()
     best: tuple[str, AgentSpec] | None = None
     best_rank = (0, False, 0)
@@ -330,7 +383,15 @@ def build_plan(
     default_tool = DOMAIN_KEYS[default_key] if default_key in live else ""
 
     clauses = _clauses(question)
-    picks = [_pick(text, web_enabled=web_enabled, live=live) for text, _ in clauses]
+    picks = [
+        _pick(
+            text,
+            web_enabled=web_enabled,
+            live=live,
+            served_names=served_names,
+        )
+        for text, _ in clauses
+    ]
     if not any(kind != "none" for kind, _ in picks):
         # Nothing in the words named a specialist. The vocabulary genuinely
         # cannot see "compare my rent to the market" as file+web, and forcing a
@@ -423,4 +484,5 @@ __all__ = [
     "Plan",
     "PlanStep",
     "build_plan",
+    "is_visual_video_intent",
 ]

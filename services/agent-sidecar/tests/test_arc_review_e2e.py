@@ -127,6 +127,61 @@ async def test_e2e_arc_004_024_028_capabilities_and_tagged_refusal() -> None:
     assert mcp.calls == []
     assert "*video isn't a specialist this room has" in outcome.final
 
+    # A protected cloud still has ordinary file reads, so ask_file_agent stays
+    # in the Main agent's catalog.  A visual video instruction must not use
+    # that surviving domain as a back door into files.read when Video's pixel
+    # tool was removed.  This is the exact installed failure mode: the user did
+    # not mistag the turn; the hub selected its closest remaining domain.
+    hub = FakeChatModel(
+        [
+            Round(
+                calls=[
+                    call(
+                        "ask_file_agent",
+                        instruction="Inspect video.mp4 at 1:05 and describe only the visible frame.",
+                    )
+                ]
+            ),
+            Round(
+                content=(
+                    "MISSING: Cloud Privacy kept the video frame on this Mac. "
+                    "Switch to On this Mac or approve the blocked image for one turn."
+                )
+            ),
+        ]
+    )
+    protected_room = FakeMCP(tools=specs(sorted(effective)))
+    protected_request = make_request(
+        "Inspect video.mp4 at 1:05 and describe only the visible frame.",
+        model="minimax-m3:cloud",
+    )
+    protected_request.privacy = {"active": True, "rules": []}
+    protected = await drive(protected_request, hub, protected_room)
+
+    assert protected_room.calls == []
+    assert "MISSING:" in protected.final
+    assert "Cloud Privacy" in protected.final
+    assert "On this Mac" in protected.final
+    tool_results = [
+        str(message.get("content") or "")
+        for turn in hub.seen_messages
+        for message in turn
+        if message.get("role") == "tool"
+    ]
+    refusal = next(text for text in tool_results if "Video agent" in text)
+    assert "protected-cloud turn" in refusal
+    assert "Do not substitute the File agent" in refusal
+    plan_entries = [
+        entry
+        for event in protected.of("plan")
+        for entry in event["v"]
+    ]
+    assert not any(entry.get("agent") == "files.read" for entry in plan_entries)
+    assert any(
+        entry.get("agent") == "media.video" and entry.get("status") == "failed"
+        for entry in plan_entries
+    )
+
 
 def _studio_receipt(name: str) -> str:
     return (
@@ -320,7 +375,7 @@ async def test_e2e_arc_011_024_frame_receipt_and_pixels_reach_model() -> None:
     receipt = "FRAME timestamp=1.05s width=640 height=360 sha256=abc123"
     chat = FakeChatModel(
         [
-            Round(calls=[call("view_media_frame", name="qa.mp4", timestamp="1.05")]),
+            Round(calls=[call("view_media_frame", name="qa.mp4", at="1.05")]),
             Round(content="FOUND: the exact attached frame shows color bars at 1.05s."),
         ]
     )
@@ -338,6 +393,36 @@ async def test_e2e_arc_011_024_frame_receipt_and_pixels_reach_model() -> None:
     second_round = chat.seen_messages[1]
     assert any(receipt in str(message.get("content")) for message in second_round)
     assert any(message.get("images") == [pixel] for message in second_round)
+
+    # The protected-cloud case above removes this tool before dispatch.  With
+    # the door explicitly open for a vision-capable direct cloud model, the
+    # inverse contract also matters: do not over-correct by stripping Video.
+    cloud_chat = FakeChatModel(
+        [
+            Round(calls=[call("view_media_frame", name="qa.mp4", at="1.05")]),
+            Round(content="FOUND: the direct cloud model received the same color bars."),
+        ]
+    )
+    cloud_room = FakeMCP(
+        tools=specs(["view_media_frame", "search_room"]),
+        results={"view_media_frame": ToolResult(text=receipt, images=[pixel])},
+    )
+    cloud = await drive_worker(
+        make_request(
+            "what is on screen in qa.mp4 at 1.05 seconds",
+            model="openrouter::vision-capable/test-model",
+        ),
+        cloud_chat,
+        cloud_room,
+        agent_id="media.video",
+    )
+    assert cloud.final.startswith("FOUND:")
+    assert "view_media_frame" in cloud_chat.offered_names[0]
+    assert cloud_room.calls == [
+        ("view_media_frame", {"name": "qa.mp4", "at": "1.05"})
+    ]
+    cloud_second_round = cloud_chat.seen_messages[1]
+    assert any(message.get("images") == [pixel] for message in cloud_second_round)
 
 
 async def test_e2e_arc_027_retranscribe_terminal_and_pending_contract() -> None:

@@ -1129,6 +1129,8 @@ export default function ChatPane({
                   ? `${s.askPrivacy.entities_hidden} private detail${
                       (s.askPrivacy.entities_hidden ?? 0) === 1 ? "" : "s"
                     } hidden from the cloud model`
+                  : (s.askPrivacy.images_blocked ?? 0) > 0
+                    ? "Shielded — no private text needed hiding"
                   : "Shielded — nothing private needed hiding"}
                 {(s.askPrivacy.images_blocked ?? 0) > 0 &&
                   ` · ${s.askPrivacy.images_blocked} image${
@@ -1139,10 +1141,16 @@ export default function ChatPane({
             {/* The valve: only offered when something was actually hidden, and
                 only through a human click — the agent driver is fenced out. */}
             {!s.askPrivacy.bypassed &&
-              (s.askPrivacy.entities_hidden ?? 0) > 0 &&
+              ((s.askPrivacy.entities_hidden ?? 0) > 0 ||
+                (s.askPrivacy.images_blocked ?? 0) > 0) &&
               (confirmReal ? (
                 <span className="privacy-valve-confirm" data-agent-blocked>
-                  Send this question again with the real details?
+                  {(s.askPrivacy.entities_hidden ?? 0) > 0 &&
+                  (s.askPrivacy.images_blocked ?? 0) > 0
+                    ? "Send this question again with the real details and blocked images?"
+                    : (s.askPrivacy.images_blocked ?? 0) > 0
+                      ? "Send this question again with the blocked images?"
+                      : "Send this question again with the real details?"}
                   <button
                     className="subtle danger"
                     onClick={() => {
@@ -1160,10 +1168,16 @@ export default function ChatPane({
                 <button
                   className="subtle privacy-valve"
                   data-agent-blocked
-                  title="The hidden details made this answer vague? Re-ask sharing the real values — for this one question only."
+                  title={
+                    (s.askPrivacy.images_blocked ?? 0) > 0
+                      ? "The cloud model could not see the blocked images. Re-ask sharing them for this one question only."
+                      : "The hidden details made this answer vague? Re-ask sharing the real values — for this one question only."
+                  }
                   onClick={() => setConfirmReal(true)}
                 >
-                  Ask again with real details…
+                  {(s.askPrivacy.images_blocked ?? 0) > 0
+                    ? "Ask again sharing blocked images…"
+                    : "Ask again with real details…"}
                 </button>
               ))}
           </div>

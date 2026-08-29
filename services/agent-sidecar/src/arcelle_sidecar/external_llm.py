@@ -1365,8 +1365,9 @@ def _stage_image_files(images: list[str]) -> list[str]:
     """Codex's image channel: each base64 PNG becomes a private temp file for
     ``-i`` to attach (the CLI reads and embeds them itself — no tool needed).
     The caller unlinks every path on EVERY exit: the files hold decrypted room
-    pixels. A write failure skips that image rather than aborting the turn —
-    same contract as the Electron advisor's staging."""
+    pixels. Staging is atomic: one invalid decode/write removes every path and
+    returns no attachments, so the caller can fail closed instead of sending a
+    prompt that claims Codex saw pixels it never received."""
     import base64
 
     paths: list[str] = []
@@ -1374,14 +1375,29 @@ def _stage_image_files(images: list[str]) -> list[str]:
         try:
             data = base64.b64decode(b64, validate=True)
         except (ValueError, TypeError):
-            continue
+            _unlink_all(paths)
+            return []
+        fd = -1
+        path: str | None = None
         try:
             fd, path = tempfile.mkstemp(prefix="arcelle-img-", suffix=".png")
             with os.fdopen(fd, "wb") as fh:
+                fd = -1  # fdopen owns it from here, including exceptional exits
                 fh.write(data)
             paths.append(path)
         except OSError:
-            continue
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            if path is not None:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+            _unlink_all(paths)
+            return []
     return paths
 
 
@@ -1429,6 +1445,13 @@ async def generate_external(
     staged = (
         _stage_image_files(deliverable) if engine == "codex-cli" and deliverable else []
     )
+    if engine == "codex-cli" and len(staged) != len(deliverable):
+        _unlink_all(staged)
+        raise LlmError(
+            "ENGINE_ERROR",
+            "Codex image pixels could not be staged, so visual interpretation "
+            "stopped before model dispatch.",
+        )
     try:
         try:
             cmdline = build_cmdline(
@@ -1987,30 +2010,38 @@ class ExternalChatModel:
 
         All files live for the call only.
         """
+        from .llm import LlmError  # local import: llm.py imports this module
+
         paths: list[str] = []
-        system_path: str | None = None
-        mcp_path: str | None = None
-        if system:
-            fd, system_path = tempfile.mkstemp(prefix="arcelle-sys-", suffix=".txt")
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                fh.write(system)
-            paths.append(system_path)
-        if (bridge_tools and self.mcp_url) or hub is not None:
-            fd, mcp_path = tempfile.mkstemp(prefix="arcelle-mcp-", suffix=".json")
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                fh.write(
-                    mcp_config_json(
-                        self.mcp_url if bridge_tools else "",
-                        self.mcp_token,
-                        hub=(hub.url, hub.token) if hub is not None else None,
-                    )
-                )
-            paths.append(mcp_path)
-        image_paths: list[str] = []
-        if self.engine == "codex-cli" and images:
-            image_paths = _stage_image_files(images)
-            paths.extend(image_paths)
         try:
+            system_path: str | None = None
+            mcp_path: str | None = None
+            if system:
+                fd, system_path = tempfile.mkstemp(prefix="arcelle-sys-", suffix=".txt")
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fh.write(system)
+                paths.append(system_path)
+            if (bridge_tools and self.mcp_url) or hub is not None:
+                fd, mcp_path = tempfile.mkstemp(prefix="arcelle-mcp-", suffix=".json")
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fh.write(
+                        mcp_config_json(
+                            self.mcp_url if bridge_tools else "",
+                            self.mcp_token,
+                            hub=(hub.url, hub.token) if hub is not None else None,
+                        )
+                    )
+                paths.append(mcp_path)
+            image_paths: list[str] = []
+            if self.engine == "codex-cli" and images:
+                image_paths = _stage_image_files(images)
+                paths.extend(image_paths)
+                if len(image_paths) != len(images):
+                    raise LlmError(
+                        "ENGINE_ERROR",
+                        "Codex image pixels could not be staged, so visual "
+                        "interpretation stopped before model dispatch.",
+                    )
             return await self._spawn(
                 prompt,
                 cancel,

@@ -31,7 +31,9 @@ data -- see project memory). What IS validated, per the porting brief:
 from __future__ import annotations
 
 import math
+import os
 import subprocess
+import time
 from pathlib import Path
 
 import numpy as np
@@ -40,10 +42,31 @@ import pytest
 from arcelle_sidecar.diar import embed as diar
 from arcelle_sidecar.media import decode
 
-MODEL_PATH = "/Users/benreich/private-room/apps/desktop/assets/models/nemo_en_titanet_small.onnx"
+# Resolve from this checkout rather than one developer's absolute path. CI can
+# point at externally provisioned weights explicitly; a misspelled override is
+# an error rather than a silently skipped neural test.
+_MODEL_ENV = "ARCELLE_TEST_TITANET_MODEL"
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
+
+def _resolve_titanet_model() -> Path:
+    if override := os.environ.get(_MODEL_ENV):
+        path = Path(override).expanduser().resolve()
+        if not path.is_file():
+            raise FileNotFoundError(f"{_MODEL_ENV} does not name a file: {path}")
+        return path
+
+    locations = (
+        _REPO_ROOT / "apps/desktop/resources/models/nemo_en_titanet_small.onnx",
+        _REPO_ROOT / "apps/desktop/assets/models/nemo_en_titanet_small.onnx",
+    )
+    return next((path for path in locations if path.is_file()), locations[0])
+
+
+MODEL_PATH = str(_resolve_titanet_model())
 requires_model = pytest.mark.skipif(
     not Path(MODEL_PATH).exists(),
-    reason="real TitaNet ONNX model not present on this machine",
+    reason=f"real TitaNet ONNX model unavailable; bundle it or set {_MODEL_ENV}",
 )
 
 _HAS_SAY = Path("/usr/bin/say").exists() and Path("/usr/bin/afconvert").exists()
@@ -609,3 +632,128 @@ class TestVoicePrint:
     def test_defines_voice_false_when_voiced_frames_meets_bar_but_vec_is_zero(self) -> None:
         vp = diar.VoicePrint(vec=np.zeros(3, dtype=np.float32), voiced_frames=100)
         assert not vp.defines_voice(1)  # is_silent() wins even with plenty of frames
+
+
+# =============================================================================
+# (9) The model cache -- a failed load must be RETRYABLE
+# =============================================================================
+
+
+class TestModelLoadCache:
+    """The cache used to store a failed load as ``None`` and test membership
+    with ``path in _MODEL_CACHE``, which made ONE failure permanent for the
+    life of the process: a model file still being copied into place, a path the
+    host had not finished resolving, or a single transient onnxruntime error
+    during the first phrase of the first recording silently downgraded EVERY
+    later phrase, in every later recording, to the 21-dim DSP print -- and with
+    it saved-voice enrollment and cross-recording recognition, which need 192
+    dims. Nothing pinned that behavior either way before now.
+
+    The rate limit the old cache existed for is preserved and pinned too: this
+    runs once per 2 s embedding window, so a retry per call would be a real
+    cost on a machine with no model at all.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _isolated_cache(self):
+        diar._MODEL_CACHE.clear()
+        diar._MODEL_FAILED_AT.clear()
+        yield
+        diar._MODEL_CACHE.clear()
+        diar._MODEL_FAILED_AT.clear()
+
+    def test_a_failed_load_is_not_retried_inside_the_quiet_window(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        attempts: list[str] = []
+
+        def always_fails(path, providers=None):
+            attempts.append(path)
+            raise RuntimeError("no such file")
+
+        monkeypatch.setattr(diar.ort, "InferenceSession", always_fails)
+        assert diar._model_for("/missing/titanet.onnx") is None
+        assert diar._model_for("/missing/titanet.onnx") is None
+        assert diar._model_for("/missing/titanet.onnx") is None
+        assert len(attempts) == 1, "a per-phrase hot path must not retry every call"
+
+    def test_a_failed_load_recovers_once_the_quiet_window_has_passed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The headline fix: the model that shows up a moment later is used."""
+        session = object()
+        attempts: list[str] = []
+
+        def fails_once(path, providers=None):
+            attempts.append(path)
+            if len(attempts) == 1:
+                raise RuntimeError("model file is still being copied")
+            return session
+
+        monkeypatch.setattr(diar.ort, "InferenceSession", fails_once)
+        path = "/late/titanet.onnx"
+        assert diar._model_for(path) is None
+        # Pretend the quiet window has elapsed rather than sleeping through it.
+        diar._MODEL_FAILED_AT[path] = time.monotonic() - diar.MODEL_RETRY_SECS - 1.0
+        assert diar._model_for(path) is session
+        assert len(attempts) == 2
+
+    def test_a_loaded_model_is_never_loaded_a_second_time(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        session = object()
+        attempts: list[str] = []
+
+        def loads(path, providers=None):
+            attempts.append(path)
+            return session
+
+        monkeypatch.setattr(diar.ort, "InferenceSession", loads)
+        for _ in range(5):
+            assert diar._model_for("/good/titanet.onnx") is session
+        assert len(attempts) == 1
+
+    def test_a_recovery_clears_the_failure_stamp(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Otherwise a path that failed long ago, then loaded, would still carry
+        a stale timestamp -- harmless today, a trap for the next reader."""
+        session = object()
+        calls: list[int] = []
+
+        def fails_once(path, providers=None):
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError("nope")
+            return session
+
+        monkeypatch.setattr(diar.ort, "InferenceSession", fails_once)
+        path = "/late/titanet.onnx"
+        assert diar._model_for(path) is None
+        assert path in diar._MODEL_FAILED_AT
+        diar._MODEL_FAILED_AT[path] = time.monotonic() - diar.MODEL_RETRY_SECS - 1.0
+        assert diar._model_for(path) is session
+        assert path not in diar._MODEL_FAILED_AT
+
+    def test_neural_ready_reports_model_load_state_not_vector_shape(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``is_neural`` needs a vector to inspect and cannot be asked before
+        one exists; this is the question a job-level caller actually has."""
+        session = object()
+        monkeypatch.setattr(diar.ort, "InferenceSession", lambda path, providers=None: session)
+        assert diar.neural_ready("/good/titanet.onnx") is True
+        assert diar.neural_ready("") is False, "an unresolved path is not a model"
+
+    def test_neural_ready_is_false_when_the_model_cannot_be_loaded(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def always_fails(path, providers=None):
+            raise RuntimeError("no such file")
+
+        monkeypatch.setattr(diar.ort, "InferenceSession", always_fails)
+        assert diar.neural_ready("/missing/titanet.onnx") is False
+
+    @requires_model
+    def test_neural_ready_is_true_for_the_real_bundled_model(self) -> None:
+        assert diar.neural_ready(MODEL_PATH) is True

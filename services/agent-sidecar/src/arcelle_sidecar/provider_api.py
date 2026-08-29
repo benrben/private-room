@@ -488,6 +488,27 @@ class OpenAICompatibleChatModel:
             "X-OpenRouter-Title": "Arcelle",
         }
 
+    def _require_image_input(
+        self, messages: list[Message], images: list[str] | None
+    ) -> None:
+        """Refuse pixels when the provider catalog explicitly says blind.
+
+        OpenAI-compatible transport *can* carry images as ``image_url`` data
+        URLs, but that does not make every routed model multimodal. Previously
+        the adapter sent the frame anyway and waited for an upstream 400 (or a
+        text-only model ignoring it). ``None`` is the deliberate old-host
+        compatibility state; only an explicit catalog ``False`` fails closed.
+        """
+        if getattr(self.provider, "supports_vision", None) is not False:
+            return
+        if not images and not any(message.get("images") for message in messages):
+            return
+        raise ProviderApiError(
+            "The selected OpenRouter model does not support image input, so it "
+            "cannot inspect the captured frame. Choose a model with Vision "
+            "capability or switch to On this Mac."
+        )
+
     def _payload(
         self,
         messages: list[Message],
@@ -497,6 +518,7 @@ class OpenAICompatibleChatModel:
         format: dict[str, Any] | None = None,  # noqa: A002
         images: list[str] | None = None,
     ) -> dict[str, Any]:
+        self._require_image_input(messages, images)
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": _messages_for_api(messages, images),

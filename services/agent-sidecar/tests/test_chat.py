@@ -69,6 +69,21 @@ def test_images_ride_on_the_user_turn_as_blocks() -> None:
     ]
 
 
+async def test_ollama_vision_false_refuses_before_opening_a_model_request() -> None:
+    """An explicit catalog false may not degrade to a blind text answer."""
+    from arcelle_sidecar.llm import LlmError
+
+    model = OllamaChatModel(
+        "qwen3.5:4b",
+        "http://127.0.0.1:11434",
+        supports_vision=False,
+    )
+    with pytest.raises(LlmError, match="does not support image input"):
+        await model.generate(
+            [{"role": "user", "content": "inspect", "images": ["AAAA"]}]
+        )
+
+
 def test_chunk_text_handles_str_and_blocks() -> None:
     assert _chunk_text("hello") == "hello"
     assert _chunk_text([{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]) == "ab"

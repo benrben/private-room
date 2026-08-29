@@ -15,6 +15,16 @@ const requireFromElectron = createRequire(
   new URL("../../apps/desktop/package.json", import.meta.url),
 );
 const sharp = requireFromElectron("sharp");
+const DEFAULT_MODEL = "qwen3.5:4b";
+const BLIND_MODEL = "qwen3.5-blind:4b";
+
+// A 2-second, 1920x1080 H.264 fixture generated once with ffmpeg: red at
+// 0.0-0.4s and blue from 0.5s onward, at ten frames per second. Embedding its
+// tiny payload
+// keeps the always-run deep E2E deterministic, offline, and independent of a
+// system ffmpeg installation while still exercising Chromium's real decoder.
+const GOLDEN_VIDEO_B64 =
+  "AAAAIGZ0eXBpc29tAAACAGlzb21pc28yYXZjMW1wNDEAAAQobW9vdgAAAGxtdmhkAAAAAAAAAAAAAAAAAAAD6AAAB9AAAQAAAQAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgAAA1N0cmFrAAAAXHRraGQAAAADAAAAAAAAAAAAAAABAAAAAAAAB9AAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAABAAAAAB4AAAAQ4AAAAAAAkZWR0cwAAABxlbHN0AAAAAAAAAAEAAAfQAAAIAAABAAAAAALLbWRpYQAAACBtZGhkAAAAAAAAAAAAAAAAAAAoAAAAUABVxAAAAAAALWhkbHIAAAAAAAAAAHZpZGUAAAAAAAAAAAAAAABWaWRlb0hhbmRsZXIAAAACdm1pbmYAAAAUdm1oZAAAAAEAAAAAAAAAAAAAACRkaW5mAAAAHGRyZWYAAAAAAAAAAQAAAAx1cmwgAAAAAQAAAjZzdGJsAAAAwnN0c2QAAAAAAAAAAQAAALJhdmMxAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAB4AEOABIAAAASAAAAAAAAAABFUxhdmM2MS4xOS4xMDEgbGlieDI2NAAAAAAAAAAAAAAAGP//AAAAOGF2Y0MBZAAo/+EAG2dkACis2UB4AiflwEQAAAMABAAAAwBQPGDGWAEABmjr48siwP34+AAAAAAQcGFzcAAAAAEAAAABAAAAFGJ0cnQAAAAAAAAshAAAAAAAAAAYc3R0cwAAAAAAAAABAAAAFAAABAAAAAAYc3RzcwAAAAAAAAACAAAAAQAAAAsAAACoY3R0cwAAAAAAAAATAAAAAQAACAAAAAABAAAUAAAAAAEAAAgAAAAAAQAAAAAAAAABAAAEAAAAAAEAABQAAAAAAQAACAAAAAABAAAAAAAAAAEAAAQAAAAAAgAACAAAAAABAAAUAAAAAAEAAAgAAAAAAQAAAAAAAAABAAAEAAAAAAEAABQAAAAAAQAACAAAAAABAAAAAAAAAAEAAAQAAAAAAQAACAAAAAAcc3RzYwAAAAAAAAABAAAAAQAAABQAAAABAAAAZHN0c3oAAAAAAAAAAAAAABQAAARhAAAARwAAAEQAAABEAAAARAAAAF0AAABIAAAARgAAAEQAAABNAAABtQAAAEgAAABEAAAARAAAAEQAAABNAAAARgAAAEQAAABEAAAATQAAABRzdGNvAAAAAAAAAAEAAARYAAAAYXVkdGEAAABZbWV0YQAAAAAAAAAhaGRscgAAAAAAAAAAbWRpcmFwcGwAAAAAAAAAAAAAAAAsaWxzdAAAACSpdG9vAAAAHGRhdGEAAAABAAAAAExhdmY2MS43LjEwMAAAAAhmcmVlAAALKW1kYXQAAAKsBgX//6jcRem95tlIt5Ys2CDZI+7veDI2NCAtIGNvcmUgMTY0IHIzMTA4IDMxZTE5ZjkgLSBILjI2NC9NUEVHLTQgQVZDIGNvZGVjIC0gQ29weWxlZnQgMjAwMy0yMDIzIC0gaHR0cDovL3d3dy52aWRlb2xhbi5vcmcveDI2NC5odG1sIC0gb3B0aW9uczogY2FiYWM9MSByZWY9MyBkZWJsb2NrPTE6MDowIGFuYWx5c2U9MHgzOjB4MTEzIG1lPWhleCBzdWJtZT03IHBzeT0xIHBzeV9yZD0xLjAwOjAuMDAgbWl4ZWRfcmVmPTEgbWVfcmFuZ2U9MTYgY2hyb21hX21lPTEgdHJlbGxpcz0xIDh4OGRjdD0xIGNxbT0wIGRlYWR6b25lPTIxLDExIGZhc3RfcHNraXA9MSBjaHJvbWFfcXBfb2Zmc2V0PS0yIHRocmVhZHM9MTUgbG9va2FoZWFkX3RocmVhZHM9MiBzbGljZWRfdGhyZWFkcz0wIG5yPTAgZGVjaW1hdGU9MSBpbnRlcmxhY2VkPTAgYmx1cmF5X2NvbXBhdD0wIGNvbnN0cmFpbmVkX2ludHJhPTAgYmZyYW1lcz0zIGJfcHlyYW1pZD0yIGJfYWRhcHQ9MSBiX2JpYXM9MCBkaXJlY3Q9MSB3ZWlnaHRiPTEgb3Blbl9nb3A9MCB3ZWlnaHRwPTIga2V5aW50PTEwIGtleWludF9taW49NiBzY2VuZWN1dD0wIGludHJhX3JlZnJlc2g9MCByY19sb29rYWhlYWQ9MTAgcmM9Y3JmIG1idHJlZT0xIGNyZj0yMy4wIHFjb21wPTAuNjAgcXBtaW49MCBxcG1heD02OSBxcHN0ZXA9NCBpcF9yYXRpbz0xLjQwIGFxPTE6MS4wMACAAAABrWWIhAAQ//7mwPmWVQ1Xf/1pPSv4zSLlJeKTDK3g+nEAy5DQ8ufAAAADAAADAAADAAADAABeW2FVK1Oh+7/xAAADAAADAACMAAADABowAAAKMAAABbwAAAMD6AAAAwMkAAADA4gAAAMD+AAABMgAAAhoAAAQEAAAGKAAADsAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMBAQAAAENBmiRsQ3/+p4QAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAABnwAAAAQEGeQniHfwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAABoUAAABAAZ5hdEN/AAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAAJOAAAAEABnmNqQ38AAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAk5AAAAWUGaaEuoQhBaIc8D8BPgKAB/AfgH7A/AUQCCH/6qVQAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwNXAAAAREGehkURLD//7YlvEAtwAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAEnAAAAQgGepXRDf+6ccJghIAAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwADewAAAEABnqdqQ38AAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAk4AAAASUGaqUmoQWyZTAhv//6nhAAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAGfAAAAGxZYiCAAT//urj/MstsBc2CqWqI419bldTT0hMRL3GW2p9uFceuz1gAAADAAADAAADAAADAAA4hToQ1URw4f6DwAAAAwAAAwAfgAAABlwAAAMCKgAAAwELAAADANQAAAMAyQAAAwDiAAADAP4AAAMBMgAAAwIaAAAEBAAABigAAA7AAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAABAQQAAAERBmiRsQQ/+qlUAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMDVgAAAEBBnkJ4h38AAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAaEAAAAQAGeYXRDfwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAACTkAAABAAZ5jakN/AAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAAJOQAAAElBmmhJqEFomUwId//+qZYAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAA0JAAAAQkGehkURLDv/AAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAAGhAAAAEABnqV0Q38AAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAk4AAAAQAGep2pDfwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAACTkAAABJQZqpSahBbJlMCG///qeEAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAAZ8A==";
 
 const CANONICAL_SPECIALISTS = [
   "file", "scripts", "transcribe", "video", "studio", "sketch", "web", "browse",
@@ -52,6 +62,76 @@ export async function runArcLiveRegression({ window, invoke, waitFor, temp, log 
     name: "arc-evidence.txt",
     content: "UNRELATED_ARC_ROOM_EVIDENCE must never attach to closed-evidence or tagged inventory turns.",
   });
+
+  // ARC-011 / ARC-024: build a real nested-path MP4, import it, and move the
+  // public room file into a folder so the model must use its qualified name.
+  // An ordinary-language Main turn delegates to Video, which calls the real
+  // renderer-backed MCP tool. The Ollama double decodes the provider-bound PNG
+  // and refuses to emit Main's OK marker unless the child report's pixels,
+  // receipt dimensions, SHA-256, and timestamp all agree.
+  const goldenSource = path.join(temp, "arc-golden-video", "fixtures", "timestamp-colors.mp4");
+  await mkdir(path.dirname(goldenSource), { recursive: true });
+  await writeFile(goldenSource, Buffer.from(GOLDEN_VIDEO_B64, "base64"));
+  const goldenReport = await invoke(window, "import_files", { paths: [goldenSource] });
+  assert.equal(goldenReport.errors.length, 0);
+  assert.equal(goldenReport.imported.length, 1);
+  const goldenFolder = await invoke(window, "create_folder", { name: "ARC Golden Video" });
+  await invoke(window, "move_file_to_folder", {
+    fileId: goldenReport.imported[0].id,
+    folderId: goldenFolder.id,
+  });
+  const videoChat = await invoke(window, "create_chat");
+  const videoAnswer = await invoke(window, "ask", {
+    chatId: videoChat.id,
+    question: "ARC_GOLDEN_VIDEO inspect ARC Golden Video/timestamp-colors.mp4 at 1.05 seconds and report what color fills the visible frame.",
+    attachments: [],
+    askId: `arc-011-${Date.now()}`,
+    viewing: null,
+    privacyBypass: null,
+  });
+  const goldenMatch = (videoAnswer.content ?? "").match(
+    /ARC_GOLDEN_VIDEO_MAIN_OK timestamp=([0-9.]+) sha256=([a-f0-9]{64}) dimensions=(\d+)x(\d+) center=(\d+),(\d+),(\d+)/,
+  );
+  assert(goldenMatch, `ARC-011 Main did not synthesize the verified Video child report: ${videoAnswer.content ?? ""}`);
+  const [, timestamp, sha256, width, height, red, green, blue] = goldenMatch;
+  assert(Math.abs(Number(timestamp) - 1.05) <= 0.35, `ARC-011 presented timestamp drifted: ${timestamp}s`);
+  assert.equal(sha256.length, 64);
+  assert.equal(Number(width), 1280);
+  assert.equal(Number(height), 720);
+  assert(Number(red) < 60 && Number(green) < 60 && Number(blue) > 190,
+    `ARC-011 expected a blue center pixel, got ${red},${green},${blue}`);
+  log("ARC-011/024: Main delegated a live nested video frame and synthesized its verified 1280x720 blue PNG child report");
+
+  // The same ordinary-language route must fail closed when Ollama's own model
+  // metadata authoritatively says it cannot accept images. Main still has the
+  // File domain, so this specifically guards against silently substituting a
+  // files.read child for the unavailable Video specialist.
+  const previousModel = await invoke(window, "get_setting", { key: "model" });
+  await invoke(window, "set_setting", { key: "model", value: BLIND_MODEL });
+  try {
+    const blindChat = await invoke(window, "create_chat");
+    const blindAnswer = await invoke(window, "ask", {
+      chatId: blindChat.id,
+      question: "ARC_BLIND_VIDEO inspect ARC Golden Video/timestamp-colors.mp4 at 1.05 seconds and describe only the visible frame.",
+      attachments: [],
+      askId: `arc-024-blind-${Date.now()}`,
+      viewing: null,
+      privacyBypass: null,
+    });
+    assert.match(
+      blindAnswer.content ?? "",
+      /ARC_BLIND_VIDEO_REFUSED_OK no-frame no-image no-file-substitution/,
+      `ARC-024 blind model did not fail closed through Main: ${blindAnswer.content ?? ""}`,
+    );
+  } finally {
+    // A never-explicit room has no delete-setting IPC. Restoring the same
+    // selected default explicitly is behaviorally identical for later turns.
+    await invoke(window, "set_setting", {
+      key: "model",
+      value: typeof previousModel === "string" && previousModel ? previousModel : DEFAULT_MODEL,
+    });
+  }
+  log("ARC-024: Main refused blind-model video perception before any frame, image payload, or File substitution");
 
   // ARC-006: a slash skill that explicitly closes tools/files crosses the host
   // with an empty source set, even though the room contains a tempting match.

@@ -1024,6 +1024,18 @@ async def route_action(state: AgentState) -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 
 
+def route_after_react_prepare(state: AgentState) -> str:
+    """Run a deterministic delegation prepared by Arcelle before any model.
+
+    Ordinary react/supervisor turns still enter ``call_model``.  The one
+    prepared-call case is Main's high-confidence visual-video delegation; it
+    goes through the normal ``execute_tools`` hub path, so privacy refusal,
+    roster accounting and the media.video child remain identical to a model-
+    authored ``ask_file_agent`` call.
+    """
+    return "execute_tools" if state.get("calls") else "call_model"
+
+
 def _react(g: StateGraph) -> StateGraph:
     """The tool-calling cycle shared by most workers."""
     g.add_node("prepare", prepare)
@@ -1031,7 +1043,11 @@ def _react(g: StateGraph) -> StateGraph:
     g.add_node("execute_tools", execute_tools)
     g.add_node("synthesize", synthesize)
     g.add_edge(START, "prepare")
-    g.add_edge("prepare", "call_model")
+    g.add_conditional_edges(
+        "prepare",
+        route_after_react_prepare,
+        {"execute_tools": "execute_tools", "call_model": "call_model"},
+    )
     g.add_conditional_edges(
         "call_model",
         route_after_model,

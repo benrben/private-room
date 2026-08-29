@@ -382,15 +382,18 @@ describe("providerRuntimeConfigWire", () => {
       model: "vendor/model",
       contextWindow: 128_000,
       supportsTools: true,
+      supportsVision: true,
     });
     expect(wire.api_key).toBe("secret");
     expect(wire.base_url).toBe(OPENROUTER_BASE_URL);
     expect(wire.context_window).toBe(128_000);
     expect(wire.supports_tools).toBe(true);
+    expect(wire.supports_vision).toBe(true);
     expect(wire).not.toHaveProperty("apiKey");
     expect(wire).not.toHaveProperty("baseUrl");
     expect(wire).not.toHaveProperty("contextWindow");
     expect(wire).not.toHaveProperty("supportsTools");
+    expect(wire).not.toHaveProperty("supportsVision");
   });
 });
 
@@ -880,6 +883,7 @@ describe("providerRuntimeConfig", () => {
       model: "vendor/tooly",
       contextWindow: 128_000,
       supportsTools: true,
+      supportsVision: false,
     });
   });
 
@@ -911,10 +915,11 @@ describe("providerRuntimeConfig", () => {
     );
   });
 
-  it("defaults to supportsTools=true and contextWindow=null when the model is not in the cache", () => {
+  it("keeps vision unknown and defaults tools on when the model is not in the cache", () => {
     const config = providerRuntimeConfig("openrouter::vendor/never-fetched", forbiddenDeps({ readKey: () => "sk" }));
     expect(config?.contextWindow).toBeNull();
     expect(config?.supportsTools).toBe(true);
+    expect(config?.supportsVision).toBeNull();
   });
 
   it("removes only surrounding whitespace and keeps the exact catalog slug", async () => {
@@ -933,6 +938,7 @@ describe("providerRuntimeConfig", () => {
     expect(config?.model).toBe("vendor/padded");
     expect(config?.contextWindow).toBe(42);
     expect(config?.supportsTools).toBe(false);
+    expect(config?.supportsVision).toBe(false);
     expect(providerModelFacts("openrouter::  vendor/padded  ")?.contextWindow).toBe(42);
   });
 });
@@ -956,6 +962,7 @@ describe("injectProviderRuntime", () => {
       model: "vendor/model",
       context_window: null,
       supports_tools: true,
+      supports_vision: null,
     });
     // The input is not mutated — the Rust source clones before inserting.
     expect(body).not.toHaveProperty("provider");

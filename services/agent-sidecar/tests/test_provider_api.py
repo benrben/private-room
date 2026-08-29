@@ -7,7 +7,7 @@ import pytest
 from arcelle_sidecar import provider_api
 
 
-def config(*, tools: bool = True):
+def config(*, tools: bool = True, vision: bool | None = None):
     return SimpleNamespace(
         id="openrouter",
         api_key="test-secret",
@@ -15,6 +15,7 @@ def config(*, tools: bool = True):
         model="vendor/model",
         context_window=200_000,
         supports_tools=tools,
+        supports_vision=vision,
     )
 
 
@@ -82,6 +83,36 @@ def test_message_conversion_preserves_images_and_stringifies_tool_arguments() ->
     )
     assert converted[0]["content"][1]["image_url"]["url"].endswith("abc")
     assert converted[1]["tool_calls"][0]["function"]["arguments"] == '{"name":"a.pdf"}'
+
+
+def test_openrouter_vision_false_refuses_pixels_before_building_a_payload() -> None:
+    """Transport support is not per-model support; explicit false wins."""
+    model = provider_api.OpenAICompatibleChatModel(
+        "openrouter::vendor/text-only", config(vision=False)
+    )
+    with pytest.raises(provider_api.ProviderApiError, match="does not support image input"):
+        model._payload(
+            [{"role": "user", "content": "inspect this", "images": ["AAAA"]}],
+            stream=True,
+        )
+
+
+@pytest.mark.parametrize("vision", [True, None])
+def test_openrouter_vision_true_or_legacy_unknown_uses_real_image_url_channel(
+    vision: bool | None,
+) -> None:
+    """True sends pixels; None preserves compatibility with an older host."""
+    model = provider_api.OpenAICompatibleChatModel(
+        "openrouter::vendor/vision", config(vision=vision)
+    )
+    payload = model._payload(
+        [{"role": "user", "content": "inspect this", "images": ["QUJDRA=="]}]
+    )
+    content = payload["messages"][0]["content"]
+    assert content[1] == {
+        "type": "image_url",
+        "image_url": {"url": "data:image/png;base64,QUJDRA=="},
+    }
 
 
 @pytest.mark.asyncio

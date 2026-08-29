@@ -43,6 +43,7 @@ import {
   adaptMcpBridge,
   buildCommandLine,
   checkCliSlug,
+  claudeImageUserEvent,
   makeRunAdvisorCli,
   parseClaudeJsonResult,
   parseCodexJsonStream,
@@ -144,6 +145,15 @@ describe("buildCommandLine", () => {
       "claude -p --output-format json --mcp-config '/tmp/x/mcp-room.json' --strict-mcp-config " +
         "--allowedTools 'mcp__room__*'"
     );
+    expect(
+      buildCommandLine("claude-cli", {
+        submodel: null,
+        effort: null,
+        streamJsonInput: true,
+      })
+    ).toBe(
+      "claude -p --input-format stream-json --output-format stream-json --verbose"
+    );
   });
 
   it("codex: carries the Arcelle flags, and takes effort as a -c override rather than --effort", () => {
@@ -163,6 +173,25 @@ describe("buildCommandLine", () => {
       "agy --sandbox --mode plan --input-format stream-json --output-format stream-json --print-timeout 5m"
     );
     expect(buildCommandLine("antigravity-cli", { submodel: "gemini-3.7-flash-high", effort: null })).toContain("--model 'gemini-3.7-flash-high'");
+  });
+});
+
+describe("claudeImageUserEvent", () => {
+  it("uses Claude Code's user-message image content-block schema", () => {
+    const event = JSON.parse(claudeImageUserEvent("inspect pixels", [TINY_PNG_B64]));
+    expect(event).toEqual({
+      type: "user",
+      message: {
+        role: "user",
+        content: [
+          { type: "text", text: "inspect pixels" },
+          {
+            type: "image",
+            source: { type: "base64", media_type: "image/png", data: TINY_PNG_B64 },
+          },
+        ],
+      },
+    });
   });
 });
 
@@ -200,6 +229,27 @@ describe("parseClaudeJsonResult", () => {
     expect(text).toBe("not json at all");
     expect(usage.inputTokens).toBeNull();
     expect(usage.outputTokens).toBeNull();
+  });
+
+  it("reads the terminal result from Claude's stream-JSON image channel", () => {
+    const stdout = [
+      "shell startup banner",
+      JSON.stringify({ type: "system", subtype: "init" }),
+      JSON.stringify({
+        type: "result",
+        result: "red",
+        usage: {
+          input_tokens: 3,
+          cache_creation_input_tokens: 4,
+          cache_read_input_tokens: 5,
+          output_tokens: 1,
+        },
+      }),
+    ].join("\n");
+    expect(parseClaudeJsonResult(stdout)).toEqual({
+      text: "red",
+      usage: { inputTokens: 12, outputTokens: 1 },
+    });
   });
 
   it("a valid envelope with no `result` string falls back to the raw stdout", () => {
@@ -459,28 +509,31 @@ describe.skipIf(!hasPosixShell)("runExternalCli — real subprocess", () => {
     expect(argv).toContain("high");
   });
 
-  it("stages attached images in a scratch dir, points the CLI at them, and removes the dir afterwards", async () => {
+  it("sends Claude the exact image bytes as a stream-JSON content block, never a narrated path", async () => {
     const capture = scratchFile("claude-stdin-img");
-    const sizeCapture = scratchFile("claude-img-size");
-    // `wc -c` on the staged file proves the CLI could really open it: the file
-    // existed, at the path the prompt named, while the CLI was running.
+    const argvCapture = scratchFile("claude-argv-img");
     const options = fakeCli(
       "claude",
       `cat > "${capture}"\n` +
-        `wc -c < "$(grep -o '/.*attachment-1\\.png' "${capture}" | head -1)" > "${sizeCapture}"\n` +
+        `for a in "$@"; do printf '%s\\n' "$a" >> "${argvCapture}"; done\n` +
         `echo '{"result":"ok"}'`
     );
     await runExternalCli("claude-cli", [userMsg("look at this", [TINY_PNG_B64])], options);
 
     const sent = readFileSync(capture, "utf8");
-    expect(sent).toContain("The user attached 1 image(s), saved for you at:");
-    expect(sent).toContain("Open and view them before answering.");
-    const imgLine = sent.split("\n").find((l) => l.endsWith("attachment-1.png"));
-    expect(imgLine).toBeDefined();
-    expect(Number(readFileSync(sizeCapture, "utf8").trim())).toBe(Buffer.from(TINY_PNG_B64, "base64").length);
-    // And the whole directory — decrypted pixels and all — is gone by the time
-    // the call returns.
-    expect(existsSync(path.dirname(imgLine as string))).toBe(false);
+    const event = JSON.parse(sent) as {
+      message: { content: Array<{ type: string; text?: string; source?: { data?: string } }> };
+    };
+    const text = event.message.content.find((block) => block.type === "text")?.text ?? "";
+    const image = event.message.content.find((block) => block.type === "image")?.source?.data;
+    expect(text).toContain("image content blocks");
+    expect(text).not.toContain("saved for you at");
+    expect(sent).not.toContain("attachment-1.png");
+    expect(image).toBe(TINY_PNG_B64);
+    expect(Buffer.from(image as string, "base64")).toEqual(Buffer.from(TINY_PNG_B64, "base64"));
+    const argv = readFileSync(argvCapture, "utf8").split("\n").filter(Boolean);
+    expect(argv).toContain("--input-format");
+    expect(argv).toContain("stream-json");
   });
 
   it("skips an attachment that is not valid standard base64 rather than writing a corrupt PNG", async () => {
@@ -616,19 +669,26 @@ describe.skipIf(!hasPosixShell)("runExternalCli — real subprocess", () => {
     }
   });
 
-  it("privacyBypass sends the real values even when a policy is active", async () => {
+  it("privacyBypass sends real text and actual Claude image content when a policy is active", async () => {
     const capture = scratchFile("claude-stdin-bypass");
     const options = fakeCli("claude", `cat > "${capture}"\necho '{"result":"ok"}'`);
     const policy: AdvisorPrivacyPolicy = {
       redact: (text) => text.replaceAll("Ben", "[Person A]"),
       restore: (text) => text,
     };
-    await runExternalCli("claude-cli", [userMsg("Ben asked a question")], {
+    await runExternalCli("claude-cli", [userMsg("Ben asked a question", [TINY_PNG_B64])], {
       ...options,
       activePolicy: () => policy,
       privacyBypass: true,
     });
-    expect(readFileSync(capture, "utf8")).toContain("Ben asked a question");
+    const event = JSON.parse(readFileSync(capture, "utf8")) as {
+      message: { content: Array<{ type: string; text?: string; source?: { data?: string } }> };
+    };
+    expect(event.message.content[0]?.text).toContain("Ben asked a question");
+    expect(event.message.content[1]).toMatchObject({
+      type: "image",
+      source: { type: "base64", media_type: "image/png", data: TINY_PNG_B64 },
+    });
   });
 
   it("drops attached images under an active privacy policy rather than sending pixels", async () => {
@@ -768,16 +828,20 @@ describe("the production shell and working directory", () => {
       .rejects.toThrow(/failed after one bounded retry: exit=0; stdout=.*still-empty.*stderr=provider emitted no terminal result/);
   });
 
-  it("runs in the system temp dir when nothing was staged, and in the scratch dir when an image was", async () => {
+  it("keeps Claude's in-band pixels off disk while preserving the staged-file adapter", async () => {
     const { spawnFn, calls } = recordingSpawner(OK);
     await runExternalCli("claude-cli", [userMsg("no images")], { spawnFn });
     expect(calls[0]?.cwd).toBe(os.tmpdir());
 
     await runExternalCli("claude-cli", [userMsg("has an image", [TINY_PNG_B64])], { spawnFn });
-    expect(calls[1]?.cwd).not.toBe(os.tmpdir());
-    expect(calls[1]?.cwd).toContain("arcelle-cli-");
-    // The scratch dir it ran in does not outlive the call.
-    expect(existsSync(calls[1]?.cwd as string)).toBe(false);
+    expect(calls[1]?.cwd).toBe(os.tmpdir());
+    expect(calls[1]?.stdin).not.toContain("attachment-1.png");
+
+    await runExternalCli("codex-cli", [userMsg("has an image", [TINY_PNG_B64])], { spawnFn });
+    expect(calls[2]?.cwd).not.toBe(os.tmpdir());
+    expect(calls[2]?.cwd).toContain("arcelle-cli-");
+    // The staged-file adapter's scratch directory does not outlive the call.
+    expect(existsSync(calls[2]?.cwd as string)).toBe(false);
   });
 
   it("does not set the bridge token env var when no bridge is attached", async () => {

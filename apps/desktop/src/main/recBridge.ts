@@ -100,15 +100,37 @@
  *    the explanation, so a stale renderer bundle fails with an instruction
  *    rather than with "no handler registered".
  *
- * 6. NOT PORTED, disclosed rather than guessed at:
+ * 6. THE `retranscribing` GUARD SET ({@link beginRetranscribe} /
+ *    {@link endRetranscribe} / {@link isRetranscribing}) — the port of
+ *    `RecState.retranscribing` (`recording_cmds.rs:12-15`). It used to be
+ *    missing, and this doc used to explain that away with "`session_ws.py`
+ *    mounts no `/rec/retranscribe` route, so nothing can populate it". That
+ *    route EXISTS now, and `mediaTranscribeJob.ts` drives it, so the set is
+ *    real again and the three commands Rust gates on it —
+ *    {@link recStart} (resume only), {@link recDeleteRange},
+ *    {@link recCorrectRange} — refuse against it exactly as Rust does.
+ *
+ *    IT IS MODULE STATE, not a {@link RecBridgeState} field, and that is a
+ *    decision rather than an oversight. Rust's own set lives on `RecState`, a
+ *    Tauri MANAGED SINGLETON — one per app process, which is what a
+ *    module-level `Set` is here too. More decisively: the rebuild does not run
+ *    through a `RecBridgeCtx` at all. `recIpc.ts` hands `rec_retranscribe` a
+ *    ctx, but the live wiring overrides that channel with a handler that
+ *    ignores it and calls `transcribeMediaWithSpeakers`, whose dependencies
+ *    are a `RoomManagerState` — so a set hanging off `RecBridgeState` would be
+ *    a guard nothing could ever populate, which is precisely the inert shape
+ *    the previous version of this comment was apologising for.
+ *
+ * 7. NOT PORTED, disclosed rather than guessed at:
  *    - `rec_read_start` (and `rec_stop`'s best-effort kickoff of the same job)
  *      needs the room's background JOB system — a separate, unported subsystem.
- *    - `rec_retranscribe` reruns the whole Whisper+diarization pipeline, and
- *      `session_ws.py` mounts no `/rec/retranscribe` route to ask for it.
- *      Whoever adds it must also restore `RecState.retranscribing`
- *      (`recording_cmds.rs:12-15`): `rec_start`, `rec_delete_range` and
- *      `rec_correct_range` all refuse against that set, and it is omitted here
- *      only because nothing can populate it while the command throws.
+ *    - `rec_retranscribe`'s COMMAND BODY. The pipeline half now has a route
+ *      (`POST /rec/retranscribe`) and the whole job — staging, the NDJSON
+ *      stream, the GH #5 name fold, the paired `recordings.meta` +
+ *      `files.extracted_text` write — lives in `mediaTranscribeJob.ts`, which
+ *      every route into transcription shares. {@link recRetranscribe} stays
+ *      here only as the default behind `recIpc.ts`'s `live.retranscribe ?? …`
+ *      seam, and says where the real one is.
  *    - `caffeinate -i` for a live session's lifetime, and the
  *      `rolling_back`/`ROLLBACK_BUSY` room-checkpoint guard: room-lifecycle
  *      concerns with no Electron equivalent yet.
@@ -179,6 +201,7 @@ import {
   type VoicePrint,
 } from "./recFormat.js";
 import { stripThinkSpans } from "./engineRouting.js";
+import * as obs from "./obs.js";
 import type { OpenRoom } from "./turnEngine.js";
 
 export type { FileMeta, KnownVoice, SavedVoice };
@@ -247,6 +270,64 @@ export class RecBridgeState {
   lastMeta: RecMeta | null = null;
 }
 
+// -----------------------------------------------------------------------------
+// ---- the `retranscribing` guard set (recording_cmds.rs:12-15) ---------------
+// -----------------------------------------------------------------------------
+
+/**
+ * File ids whose transcript is being REBUILT from the audio right now — the
+ * port of `RecState.retranscribing`. See this module's §6 for why it is module
+ * state rather than a {@link RecBridgeState} field.
+ *
+ * A rebuild reads the whole file's audio, re-runs the pipeline for minutes and
+ * then overwrites both `recordings.meta` and `files.extracted_text` with what
+ * it computed. Anything that edits either one MEANWHILE is silently thrown
+ * away when the rebuild lands: a studio cut, a retyped phrase, or (worst) a
+ * Resume that appends new audio to a file whose transcript is about to be
+ * replaced by one written from the OLD audio, putting every timestamp after
+ * the join out by the length of the addition. So the three commands Rust gates
+ * refuse here too, with Rust's own sentence.
+ */
+const retranscribing = new Set<string>();
+
+/**
+ * Claim `fileId` for a rebuild. `false` means one is already running for it —
+ * `Rust: !rec.retranscribing.lock().unwrap().insert(id)`.
+ *
+ * The caller MUST pair every `true` with {@link endRetranscribe} in a
+ * `finally`: a claim that outlives its job locks the file's transcript editing
+ * for the rest of the app run.
+ */
+export function beginRetranscribe(fileId: string): boolean {
+  if (retranscribing.has(fileId)) {
+    return false;
+  }
+  retranscribing.add(fileId);
+  return true;
+}
+
+/** Release a claim taken by {@link beginRetranscribe}. Idempotent. */
+export function endRetranscribe(fileId: string): void {
+  retranscribing.delete(fileId);
+}
+
+/** Is this file's transcript being rebuilt right now? */
+export function isRetranscribing(fileId: string): boolean {
+  return retranscribing.has(fileId);
+}
+
+/** Rust's refusal sentence, spelled once so the three gated commands cannot
+ * drift apart. */
+const RETRANSCRIBING_REFUSAL =
+  "This recording is being re-transcribed — wait for it to finish.";
+
+/** The three gated commands' shared guard. */
+function refuseWhileRetranscribing(fileId: string): void {
+  if (retranscribing.has(fileId)) {
+    throw new Error(RETRANSCRIBING_REFUSAL);
+  }
+}
+
 /** The minimal socket shape {@link attachHostWs} needs. The real Node
  * `WebSocket` is adapted to it by {@link defaultConnectHostWs}; a test passes a
  * plain object. */
@@ -283,6 +364,26 @@ export interface RecBridgeDeps {
   /** Where this session's encrypted spool file should live (`/rec/start`'s own
    * `spoolDir` field). */
   spoolDir: () => string;
+  /**
+   * The TitaNet speaker-embedding weights' resolved path — the diarize half of
+   * what Rust's `install_diarize_model(app)` did before every session.
+   *
+   * OPTIONAL, WITH A LOUD DEFAULT, because `null` is NOT a neutral answer:
+   * `/rec/start` hands it straight to the sidecar, which falls back to a
+   * 21-dimension DSP embedding when it is absent. `identityPrint`
+   * (`db-host/voices.ts`) requires the 192-dimension neural print, so it
+   * returns `null` for every DSP voiceprint, `learnVoice` early-returns on
+   * that `null`, and NOTHING is ever enrolled — Settings → Saved voices stays
+   * empty and cross-recording recognition never fires. All of that is silent.
+   *
+   * So the default here is `() => null` written out in {@link createRecBridgeCtx}
+   * rather than left implicit: a context that has not been given this is
+   * making a real choice (recordings that can never teach the room a voice),
+   * and the production wiring must pass
+   * `mediaTranscribeJob.ts::diarizeEffectiveModel(userDataDir, resourcesPath)`
+   * — which also resolves in a dev tree, where `resourcesPath` is always
+   * `null`.
+   */
   diarizeModelPath?: () => string | null;
   defaultTranslationModel?: () => string | null;
   /** The Ollama endpoint the sidecar should use for live translation. */
@@ -333,6 +434,11 @@ export function createRecBridgeCtx(
           recHostWsUrl(await ensureUp(), fileId, authToken()).replace("/rec/host?", "/rec/session?")),
       readSpoolFrame: deps.readSpoolFrame ?? readSpoolFrame,
       resolveSttModel: deps.resolveSttModel ?? ((): string | null => null),
+      // Spelled out rather than left to `?.() ?? null` at the call site — see
+      // {@link RecBridgeDeps.diarizeModelPath}. "No diarize weights" is a real
+      // decision with a silent consequence (no voice is ever enrolled from
+      // this session), so a context that makes it makes it visibly.
+      diarizeModelPath: deps.diarizeModelPath ?? ((): string | null => null),
       spoolDir: deps.spoolDir ?? ((): string => os.tmpdir()),
     },
   };
@@ -874,6 +980,14 @@ export async function recStart(
     }
     throw new Error(`A recording is already running (file ${ctx.state.liveFileId}). Stop it first.`);
   }
+  // RESUME ONLY, exactly like Rust's `file_id.as_ref().is_some_and(..)`: a
+  // BRAND-NEW recording shares nothing with a rebuild in flight, but resuming
+  // one appends audio to a file whose transcript is about to be overwritten by
+  // a rebuild computed from the audio as it was BEFORE the append — every
+  // timestamp past the join would be wrong, and the new tail would vanish.
+  if (opts.fileId != null && opts.fileId !== "") {
+    refuseWhileRetranscribing(opts.fileId);
+  }
   const room = ctx.deps.currentRoom();
   if (room === null) {
     throw new Error("No room is open.");
@@ -949,6 +1063,17 @@ export async function recStart(
     known = [];
   }
 
+  // Resolved once, and SAID OUT LOUD when it is absent. `null` here is not a
+  // neutral setting: the sidecar falls back to a 21-dimension DSP embedding,
+  // `identityPrint` rejects every one of those, and the whole session is
+  // therefore incapable of teaching this room a voice — silently, from the
+  // user's side and from ours. One log line per session start is the cheapest
+  // way for "saved voices never fill up" to have a visible cause.
+  const diarize = ctx.deps.diarizeModelPath?.() ?? null;
+  if (diarize === null) {
+    obs.warn("rec.start.no_diarize_model", [["file", obs.id(fileId)]]);
+  }
+
   const ollama = ctx.deps.ollamaBaseUrl?.() ?? null;
   const body: Record<string, unknown> = {
     fileId,
@@ -958,7 +1083,7 @@ export async function recStart(
     systemAudio: opts.systemAudio,
     liveTranslate,
     knownVoices: known,
-    diarizeModelPath: ctx.deps.diarizeModelPath?.() ?? null,
+    diarizeModelPath: diarize,
     defaultTranslationModel: ctx.deps.defaultTranslationModel?.() ?? null,
     spoolDir: ctx.deps.spoolDir(),
   };
@@ -1536,6 +1661,7 @@ export function recDeleteRange(
   if (ctx.state.liveFileId === id) {
     throw new Error("Pause the recording before editing the transcript.");
   }
+  refuseWhileRetranscribing(id);
   const meta = parseRecMeta(getRecMeta(db, id));
   for (const seg of meta.segments) {
     for (const w of seg.words) {
@@ -1562,6 +1688,10 @@ export async function recDeleteRangeHybrid(
   t0: number,
   t1: number,
 ): Promise<RecMeta> {
+  // BEFORE the snapshot, not only inside {@link recDeleteRange}: this wrapper
+  // writes a History entry first, so a refusal reached after it would spend one
+  // of the ten kept versions on an edit that never happened.
+  refuseWhileRetranscribing(id);
   const open = ctx.deps.currentRoom();
   if (open?.db !== db || open.workspace === undefined) return recDeleteRange(db, ctx, id, t0, t1);
   await open.workspace.snapshotVersion(id, "Edited transcript");
@@ -1640,6 +1770,7 @@ export function recCorrectRange(
   if (ctx.state.liveFileId === id) {
     throw new Error("Pause the recording before editing the transcript.");
   }
+  refuseWhileRetranscribing(id);
   const meta = parseRecMeta(getRecMeta(db, id));
   const touched: number[] = [];
   meta.segments.forEach((s, i) => {
@@ -1674,6 +1805,9 @@ export async function recCorrectRangeHybrid(
   t1: number,
   text: string,
 ): Promise<RecMeta> {
+  // See {@link recDeleteRangeHybrid}: refused before the snapshot, so a
+  // rebuild in flight cannot cost the file a History slot.
+  refuseWhileRetranscribing(id);
   const open = ctx.deps.currentRoom();
   if (open?.db !== db || open.workspace === undefined) return recCorrectRange(db, ctx, id, t0, t1, text);
   await open.workspace.snapshotVersion(id, "Corrected transcript");
@@ -1971,21 +2105,44 @@ export async function recTranslate(
 }
 
 // =============================================================================
-// ---- out of scope for this batch — see §6 ----------------------------------
+// ---- lives elsewhere / not ported — see §7 ---------------------------------
 // =============================================================================
 
-/** `rec_retranscribe` (recording_cmds.rs:383-517). */
+/**
+ * `rec_retranscribe` (recording_cmds.rs:383-517) — THE SEAM DEFAULT ONLY.
+ *
+ * The command itself is implemented, and not here:
+ * `mediaTranscribeJob.ts::transcribeMediaWithSpeakers` stages the audio, drives
+ * `POST /rec/retranscribe`, folds in any speaker name typed while the rebuild
+ * ran, and writes `recordings.meta` and `files.extracted_text` together. That
+ * is deliberately one lane shared with the import, download and clip paths
+ * rather than a second copy living behind this signature — those four used to
+ * be four different answers to "transcribe this file", and three of them
+ * produced speakerless text.
+ *
+ * `recIpc.ts` dispatches `rec_retranscribe` as `live.retranscribe ?? this`, and
+ * the live registry always supplies `live.retranscribe` (it is the one call
+ * site that can hand the job a `RoomManagerState`). So reaching this body means
+ * a context was built with no live wiring at all — a partial harness — and the
+ * only honest answer is to say where the real one is rather than half-run a
+ * pipeline with no room to write into.
+ *
+ * The guard set that goes with the command is real and lives above:
+ * {@link beginRetranscribe} / {@link endRetranscribe} / {@link isRetranscribing},
+ * claimed by the job and refused against by {@link recStart},
+ * {@link recDeleteRange} and {@link recCorrectRange}.
+ */
 export async function recRetranscribe(
   _db: Database.Database,
   _ctx: RecBridgeCtx,
   _id: string
 ): Promise<RecMeta> {
   throw new Error(
-    "Re-transcribing is not available yet in this migration: it reruns the whisper/diarization pipeline, " +
-      "which lives entirely in the sidecar's Engine and has no HTTP route mounted in session_ws.py yet " +
-      "(only start/pause/resume/set_live_stt/set_live_translate/edit_meta/stop are). Whoever adds that " +
-      "route must also restore recording_cmds.rs's `retranscribing` guard set — rec_start, rec_delete_range " +
-      "and rec_correct_range all refuse against it."
+    "Re-transcribing is wired through mediaTranscribeJob.ts::transcribeMediaWithSpeakers, which needs the " +
+      "room manager state this rec-bridge context does not carry. This build registered rec_retranscribe " +
+      "without that wiring (recIpc.ts dispatches `live.retranscribe ?? recRetranscribe`), so nothing ran and " +
+      "nothing was changed. The retranscribing guard set is still enforced by rec_start, rec_delete_range " +
+      "and rec_correct_range."
   );
 }
 

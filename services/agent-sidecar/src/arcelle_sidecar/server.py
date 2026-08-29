@@ -149,6 +149,7 @@ def _default_chat_model(req: RunRequest) -> ChatModel:
         model=req.model,
         base_url=req.ollama_base_url,
         temperature=req.temperature,
+        supports_vision=req.supports_vision,
     )
 
 

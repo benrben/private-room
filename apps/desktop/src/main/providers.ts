@@ -15,7 +15,7 @@
  * field names, and the Rust source pins exactly that in
  * `runtime_config_uses_the_python_sidecar_field_names`. It has to: the
  * sidecar's `ProviderConfig` (`services/agent-sidecar/src/arcelle_sidecar/config.py`) declares
- * `api_key`/`base_url`/`context_window`/`supports_tools` with no pydantic
+ * `api_key`/`base_url`/`context_window`/`supports_tools`/`supports_vision` with no pydantic
  * alias and `extra="ignore"`, so a camelCase object would drop every field it
  * ignores and then fail validation on the required `api_key` that never
  * arrived.
@@ -133,6 +133,10 @@ export interface ProviderRuntimeConfig {
   model: string;
   contextWindow: number | null;
   supportsTools: boolean;
+  /** The selected provider model's catalog-declared image-input support.
+   * `null` means the catalog could not be consulted, not that the model is
+   * known to be blind. */
+  supportsVision: boolean | null;
 }
 
 /** The minimal slice of a `fetch()` response this module needs, so a test can
@@ -1023,6 +1027,7 @@ export function providerRuntimeConfig(
   const facts = modelRuntimeCache.get(selected);
   const contextWindow = facts ? facts.contextWindow : null;
   const supportsTools = facts ? facts.tools : true;
+  const supportsVision = facts ? facts.vision : null;
 
   // Disconnecting a provider only re-points the OPEN room at a local model.
   // Every other room still set to it lands here with no key, and the generic
@@ -1041,7 +1046,15 @@ export function providerRuntimeConfig(
     );
   }
 
-  return { id: provider, apiKey, baseUrl, model: selected, contextWindow, supportsTools };
+  return {
+    id: provider,
+    apiKey,
+    baseUrl,
+    model: selected,
+    contextWindow,
+    supportsTools,
+    supportsVision,
+  };
 }
 
 /** The EXACT JSON object the Python sidecar's `ProviderConfig` reads —
@@ -1055,6 +1068,7 @@ export function providerRuntimeConfigWire(config: ProviderRuntimeConfig): Record
     model: config.model,
     context_window: config.contextWindow,
     supports_tools: config.supportsTools,
+    supports_vision: config.supportsVision,
   };
 }
 

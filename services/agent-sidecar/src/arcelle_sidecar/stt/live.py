@@ -87,8 +87,9 @@ The inherited constraint (both candidates' docstrings already noted this,
 correctly, from `engine.py`'s "DIVERGENCE 2"): `whisper_full()` is, per
 whisper.cpp's own header comment, "Not thread safe for same context" — two
 decodes must never run against the same `ctx` concurrently, live phrase or
-whole-file. Nothing in this sidecar currently calls into either path
-concurrently on the same model.
+whole-file. Both paths therefore hold the cache entry's per-context
+`decode_lock` through the actual decode and every result read. Cache lookup
+itself remains independent and short-lived.
 
 --------------------------------------------------------- DEVIATION: no
 `no_speech_probability` binding
@@ -297,7 +298,10 @@ def transcribe_segments(
     # uses (see the module docstring's DECISION note) — never a second,
     # separate warm model.
     entry = _checkout(model_path)
+    decode_acquired = False
     try:
+        entry.decode_lock.acquire()
+        decode_acquired = True
         ctx = entry.model._ctx  # noqa: SLF001 - see module docstring
 
         # Finals (Sniff/Watch) decode with beam search — the reference
@@ -423,4 +427,6 @@ def transcribe_segments(
 
         return PhraseOut(segs=out, detected=detected)
     finally:
+        if decode_acquired:
+            entry.decode_lock.release()
         _checkin(entry)

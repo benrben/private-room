@@ -163,6 +163,9 @@ export interface BuildCommandLineOptions {
   /** Codex only: the `-c mcp_servers.room.*` overrides, when a room bridge is
    * attached. */
   codexMcpFlags?: string;
+  /** Claude only: stdin is one stream-JSON user event carrying image content
+   * blocks, rather than the ordinary flat-text prompt. */
+  streamJsonInput?: boolean;
 }
 
 /**
@@ -191,13 +194,16 @@ export function buildCommandLine(engine: CliEngine, opts: BuildCommandLineOption
         : ` -c 'model_reasoning_effort=${opts.effort}'`;
 
   if (engine === "claude-cli") {
+    const formatFlags = opts.streamJsonInput === true
+      ? "--input-format stream-json --output-format stream-json --verbose"
+      : "--output-format json";
     if (opts.mcpConfigPath !== undefined && opts.mcpConfigPath !== null) {
       return (
-        `claude -p --output-format json --mcp-config '${opts.mcpConfigPath}' ` +
+        `claude -p ${formatFlags} --mcp-config '${opts.mcpConfigPath}' ` +
         `--strict-mcp-config --allowedTools 'mcp__room__*'${modelFlag}${effortFlag}`
       );
     }
-    return `claude -p --output-format json${modelFlag}${effortFlag}`;
+    return `claude -p ${formatFlags}${modelFlag}${effortFlag}`;
   }
   if (engine === "antigravity-cli") {
     return `agy --sandbox --mode plan --input-format stream-json --output-format stream-json --print-timeout 5m${modelFlag}`;
@@ -258,7 +264,21 @@ export function parseClaudeJsonResult(stdout: Buffer | string): { text: string; 
   try {
     parsed = JSON.parse(raw);
   } catch {
-    return { text: fallbackText(), usage: NO_USAGE };
+    // Image-bearing Claude requests require stream-JSON input, which in turn
+    // requires stream-JSON OUTPUT. Read the terminal result object out of the
+    // NDJSON stream while ignoring shell banners and intermediate events.
+    parsed = null;
+    for (const line of raw.split("\n")) {
+      if (line.trim() === "") continue;
+      try {
+        const event = JSON.parse(line) as unknown;
+        const obj = asRecord(event);
+        if (obj?.type === "result") parsed = event;
+      } catch {
+        // Interactive shell startup output is not part of Claude's envelope.
+      }
+    }
+    if (parsed === null) return { text: fallbackText(), usage: NO_USAGE };
   }
   const obj = asRecord(parsed);
   if (obj === null) {
@@ -639,6 +659,25 @@ function decodeBase64Strict(s: string): Buffer | null {
  * `images.iter().take(3)` (external.rs line 701). */
 const MAX_IMAGES_PER_MESSAGE = 3;
 
+/** One Claude Code stream-JSON user event. Image bytes ride the same request
+ * as base64 image content blocks, so vision does not depend on a filesystem
+ * path or on Claude's Read tool being available. */
+export function claudeImageUserEvent(prompt: string, images: readonly string[]): string {
+  return `${JSON.stringify({
+    type: "user",
+    message: {
+      role: "user",
+      content: [
+        { type: "text", text: prompt },
+        ...images.map((data) => ({
+          type: "image",
+          source: { type: "base64", media_type: "image/png", data },
+        })),
+      ],
+    },
+  })}\n`;
+}
+
 export interface RunExternalOptions {
   /** ADD-7: the Stop flag. Polled every 100ms; the child is killed the moment
    * it reads true. */
@@ -672,9 +711,10 @@ export interface ExternalRunResult {
  * `run_external` (external.rs lines 643-892). The content leaves the machine
  * via the user's own account.
  *
- * These CLIs are agents with file access, so attached images are written to a
- * private temp folder for the CLI to open itself, then deleted — on every
- * exit path, not just the happy one ({@link cleanupScratchDir}).
+ * Claude receives attached images as base64 content blocks on stream-JSON
+ * stdin, including when its file tools are disabled. Other CLI adapters retain
+ * their private temporary-file flow, cleaned on every exit path rather than
+ * just the happy one ({@link cleanupScratchDir}).
  *
  * `engineRaw` is either a bare engine id (`"claude-cli"`/`"codex-cli"`) or a
  * composite one carrying the model and/or reasoning effort the Cloud picker
@@ -715,12 +755,17 @@ export async function runExternalCli(
 
   const tmpDir = path.join(os.tmpdir(), `arcelle-cli-${randomUUID()}`);
   try {
+    const claudeImages: string[] = [];
     const imagePaths: string[] = [];
     for (const m of guarded) {
       if (m.images === undefined) continue;
       for (const b64 of m.images.slice(0, MAX_IMAGES_PER_MESSAGE)) {
         const bytes = decodeBase64Strict(b64);
         if (bytes === null) continue;
+        if (engine === "claude-cli") {
+          claudeImages.push(b64);
+          continue;
+        }
         if (imagePaths.length === 0) {
           await mkdir(tmpDir, { recursive: true });
         }
@@ -746,7 +791,11 @@ export async function runExternalCli(
       }
       // "tool" and anything else is skipped, matching Rust's `_ => {}`.
     }
-    if (imagePaths.length > 0) {
+    if (claudeImages.length > 0) {
+      prompt +=
+        `${claudeImages.length} image(s) are attached to this request as image content blocks. ` +
+        "Inspect those pixels before answering.\n\n";
+    } else if (imagePaths.length > 0) {
       prompt +=
         `The user attached ${imagePaths.length} image(s), saved for you at:\n${imagePaths.join("\n")}\n` +
         "Open and view them before answering.\n\n";
@@ -788,7 +837,13 @@ export async function runExternalCli(
     if (engine !== "claude-cli" && engine !== "codex-cli" && engine !== "antigravity-cli") {
       throw new Error("Unknown engine");
     }
-    const cmdline = buildCommandLine(engine, { submodel, effort, mcpConfigPath, codexMcpFlags });
+    const cmdline = buildCommandLine(engine, {
+      submodel,
+      effort,
+      mcpConfigPath,
+      codexMcpFlags,
+      streamJsonInput: engine === "claude-cli" && claudeImages.length > 0,
+    });
 
     const workDir = imagePaths.length === 0 ? os.tmpdir() : tmpDir;
     const shell = options.shell ?? DEFAULT_SHELL;
@@ -806,7 +861,9 @@ export async function runExternalCli(
       env,
       stdinText: engine === "antigravity-cli"
         ? `${JSON.stringify({ event: "user", message: { role: "user", content: prompt } })}\n`
-        : prompt,
+        : engine === "claude-cli" && claudeImages.length > 0
+          ? claudeImageUserEvent(prompt, claudeImages)
+          : prompt,
       engineName: engine,
       cancel: options.cancel,
     });

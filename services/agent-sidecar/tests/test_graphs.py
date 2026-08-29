@@ -19,6 +19,7 @@ from arcelle_sidecar.graphs import (
     WRITE_TOOLS,
     build_agent_graph,
     graph_for,
+    route_after_react_prepare,
     template_for,
 )
 
@@ -60,6 +61,11 @@ def test_every_registered_agent_compiles_to_a_graph() -> None:
     for spec in REGISTRY:
         assert graph_for(spec.id) is not None, spec.id
         assert template_for(spec.id) in TEMPLATES, spec.id
+
+
+def test_react_prepare_runs_only_graph_synthesized_calls_before_the_model() -> None:
+    assert route_after_react_prepare({"calls": []}) == "call_model"  # type: ignore[arg-type]
+    assert route_after_react_prepare({"calls": [object()]}) == "execute_tools"  # type: ignore[arg-type]
 
 
 def test_agents_sharing_a_template_share_one_compiled_graph() -> None:

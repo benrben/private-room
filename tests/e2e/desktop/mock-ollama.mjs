@@ -14,12 +14,15 @@
 // Tool-less calls receive a small deterministic answer, which also keeps model
 // preflights and command error-path tests local and repeatable.
 //
-// No dependencies beyond Node's built-in http module.
+// No dependencies beyond Node built-ins.
 
+import { createHash } from "node:crypto";
 import http from "node:http";
+import { inflateSync } from "node:zlib";
 
 const PORT = Number(process.env.MOCK_OLLAMA_PORT || 11434);
 const MODEL = "qwen3.5:4b"; // matches DEFAULT_MODEL so best_default() selects it
+const BLIND_MODEL = "qwen3.5-blind:4b";
 
 let nextToolCall = 1;
 let activeStalls = 0;
@@ -97,6 +100,94 @@ function answer(res, content, stream = true) {
   ]);
 }
 
+function paethPredictor(left, up, upLeft) {
+  const estimate = left + up - upLeft;
+  const leftDistance = Math.abs(estimate - left);
+  const upDistance = Math.abs(estimate - up);
+  const upLeftDistance = Math.abs(estimate - upLeft);
+  if (leftDistance <= upDistance && leftDistance <= upLeftDistance) return left;
+  return upDistance <= upLeftDistance ? up : upLeft;
+}
+
+function decodePngCenter(base64) {
+  const bytes = Buffer.from(base64.replace(/^data:image\/png;base64,/, ""), "base64");
+  const signature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+  if (bytes.length < signature.length || !bytes.subarray(0, 8).equals(signature)) {
+    throw new Error("provider image was not a PNG");
+  }
+  let offset = 8;
+  let width = 0;
+  let height = 0;
+  let bitDepth = 0;
+  let colorType = -1;
+  let interlace = -1;
+  const idat = [];
+  while (offset + 12 <= bytes.length) {
+    const length = bytes.readUInt32BE(offset);
+    const type = bytes.toString("ascii", offset + 4, offset + 8);
+    const start = offset + 8;
+    const end = start + length;
+    if (end + 4 > bytes.length) throw new Error("provider PNG had a truncated chunk");
+    if (type === "IHDR") {
+      width = bytes.readUInt32BE(start);
+      height = bytes.readUInt32BE(start + 4);
+      bitDepth = bytes[start + 8];
+      colorType = bytes[start + 9];
+      interlace = bytes[start + 12];
+    } else if (type === "IDAT") {
+      idat.push(bytes.subarray(start, end));
+    }
+    offset = end + 4;
+    if (type === "IEND") break;
+  }
+  const channels = colorType === 6 ? 4 : colorType === 2 ? 3 : 0;
+  if (!width || !height || bitDepth !== 8 || channels === 0 || interlace !== 0 || idat.length === 0) {
+    throw new Error(
+      `provider PNG shape unsupported: ${width}x${height}, depth=${bitDepth}, color=${colorType}, interlace=${interlace}`,
+    );
+  }
+  const inflated = inflateSync(Buffer.concat(idat));
+  const stride = width * channels;
+  if (inflated.length !== height * (stride + 1)) {
+    throw new Error(`provider PNG scanline size disagreed: ${inflated.length}`);
+  }
+  const decoded = Buffer.alloc(stride * height);
+  let source = 0;
+  for (let y = 0; y < height; y += 1) {
+    const filter = inflated[source++];
+    const row = y * stride;
+    const previous = row - stride;
+    for (let x = 0; x < stride; x += 1) {
+      const raw = inflated[source++];
+      const left = x >= channels ? decoded[row + x - channels] : 0;
+      const up = y > 0 ? decoded[previous + x] : 0;
+      const upLeft = y > 0 && x >= channels ? decoded[previous + x - channels] : 0;
+      let value;
+      if (filter === 0) value = raw;
+      else if (filter === 1) value = raw + left;
+      else if (filter === 2) value = raw + up;
+      else if (filter === 3) value = raw + Math.floor((left + up) / 2);
+      else if (filter === 4) value = raw + paethPredictor(left, up, upLeft);
+      else throw new Error(`provider PNG used unknown filter ${filter}`);
+      decoded[row + x] = value & 0xff;
+    }
+  }
+  const center = (Math.floor(height / 2) * stride) + (Math.floor(width / 2) * channels);
+  return {
+    bytes,
+    width,
+    height,
+    red: decoded[center],
+    green: decoded[center + 1],
+    blue: decoded[center + 2],
+  };
+}
+
+function messageImages(messages) {
+  return messages.flatMap((message) => Array.isArray(message?.images) ? message.images : [])
+    .filter((image) => typeof image === "string" && image.length > 0);
+}
+
 const server = http.createServer(async (req, res) => {
   const url = req.url || "";
 
@@ -104,8 +195,9 @@ const server = http.createServer(async (req, res) => {
     return json(res, { activeStalls, unknownRequests });
   }
 
-  // GET /api/tags — model inventory. One model, named to match DEFAULT_MODEL
-  // so the app reports AI "running" and picks it as the default.
+  // GET /api/tags — model inventory. The first model matches DEFAULT_MODEL so
+  // the app reports AI "running" and picks it by default. The second keeps tool
+  // calling but authoritatively lacks vision, for the live fail-closed test.
   if (req.method === "GET" && url.startsWith("/api/tags")) {
     return json(res, {
       models: [
@@ -114,6 +206,13 @@ const server = http.createServer(async (req, res) => {
           model: MODEL,
           size: 4_000_000_000,
           digest: "mockmockmock",
+          details: { family: "qwen3", parameter_size: "4B", quantization_level: "Q4_K_M" },
+        },
+        {
+          name: BLIND_MODEL,
+          model: BLIND_MODEL,
+          size: 4_000_000_000,
+          digest: "mockmockblind",
           details: { family: "qwen3", parameter_size: "4B", quantization_level: "Q4_K_M" },
         },
       ],
@@ -143,6 +242,128 @@ const server = http.createServer(async (req, res) => {
     }
     const toolAlreadyRan = messages.some((m) => m && m.role === "tool");
     const offered = toolNames(body);
+
+    // ARC-011/024: this is an ordinary-language Main turn, not a direct *video
+    // tag. MAIN_OK can only be produced after Main delegates through
+    // ask_file_agent, the resolved Video child captures a real frame, this
+    // provider independently verifies its PNG, and Main receives that child's
+    // PIXELS_OK report for synthesis.
+    if (allText.includes("ARC_GOLDEN_VIDEO")) {
+      const toolTexts = messages
+        .filter((message) => message?.role === "tool" && typeof message.content === "string")
+        .map((message) => message.content);
+      const verifiedChild = toolTexts.find((content) =>
+        content.includes("ARC_GOLDEN_VIDEO_PIXELS_OK"));
+      if (verifiedChild) {
+        const result = verifiedChild.match(
+          /ARC_GOLDEN_VIDEO_PIXELS_OK timestamp=([0-9.]+) sha256=([a-f0-9]{64}) dimensions=(\d+)x(\d+) center=(\d+),(\d+),(\d+)/,
+        );
+        if (!result) {
+          return answer(res, "ARC_GOLDEN_VIDEO_FAIL Main received a malformed child marker", streams);
+        }
+        return answer(
+          res,
+          `ARC_GOLDEN_VIDEO_MAIN_OK timestamp=${result[1]} sha256=${result[2]} dimensions=${result[3]}x${result[4]} center=${result[5]},${result[6]},${result[7]}`,
+          streams,
+        );
+      }
+      const receipt = messages
+        .filter((message) => message?.role === "tool" && typeof message.content === "string")
+        .map((message) => message.content)
+        .find((content) => content.includes("Frame receipt:"));
+      if (!receipt && offered.has("ask_file_agent")) {
+        if (toolAlreadyRan) {
+          return answer(res, "ARC_GOLDEN_VIDEO_FAIL Main did not receive a verified Video child report", streams);
+        }
+        return toolCall(res, "ask_file_agent", {
+          instruction: "ARC_GOLDEN_VIDEO inspect ARC Golden Video/timestamp-colors.mp4 at 1.05 seconds and report what color fills the visible frame.",
+        });
+      }
+      if (!receipt && offered.has("view_media_frame")) {
+        return toolCall(res, "view_media_frame", {
+          name: "ARC Golden Video/timestamp-colors.mp4",
+          at: "1.05",
+        });
+      }
+      if (!receipt) {
+        return answer(
+          res,
+          "ARC_GOLDEN_VIDEO_FAIL neither Main delegation nor the Video frame tool was offered",
+          streams,
+        );
+      }
+      try {
+        const images = messageImages(messages);
+        if (images.length !== 1) throw new Error(`expected one provider image, received ${images.length}`);
+        const frame = decodePngCenter(images[0]);
+        const match = receipt.match(
+          /at ([0-9.]+)s; SHA-256 ([a-f0-9]{64}); (\d+)×(\d+) PNG/,
+        );
+        if (!match) throw new Error(`receipt was malformed: ${receipt}`);
+        const actualSeconds = Number(match[1]);
+        const receiptHash = match[2];
+        const receiptWidth = Number(match[3]);
+        const receiptHeight = Number(match[4]);
+        const actualHash = createHash("sha256").update(frame.bytes).digest("hex");
+        if (receiptHash !== actualHash) throw new Error("receipt SHA-256 did not bind the provider PNG");
+        if (receiptWidth !== frame.width || receiptHeight !== frame.height) {
+          throw new Error(`receipt dimensions ${receiptWidth}x${receiptHeight} did not bind ${frame.width}x${frame.height}`);
+        }
+        if (frame.width !== 1280 || frame.height !== 720) {
+          throw new Error(`expected capped 1280x720 PNG, received ${frame.width}x${frame.height}`);
+        }
+        if (Math.abs(actualSeconds - 1.05) > 0.35) {
+          throw new Error(`presented timestamp ${actualSeconds}s was outside codec tolerance`);
+        }
+        if (!(frame.red < 60 && frame.green < 60 && frame.blue > 190)) {
+          throw new Error(`expected blue pixels at 1.05s, received ${frame.red},${frame.green},${frame.blue}`);
+        }
+        return answer(
+          res,
+          `ARC_GOLDEN_VIDEO_PIXELS_OK timestamp=${actualSeconds.toFixed(3)} sha256=${actualHash} dimensions=${frame.width}x${frame.height} center=${frame.red},${frame.green},${frame.blue}`,
+          streams,
+        );
+      } catch (error) {
+        return answer(res, `ARC_GOLDEN_VIDEO_FAIL ${error?.message ?? error}`, streams);
+      }
+    }
+
+    // A model that can call Main's delegation tools but cannot accept images
+    // must fail before Video launches. A File child, frame-tool offer, or image
+    // payload is an immediate regression rather than a plausible-looking reply.
+    if (allText.includes("ARC_BLIND_VIDEO")) {
+      const images = messageImages(messages);
+      if (images.length > 0) {
+        return answer(res, `ARC_BLIND_VIDEO_FAIL received ${images.length} image payload(s)`, streams);
+      }
+      if (offered.has("view_media_frame")) {
+        return answer(res, "ARC_BLIND_VIDEO_FAIL view_media_frame reached the blind model", streams);
+      }
+      const toolTexts = messages
+        .filter((message) => message?.role === "tool" && typeof message.content === "string")
+        .map((message) => message.content);
+      const refusal = toolTexts.find((content) => content.includes("Video agent cannot inspect"));
+      if (refusal) {
+        for (const required of [
+          "no usable video-image channel",
+          "Do not substitute the File agent",
+        ]) {
+          if (!refusal.includes(required)) {
+            return answer(res, `ARC_BLIND_VIDEO_FAIL refusal omitted: ${required}`, streams);
+          }
+        }
+        return answer(res, "ARC_BLIND_VIDEO_REFUSED_OK no-frame no-image no-file-substitution", streams);
+      }
+      if (toolAlreadyRan) {
+        return answer(res, "ARC_BLIND_VIDEO_FAIL delegation returned no Video refusal", streams);
+      }
+      if (!offered.has("ask_file_agent")) {
+        return answer(res, "ARC_BLIND_VIDEO_FAIL Main was not offered ask_file_agent", streams);
+      }
+      return toolCall(res, "ask_file_agent", {
+        instruction: "ARC_BLIND_VIDEO inspect ARC Golden Video/timestamp-colors.mp4 at 1.05 seconds and describe only the visible frame.",
+      });
+    }
 
     // ARC-005/023: the live Electron regression asks the Studio specialist to
     // author flashcards. This is the nested structured generation call made by
@@ -279,8 +500,12 @@ const server = http.createServer(async (req, res) => {
   // model that can do nothing at all, which is a lie about the demo model —
   // the whole smoke test is one round of tool-calling.
   if (req.method === "POST" && url.startsWith("/api/show")) {
+    const body = await readBody(req);
+    const requestedModel = String(body?.model ?? body?.name ?? "");
     return json(res, {
-      capabilities: ["completion", "tools"],
+      capabilities: requestedModel === BLIND_MODEL
+        ? ["completion", "tools"]
+        : ["completion", "tools", "vision"],
       details: { family: "qwen3", parameter_size: "4B", quantization_level: "Q4_K_M" },
       model_info: { "general.parameter_count": 4_000_000_000, "qwen3.context_length": 32768 },
       parameters: "stop \"<|im_end|>\"",

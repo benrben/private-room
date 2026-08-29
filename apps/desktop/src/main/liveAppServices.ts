@@ -5,9 +5,10 @@ import type { McpRuntime } from "./mcpSurfaceIpc.js";
 import type { AgentUiRuntime } from "./agentUiSurfaceIpc.js";
 import { requestAgentUi } from "./agentUiSurfaceIpc.js";
 import type { FileRuntimeStores } from "./fileRuntimeSurfaceIpc.js";
-import { findFileLike, getFileBytes, getFileMeta } from "./db-host/files.js";
+import { findFileLikeQualified, getFileBytes, getFileMeta } from "./db-host/files.js";
 import { getSetting } from "./db-host/settings.js";
-import { stageMediaBytes, stageMediaStream } from "./mediaTools.js";
+import { playableMediaMime, stageMediaBytes, stageMediaStream } from "./mediaTools.js";
+import { guessDownloadMime } from "./webFetch.js";
 import { createDownloadEngineDeps } from "./mediaDownloadSurfaceIpc.js";
 import { createWorkflowRunDeps } from "./jobWorkflowSurfaceIpc.js";
 import {
@@ -50,6 +51,80 @@ function parseTimestamp(value: unknown): number {
   const parts = raw.split(":").map(Number);
   if (parts.some((n) => !Number.isFinite(n) || n < 0)) throw new Error(`Invalid media timestamp: ${raw}`);
   return parts.reduce((total, n) => total * 60 + n, 0);
+}
+
+function extensionOf(name: string): string {
+  const dot = name.lastIndexOf(".");
+  return dot > 0 && dot < name.length - 1 ? name.slice(dot + 1).toLowerCase() : "";
+}
+
+/** The Content-Type the renderer's hidden video element should receive.
+ *
+ * Normal imports already persist a video MIME, but an existing workspace can
+ * be reconciled from filenames alone and older rows commonly carry
+ * `application/octet-stream`. The ordinary viewer repairs that label with
+ * `playableMediaMime`; the agent frame path must make the same repair or a
+ * file the user can watch is rejected before the renderer ever sees it. */
+export function playableVideoMime(name: string, storedMime: string): string | null {
+  const extension = extensionOf(name);
+  const normalized = storedMime.trim().toLowerCase();
+  const guessed = guessDownloadMime(name);
+  const sourceMime = normalized.startsWith("video/")
+    ? normalized
+    : guessed.startsWith("video/")
+      ? guessed
+      : extension === "m4v"
+        ? "video/mp4"
+        : null;
+  return sourceMime === null ? null : playableMediaMime(sourceMime, extension, true);
+}
+
+/** Resolve, stage and ask the live renderer for one video frame.
+ *
+ * Kept as a narrow exported seam so the real qualified-name lookup,
+ * roommedia staging and AgentUi round-trip can be regression-tested together
+ * without constructing the unrelated browser/job/runtime dependencies used by
+ * the rest of {@link applyLiveAppServices}. */
+export async function requestLiveMediaFrame(
+  state: RoomManagerState,
+  files: Pick<FileRuntimeStores, "mediaStreams">,
+  agentUi: AgentUiRuntime,
+  emit: EventSender,
+  args: Record<string, unknown>,
+): Promise<unknown> {
+  if (state.room === null) throw new Error("No room is open.");
+  const [id] = findFileLikeQualified(state.room.conn, String(args.name ?? ""));
+  const meta = getFileMeta(state.room.conn, id);
+  const streamMime = playableVideoMime(meta.name, meta.mimeType);
+  if (streamMime === null) {
+    throw new Error(`“${meta.name}” is not a supported video file.`);
+  }
+
+  let token: string;
+  if (state.room.workspace !== undefined) {
+    const row = state.room.conn.prepare(
+      "SELECT size_bytes FROM files WHERE id = ? AND storage_kind = 'workspace' AND trashed_at IS NULL",
+    ).get(id) as { size_bytes: number } | undefined;
+    if (row === undefined) throw new Error("That video is unavailable in the workspace.");
+    const openRoom = state.room;
+    token = stageMediaStream(
+      files.mediaStreams,
+      row.size_bytes,
+      streamMime,
+      async () => openRoom.workspace!.readStream(id),
+      async (start, end) => openRoom.workspace!.readStream(id, { start, end }),
+    );
+  } else {
+    const bytes = getFileBytes(state.room.conn, id);
+    if (bytes === null) throw new Error("That video has no saved bytes to decode.");
+    token = stageMediaBytes(files.mediaStreams, bytes, streamMime);
+  }
+
+  return requestAgentUi(agentUi, emit, "media_frame", {
+    token,
+    mime: streamMime,
+    seconds: parseTimestamp(args.at),
+  });
 }
 
 function schemaObject(value: unknown): Record<string, unknown> {
@@ -192,38 +267,10 @@ export function applyLiveAppServices(
       sttModelState: services.sttModelState,
     }),
     agentUi: async (kind, args) => {
-      let requestArgs = args;
       if (kind === "media_frame") {
-        if (state.room === null) throw new Error("No room is open.");
-        const [id] = findFileLike(state.room.conn, String(args.name ?? ""));
-        const meta = getFileMeta(state.room.conn, id);
-        if (!meta.mimeType.startsWith("video/")) throw new Error(`“${meta.name}” is not a video.`);
-        let token: string;
-        if (state.room.workspace !== undefined) {
-          const row = state.room.conn.prepare(
-            "SELECT size_bytes FROM files WHERE id = ? AND storage_kind = 'workspace' AND trashed_at IS NULL",
-          ).get(id) as { size_bytes: number } | undefined;
-          if (row === undefined) throw new Error("That media file is unavailable.");
-          const openRoom = state.room;
-          token = stageMediaStream(
-            services.files.mediaStreams,
-            row.size_bytes,
-            meta.mimeType,
-            async () => openRoom.workspace!.readStream(id),
-            async (start, end) => openRoom.workspace!.readStream(id, { start, end }),
-          );
-        } else {
-          const bytes = getFileBytes(state.room.conn, id);
-          if (bytes === null) throw new Error("That media file has no saved bytes.");
-          token = stageMediaBytes(services.files.mediaStreams, bytes, meta.mimeType);
-        }
-        requestArgs = {
-          token,
-          mime: meta.mimeType,
-          seconds: parseTimestamp(args.at),
-        };
+        return requestLiveMediaFrame(state, services.files, services.agentUi, emit, args);
       }
-      return requestAgentUi(services.agentUi, emit, kind, requestArgs);
+      return requestAgentUi(services.agentUi, emit, kind, args);
     },
     callConnectorTool: async (route, args) => {
       const server = services.mcp.manager.servers.find((entry) => entry.name === route.serverName);
