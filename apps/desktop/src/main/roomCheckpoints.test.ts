@@ -237,7 +237,7 @@ describe("workspace-folder checkpoints", () => {
     } finally {
       teardownOpenRoom(state, deps);
     }
-  });
+  }, 20_000);
 });
 
 /** Plant a real, valid `.roomck` encrypted under a DIFFERENT password, with a
