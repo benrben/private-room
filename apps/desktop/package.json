@@ -10,6 +10,8 @@
     "dev:renderer": "vite --host 127.0.0.1 --port 1420 --strictPort",
     "preview": "vite preview",
     "test": "vitest run --maxWorkers 4",
+    "test:unit": "vitest run --maxWorkers 4 --exclude src/main/index.electron.test.ts",
+    "test:electron-real": "vitest run --maxWorkers 1 --run src/main/index.electron.test.ts",
     "test:packaging": "vitest run --config scripts/vitest.config.mjs",
     "test:watch": "vitest",
     "e2e": "scripts/e2e.sh",

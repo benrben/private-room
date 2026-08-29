@@ -35,8 +35,8 @@ jobs:
       - run: npm run build
       # The real-Electron boot proof owns a process-wide single-instance lock
       # and capture devices. Keep it out of the four-worker unit-test pool.
-      - run: npm run test:electron -- -- --exclude src/main/index.electron.test.ts
-      - run: npm run test:electron -- -- --run src/main/index.electron.test.ts
+      - run: npm run test:electron:unit
+      - run: npm run test:electron:real
         env:
           # Hosted macOS runners have no Screen & System Audio Recording grant.
           # Unit coverage still proves both handler answers and the bounded

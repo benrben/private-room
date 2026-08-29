@@ -21,9 +21,9 @@
 #
 # Ordering (research doc section 9, "release.mjs" note): preflight — which
 # runs the suites under NODE's ABI — must complete BEFORE packaging flips
-# the ABI forward. This script runs `npm run typecheck` and `npm test`
-# first, for exactly that reason: if either fails, the ABI is never touched
-# at all.
+# the ABI forward. This script runs `npm run typecheck`, the unit suite, and
+# then the process-owning real-Electron suite by itself, for exactly
+# that reason: if any fails, the ABI is never touched at all.
 #
 # Never wired as a postinstall hook (the committed decision this whole batch
 # exists to satisfy) -- this script only runs when a human/CI explicitly
@@ -38,7 +38,11 @@ if ! npm run typecheck; then
   echo "✗ typecheck failed — not touching the native module ABI." >&2
   exit 1
 fi
-if ! npm test; then
+if ! npm run test:unit; then
+  echo "✗ unit test suite failed — not touching the native module ABI." >&2
+  exit 1
+fi
+if ! npm run test:electron-real; then
   echo "✗ test suite failed — not touching the native module ABI." >&2
   exit 1
 fi

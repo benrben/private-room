@@ -130,7 +130,8 @@ for model in nemo_en_titanet_small.onnx ggml-silero-v5.1.2.bin ggml-large-v3-tur
 done
 
 CSC_IDENTITY_AUTO_DISCOVERY=true ARCELLE_MAC_IDENTITY="${ARCELLE_MAC_IDENTITY:-}" \
-ARCELLE_MODELS_DIR="$MODELS" ARCELLE_SIDECAR_STAGE_DIR="$SIDECAR" npm run package:mac
+ARCELLE_MODELS_DIR="$MODELS" ARCELLE_SIDECAR_STAGE_DIR="$SIDECAR" \
+  ARCELLE_SKIP_DISPLAY_MEDIA_CAPTURE=1 npm run package:mac
 
 OUT="$APP_DIR/release"
 APP="$OUT/mac-arm64/Arcelle.app"

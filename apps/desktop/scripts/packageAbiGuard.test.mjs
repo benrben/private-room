@@ -16,14 +16,17 @@ describe("package.sh native-module ABI guard", () => {
   });
 
   it("forces the database addon to Electron and verifies the finished app before restoring Node", () => {
-    const preflight = script.indexOf("if ! npm test");
+    const unitPreflight = script.indexOf("npm run test:unit");
+    const realElectronPreflight = script.indexOf("npm run test:electron-real");
     const trap = script.indexOf("trap rebuild_back EXIT");
     const forcedElectronRebuild = script.indexOf("electron-rebuild -f -w");
     const builder = script.indexOf("npx electron-builder");
     const packagedVerification = script.indexOf("ARCELLE_PACKAGED_NATIVE");
 
-    expect(preflight).toBeGreaterThanOrEqual(0);
-    expect(trap).toBeGreaterThan(preflight);
+    expect(unitPreflight).toBeGreaterThanOrEqual(0);
+    expect(realElectronPreflight).toBeGreaterThan(unitPreflight);
+    expect(script).not.toContain("ARCELLE_SKIP_DISPLAY_MEDIA_CAPTURE");
+    expect(trap).toBeGreaterThan(realElectronPreflight);
     expect(forcedElectronRebuild).toBeGreaterThan(trap);
     expect(builder).toBeGreaterThan(forcedElectronRebuild);
     expect(packagedVerification).toBeGreaterThan(builder);

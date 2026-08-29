@@ -122,6 +122,7 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { _electron as electron, type ElectronApplication, type Page } from "playwright";
 import { execFileSync } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -245,18 +246,139 @@ async function waitForReadyMarker(app: ElectronApplication, timeoutMs: number): 
   }
 }
 
-/** Playwright can finish its CDP teardown just before Chromium releases the
- * process-wide single-instance lock. Wait for the real child, not the socket,
- * before the next test launches another Arcelle process. */
-async function closeAndWaitForExit(app: ElectronApplication, timeoutMs: number): Promise<void> {
-  const proc = app.process();
-  await app.close();
-  const deadline = Date.now() + timeoutMs;
-  while (proc.exitCode === null) {
-    if (Date.now() > deadline) {
-      throw new Error(`Electron did not exit within ${timeoutMs}ms of app.close()`);
+type ElectronChildProcess = ReturnType<ElectronApplication["process"]>;
+
+function isExpectedTargetClosure(error: unknown): boolean {
+  return /Target page, context or browser has been closed/.test(String(error));
+}
+
+/** Bound an external teardown promise and clear the losing timer. The original
+ * promise remains observed by `then`, so a late rejection cannot become an
+ * unhandled rejection after the deadline wins. */
+function promiseWithin<T>(promise: Promise<T>, ms: number, what: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const finish = (callback: () => void): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      callback();
+    };
+    const timer = setTimeout(() => {
+      finish(() => reject(new Error(`${what} did not settle within ${ms}ms`)));
+    }, ms);
+    promise.then(
+      (value) => finish(() => resolve(value)),
+      (error: unknown) => finish(() => reject(error)),
+    );
+  });
+}
+
+/** Wait for a real child-process exit, or fail with a message that says which
+ * quit did not take. */
+function exitWithin(proc: ElectronChildProcess, ms: number, what: string): Promise<void> {
+  if (proc.exitCode !== null) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const onExit = (): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      proc.removeListener("exit", onExit);
+      reject(new Error(`the process did not exit within ${ms}ms of ${what}`));
+    }, ms);
+    proc.once("exit", onExit);
+    // Close the race between the first exitCode read and listener install.
+    if (proc.exitCode !== null) {
+      onExit();
     }
-    await new Promise((resolve) => setTimeout(resolve, 25));
+  });
+}
+
+/** Bound Playwright's CDP close, then guarantee the exact captured child is
+ * gone. A target-closed error after a successful terminal quit is expected;
+ * any other close failure remains visible after exact-child cleanup. */
+async function closeElectronApp(
+  app: ElectronApplication,
+  proc: ElectronChildProcess,
+  closeTimeoutMs = 10_000,
+): Promise<void> {
+  let closeFailed = false;
+  let closeError: unknown;
+  let ignoreCloseError = false;
+  try {
+    await promiseWithin(app.close(), closeTimeoutMs, "Playwright app.close()");
+  } catch (error) {
+    closeFailed = true;
+    closeError = error;
+    ignoreCloseError = proc.exitCode !== null && isExpectedTargetClosure(error);
+  }
+
+  let termFailed = false;
+  let termError: unknown;
+  if (proc.exitCode === null) {
+    proc.kill("SIGTERM");
+    try {
+      await exitWithin(proc, 5_000, "test cleanup SIGTERM");
+    } catch (error) {
+      termFailed = true;
+      termError = error;
+    }
+  }
+  if (proc.exitCode === null) {
+    proc.kill("SIGKILL");
+    await exitWithin(proc, 5_000, "test cleanup SIGKILL");
+  }
+
+  if (closeFailed && !ignoreCloseError && termFailed) {
+    throw new AggregateError([closeError, termError], "Electron close and cleanup both failed");
+  }
+  if (closeFailed && !ignoreCloseError) {
+    throw closeError;
+  }
+  if (termFailed) {
+    throw termError;
+  }
+}
+
+/** Preserve the test's primary failure even when teardown fails too. */
+async function runWithCleanup(
+  body: () => Promise<void>,
+  cleanup: () => Promise<void>,
+): Promise<void> {
+  let bodyFailed = false;
+  let bodyError: unknown;
+  try {
+    await body();
+  } catch (error) {
+    bodyFailed = true;
+    bodyError = error;
+  }
+
+  let cleanupFailed = false;
+  let cleanupError: unknown;
+  try {
+    await cleanup();
+  } catch (error) {
+    cleanupFailed = true;
+    cleanupError = error;
+  }
+
+  if (bodyFailed && cleanupFailed) {
+    throw new AggregateError([bodyError, cleanupError], "Electron test body and cleanup both failed");
+  }
+  if (bodyFailed) {
+    throw bodyError;
+  }
+  if (cleanupFailed) {
+    throw cleanupError;
   }
 }
 
@@ -304,9 +426,15 @@ describe("real Electron boot (index.ts, compiled + launched for real)", () => {
 
   afterAll(async () => {
     if (electronApp) {
-      await closeAndWaitForExit(electronApp, 30_000);
-    }
-    if (userDataDir) {
+      const proc = electronApp.process();
+      try {
+        await closeElectronApp(electronApp, proc);
+      } finally {
+        if (userDataDir && proc.exitCode !== null) {
+          rmSync(userDataDir, { recursive: true, force: true });
+        }
+      }
+    } else if (userDataDir) {
       rmSync(userDataDir, { recursive: true, force: true });
     }
   }, 60_000);
@@ -1483,21 +1611,6 @@ describe("real Electron boot (index.ts, compiled + launched for real)", () => {
 // own).
 
 describe("real Electron boot — the quit door, driven to a real exit", () => {
-  function isExpectedTargetClosure(error: unknown): boolean {
-    return /Target page, context or browser has been closed/.test(String(error));
-  }
-
-  /** Wait for a real child-process exit, or fail with a message that says which
-   * quit did not take. */
-  function exitWithin(proc: { once(e: "exit", cb: () => void): void }, ms: number, what: string) {
-    return Promise.race([
-      new Promise<void>((resolve) => proc.once("exit", () => resolve())),
-      new Promise<never>((_resolve, reject) =>
-        setTimeout(() => reject(new Error(`the process did not exit within ${ms}ms of ${what}`)), ms)
-      ),
-    ]);
-  }
-
   /** Run `body` against a freshly launched app, always cleaning up. */
   async function withFreshApp(
     name: string,
@@ -1511,14 +1624,148 @@ describe("real Electron boot — the quit door, driven to a real exit", () => {
     // teardown. Node's `ChildProcess` has no such lifecycle — its `exitCode` is
     // safe to read at any point.
     const proc = app.process();
-    try {
-      await waitForReadyMarker(app, 30_000);
-      await body(app, proc);
-    } finally {
-      await app.close().catch(() => undefined);
-      rmSync(dir, { recursive: true, force: true });
-    }
+    await runWithCleanup(
+      async () => {
+        await waitForReadyMarker(app, 30_000);
+        await body(app, proc);
+      },
+      async () => {
+        try {
+          await closeElectronApp(app, proc);
+        } finally {
+          // Never race profile deletion against a child that is still using it.
+          if (proc.exitCode !== null) {
+            rmSync(dir, { recursive: true, force: true });
+          }
+        }
+      },
+    );
   }
+
+  it("the exit waiter clears its losing deadline when the child exits", async () => {
+    let exitListener: (() => void) | undefined;
+    const proc = {
+      exitCode: null,
+      once: (_event: string, listener: () => void) => {
+        exitListener = listener;
+      },
+      removeListener: vi.fn(),
+    } as unknown as ElectronChildProcess;
+    const clearTimeoutSpy = vi.spyOn(globalThis, "clearTimeout");
+    try {
+      const exited = exitWithin(proc, 10_000, "fake child");
+      exitListener?.();
+      await exited;
+      expect(clearTimeoutSpy).toHaveBeenCalled();
+      expect(proc.removeListener).not.toHaveBeenCalled();
+    } finally {
+      clearTimeoutSpy.mockRestore();
+    }
+  });
+
+  it("a Playwright close failure still terminates the exact captured child and stays visible", async () => {
+    const closeFailure = new Error("CDP close failed");
+    const proc = {
+      exitCode: null as number | null,
+      kill: vi.fn(function (this: { exitCode: number | null }) {
+        this.exitCode = 0;
+        return true;
+      }),
+    } as unknown as ElectronChildProcess;
+    const app = { close: vi.fn().mockRejectedValue(closeFailure) } as unknown as ElectronApplication;
+
+    await expect(closeElectronApp(app, proc)).rejects.toBe(closeFailure);
+    expect(proc.kill).toHaveBeenCalledExactlyOnceWith("SIGTERM");
+    expect(proc.exitCode).toBe(0);
+  });
+
+  it("a never-settling Playwright close is bounded before exact-child cleanup", async () => {
+    vi.useFakeTimers();
+    try {
+      const proc = {
+        exitCode: null as number | null,
+        kill: vi.fn(function (this: { exitCode: number | null }) {
+          this.exitCode = 0;
+          return true;
+        }),
+      } as unknown as ElectronChildProcess;
+      const app = {
+        close: vi.fn(() => new Promise<void>(() => undefined)),
+      } as unknown as ElectronApplication;
+
+      const cleanup = closeElectronApp(app, proc, 100);
+      const rejection = expect(cleanup).rejects.toThrow("Playwright app.close() did not settle within 100ms");
+      await vi.advanceTimersByTimeAsync(100);
+      await rejection;
+      expect(proc.kill).toHaveBeenCalledExactlyOnceWith("SIGTERM");
+      expect(proc.exitCode).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("accepts the expected CDP target closure after the child already exited", async () => {
+    const proc = {
+      exitCode: 0,
+      kill: vi.fn(),
+    } as unknown as ElectronChildProcess;
+    const app = {
+      close: vi.fn().mockRejectedValue(new Error("Target page, context or browser has been closed")),
+    } as unknown as ElectronApplication;
+
+    await expect(closeElectronApp(app, proc)).resolves.toBeUndefined();
+    expect(proc.kill).not.toHaveBeenCalled();
+  });
+
+  it("preserves both the test-body failure and a cleanup failure", async () => {
+    const bodyFailure = new Error("body failed");
+    const cleanupFailure = new Error("cleanup failed");
+
+    const failure = await runWithCleanup(
+      async () => {
+        throw bodyFailure;
+      },
+      async () => {
+        throw cleanupFailure;
+      },
+    ).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(AggregateError);
+    expect((failure as AggregateError).errors).toEqual([bodyFailure, cleanupFailure]);
+  });
+
+  it("escalates a timed-out SIGTERM to SIGKILL and preserves both teardown errors", async () => {
+    vi.useFakeTimers();
+    try {
+      const closeFailure = new Error("CDP close failed");
+      const child = new EventEmitter() as EventEmitter & {
+        exitCode: number | null;
+        kill: ReturnType<typeof vi.fn>;
+      };
+      child.exitCode = null;
+      child.kill = vi.fn((signal: NodeJS.Signals) => {
+        if (signal === "SIGKILL") {
+          child.exitCode = 0;
+          child.emit("exit", 0, signal);
+        }
+        return true;
+      });
+      const proc = child as unknown as ElectronChildProcess;
+      const app = { close: vi.fn().mockRejectedValue(closeFailure) } as unknown as ElectronApplication;
+
+      const cleanup = closeElectronApp(app, proc);
+      const rejection = cleanup.catch((error: unknown) => error);
+      await vi.advanceTimersByTimeAsync(5_000);
+      const failure = await rejection;
+
+      expect(child.kill.mock.calls.map(([signal]) => signal)).toEqual(["SIGTERM", "SIGKILL"]);
+      expect(failure).toBeInstanceOf(AggregateError);
+      expect((failure as AggregateError).errors[0]).toBe(closeFailure);
+      expect(String((failure as AggregateError).errors[1])).toContain("test cleanup SIGTERM");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 
   it("nothing unsaved: a real app.quit() really TERMINATES the real process", async () => {
     // The other half of every "it was held" assertion in this file. Without

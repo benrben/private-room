@@ -14,6 +14,8 @@ import { dirname, join } from "node:path";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const sh = readFileSync(join(root, "scripts/release.sh"), "utf8");
+const rootPackage = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
+const desktopPackage = JSON.parse(readFileSync(join(root, "apps/desktop/package.json"), "utf8"));
 
 const lineOf = (re, what) => {
   const i = sh.split("\n").findIndex((l) => !l.trimStart().startsWith("#") && re.test(l));
@@ -49,6 +51,37 @@ test("the preflight it calls really compares every version site", () => {
   }
 });
 
+test("every npm Electron gate isolates the process-owning real-Electron suite", () => {
+  const pf = readFileSync(join(root, "scripts/preflight.sh"), "utf8");
+  assert.match(pf, /npm test/, "the canonical preflight no longer runs the root test composite");
+  assert.match(rootPackage.scripts.test, /test:electron/, "the root composite no longer reaches Electron tests");
+  assert.match(
+    rootPackage.scripts["test:electron"],
+    /^npm run test:electron:unit && npm run test:electron:real$/,
+    "the root Electron gate no longer serializes the unit and process-owning lanes",
+  );
+  assert.match(desktopPackage.scripts.test, /^vitest run --maxWorkers 4$/);
+  assert.match(rootPackage.scripts["test:electron:unit"], /test:unit.*@arcelle\/desktop/);
+  assert.match(rootPackage.scripts["test:electron:real"], /test:electron-real.*@arcelle\/desktop/);
+  assert.match(desktopPackage.scripts["test:unit"], /--exclude src\/main\/index\.electron\.test\.ts/);
+  assert.match(desktopPackage.scripts["test:electron-real"], /--maxWorkers 1.*index\.electron\.test\.ts/);
+  assert.doesNotMatch(
+    desktopPackage.scripts["test:electron-real"],
+    /ARCELLE_SKIP_DISPLAY_MEDIA_CAPTURE/,
+    "the default local real-Electron lane no longer proves physical display capture",
+  );
+});
+
+test("standalone packaging keeps physical capture while release skips only its post-preflight repeat", () => {
+  const packageScript = readFileSync(join(root, "apps/desktop/scripts/package.sh"), "utf8");
+  assert.match(packageScript, /if ! npm run test:electron-real/);
+  assert.doesNotMatch(packageScript, /ARCELLE_SKIP_DISPLAY_MEDIA_CAPTURE/);
+  assert.match(
+    sh,
+    /ARCELLE_SIDECAR_STAGE_DIR="\$SIDECAR"[\s\\]+ARCELLE_SKIP_DISPLAY_MEDIA_CAPTURE=1 npm run package:mac/,
+  );
+});
+
 test("release resource defaults stay absolute when npm changes into the Electron package", () => {
   assert.match(sh, /^ROOT="\$\(pwd -P\)"$/m, "release root is not captured as an absolute path");
   assert.match(
@@ -63,7 +96,7 @@ test("release resource defaults stay absolute when npm changes into the Electron
   );
   assert.match(
     sh,
-    /ARCELLE_MODELS_DIR="\$MODELS"[\s\\]+ARCELLE_SIDECAR_STAGE_DIR="\$SIDECAR" npm run package:mac/,
+    /ARCELLE_MODELS_DIR="\$MODELS"[\s\\]+ARCELLE_SIDECAR_STAGE_DIR="\$SIDECAR"[\s\\]+ARCELLE_SKIP_DISPLAY_MEDIA_CAPTURE=1 npm run package:mac/,
     "the validated absolute resources are not passed to the package build",
   );
 });
