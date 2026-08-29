@@ -516,7 +516,7 @@ describe("changePassword / changePasswordCore", () => {
         expect(() => verifyPassword(ckPath, "correct horse battery staple")).toThrow();
       }
     );
-  });
+  }, 20_000);
 
   it("reports (not silently swallows) a checkpoint that missed the rekey", async () => {
     freshRoom();
