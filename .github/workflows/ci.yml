@@ -23,9 +23,25 @@ jobs:
         with:
           node-version: 22
           cache: npm
+      # sidecarRun.wire.test.ts launches the real Python wire-compat server.
+      # The separate sidecar job has its own isolated runner, so its uv install
+      # is not visible here.
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
       - run: npm ci
+      - run: uv sync --extra dev
+        working-directory: services/agent-sidecar
       - run: npm run build
-      - run: npm run test:electron
+      # The real-Electron boot proof owns a process-wide single-instance lock
+      # and capture devices. Keep it out of the four-worker unit-test pool.
+      - run: npm run test:electron -- -- --exclude src/main/index.electron.test.ts
+      - run: npm run test:electron -- -- --run src/main/index.electron.test.ts
+        env:
+          # Hosted macOS runners have no Screen & System Audio Recording grant.
+          # Unit coverage still proves both handler answers and the bounded
+          # failure path; physical acquisition remains an installed-app proof.
+          ARCELLE_SKIP_DISPLAY_MEDIA_CAPTURE: "1"
       - run: npm run test:page
       - run: npm run test:packaging
       - run: npm run e2e
@@ -39,6 +55,15 @@ jobs:
         working-directory: services/agent-sidecar
     steps:
       - uses: actions/checkout@v4
+      # The wire-compatibility suite boots the real TypeScript MCP bridge with
+      # vite-node, so this job needs the desktop workspace's pinned dev tools.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install MCP bridge test dependencies
+        run: npm ci --workspace @arcelle/desktop --ignore-scripts
+        working-directory: ${{ github.workspace }}
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true

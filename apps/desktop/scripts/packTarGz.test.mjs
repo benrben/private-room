@@ -139,7 +139,14 @@ describe("packTarGz_a — real tar/plutil round trip through installBundle.ts", 
   it("re-confirms the failure packTarGz_a exists to prevent: a raw bsdtar call WITHOUT COPYFILE_DISABLE really does carry an AppleDouble entry that breaks extraction", async () => {
     const src = path.join(work, "dirty-src");
     await fs.mkdir(src, { recursive: true });
-    await buildFixtureApp(src);
+    const dirtyApp = await buildFixtureApp(src);
+    // Make the premise deterministic. Older local filesystems happened to add
+    // metadata of their own, while fresh GitHub runner volumes do not. A real
+    // xattr is exactly what COPYFILE_DISABLE must keep out of the archive.
+    const taggedFile = path.join(dirtyApp, "Contents", "Info.plist");
+    await execFileAsync("/usr/bin/xattr", ["-w", "com.arcelle.pack-proof", "present", taggedFile]);
+    const xattr = await execFileAsync("/usr/bin/xattr", ["-p", "com.arcelle.pack-proof", taggedFile]);
+    expect(xattr.stdout.trim()).toBe("present");
     const dirtyTar = path.join(work, "dirty.tar.gz");
     const env = { ...process.env };
     delete env.COPYFILE_DISABLE;
@@ -155,27 +162,26 @@ describe("packTarGz_a — real tar/plutil round trip through installBundle.ts", 
     // version/filesystem, but the archive genuinely differs from
     // packTarGz_a's COPYFILE_DISABLE=1 output -- assert that difference
     // directly rather than assuming one specific failure mode.
-    const listing = await execFileAsync("/usr/bin/tar", ["-tzf", dirtyTar]);
     const cleanTar = path.join(work, "clean-for-contrast.tar.gz");
     await packTarGz({ appPath: await buildFixtureApp(path.join(work, "clean-for-contrast-src")), outFile: cleanTar });
-    const cleanListing = await execFileAsync("/usr/bin/tar", ["-tzf", cleanTar]);
-    // Both list only "Arcelle.app/..." to bsdtar's own AppleDouble-aware
-    // listing view, but the underlying byte count on disk differs when
-    // xattrs are present and COPYFILE_DISABLE was not set -- python's
-    // tarfile (not AppleDouble-aware) is what release.sh's own doc comment
-    // says actually surfaces the ._* entries; approximate that here by
-    // comparing archive sizes as a proxy signal, and treat a real
-    // `extract_produced_no_bundle`/`extract_failed` as the strong signal
-    // when the OS reproduces it.
+    // bsdtar hides AppleDouble members in its own metadata-aware listing.
+    // Python's raw tar reader does not, which directly proves the dirty
+    // archive contains the dangerous entries and the production packer does
+    // not. Archive size was only a proxy and became identical on clean CI
+    // volumes, even though the production rule itself remained necessary.
+    const listRawMembers = async (tarPath) => {
+      const script =
+        "import json, sys, tarfile; " +
+        "print(json.dumps(tarfile.open(sys.argv[1], 'r:gz').getnames()))";
+      const { stdout } = await execFileAsync("/usr/bin/python3", ["-c", script, tarPath]);
+      return JSON.parse(stdout);
+    };
+    const isAppleDouble = (name) => name.split("/").some((part) => part.startsWith("._"));
+    expect((await listRawMembers(dirtyTar)).some(isAppleDouble)).toBe(true);
+    expect((await listRawMembers(cleanTar)).some(isAppleDouble)).toBe(false);
+
     if (err) {
       expect(err).toBeInstanceOf(InstallError);
-    } else {
-      // Didn't reproduce the hard failure on this host/macOS version -- at
-      // minimum the dirty archive must not be byte-identical to the clean
-      // one, or COPYFILE_DISABLE would be proven to have no effect at all.
-      const dirtyStat = await fs.stat(dirtyTar);
-      const cleanStat = await fs.stat(cleanTar);
-      expect(dirtyStat.size).not.toBe(cleanStat.size);
     }
   });
 });

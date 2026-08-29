@@ -142,6 +142,7 @@ const projectRoot = path.resolve(here, "..", ".."); // src/main -> apps/desktop
 const repoRoot = path.resolve(projectRoot, "..", "..");
 const distDir = path.join(projectRoot, "dist_boot");
 const mainScript = path.join(distDir, "src", "main", "index.js");
+const skipPhysicalDisplayCapture = process.env.ARCELLE_SKIP_DISPLAY_MEDIA_CAPTURE === "1";
 
 /**
  * Every non-`.ts` file the compiled MAIN PROCESS reads at runtime, each
@@ -244,6 +245,21 @@ async function waitForReadyMarker(app: ElectronApplication, timeoutMs: number): 
   }
 }
 
+/** Playwright can finish its CDP teardown just before Chromium releases the
+ * process-wide single-instance lock. Wait for the real child, not the socket,
+ * before the next test launches another Arcelle process. */
+async function closeAndWaitForExit(app: ElectronApplication, timeoutMs: number): Promise<void> {
+  const proc = app.process();
+  await app.close();
+  const deadline = Date.now() + timeoutMs;
+  while (proc.exitCode === null) {
+    if (Date.now() > deadline) {
+      throw new Error(`Electron did not exit within ${timeoutMs}ms of app.close()`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}
+
 /** The real preload-exposed bridge, as the renderer sees it. */
 type RendererArcelle = {
   invoke(channel: string, args: unknown): Promise<unknown>;
@@ -287,7 +303,9 @@ describe("real Electron boot (index.ts, compiled + launched for real)", () => {
   }, 180_000);
 
   afterAll(async () => {
-    await electronApp?.close();
+    if (electronApp) {
+      await closeAndWaitForExit(electronApp, 30_000);
+    }
     if (userDataDir) {
       rmSync(userDataDir, { recursive: true, force: true });
     }
@@ -1173,46 +1191,55 @@ describe("real Electron boot (index.ts, compiled + launched for real)", () => {
   // load-bearing rather than defensive: that arm IS the difference between
   // this row and the one above it.
 
-  it("a real audio-only getDisplayMedia() is GRANTED by the handler this bootstrap registered", async () => {
-    // `loopbackTap.ts`'s `SYSTEM_AUDIO_CONSTRAINTS`, answered by
-    // `grantDisplayMediaRequest`'s primary branch: `{audio: "loopback"}` with
-    // no video source, so the stream carries an audio track and nothing else
-    // — no picker, no screen capture. Red-checked: with the registration
-    // removed this is `rejected:NotSupportedError`.
-    expect(await driveGetDisplayMedia({ audio: true, video: false })).toBe("resolved:audio");
-  });
+  it.skipIf(skipPhysicalDisplayCapture)(
+    "a real audio-only getDisplayMedia() is GRANTED by the handler this bootstrap registered",
+    async () => {
+      // `loopbackTap.ts`'s `SYSTEM_AUDIO_CONSTRAINTS`, answered by
+      // `grantDisplayMediaRequest`'s primary branch: `{audio: "loopback"}` with
+      // no video source, so the stream carries an audio track and nothing else
+      // — no picker, no screen capture. Red-checked: with the registration
+      // removed this is `rejected:NotSupportedError`.
+      expect(await driveGetDisplayMedia({ audio: true, video: false })).toBe("resolved:audio");
+    }
+  );
 
-  it("the FALLBACK {audio, video} shape is granted a real screen source too", async () => {
-    // `SYSTEM_AUDIO_FALLBACK_CONSTRAINTS`, the retry `acquireSystemAudio`
-    // makes on a build that refuses `video: false`. This is the branch that
-    // really calls `desktopCapturer.getSources` in the real main process, and
-    // `loopbackTap.ts` throws the video track away the moment it arrives.
-    // Both tracks coming back is what proves the video branch is live code.
-    expect(await driveGetDisplayMedia({ audio: true, video: true })).toBe("resolved:audio,video");
-  });
+  it.skipIf(skipPhysicalDisplayCapture)(
+    "the FALLBACK {audio, video} shape is granted a real screen source too",
+    async () => {
+      // `SYSTEM_AUDIO_FALLBACK_CONSTRAINTS`, the retry `acquireSystemAudio`
+      // makes on a build that refuses `video: false`. This is the branch that
+      // really calls `desktopCapturer.getSources` in the real main process, and
+      // `loopbackTap.ts` throws the video track away the moment it arrives.
+      // Both tracks coming back is what proves the video branch is live code.
+      expect(await driveGetDisplayMedia({ audio: true, video: true })).toBe("resolved:audio,video");
+    }
+  );
 
-  it("the handler's own answer really governs the outcome — the video branch RAN", async () => {
-    // The sharpest form of "this registration is genuinely consulted", and
-    // the one that no amount of Chromium default behavior could fake: the
-    // video-requested branch of `grantDisplayMediaRequest` writes
-    // `display_media_video_fallback` to the host log through `obs.warn`
-    // before it ever looks for a source. If that line appears in the real
-    // log file after a real renderer's real request, OUR function ran inside
-    // the real handler — not some fallback path of Electron's own.
-    //
-    // A DELTA, never "the file contains it": `obs.ts`'s log lives at a fixed
-    // machine-wide path (`os.tmpdir()/arcelle-host.log`), so a line left by an
-    // earlier run of this very file would otherwise pass this test with the
-    // handler deleted. Counted across BOTH generations because `Sink`'s
-    // constructor ROTATES on open (`arcelle-host.log` → `arcelle-host.prev.log`)
-    // — nothing else in this suite calls `obs.init`, but a stray rotation must
-    // not be able to turn a real pass into a spurious failure either.
-    const before = countInHostLog("display_media_video_fallback");
+  it.skipIf(skipPhysicalDisplayCapture)(
+    "the handler's own answer really governs the outcome — the video branch RAN",
+    async () => {
+      // The sharpest form of "this registration is genuinely consulted", and
+      // the one that no amount of Chromium default behavior could fake: the
+      // video-requested branch of `grantDisplayMediaRequest` writes
+      // `display_media_video_fallback` to the host log through `obs.warn`
+      // before it ever looks for a source. If that line appears in the real
+      // log file after a real renderer's real request, OUR function ran inside
+      // the real handler — not some fallback path of Electron's own.
+      //
+      // A DELTA, never "the file contains it": `obs.ts`'s log lives at a fixed
+      // machine-wide path (`os.tmpdir()/arcelle-host.log`), so a line left by an
+      // earlier run of this very file would otherwise pass this test with the
+      // handler deleted. Counted across BOTH generations because `Sink`'s
+      // constructor ROTATES on open (`arcelle-host.log` → `arcelle-host.prev.log`)
+      // — nothing else in this suite calls `obs.init`, but a stray rotation must
+      // not be able to turn a real pass into a spurious failure either.
+      const before = countInHostLog("display_media_video_fallback");
 
-    expect(await driveGetDisplayMedia({ audio: true, video: true })).toBe("resolved:audio,video");
+      expect(await driveGetDisplayMedia({ audio: true, video: true })).toBe("resolved:audio,video");
 
-    expect(countInHostLog("display_media_video_fallback")).toBeGreaterThan(before);
-  });
+      expect(countInHostLog("display_media_video_fallback")).toBeGreaterThan(before);
+    }
+  );
 
   // ==========================================================================
   // The quit door — LAST, because it drives a real app.quit() at a live app
@@ -1456,6 +1483,10 @@ describe("real Electron boot (index.ts, compiled + launched for real)", () => {
 // own).
 
 describe("real Electron boot — the quit door, driven to a real exit", () => {
+  function isExpectedTargetClosure(error: unknown): boolean {
+    return /Target page, context or browser has been closed/.test(String(error));
+  }
+
   /** Wait for a real child-process exit, or fail with a message that says which
    * quit did not take. */
   function exitWithin(proc: { once(e: "exit", cb: () => void): void }, ms: number, what: string) {
@@ -1521,16 +1552,26 @@ describe("real Electron boot — the quit door, driven to a real exit", () => {
       // The renderer's own answer, over real IPC — and it must RESOLVE, not
       // reject: the handler defers the exit by a turn precisely so the reply
       // reaches the renderer before its window is torn down.
-      const answered = await win.evaluate(async () => {
-        const api = (globalThis as unknown as { arcelle: RendererArcelle }).arcelle;
-        try {
-          await api.invoke("quit_guard_confirm", {});
-          return "resolved";
-        } catch (e) {
-          return e instanceof Error ? e.message : String(e);
+      try {
+        const answered = await win.evaluate(async () => {
+          const api = (globalThis as unknown as { arcelle: RendererArcelle }).arcelle;
+          try {
+            await api.invoke("quit_guard_confirm", {});
+            return "resolved";
+          } catch (e) {
+            return e instanceof Error ? e.message : String(e);
+          }
+        });
+        expect(answered).toBe("resolved");
+      } catch (error) {
+        // On a loaded hosted runner Chromium can close the CDP target before
+        // Playwright receives the handler's reply. That is acceptable only
+        // for this terminal command; `exited` below must still prove the real
+        // process honored it.
+        if (!isExpectedTargetClosure(error)) {
+          throw error;
         }
-      });
-      expect(answered).toBe("resolved");
+      }
       await exited;
       expect(proc.exitCode).not.toBeNull();
     });
@@ -1570,10 +1611,16 @@ describe("real Electron boot — the quit door, driven to a real exit", () => {
       expect(proc.exitCode, "the red button was not held — the window closed on a dirty buffer").toBeNull();
 
       const exited = exitWithin(proc, 10_000, "quit_guard_confirm after a red-button hold");
-      await win.evaluate(async () => {
-        const api = (globalThis as unknown as { arcelle: RendererArcelle }).arcelle;
-        await api.invoke("quit_guard_confirm", {});
-      });
+      try {
+        await win.evaluate(async () => {
+          const api = (globalThis as unknown as { arcelle: RendererArcelle }).arcelle;
+          await api.invoke("quit_guard_confirm", {});
+        });
+      } catch (error) {
+        if (!isExpectedTargetClosure(error)) {
+          throw error;
+        }
+      }
       await exited;
       expect(proc.exitCode).not.toBeNull();
     });

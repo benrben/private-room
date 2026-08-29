@@ -10,6 +10,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   REQUEST_DISPLAY_MEDIA_NOT_IMPLEMENTED,
+  SYSTEM_AUDIO_ACQUIRE_TIMEOUT_MS,
   SYSTEM_AUDIO_CONSTRAINTS,
   SYSTEM_AUDIO_FALLBACK_CONSTRAINTS,
   acquireSystemAudio,
@@ -59,6 +60,33 @@ describe("the NOT_IMPLEMENTED seam", () => {
 });
 
 describe("acquireSystemAudio", () => {
+  it("bounds a browser request that never settles and stops a stream that arrives after the timeout", async () => {
+    let resolveRequest!: (stream: ReturnType<typeof fakeMediaStream>) => void;
+    const request = vi.fn(
+      () =>
+        new Promise<ReturnType<typeof fakeMediaStream>>((resolve) => {
+          resolveRequest = resolve;
+        })
+    );
+    const pending = acquireSystemAudio(request, { timeoutMs: 25 });
+    const refusal = expect(pending).rejects.toThrow(/did not respond within 25ms/i);
+
+    await vi.advanceTimersByTimeAsync(25);
+    await refusal;
+    expect(request).toHaveBeenCalledTimes(1);
+
+    const track = fakeAudioTrack();
+    resolveRequest(fakeMediaStream({ audioTracks: [track] }));
+    await vi.runAllTimersAsync();
+    await Promise.resolve();
+    expect(track.stopCalls).toBe(1);
+  });
+
+  it("uses a finite production timeout by default", () => {
+    expect(SYSTEM_AUDIO_ACQUIRE_TIMEOUT_MS).toBeGreaterThan(0);
+    expect(Number.isFinite(SYSTEM_AUDIO_ACQUIRE_TIMEOUT_MS)).toBe(true);
+  });
+
   it("returns the stream when the audio-only shape is granted directly", async () => {
     const stream = fakeMediaStream();
     const request = vi.fn().mockResolvedValue(stream);

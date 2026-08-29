@@ -3,6 +3,31 @@
 All notable, user-facing changes to Arcelle. Versions follow
 [semver](https://semver.org); dates are the GitHub release dates.
 
+## 0.26.9 — 2026-08-30
+
+Video questions now use real pixels instead of relying on a transcript. Arcelle
+builds a private, low-resolution one-frame-per-second visual index for imported
+workspace videos, serves the requested timestamp from that index, and captures
+an exact frame immediately when the index is still cold. A 56-minute production
+video was indexed into 3,400 frames in 7.41 seconds, while an uncached exact
+frame at 6:00 was available in 0.51 seconds.
+
+The File agent can now inspect ordinary image files and Sketch documents, and
+the Video, Drawing, App and coordinating agents share the same verified image
+handoff. A receipt, filename, transcript or OCR result is no longer accepted as
+visual evidence: if the selected model cannot receive actual pixels, Arcelle
+reports that limitation instead of inventing a description.
+
+Visual indexes are workspace-only, content-addressed, integrity-checked and
+stored outside transcripts, room databases and checkpoints. Atomic owner-only
+files, bounded LRU cleanup, source revalidation and Cloud Privacy gates keep the
+cache local and prevent stale or private frames from crossing trust boundaries.
+
+This release also completes the installed-app media review: opening workspace
+folders routes through Arcelle, converted Sketch files render and save, converted
+recordings draw a real waveform and play, and Codex, Claude, Ollama and
+OpenRouter image handoffs share the same fail-closed evidence path.
+
 ## 0.26.8 — 2026-08-28
 
 Ollama Cloud model names are now canonicalized after installed-catalog

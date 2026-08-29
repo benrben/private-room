@@ -74,6 +74,14 @@ export const SYSTEM_AUDIO_FALLBACK_CONSTRAINTS: DisplayMediaStreamOptions = Obje
 
 export type RequestDisplayMedia = (constraints: DisplayMediaStreamOptions) => Promise<MediaStreamLike>;
 
+/** A display-media request that the browser never settles must not leave the
+ * recording lane stuck in its `starting` state forever. */
+export const SYSTEM_AUDIO_ACQUIRE_TIMEOUT_MS = 10_000;
+
+export interface AcquireSystemAudioOptions {
+  timeoutMs?: number;
+}
+
 /** The labeled reason the stub seam fails with — exported so a caller or test
  * can recognize it without hand-copying the string, matching `jobDownload.ts`'s
  * `FETCH_DOWNLOAD_NOT_IMPLEMENTED` convention. */
@@ -123,6 +131,37 @@ function stopVideoTracks(stream: MediaStreamLike): void {
   stream.getVideoTracks().forEach((t) => t.stop());
 }
 
+/** Bound a browser-owned request that has no AbortSignal API. If Chromium
+ * hands back a stream after the timeout, stop every track immediately: the
+ * caller has already reported failure and no longer owns a handle to it. */
+async function requestDisplayMediaWithTimeout(
+  requestDisplayMedia: RequestDisplayMedia,
+  constraints: DisplayMediaStreamOptions,
+  timeoutMs: number
+): Promise<MediaStreamLike> {
+  let timedOut = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const request = requestDisplayMedia(constraints).then((stream) => {
+    if (timedOut) {
+      stream.getTracks().forEach((track) => track.stop());
+    }
+    return stream;
+  });
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      timedOut = true;
+      reject(new Error(`System audio capture did not respond within ${timeoutMs}ms.`));
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([request, timeout]);
+  } finally {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+    }
+  }
+}
+
 /**
  * Acquire a system-loopback audio `MediaStream`, trying the audio-only shape
  * first and falling back to audio+video (stopping the video track) only when
@@ -135,17 +174,23 @@ function stopVideoTracks(stream: MediaStreamLike): void {
  * no main-process handler behind it.
  */
 export async function acquireSystemAudio(
-  requestDisplayMedia: RequestDisplayMedia = requestDisplayMediaNotImplemented
+  requestDisplayMedia: RequestDisplayMedia = requestDisplayMediaNotImplemented,
+  options: AcquireSystemAudioOptions = {}
 ): Promise<MediaStreamLike> {
+  const timeoutMs = options.timeoutMs ?? SYSTEM_AUDIO_ACQUIRE_TIMEOUT_MS;
   let stream: MediaStreamLike;
   try {
-    stream = await requestDisplayMedia(SYSTEM_AUDIO_CONSTRAINTS);
+    stream = await requestDisplayMediaWithTimeout(requestDisplayMedia, SYSTEM_AUDIO_CONSTRAINTS, timeoutMs);
   } catch (primaryErr) {
     if (!isUnsupportedShape(primaryErr)) {
       throw mapDisplayMediaError(primaryErr);
     }
     try {
-      stream = await requestDisplayMedia(SYSTEM_AUDIO_FALLBACK_CONSTRAINTS);
+      stream = await requestDisplayMediaWithTimeout(
+        requestDisplayMedia,
+        SYSTEM_AUDIO_FALLBACK_CONSTRAINTS,
+        timeoutMs
+      );
     } catch (fallbackErr) {
       throw mapDisplayMediaError(fallbackErr);
     }
