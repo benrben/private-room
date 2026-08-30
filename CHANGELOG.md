@@ -3,6 +3,21 @@
 All notable, user-facing changes to Arcelle. Versions follow
 [semver](https://semver.org); dates are the GitHub release dates.
 
+## 0.26.10 — 2026-08-30
+
+Signed updates now verify correctly inside the shipping Electron runtime.
+Arcelle computes the Minisign prehash with a runtime-independent BLAKE2b
+implementation, avoiding the `Digest method not supported` failure while still
+requiring both the payload signature and trusted-comment signature before an
+update can be installed.
+
+The release gate now creates and verifies a genuine prehashed update signature
+inside Electron, so differences between ordinary Node and the packaged app are
+caught before publication. Every other currently open issue was also audited
+against its implementation and regression coverage, including navigation,
+recordings, transcription, model management, permissions, downloads, OAuth,
+responsive layout and error presentation.
+
 ## 0.26.9 — 2026-08-30
 
 Video questions now use real pixels instead of relying on a transcript. Arcelle
