@@ -122,6 +122,7 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { _electron as electron, type ElectronApplication, type Page } from "playwright";
 import { execFileSync } from "node:child_process";
+import { createHash, generateKeyPairSync, sign as cryptoSign } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import os from "node:os";
@@ -144,6 +145,40 @@ const repoRoot = path.resolve(projectRoot, "..", "..");
 const distDir = path.join(projectRoot, "dist_boot");
 const mainScript = path.join(distDir, "src", "main", "index.js");
 const skipPhysicalDisplayCapture = process.env.ARCELLE_SKIP_DISPLAY_MEDIA_CAPTURE === "1";
+
+/** Build a genuine small minisign payload in Vitest's regular Node process.
+ * Electron receives only the public verification inputs below: the disposable
+ * private key never enters the application process. */
+function signedUpdaterFixture() {
+  const payload = Buffer.from("real Electron updater digest regression");
+  const { publicKey, privateKey } = generateKeyPairSync("ed25519");
+  const rawPub = publicKey.export({ type: "spki", format: "der" }).subarray(12);
+  const keyId = Buffer.from("0123456789abcdef", "hex");
+  const publicKeyFile =
+    `untrusted comment: disposable updater test key\n` +
+    `${Buffer.concat([Buffer.from("Ed", "latin1"), keyId, rawPub]).toString("base64")}\n`;
+  const signature = cryptoSign(
+    null,
+    createHash("blake2b512").update(payload).digest(),
+    privateKey,
+  );
+  const trustedComment = "timestamp:1\tfile:Arcelle.app.tar.gz";
+  const globalSignature = cryptoSign(
+    null,
+    Buffer.concat([signature, Buffer.from(trustedComment, "utf8")]),
+    privateKey,
+  );
+  const signatureFile =
+    `untrusted comment: disposable updater test signature\n` +
+    `${Buffer.concat([Buffer.from("ED", "latin1"), keyId, signature]).toString("base64")}\n` +
+    `trusted comment: ${trustedComment}\n` +
+    `${globalSignature.toString("base64")}\n`;
+  return {
+    payload: payload.toString("base64"),
+    signature: Buffer.from(signatureFile, "utf8").toString("base64"),
+    publicKey: Buffer.from(publicKeyFile, "utf8").toString("base64"),
+  };
+}
 
 /**
  * Every non-`.ts` file the compiled MAIN PROCESS reads at runtime, each
@@ -454,6 +489,40 @@ describe("real Electron boot (index.ts, compiled + launched for real)", () => {
       ({ BrowserWindow }) => BrowserWindow.getAllWindows().length
     );
     expect(windowCount).toBe(1);
+  });
+
+  it("GH #40: verifies a prehashed update signature in the real Electron main process", async () => {
+    const fixture = signedUpdaterFixture();
+    const verifierPath = path.join(distDir, "src", "main", "updater", "minisignVerify.js");
+    const result = await electronApp.evaluate(
+      async (_electron, input: typeof fixture & { verifierPath: string }) => {
+        try {
+          // Keep module loading inside the spawned Electron process. A dynamic
+          // import in Playwright's evaluation VM has no import callback, while
+          // Node 24's createRequire can synchronously load this no-TLA ESM
+          // module and its normal production dependencies.
+          const nodeModule = process.getBuiltinModule("node:module") as typeof import("node:module");
+          const requireInElectron = nodeModule.createRequire(input.verifierPath);
+          const verifier = requireInElectron(input.verifierPath) as {
+            verifyManifestSignature(
+              payload: Buffer,
+              manifestSignatureB64: string,
+              pubkeyB64: string,
+            ): void;
+          };
+          verifier.verifyManifestSignature(
+            Buffer.from(input.payload, "base64"),
+            input.signature,
+            input.publicKey,
+          );
+          return { ok: true, error: "" };
+        } catch (error) {
+          return { ok: false, error: error instanceof Error ? error.message : String(error) };
+        }
+      },
+      { ...fixture, verifierPath },
+    );
+    expect(result, result.error).toEqual({ ok: true, error: "" });
   });
 
   it("the main process reports a fully-registered, complete IPC registry via the ready marker", async () => {

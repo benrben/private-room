@@ -23,12 +23,16 @@
  *      valid (payload, signature) pair could be replayed under a forged
  *      comment.
  *
- * NO THIRD-PARTY CRYPTO DEPENDENCY. `node:crypto` (OpenSSL) already exposes
- * both primitives: `blake2b512` as a built-in digest, and Ed25519 verify via
+ * CRYPTO BOUNDARY. `node:crypto` performs Ed25519 verification via
  * `crypto.verify(null, …)` once the raw 32-byte key is wrapped in its fixed
- * SPKI DER envelope. The only hand-written part here is byte-slicing minisign's
- * container format — parsing, not cryptography. No curve arithmetic, no hash
- * function, no signature scheme is implemented in this file.
+ * SPKI DER envelope. BLAKE2b-512 comes from `@noble/hashes`: Electron's Node
+ * build uses BoringSSL and throws "Digest method not supported" for
+ * `createHash("blake2b512")`, even though ordinary Node exposes that digest.
+ * Noble is a pure-JS implementation with no nested dependencies, so the
+ * updater behaves identically in tests and in the shipping Electron process.
+ * The only hand-written part here is byte-slicing minisign's container format
+ * — parsing, not cryptography. No curve arithmetic, hash function, or
+ * signature scheme is implemented in this file.
  *
  * ⚠️ A migration draft proposed verifying "via
  * `libsodium-wrappers` (Ed25519ph + Blake2b)". That is wrong and would verify
@@ -39,7 +43,8 @@
  * `crypto_sign_init/update/final_verify` API for this.
  */
 
-import { createHash, createPublicKey, verify as cryptoVerify, type KeyObject } from "node:crypto";
+import { blake2b } from "@noble/hashes/blake2.js";
+import { createPublicKey, verify as cryptoVerify, type KeyObject } from "node:crypto";
 
 /**
  * Thrown for every verification failure. `code` lets a caller distinguish
@@ -338,7 +343,7 @@ export function verifyMinisign(
     );
   }
 
-  const message = sig.prehashed ? createHash("blake2b512").update(payload).digest() : payload;
+  const message = sig.prehashed ? Buffer.from(blake2b(payload)) : payload;
   if (!ed25519Verify(message, sig.signature, pub.publicKey)) {
     throw new MinisignError("signature_verification_failed", "The signature verification failed");
   }

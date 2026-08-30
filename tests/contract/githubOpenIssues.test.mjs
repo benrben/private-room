@@ -1,4 +1,4 @@
-/* Regression map for every open GitHub issue audited on 2026-08-26.
+/* Regression map for every open GitHub issue audited through 2026-08-30.
  *
  * The expensive behavioral cases for long-translation and yt-dlp live beside
  * their Electron implementations (recBridge.test.ts and ytdlp.test.ts). This
@@ -155,4 +155,15 @@ test("GH #33: installed remote connectors expose OAuth and dual-stack discovery 
   assert.match(connectors, /api\.mcpOauthAuthorize\(server\)/);
   assert.match(guard, /addrs\.find\(\(a\) => a\.family === 4\) \?\? addrs\[0\]/);
   assert.match(oauthTests, /discovers, registers, and drives the whole authorize flow to a stored token/);
+});
+
+test("GH #40: the signed updater does not ask Electron's BoringSSL for BLAKE2b", () => {
+  const verifier = read("apps/desktop/src/main/updater/minisignVerify.ts");
+  const electronTest = read("apps/desktop/src/main/index.electron.test.ts");
+  assert.match(verifier, /import \{ blake2b \} from "@noble\/hashes\/blake2\.js"/);
+  assert.doesNotMatch(
+    verifier,
+    /import\s*\{[^}]*createHash[^}]*\}\s*from\s*"node:crypto"/,
+  );
+  assert.match(electronTest, /GH #40: verifies a prehashed update signature in the real Electron main process/);
 });
