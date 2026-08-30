@@ -3,6 +3,18 @@
 All notable, user-facing changes to Arcelle. Versions follow
 [semver](https://semver.org); dates are the GitHub release dates.
 
+## 0.26.11 — 2026-08-30
+
+Automatic updates now work directly from v0.26.9. Release archives use the
+standard direct-Ed25519 Minisign form that the older Electron runtime already
+supports, avoiding its unavailable BLAKE2b digest while continuing to require
+both the payload signature and the trusted-comment signature before install.
+
+The release gate verifies the production-sized archive in Electron and refuses
+to publish a prehashed signature. The full v0.26.10 archive was also verified
+successfully with the exact updater module extracted from an installed v0.26.9
+app, covering the bootstrap path that previously failed.
+
 ## 0.26.10 — 2026-08-30
 
 Signed updates now verify correctly inside the shipping Electron runtime.
