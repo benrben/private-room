@@ -8,10 +8,11 @@
  * the terminal and into whatever log is capturing it — which is why the project
  * notes said to "scrub the key-bearing log immediately" after a release.
  *
- * `tauri signer sign` can read the private key FILE through
- * TAURI_SIGNING_PRIVATE_KEY_PATH. That is safer than putting the key's bytes in
- * argv or exporting them to every child process. This pins both the secure
- * handoff and the release gates around it.
+ * The Tauri key of record is an outer-base64-wrapped Minisign secret-key file.
+ * The release flow decodes it only into an owner-only temporary directory and
+ * gives generic Minisign that temporary PATH. That is safer than putting the
+ * key's bytes in argv or exporting them to every child process. This pins both
+ * the secure handoff and the release gates around it.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -48,15 +49,24 @@ for (const rel of ["scripts/release.sh", "RELEASING.md"]) {
   });
 }
 
-test("release.sh signs with Tauri's key-path handoff, never generic minisign", () => {
+test("release.sh emits an old-client-compatible Ed signature without exposing key bytes", () => {
   const sh = read("scripts/release.sh");
   const executableLines = sh
     .split("\n")
     .filter((line) => !line.trimStart().startsWith("#"))
     .join("\n");
-  assert.match(sh, /TAURI_SIGNING_PRIVATE_KEY_PATH="\$UPDATER_KEY_PATH"/, "the signer does not receive the key path");
-  assert.match(sh, /"\$TAURI_CLI" signer sign "\$TAR"/, "the updater tar is no longer signed by Tauri CLI");
-  assert.doesNotMatch(executableLines, /\bminisign\b/i, "generic minisign cannot consume the Tauri key of record safely");
+  assert.match(sh, /mktemp -d \/tmp\/arcelle-updater-signing\.XXXXXX/,
+    "the decoded key does not live in a private temporary directory");
+  assert.match(sh, /spawn -noecho \$env\(ARCELLE_MINISIGN\) -S -l/,
+    "the signer no longer requests Minisign's legacy Ed compatibility format");
+  assert.match(sh, /unset env\(ARCELLE_MINISIGN_PASSWORD\)/,
+    "the password leaks into the spawned signer environment");
+  assert.match(sh, /parsed\.prehashed/,
+    "the finished signature is not checked for the required Ed algorithm before publication");
+  assert.match(sh, /ELECTRON_RUN_AS_NODE=1/,
+    "the compatibility signature is not verified in Electron before publication");
+  assert.doesNotMatch(executableLines, /TAURI_SIGNING_PRIVATE_KEY_PATH=/,
+    "the wrapped Tauri key path still leaks into an unrelated signer child");
   assert.match(sh, /unset TAURI_SIGNING_PRIVATE_KEY_PATH TAURI_SIGNING_PRIVATE_KEY_PASSWORD/,
     "key settings leak into unrelated build and test child processes");
   assert.match(sh, /\[\[ -z "\$\{TAURI_SIGNING_PRIVATE_KEY:-\}" \]\]/,
@@ -89,6 +99,8 @@ test("release.sh validates every release identity before publishing", () => {
     'xcrun stapler validate "$APP"',
     'spctl --assess --type execute --verbose "$APP"',
     "verifyManifestSignature(",
+    "parsed.prehashed",
+    "ELECTRON_RUN_AS_NODE=1",
   ]) {
     const at = line(verification);
     assert.ok(at > build, `${verification} does not verify the finished app/payload`);
@@ -98,11 +110,12 @@ test("release.sh validates every release identity before publishing", () => {
 
 test("the canonical release guide documents the compatible key and hard gates", () => {
   const doc = read("RELEASING.md");
-  assert.match(doc, /Tauri CLI v2/);
+  assert.match(doc, /Minisign 0\.12/);
   assert.match(doc, /chmod 600 ~\/\.tauri\/private-room\.key/);
   assert.match(doc, /Do not export the key contents as `TAURI_SIGNING_PRIVATE_KEY`/);
+  assert.match(doc, /legacy `Ed` signature/);
   assert.match(doc, /Developer ID Application/);
   assert.match(doc, /ad-hoc choice explicit when publishing/);
   assert.match(doc, /stable\s+designated requirement/);
-  assert.match(doc, /verifies that signature through the same pinned public key/);
+  assert.match(doc, /verifies the[\s\S]*signature through the same pinned public key/);
 });

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build a signed Electron release, authenticate its updater payload with
-# Arcelle's existing Tauri key, then publish with `gh`. Developer ID +
+# Arcelle's existing Tauri-compatible Minisign key, then publish with `gh`. Developer ID +
 # notarization is preferred; an explicit stable-DR ad-hoc release remains
 # supported for the current distribution workflow.
 set -euo pipefail
@@ -10,6 +10,27 @@ fail() {
   echo "release refused: $*" >&2
   exit 1
 }
+
+# Generic Minisign needs the decoded form of Tauri's outer-base64 key wrapper.
+# Keep that decoded secret in one narrowly-named owner-only directory, remove
+# only the two files this script can create, and refuse any broader cleanup.
+SIGNING_TMP=""
+cleanup_updater_signing_tmp() {
+  [[ -n "$SIGNING_TMP" ]] || return 0
+  case "$SIGNING_TMP" in
+    /tmp/arcelle-updater-signing.*) ;;
+    *)
+      echo "release cleanup refused unexpected path: $SIGNING_TMP" >&2
+      return 1
+      ;;
+  esac
+  for signing_file in "$SIGNING_TMP/minisign.key" "$SIGNING_TMP/Arcelle.app.tar.gz.minisig"; do
+    [[ ! -e "$signing_file" && ! -L "$signing_file" ]] || unlink "$signing_file"
+  done
+  rmdir "$SIGNING_TMP"
+  SIGNING_TMP=""
+}
+trap cleanup_updater_signing_tmp EXIT
 
 ROOT="$(pwd -P)"
 REPO="benrben/private-room"
@@ -42,6 +63,7 @@ command -v security >/dev/null || fail "macOS security tool is required"
 command -v codesign >/dev/null || fail "macOS codesign is required"
 command -v xcrun >/dev/null || fail "Xcode command-line tools are required"
 command -v spctl >/dev/null || fail "macOS spctl is required"
+[[ -x /usr/bin/expect ]] || fail "macOS expect is required for the protected updater key"
 
 [[ "${ARCELLE_PACKAGE_UNSIGNED_PROOF:-}" != "1" ]] || \
   fail "ARCELLE_PACKAGE_UNSIGNED_PROOF cannot be used for a release"
@@ -79,11 +101,11 @@ if [[ "$SIGNING_MODE" == "developer-id" ]]; then
 fi
 
 # The old Tauri updater and the Electron bridge pin the public half of this
-# exact key. Use Tauri's signer, not generic minisign: the key of record is the
-# Tauri CLI's base64 private-key format, and Tauri writes the already-base64
-# signature string expected by latest.json. The *_PATH hand-off lets the signer
-# read the existing file itself; private bytes never enter argv, logs, command
-# substitution, or an exported environment variable.
+# exact key. The key of record is a base64 wrapper around a normal Minisign
+# secret-key file. Only its path and password enter this process; decoded bytes
+# live briefly in the owner-only temporary directory created immediately before
+# signing and never enter argv, logs, command substitution, or an environment
+# variable.
 [[ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]] || \
   fail "unset TAURI_SIGNING_PRIVATE_KEY; use TAURI_SIGNING_PRIVATE_KEY_PATH so key bytes are not exported"
 UPDATER_KEY_PATH="${TAURI_SIGNING_PRIVATE_KEY_PATH:-${HOME}/.tauri/private-room.key}"
@@ -98,18 +120,16 @@ KEY_MODE="$(stat -f '%Lp' "$UPDATER_KEY_PATH")"
 (( (8#$KEY_MODE & 8#077) == 0 )) || \
   fail "updater key permissions are $KEY_MODE; run: chmod 600 '$UPDATER_KEY_PATH'"
 
-if [[ -n "${ARCELLE_TAURI_CLI:-}" ]]; then
-  TAURI_CLI="$ARCELLE_TAURI_CLI"
-elif [[ -x "$ROOT/node_modules/.bin/tauri" ]]; then
-  TAURI_CLI="$ROOT/node_modules/.bin/tauri"
-elif command -v tauri >/dev/null; then
-  TAURI_CLI="$(command -v tauri)"
+if [[ -n "${ARCELLE_MINISIGN:-}" ]]; then
+  MINISIGN="$ARCELLE_MINISIGN"
 else
-  fail "Tauri CLI v2 is required only for updater signing (install @tauri-apps/cli@2.11.4)"
+  MINISIGN="$(command -v minisign || true)"
 fi
-[[ -x "$TAURI_CLI" ]] || fail "Tauri CLI is not executable: $TAURI_CLI"
-TAURI_VERSION="$($TAURI_CLI --version)"
-[[ "$TAURI_VERSION" == tauri-cli\ 2.* ]] || fail "Tauri CLI v2 is required; found: $TAURI_VERSION"
+[[ -n "$MINISIGN" && -x "$MINISIGN" ]] || \
+  fail "Minisign 0.12 is required for updater compatibility (brew install minisign)"
+MINISIGN_VERSION="$($MINISIGN -v)"
+[[ "$MINISIGN_VERSION" == "minisign 0.12" ]] || \
+  fail "Minisign 0.12 is required; found: $MINISIGN_VERSION"
 
 git diff --quiet && git diff --cached --quiet && \
   [[ -z "$(git ls-files --others --exclude-standard)" ]] || \
@@ -121,7 +141,7 @@ gh auth status >/dev/null 2>&1 || fail "gh is not authenticated"
 gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1 && \
   fail "GitHub release $TAG already exists; refusing to replace published assets"
 
-echo "release prerequisites passed: signing=$SIGNING_MODE ($DEV_ID); notarization=$NOTARY_METHOD; $TAURI_VERSION"
+echo "release prerequisites passed: signing=$SIGNING_MODE ($DEV_ID); notarization=$NOTARY_METHOD; $MINISIGN_VERSION"
 scripts/preflight.sh
 ./services/agent-sidecar/build-sidecar.sh
 [[ -x "$SIDECAR/arcelle-sidecar" ]] || fail "missing built sidecar: $SIDECAR"
@@ -162,16 +182,97 @@ else
 fi
 
 node "$APP_DIR/scripts/packTarGz.mjs" "$APP" "$TAR"
-TAURI_SIGNING_PRIVATE_KEY_PATH="$UPDATER_KEY_PATH" \
-TAURI_SIGNING_PRIVATE_KEY_PASSWORD="$UPDATER_KEY_PASSWORD" \
-  "$TAURI_CLI" signer sign "$TAR"
-[[ -s "$TAR.sig" ]] || fail "Tauri signer did not create $TAR.sig"
+
+# v0.26.9's Electron runtime cannot provide BLAKE2b through node:crypto. It can
+# still verify Minisign's standard direct-Ed25519 `Ed` form, which the bridge
+# verifier deliberately accepts. Keep publishing that compatibility form so an
+# installation which missed v0.26.10 can update directly to any later release.
+SIGNING_TMP="$(mktemp -d /tmp/arcelle-updater-signing.XXXXXX)"
+chmod 700 "$SIGNING_TMP"
+DECODED_UPDATER_KEY="$SIGNING_TMP/minisign.key"
+RAW_UPDATER_SIGNATURE="$SIGNING_TMP/Arcelle.app.tar.gz.minisig"
+ARCELLE_WRAPPED_KEY_PATH="$UPDATER_KEY_PATH" \
+ARCELLE_DECODED_KEY_PATH="$DECODED_UPDATER_KEY" \
+node --input-type=module <<'NODE'
+import { readFile, writeFile } from "node:fs/promises";
+import { TextDecoder } from "node:util";
+
+const encoded = (await readFile(process.env.ARCELLE_WRAPPED_KEY_PATH, "utf8")).trim();
+if (!encoded || encoded.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(encoded)) {
+  throw new Error("the updater key wrapper is not canonical base64");
+}
+const decoded = Buffer.from(encoded, "base64");
+if (decoded.toString("base64") !== encoded) {
+  throw new Error("the updater key wrapper is not canonical base64");
+}
+new TextDecoder("utf-8", { fatal: true }).decode(decoded);
+await writeFile(process.env.ARCELLE_DECODED_KEY_PATH, decoded, { mode: 0o600, flag: "wx" });
+NODE
+
+# `expect` supplies the password over the signer's protected terminal. The
+# value is removed from the environment before Minisign is spawned, is not in
+# argv, and terminal echo is disabled by Minisign while it is entered.
+ARCELLE_MINISIGN="$MINISIGN" \
+ARCELLE_MINISIGN_KEY="$DECODED_UPDATER_KEY" \
+ARCELLE_MINISIGN_PAYLOAD="$TAR" \
+ARCELLE_MINISIGN_SIGNATURE="$RAW_UPDATER_SIGNATURE" \
+ARCELLE_MINISIGN_PASSWORD="$UPDATER_KEY_PASSWORD" \
+/usr/bin/expect <<'EXPECT'
+set timeout -1
+set signer_password $env(ARCELLE_MINISIGN_PASSWORD)
+unset env(ARCELLE_MINISIGN_PASSWORD)
+spawn -noecho $env(ARCELLE_MINISIGN) -S -l -s $env(ARCELLE_MINISIGN_KEY) -m $env(ARCELLE_MINISIGN_PAYLOAD) -x $env(ARCELLE_MINISIGN_SIGNATURE)
+expect {
+  -re {Password:} {
+    send -- "$signer_password\r"
+    exp_continue
+  }
+  eof
+}
+set wait_result [wait]
+exit [lindex $wait_result 3]
+EXPECT
+[[ -s "$RAW_UPDATER_SIGNATURE" ]] || fail "Minisign did not create the updater signature"
+ARCELLE_RAW_SIGNATURE="$RAW_UPDATER_SIGNATURE" ARCELLE_OUTER_SIGNATURE="$TAR.sig" \
+node --input-type=module <<'NODE'
+import { readFile, writeFile } from "node:fs/promises";
+const raw = await readFile(process.env.ARCELLE_RAW_SIGNATURE);
+if (raw.length === 0) throw new Error("the updater signature is empty");
+await writeFile(process.env.ARCELLE_OUTER_SIGNATURE, raw.toString("base64"), { mode: 0o644 });
+NODE
+cleanup_updater_signing_tmp
+[[ -s "$TAR.sig" ]] || fail "compatibility signer did not create $TAR.sig"
 
 # Do not trust a successful signer exit code alone. Verify the exact payload
 # and signature through the same pinned public key and verifier the installed
 # Electron app uses. A wrong private key therefore fails before publication.
 ARCELLE_UPDATE_PAYLOAD="$TAR" ARCELLE_UPDATE_SIGNATURE="$TAR.sig" \
 node --input-type=module <<'NODE'
+import { readFileSync } from "node:fs";
+import {
+  decodeOuterBase64,
+  parseSignatureFile,
+  verifyManifestSignature,
+} from "./apps/desktop/dist_package/src/main/updater/minisignVerify.js";
+import { TAURI_UPDATE_PUBKEY_B64 } from "./apps/desktop/dist_package/src/main/updater/tauriUpdater.js";
+const signatureB64 = readFileSync(process.env.ARCELLE_UPDATE_SIGNATURE, "utf8").trim();
+const parsed = parseSignatureFile(
+  decodeOuterBase64(signatureB64, "malformed_signature", "release signature"),
+);
+if (parsed.prehashed) {
+  throw new Error("release signature is ED/prehashed; v0.26.9 requires the compatible Ed form");
+}
+verifyManifestSignature(
+  readFileSync(process.env.ARCELLE_UPDATE_PAYLOAD),
+  signatureB64,
+  TAURI_UPDATE_PUBKEY_B64,
+);
+NODE
+
+# Run the same verification in Electron's BoringSSL-backed Node runtime. This
+# is the exact crypto environment where v0.26.9 rejected an `ED` signature.
+ARCELLE_UPDATE_PAYLOAD="$TAR" ARCELLE_UPDATE_SIGNATURE="$TAR.sig" \
+ELECTRON_RUN_AS_NODE=1 "$ROOT/node_modules/.bin/electron" --input-type=module <<'NODE'
 import { readFileSync } from "node:fs";
 import { verifyManifestSignature } from "./apps/desktop/dist_package/src/main/updater/minisignVerify.js";
 import { TAURI_UPDATE_PUBKEY_B64 } from "./apps/desktop/dist_package/src/main/updater/tauriUpdater.js";
