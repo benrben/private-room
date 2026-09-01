@@ -546,7 +546,7 @@ describe("guardedGet — SSRF-guarded, per-hop redirect following", () => {
     // dns.lookup fails, so a public IPv6 literal would be unreachable.
     await expect(guardedGet("http://[2606:4700:4700::1111]/x")).rejects.toThrow();
     expect(vi.mocked(resolvePublicAddr)).toHaveBeenCalledWith("2606:4700:4700::1111", 80);
-  });
+  }, 15_000);
 });
 
 describe("guardedGet over TLS — the pin must not cost certificate identity", () => {

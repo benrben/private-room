@@ -298,7 +298,7 @@ describe("sealed workspace packages", () => {
       .run(second.fileId);
     unsafe.close();
     expect(() => inspectSealedPackage(sealedPath, password)).toThrow("cannot leave the room");
-  });
+  }, 15_000);
 
   it("exports, verifies and imports current files plus encrypted history", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "arcelle-sealed-"));

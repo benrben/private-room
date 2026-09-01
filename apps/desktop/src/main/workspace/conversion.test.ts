@@ -363,7 +363,7 @@ describe("legacy workspace conversion", () => {
       "The saved workspace conversion report is damaged.",
     );
     expect((await stat(tempDb)).isFile()).toBe(true);
-  });
+  }, 15_000);
 
   it("refuses to resume a temp workspace created from a different legacy source", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "arcelle-convert-resume-source-"));

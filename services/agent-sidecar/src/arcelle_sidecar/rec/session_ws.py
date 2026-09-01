@@ -167,27 +167,33 @@ class RecSessionManager:
         Best-effort throughout -- the session is ending either way, and a
         failure closing a socket must not become the thing the user hears
         about."""
-        if session.finalized:
-            return
-        session.finalized = True
-        if self.current is session:
-            self.current = None
-        with contextlib.suppress(Exception):
-            await session.engine.aclose()
-        with contextlib.suppress(Exception):
-            session.ports.spool.unlink()
-        host_ws = session.ports.host.ws
-        session.ports.host.detach()
-        if host_ws is not None:
+        # Startup uses this same lock. Keep the slot unavailable until its
+        # spool and sockets are gone, otherwise an immediate same-file restart
+        # can collide with the predecessor's still-existing O_EXCL spool.
+        async with self._lock:
+            if session.finalized:
+                return
+            session.finalized = True
             with contextlib.suppress(Exception):
-                await host_ws.close()
-        # `Engine.run` answers everything still in its inbox when its loop ends;
-        # this catches the case where it could not -- a run task that died on an
-        # unexpected error -- so an HTTP caller gets a failure instead of a
-        # request that never returns.
-        for fut in session.waiting:
-            if not fut.done():
-                fut.set_exception(RuntimeError("The recording engine stopped before it could save."))
+                await session.engine.aclose()
+            with contextlib.suppress(Exception):
+                session.ports.spool.unlink()
+            host_ws = session.ports.host.ws
+            session.ports.host.detach()
+            if host_ws is not None:
+                with contextlib.suppress(Exception):
+                    await host_ws.close()
+            # `Engine.run` answers everything still in its inbox when its loop ends;
+            # this catches the case where it could not -- a run task that died on an
+            # unexpected error -- so an HTTP caller gets a failure instead of a
+            # request that never returns.
+            for fut in session.waiting:
+                if not fut.done():
+                    fut.set_exception(
+                        RuntimeError("The recording engine stopped before it could save.")
+                    )
+            if self.current is session:
+                self.current = None
 
     def for_file(self, file_id: str) -> LiveSession | None:
         session = self.current
