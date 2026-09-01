@@ -457,24 +457,22 @@ describe("ensureMediaLimits (staleness policy)", () => {
         return jsonResponse(200, { data: [{ id: "vendor/a" }] });
       },
     };
-    await ensureMediaLimits("key", deps);
-    expect(fetches).toBe(2); // one per endpoint
-
-    let spy = vi.spyOn(Date, "now").mockReturnValue(Date.now() + REFRESH_AFTER_MS - 1);
+    const baseTime = Date.now();
+    const spy = vi.spyOn(Date, "now").mockReturnValue(baseTime);
     try {
       await ensureMediaLimits("key", deps);
+      expect(fetches).toBe(2); // one per endpoint
+
+      spy.mockReturnValue(baseTime + REFRESH_AFTER_MS - 1);
+      await ensureMediaLimits("key", deps);
+      expect(fetches, "still inside the one-hour window").toBe(2);
+
+      spy.mockReturnValue(baseTime + REFRESH_AFTER_MS + 1);
+      await ensureMediaLimits("key", deps);
+      expect(fetches, "past the window, a refresh is attempted").toBe(4);
     } finally {
       spy.mockRestore();
     }
-    expect(fetches, "still inside the one-hour window").toBe(2);
-
-    spy = vi.spyOn(Date, "now").mockReturnValue(Date.now() + REFRESH_AFTER_MS + 1);
-    try {
-      await ensureMediaLimits("key", deps);
-    } finally {
-      spy.mockRestore();
-    }
-    expect(fetches, "past the window, a refresh is attempted").toBe(4);
   });
 
   it("a HALF table is retried after RETRY_HALF_AFTER_MS, well before the full-hour window", async () => {

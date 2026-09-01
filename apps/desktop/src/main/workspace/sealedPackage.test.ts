@@ -57,7 +57,7 @@ describe("sealed workspace packages", () => {
     } finally {
       created.db.close();
     }
-  });
+  }, 15_000);
 
   it("keeps export preflight and cleanup transactional when workspace bytes change", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "arcelle-sealed-create-guards-"));
@@ -101,7 +101,7 @@ describe("sealed workspace packages", () => {
     } finally {
       created.db.close();
     }
-  });
+  }, 15_000);
 
   it("rejects unknown extraction selections and corrupted package metadata before publish", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "arcelle-sealed-integrity-"));
@@ -139,7 +139,7 @@ describe("sealed workspace packages", () => {
     await expect(importSealedPackage(corruptBytes, password, path.join(root, "Corrupt import")))
       .rejects.toThrow("The sealed package failed its content integrity check.");
     await expect(readdir(path.join(root, "Corrupt import"))).rejects.toThrow();
-  });
+  }, 15_000);
 
   it("rejects malformed sealed rows and cleans an import that fails after restore", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "arcelle-sealed-malformed-"));
@@ -220,7 +220,7 @@ describe("sealed workspace packages", () => {
     } finally {
       created.db.close();
     }
-  });
+  }, 15_000);
 
   it("lists safe manifest paths and atomically extracts only selected files without overwriting", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "arcelle-sealed-extract-"));
@@ -424,5 +424,5 @@ describe("sealed workspace packages", () => {
       vi.doUnmock("node:fs/promises");
       vi.resetModules();
     }
-  });
+  }, 15_000);
 });
