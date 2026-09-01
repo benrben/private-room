@@ -18,12 +18,15 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 import { El, install, currentDocument, setSelection, fireWindow } from "./dom-stub.mjs";
+import { RUNTIME_ASSETS } from "../../apps/desktop/scripts/copyRuntimeAssets.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const SOURCE = readFileSync(
-  join(here, "../../apps/desktop/src/main/browser/page.js"),
-  "utf8",
+const browserScriptPaths = RUNTIME_ASSETS.filter(
+  (parts) => parts[0] === "src" && parts[1] === "main" && parts[2] === "browser",
 );
+const SOURCE = browserScriptPaths
+  .map((parts) => readFileSync(join(here, "../../apps/desktop", ...parts), "utf8"))
+  .join("\n");
 
 function fresh() {
   const api = install(SOURCE);

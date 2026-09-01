@@ -30,11 +30,8 @@
  * looks in is worse than no button. The same four pieces this port's
  * ecosystem still owes:
  *   1. This file — done.
- *   2. `mcp.rs`'s launcher prepending the downloaded bin dirs to the
- *      connector's PATH — no Electron port of the stdio launcher's actual
- *      spawn call exists yet in this migration (`mcpClient.ts`'s
- *      `StdioConnectOptions.cachedPathPrefix` is the injection point, default
- *      `""`, documented in that file as awaiting exactly this).
+ *   2. `mcpSurfaceIpc.ts` passes the published downloaded-runtime prefix to
+ *      `mcpClient.ts` for every connector launch — done.
  *   3. `scriptRun.ts`'s own pre-existing stand-in cell
  *      ({@link cachedPathPrefix}/{@link setCachedPathPrefix} there) — THAT
  *      one this file DOES close: {@link refreshPathPrefix} below publishes to
@@ -46,10 +43,8 @@
  *      different batches with no shared module to hold one, so publishing to
  *      both from here is what keeps them from drifting the way the Rust
  *      source never could.
- *   4. The "Download runtime" prompt in `ConnectorsView.tsx`'s Electron
- *      equivalent — no Phase 2 renderer work exists in this migration yet.
- *      {@link registerRuntimesIpc} exists, tested directly, and is NOT wired
- *      into any bootstrap, per `recIpc.ts`'s precedent (rule 4).
+ *   4. The Connectors marketplace probes and provisions runtimes through
+ *      {@link registerRuntimesIpc}, which is wired by `registerAllIpc.ts` — done.
  *
  * REUSED, NOT RE-PORTED:
  *   - `mcpClient.ts`'s {@link loginShellPath} IS `crate::mcp::login_shell_path`
@@ -507,9 +502,8 @@ export async function mcpProvisionRuntime(
 }
 
 // ============================================================================
-// registerRuntimesIpc — thin `ipcMain.handle` registration, per `recIpc.ts`'s
-// precedent. NOT wired into any bootstrap yet: it exists, and it is tested
-// directly (rule 4).
+// registerRuntimesIpc — thin `ipcMain.handle` registration, wired by the main
+// IPC composition root.
 // ============================================================================
 
 /**
@@ -526,7 +520,9 @@ export function registerRuntimesIpc(
   ipcMain: Pick<IpcMain, "handle">,
   appDataDir: string,
   emit?: EventSender,
+  afterProvision: () => void | Promise<void> = () => undefined,
 ): void {
+  refreshPathPrefix(appDataDir);
   const handle = <A extends unknown[], R>(
     channel: string,
     fn: (...args: A) => R,
@@ -539,7 +535,8 @@ export function registerRuntimesIpc(
   handle("mcp_runtime_for_command", (args: { command: string }) =>
     mcpRuntimeForCommand(appDataDir, args.command),
   );
-  handle("mcp_provision_runtime", (args: { kind: string }) =>
-    mcpProvisionRuntime(appDataDir, args.kind, { emit }),
-  );
+  handle("mcp_provision_runtime", async (args: { kind: string }) => {
+    await mcpProvisionRuntime(appDataDir, args.kind, { emit });
+    await afterProvision();
+  });
 }

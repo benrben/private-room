@@ -1,6 +1,7 @@
 /* The spoken voice's sentence chunker (src/workspace/voice.ts).
  *
- * Every guard in `extractSentences`/`emit`/`breakPoint`/`stripForSpeech` exists
+ * Every guard in `voice.ts`'s `extractSentences`/`emit` and `voiceText.ts`'s
+ * `breakPoint`/`stripForSpeech` exists
  * because something was once read aloud wrong: a JSON annotation payload spoken
  * as words, a CJK answer arriving as one chunk the synthesizer silently refused,
  * "3.5b" cut in half at the decimal point. None of it had a test, so the next
@@ -28,15 +29,32 @@ const root = join(here, "../..");
 const read = (p) => readFileSync(join(root, p), "utf8");
 
 const VOICE_SOURCE = read("apps/desktop/src/renderer/workspace/voice.ts");
+const VOICE_TEXT_SOURCE = read("apps/desktop/src/renderer/workspace/voiceText.ts");
 
-// ---- slice: the chunker, from stripForSpeech to the synthesis pump ---------
+// ---- slice: the queue plus its exact owning text helpers --------------------
 
-const start = VOICE_SOURCE.indexOf("function stripForSpeech");
-const end = VOICE_SOURCE.indexOf("// ---- synthesis pump");
-assert.ok(
-  start > 0 && end > start,
-  "expected the chunker between stripForSpeech and the synthesis-pump banner — did voice.ts get reshuffled?",
+const VOICE_TREE = ts.createSourceFile(
+  "voice.ts",
+  VOICE_SOURCE,
+  ts.ScriptTarget.Latest,
+  true,
+  ts.ScriptKind.TS,
 );
+
+function voiceFunctionSource(name) {
+  const declaration = VOICE_TREE.statements.find(
+    (statement) => ts.isFunctionDeclaration(statement) && statement.name?.text === name,
+  );
+  assert.ok(declaration, `${name} is gone from voice.ts`);
+  return declaration.getText(VOICE_TREE);
+}
+
+const CHUNKER_SOURCE = [
+  "extractSentences",
+  "emit",
+  "queueChunk",
+  "flushCarry",
+].map(voiceFunctionSource).join("\n");
 
 // The constants the slice reads, taken from the source rather than restated:
 // a test that hardcodes 60/300/25 would keep passing after somebody retunes them.
@@ -47,12 +65,10 @@ const constOf = (name) => {
 };
 const MIN_CHUNK_CHARS = constOf("MIN_CHUNK_CHARS");
 const MIN_FIRST_CHUNK_CHARS = constOf("MIN_FIRST_CHUNK_CHARS");
-const FORCE_FLUSH_CHARS = constOf("FORCE_FLUSH_CHARS");
 
 const harness = `
 const MIN_CHUNK_CHARS = ${MIN_CHUNK_CHARS};
 const MIN_FIRST_CHUNK_CHARS = ${MIN_FIRST_CHUNK_CHARS};
-const FORCE_FLUSH_CHARS = ${FORCE_FLUSH_CHARS};
 let pending = "";
 let carry = "";
 let sentenceQueue = [];
@@ -65,10 +81,10 @@ export function drain() { const out = sentenceQueue.slice(); reset(); return out
 export function reset() { pending = ""; carry = ""; sentenceQueue = []; firstChunkSent = false; }
 export function held() { return pending; }
 `;
-const js = ts.transpileModule(harness + VOICE_SOURCE.slice(start, end) + exports, {
+const js = ts.transpileModule(VOICE_TEXT_SOURCE + harness + CHUNKER_SOURCE + exports, {
   compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
 }).outputText;
-const { feed, drain, reset, held } = await import(
+const { FORCE_FLUSH_CHARS, feed, drain, reset, held } = await import(
   `data:text/javascript,${encodeURIComponent(js)}`
 );
 
@@ -240,19 +256,19 @@ test("every path that starts new speech resets the first-chunk floor", () => {
   }
 });
 
-// ---- the cross-language coupling nobody was guarding -----------------------
+// ---- the host/renderer wording coupling nobody was guarding ----------------
 
-test("the offline branch still matches the words the Rust actually sends", () => {
+test("the offline branch still matches the words the host actually sends", () => {
   // `reportVoiceProblem` decides between "your internet switch is off — here is
   // where" and "the voice service didn't answer" by matching a SUBSTRING of a
-  // message composed in another language, in another file. Reword the Rust and
+  // message composed in another process, in another file. Reword the host and
   // the user is quietly pointed at a network problem instead of the one-click
   // setting that caused it — with nothing failing to say so.
-  const host = read("apps/desktop/src/main/studiosPodcastAudio.ts");
+  const host = read("apps/desktop/src/main/studiosSpeech.ts");
   const needle = VOICE_SOURCE.match(/reason\.includes\("([^"]+)"\)/);
   assert.ok(needle, "expected voice.ts to branch on a substring of the host's refusal");
   const offline = host.match(/SPEECH_OFFLINE_MESSAGE\s*=\s*([\s\S]*?);/);
-  assert.ok(offline, "expected SPEECH_OFFLINE_MESSAGE in studiosPodcastAudio.ts");
+  assert.ok(offline, "expected SPEECH_OFFLINE_MESSAGE in studiosSpeech.ts");
   assert.ok(
     offline[1].includes(needle[1]),
     `voice.ts matches on "${needle[1]}", which SPEECH_OFFLINE_MESSAGE no longer contains — ` +

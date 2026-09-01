@@ -12,6 +12,8 @@ const mocks = vi.hoisted(() => ({
   transcribe: vi.fn(),
   registerChat: vi.fn(),
   registerVideo: vi.fn(),
+  refreshMcp: vi.fn(),
+  runtimeAfterProvision: undefined as (() => void | Promise<void>) | undefined,
 }));
 
 const noOp = vi.hoisted(() => vi.fn());
@@ -90,7 +92,11 @@ vi.mock("../recIpc.js", () => ({
   },
 }));
 vi.mock("../recentTools.js", () => ({ registerRecentIpc: noOp }));
-vi.mock("../runtimesCmds.js", () => ({ registerRuntimesIpc: noOp }));
+vi.mock("../runtimesCmds.js", () => ({
+  registerRuntimesIpc: (...args: unknown[]) => {
+    mocks.runtimeAfterProvision = args[3] as typeof mocks.runtimeAfterProvision;
+  },
+}));
 vi.mock("../safetyTools.js", () => ({ registerSafetyIpc: noOp }));
 vi.mock("../searchTools.js", () => ({ registerSearchIpc: noOp }));
 vi.mock("../sketchIpc.js", () => ({ registerSketchIpc: noOp }));
@@ -136,7 +142,7 @@ vi.mock("../agentUiSurfaceIpc.js", () => ({ registerAgentUiSurfaceIpc: noOpValue
 vi.mock("../creativeJobSurfaceIpc.js", () => ({ registerCreativeJobSurfaceIpc: noOp }));
 vi.mock("../harnessSurfaceIpc.js", () => ({ registerHarnessSurfaceIpc: noOp }));
 vi.mock("../autoIndexLive.js", () => ({ createLiveAutoIndex: noOp }));
-vi.mock("../liveAppServices.js", () => ({ refreshMcpConnections: vi.fn() }));
+vi.mock("../liveAppServices.js", () => ({ refreshMcpConnections: mocks.refreshMcp }));
 vi.mock("../retrievalBackfill.js", () => ({
   createEmbedBackfillState: noOpValue,
   spawnEmbeddingBackfill: noOp,
@@ -197,7 +203,19 @@ beforeEach(() => {
   mocks.duplicateRegistration = false;
   mocks.fileRuntimeActions = undefined;
   mocks.recActions = undefined;
+  mocks.runtimeAfterProvision = undefined;
   mocks.videoDeps = undefined;
+});
+
+describe("registry runtime reconnect wiring with fabricated registrars", () => {
+  it("refreshes room connectors after a runtime is provisioned", async () => {
+    registerWithFakes([]);
+
+    expect(mocks.runtimeAfterProvision).toBeTypeOf("function");
+    await mocks.runtimeAfterProvision?.();
+
+    expect(mocks.refreshMcp).toHaveBeenCalledOnce();
+  });
 });
 
 describe("registry speaker-aware transcription wiring with fabricated registrars", () => {

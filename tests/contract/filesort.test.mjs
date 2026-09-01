@@ -120,7 +120,7 @@ test("the sidebar sorts the one list every file surface reads", () => {
   // can never disagree about the order the reader chose.
   assert.match(
     sidebar,
-    /const shownFiles = sortFiles\(libraryFiles\(s\.files\)\.filter\(matchesFilter\), s\.fileSort\)/,
+    /const shownFiles = sortFiles\(libraryFiles\(s\.files\)\.filter\(\(file\) => fileMatchesFilter\(file, filterQ\)\), s\.fileSort\)/,
   );
   assert.match(sidebar, /aria-label="Sort files"/, "the control must exist");
   assert.match(sidebar, /s\.setFileSort\(/, "…and be wired to the setter");

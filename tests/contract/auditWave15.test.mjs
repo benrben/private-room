@@ -10,9 +10,11 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { readReachableSource } from "../support/source-modules.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const read = (p) => readFileSync(join(here, "../../", p), "utf8");
+const reachable = (p) => readReachableSource(p);
 
 /* ---------------------------------------------------------------- locality */
 
@@ -38,14 +40,14 @@ test("every trust surface asks about the ROUTE, not just the model name", () => 
     "apps/desktop/src/renderer/workspace/FrontPage.tsx",
   ]) {
     const src = read(f);
-    assert.ok(/isCloudRoute\(/.test(src), `${f} does not use isCloudRoute`);
+    assert.ok(/isCloudRoute\(/.test(reachable(f)), `${f} does not use isCloudRoute`);
     assert.ok(
       !/\bisCloudEngine\(\s*s?\.?model/.test(src),
       `${f} still decides "is this cloud?" from the model name alone`,
     );
   }
   assert.ok(
-    /remoteRelay: boolean/.test(read("apps/desktop/src/shared/apiTypes.ts")),
+    /remoteRelay: boolean/.test(reachable("apps/desktop/src/shared/apiTypes.ts")),
     "AiStatus lost remoteRelay, so the UI has no way to learn about the relay",
   );
   // The Closet's own panel said the opposite, in so many words.
@@ -63,13 +65,13 @@ test("every trust surface asks about the ROUTE, not just the model name", () => 
 /* ------------------------------------------------ destructive acts ask first */
 
 test("deleting a checkpoint asks first, like rolling back does", () => {
-  const src = read("apps/desktop/src/renderer/settings/CheckpointsSection.tsx");
+  const src = reachable("apps/desktop/src/renderer/settings/CheckpointsSection.tsx");
   assert.ok(
-    /setConfirmDelete\(c\.id\)/.test(src),
+    /setConfirmDelete\(checkpoint\.id\)/.test(src),
     "the Delete button fires straight into deleteCheckpoint again",
   );
   assert.ok(
-    /confirmDelete === c\.id \? \(/.test(src),
+    /confirmDelete === checkpoint\.id/.test(src),
     "there is no armed question for a delete",
   );
   assert.ok(
@@ -79,7 +81,7 @@ test("deleting a checkpoint asks first, like rolling back does", () => {
 });
 
 test("the browser journal's Clear asks before erasing the record", () => {
-  const src = read("apps/desktop/src/renderer/workspace/BrowserView.tsx");
+  const src = reachable("apps/desktop/src/renderer/workspace/BrowserView.tsx");
   assert.ok(/confirmClear/.test(src), "Clear is a one-click erase again");
   assert.ok(
     /setConfirmClear\(true\)/.test(src),
@@ -149,10 +151,9 @@ test("a room can hand its cloud-privacy choice back to the app default", () => {
 });
 
 test("Escape in the private-topics box does not close Settings", () => {
-  const src = read("apps/desktop/src/renderer/settings/CloudPrivacySection.tsx");
-  const box = src.slice(src.indexOf("cpv-concepts"));
+  const src = reachable("apps/desktop/src/renderer/settings/CloudPrivacySection.tsx");
   assert.ok(
-    /e\.key === "Escape"/.test(box) && /stopPropagation/.test(box),
+    /onKeyDown=\{stopEscape\}/.test(src) && /event\.key === "Escape"/.test(src) && /event\.stopPropagation/.test(src),
     "that box only saves on blur, so Escape throws the typing away",
   );
 });
@@ -160,7 +161,7 @@ test("Escape in the private-topics box does not close Settings", () => {
 /* ------------------------------------------------- connector runtime download */
 
 test("the runtime download is wired end to end, not just written", () => {
-  const host = read("apps/desktop/src/main/runtimesCmds.ts");
+  const host = reachable("apps/desktop/src/main/runtimesCmds.ts");
   for (const cmd of ["mcp_runtime_for_command", "mcp_provision_runtime"]) {
     assert.ok(host.includes(`handle("${cmd}"`), `${cmd} is not in the IPC handler`);
   }
@@ -170,15 +171,15 @@ test("the runtime download is wired end to end, not just written", () => {
   );
   // Without this the download lands in a folder no connector ever looks in.
   assert.ok(
-    /cachedPathPrefix/.test(read("apps/desktop/src/main/mcpClient.ts")),
+    /cachedPathPrefix/.test(reachable("apps/desktop/src/main/mcpSurfaceIpc.ts")),
     "the connector launcher does not put the downloaded runtimes on PATH",
   );
-  const mkt = read("apps/desktop/src/renderer/settings/McpMarketplace.tsx");
+  const mkt = reachable("apps/desktop/src/renderer/settings/McpMarketplace.tsx");
   assert.ok(/mcpRuntimeForCommand/.test(mkt), "the install drawer never asks");
   assert.ok(/mcpProvisionRuntime/.test(mkt), "the install drawer offers no download");
   // Empty must read as empty: an unanswered probe shows nothing, not "ready".
   assert.ok(
-    /runtime && !runtime\.available/.test(mkt),
+    /!runtime \|\| runtime\.available/.test(mkt),
     "the prompt no longer branches on a real answer",
   );
 });

@@ -20,12 +20,11 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync, existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { dirname, join, resolve } from "node:path";
-import ts from "typescript";
+import { dirname, join } from "node:path";
 import { renderToStaticMarkup } from "react-dom/server";
 import { createElement } from "react";
+import { loadTypescriptModule } from "../support/source-modules.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const SRC = join(here, "../../apps/desktop/src/renderer");
@@ -39,110 +38,39 @@ const BARE = {
   "react/jsx-runtime": import.meta.resolve("react/jsx-runtime"),
 };
 
-const asData = (src) => `data:text/javascript,${encodeURIComponent(src)}`;
-
-// `import … from "x";` and `export … from "x";` — api.ts re-exports its type
-// module, and a missed re-export would leave a specifier node cannot resolve.
-const FROM_RE = /(?:import|export)\s+([\s\S]*?)\s+from\s+"([^"]+)";/g;
-
-/** The named/default bindings an import clause actually pulls in. Type-only
- *  imports are already gone — TypeScript elides them when it strips types. */
-function bindingsOf(clause) {
-  const names = [];
-  const braced = clause.match(/\{([\s\S]*)\}/);
-  if (braced) {
-    for (const raw of braced[1].split(",")) {
-      const n = raw.trim().split(/\s+as\s+/).pop().trim();
-      if (n) names.push(n);
-    }
-  }
-  const head = clause.replace(/\{[\s\S]*\}/, "").replace(/,\s*$/, "").trim();
-  return { names, hasDefault: Boolean(head) };
-}
-
-/** A module that satisfies an import without pretending to do its job: every
- *  binding is an inert function, which is both a valid React component and a
- *  callable that returns nothing. `overrides` supplies the few bindings a test
- *  needs to be real (the invoke recorder). */
-function stubModule(clause, overrides = {}) {
-  const { names, hasDefault } = bindingsOf(clause);
-  const body = [
-    "const inert = () => null;",
-    ...names.map((n) => `export const ${n} = ${overrides[n] ?? "inert"};`),
-    hasDefault ? "export default inert;" : "",
-  ].join("\n");
-  return asData(body);
-}
-
 // Tauri is not present under `node --test`. `invoke` is the seam we care
 // about: it records the command name a click ends up asking the host for.
 const INVOKE_RECORDER =
   "(cmd, args) => { (globalThis.__invokeCalls ??= []).push([cmd, args]); return Promise.resolve(undefined); }";
 
-/** Load a real .ts/.tsx file and everything it really imports, stubbing only
- *  what this environment cannot provide (Tauri) and what the caller names. */
-function loadReal(absPath, stubbed, cache = new Map()) {
-  const hit = cache.get(absPath);
-  if (hit) return hit;
-  const jsx = absPath.endsWith(".tsx");
-  let js = ts.transpileModule(readFileSync(absPath, "utf8"), {
-    compilerOptions: {
-      module: ts.ModuleKind.ESNext,
-      target: ts.ScriptTarget.ES2022,
-      ...(jsx ? { jsx: ts.JsxEmit.ReactJSX } : {}),
-    },
-  }).outputText;
-
-  js = js.replace(FROM_RE, (whole, clause, spec) => {
-    const swap = (url) => whole.replace(`"${spec}"`, JSON.stringify(url));
-    if (BARE[spec]) return swap(BARE[spec]);
-    if (spec.startsWith("@tauri-apps/")) {
-      return swap(
-        stubModule(
-          clause,
-          spec === "@tauri-apps/api/core" ? { invoke: INVOKE_RECORDER } : {},
-        ),
-      );
-    }
-    if (spec.startsWith(".")) {
-      const base = resolve(dirname(absPath), spec);
-      const target = [".ts", ".tsx", "/index.ts"]
-        .map((ext) => base + ext)
-        .find(existsSync);
-      assert.ok(target, `cannot resolve ${spec} from ${absPath}`);
-      if (target.endsWith("/platform.ts")) {
-        return swap(stubModule(clause, { invoke: INVOKE_RECORDER }));
-      }
-      if (stubbed.has(target)) return swap(stubModule(clause));
-      return swap(loadReal(target, stubbed, cache));
-    }
-    // A bare dependency this test has no opinion about (none today) — stub it
-    // rather than silently drop it, so a new one shows up as a failing test.
-    return swap(stubModule(clause));
-  });
-
-  // ActivityPanel and JobRow are private to AiPane.tsx, and should stay that
-  // way: nothing in the app renders them from outside. Re-exporting them here
-  // keeps the test pointed at the shipped code instead of a copy of it.
-  if (absPath.endsWith("AiPane.tsx")) js += "\nexport { ActivityPanel, JobRow };\n";
-
-  const url = asData(js);
-  cache.set(absPath, url);
-  return url;
-}
-
 // AiPane's siblings (chat, the studio shelf, the icon set) are not what this
 // test is about, and dragging them in would pull half the app.
-const PANE_STUBS = new Set(
-  ["workspace/ChatPane.tsx", "workspace/StudioShelf.tsx", "icons.tsx", "workspace/markup.ts"].map(
-    (p) => join(SRC, p),
-  ),
+const PANE_STUBS = new Map(
+  [
+    "workspace/ChatPane.tsx",
+    "workspace/StudioShelf.tsx",
+    "workspace/PodcastPanel.tsx",
+    "workspace/chatActions.ts",
+    "icons.tsx",
+    "workspace/markup.ts",
+  ].map((p) => [join(SRC, p), {}]),
 );
+PANE_STUBS.set(join(SRC, "platform.ts"), { invoke: INVOKE_RECORDER });
+const PRIVATE_EXPORTS = new Map([
+  [join(SRC, "workspace/AiPane.tsx"), "\nexport { ActivityPanel, JobRow };\n"],
+]);
 const { ActivityPanel, JobRow } = await import(
-  loadReal(join(SRC, "workspace/AiPane.tsx"), PANE_STUBS)
+  loadTypescriptModule(join(SRC, "workspace/AiPane.tsx"), {
+    bare: BARE,
+    stubs: PANE_STUBS,
+    append: PRIVATE_EXPORTS,
+  }),
 );
 const { makeStudioActions } = await import(
-  loadReal(join(SRC, "workspace/studioActions.ts"), new Set())
+  loadTypescriptModule(join(SRC, "workspace/studioActions.ts"), {
+    bare: BARE,
+    stubs: PANE_STUBS,
+  }),
 );
 
 /* ---------- fixtures ---------- */
@@ -369,6 +297,10 @@ function buttonsIn(node, out = []) {
   if (node == null || typeof node !== "object") return out;
   if (Array.isArray(node)) {
     for (const n of node) buttonsIn(n, out);
+    return out;
+  }
+  if (typeof node.type === "function") {
+    buttonsIn(node.type(node.props), out);
     return out;
   }
   if (node.type === "button") out.push(node);

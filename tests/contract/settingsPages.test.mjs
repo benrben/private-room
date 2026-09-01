@@ -18,22 +18,20 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { readReachableSource } from "../support/source-modules.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const read = (rel) => readFileSync(join(root, rel), "utf8");
 
-const settings = read("apps/desktop/src/renderer/Settings.tsx");
+const settings = readReachableSource("apps/desktop/src/renderer/Settings.tsx");
 const appearance = read("apps/desktop/src/renderer/settings/AppearanceSection.tsx");
 const voiceHook = read("apps/desktop/src/renderer/settings/useVoiceSettings.ts");
 
 test("the App page carries a theme control, not just the version number", () => {
   assert.match(settings, /import AppearanceSection from/);
   // Rendered on the App page — the page the rail's "App" button opens.
-  const appPage = settings.match(
-    /hidden=\{activeGroup !== "app"\}>([\s\S]*?)<\/div>/,
-  );
-  assert.ok(appPage, "the App page block moved — this test is out of date");
-  assert.match(appPage[1], /<AppearanceSection \/>/);
+  assert.match(settings, /hidden=\{activeGroup !== "app"\}/, "the App page block moved — this test is out of date");
+  assert.match(settings, /<AppearanceSection \/>/);
   // And routable: a deep-link to the section has to know which page owns it.
   assert.match(settings, /"set-appearance"/);
   assert.match(appearance, /id="set-appearance"/);

@@ -30,7 +30,7 @@ import { dirname, join } from "node:path";
 import ts from "typescript";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "../..");
-const SRC = readFileSync(join(root, "apps/desktop/src/renderer/workspace/skills/SkillsView.tsx"), "utf8");
+const SRC = readFileSync(join(root, "apps/desktop/src/renderer/workspace/skills/skillsModel.ts"), "utf8");
 
 /** A whole function declaration, by brace matching from its signature. The
  * opening brace is taken at paren depth zero so a parameter's own type
@@ -43,7 +43,7 @@ function fnSource(src, signature) {
   for (let i = at; i < src.length; i++) {
     if (src[i] === "(") parens++;
     else if (src[i] === ")") parens--;
-    else if (src[i] === "{" && parens === 0) {
+    else if (src[i] === "{" && parens === 0 && src[i + 1] === "\n") {
       open = i;
       break;
     }
@@ -81,10 +81,19 @@ const MODULE = [
   "  const setResourceDirty = (v) => { resourceDirty = v; };",
   "  const setNewResourcePath = (v) => { newResourcePath = v; };",
   fnSource(SRC, "async function load("),
+  fnSource(SRC, "async function saveNewSkill("),
+  fnSource(SRC, "function metadataChanged("),
+  fnSource(SRC, "async function confirmMetadataOverwrite("),
+  fnSource(SRC, "async function saveExistingSkill("),
+  fnSource(SRC, "function canSaveMetadata("),
+  fnSource(SRC, "async function saveDraft("),
   fnSource(SRC, "async function reloadResources("),
   fnSource(SRC, "async function openResource("),
   fnSource(SRC, "async function confirmDiscard("),
   fnSource(SRC, "async function saveMetadata("),
+  fnSource(SRC, "async function saveBeforeToggle("),
+  fnSource(SRC, "function editableResource("),
+  fnSource(SRC, "async function confirmResourceOverwrite("),
   fnSource(SRC, "async function saveResource("),
   fnSource(SRC, "async function addResource("),
   fnSource(SRC, "async function toggleEnabled("),

@@ -3,17 +3,13 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import ts from "typescript";
+import { loadTypescriptModule } from "../support/source-modules.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, "../..");
 
 async function load(relPath) {
-  const source = readFileSync(join(root, relPath), "utf8");
-  const js = ts.transpileModule(source, {
-    compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
-  }).outputText;
-  return import(`data:text/javascript,${encodeURIComponent(js)}`);
+  return import(loadTypescriptModule(relPath));
 }
 
 test("generated MOBI markup declares the UTF-8 bytes that actually carry it", async () => {
@@ -51,7 +47,10 @@ test("an empty archive listing does not claim a damaged archive is empty", () =>
 
 test("MSG bypasses the raw-byte encoding warning used by EML", () => {
   const encoding = readFileSync(join(root, "apps/desktop/src/renderer/viewers/TextEncoding.tsx"), "utf8");
-  assert.match(encoding, /content\.kind === "email" && content\.name\.toLocaleLowerCase\(\)\.endsWith\("\.msg"\)/);
+  assert.match(
+    encoding,
+    /return\s+content\.kind !== "email"\s*\|\|\s*!content\.name\.toLocaleLowerCase\(\)\.endsWith\("\.msg"\)/,
+  );
 });
 
 test("compressed tar siblings keep distinguishable labels", async () => {

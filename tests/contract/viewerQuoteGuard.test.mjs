@@ -1,4 +1,4 @@
-/* Which DRAG counts as pointing at the document (src/workspace/ViewerPane.tsx).
+/* Which DRAG counts as pointing at the document (src/workspace/viewerQuote.ts).
  *
  * `quoteSelection.test.mjs` pins what may be quoted once a selection has been
  * accepted; this pins the step before it — the guard that decides whether the
@@ -8,11 +8,10 @@
  * was offered as a quote of the document while the same drag made backwards was
  * refused: the answer depended on the direction of the drag.
  *
- * The guard lives inside a component's effect, and this repo has no renderer to
- * mount it with — so the reader closure is sliced out of the real source and run
+ * The guard's pure declarations are lifted from their owning module and run
  * against fake selections, the localModel.test.mjs / voiceChunker.test.mjs idiom.
- * The four predicates it calls are stubbed; everything between them is shipped
- * code.
+ * The predicates they call are stubbed; the selection and frame decisions are
+ * shipped code.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -23,14 +22,30 @@ import ts from "typescript";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, "../..");
-const SOURCE = readFileSync(join(root, "apps/desktop/src/renderer/workspace/ViewerPane.tsx"), "utf8");
-
-const start = SOURCE.indexOf("const read = () => {");
-const end = SOURCE.indexOf("// selectionchange fires continuously", start);
-assert.ok(
-  start > 0 && end > start,
-  "expected the selection reader before the selectionchange comment — did ViewerPane get reshuffled?",
+const SOURCE = readFileSync(join(root, "apps/desktop/src/renderer/workspace/viewerQuote.ts"), "utf8");
+const SOURCE_TREE = ts.createSourceFile(
+  "viewerQuote.ts",
+  SOURCE,
+  ts.ScriptTarget.Latest,
+  true,
+  ts.ScriptKind.TS,
 );
+
+function functionSource(name) {
+  const declaration = SOURCE_TREE.statements.find(
+    (statement) => ts.isFunctionDeclaration(statement) && statement.name?.text === name,
+  );
+  assert.ok(declaration, `${name} is gone from viewerQuote.ts`);
+  return declaration.getText(SOURCE_TREE);
+}
+
+const DOCUMENT_QUOTE_SOURCE = [
+  "selectionCanBeQuoted",
+  "quoteSelectionText",
+  "quoteSelectionPosition",
+  "activeDocumentSelection",
+  "readDocumentQuote",
+].map(functionSource).join("\n");
 
 /* The document/chrome predicates are DOM containment (`closest`), tested where
  * they live; here a node is just a label, so a test can say where each end of
@@ -39,13 +54,11 @@ const harness = `
 let selection = null;
 let quote = null;
 const window = { getSelection: () => selection };
-const openFile = { content: { kind: "book" } };
-const s = { editMode: false };
-const setQuote = (q) => { quote = q; };
+const kind = "book";
+const editMode = false;
 const inQuotableDocument = (node) => node === "document" || node === "chrome";
 const inExcludedSurface = (node) => node === "chrome";
 const quotableText = (text) => text.trim() || null;
-let raf = 0;
 `;
 const exports = `
 export function drag(anchorNode, focusNode, text = "a sentence of the document") {
@@ -58,17 +71,17 @@ export function drag(anchorNode, focusNode, text = "a sentence of the document")
     toString: () => text,
     getRangeAt: () => ({ getBoundingClientRect: () => ({ top: 10, left: 20, width: 100, height: 14 }) }),
   };
-  read();
+  quote = readDocumentQuote(kind, editMode);
   return quote;
 }
 export function nothingSelected() {
   quote = { text: "stale", top: 0, left: 0 };
   selection = { isCollapsed: true, rangeCount: 0, anchorNode: "document", focusNode: "document" };
-  read();
+  quote = readDocumentQuote(kind, editMode);
   return quote;
 }
 `;
-const js = ts.transpileModule(harness + SOURCE.slice(start, end) + exports, {
+const js = ts.transpileModule(harness + DOCUMENT_QUOTE_SOURCE + exports, {
   compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
 }).outputText;
 const { drag, nothingSelected } = await import(
@@ -85,12 +98,13 @@ const { drag, nothingSelected } = await import(
  * never appeared. The verification itself is stubbed here (it has its own tests
  * in quoteSelection.test.mjs); what runs for real is WHICH text gets verified. */
 
-const frameStart = SOURCE.indexOf("const onMessage = (e: MessageEvent) => {");
-const frameEnd = SOURCE.indexOf('window.addEventListener("message", onMessage);');
-assert.ok(
-  frameStart > 0 && frameEnd > frameStart,
-  "expected the frame-selection listener before its addEventListener — did ViewerPane get reshuffled?",
-);
+const FRAME_QUOTE_SOURCE = [
+  "visibleQuoteFrame",
+  "frameSourceText",
+  "searchableFrameDocument",
+  "reportedQuoteFrame",
+  "frameQuoteFromMessage",
+].map(functionSource).join("\n");
 
 const FRAME_WINDOW = { name: "the page's frame" };
 const frameHarness = `
@@ -100,8 +114,6 @@ let file = { id: "f1", content: { kind: "html", text: "" } };
 let shownFor = "f1";
 let shownText = null;
 const searchable = { current: null };
-const s = { editMode: false, openFileRef: { get current() { return file; } } };
-const setQuote = (q) => { quote = q; };
 const frameSelectionOf = (data) => data;
 const inQuotableDocument = () => true;
 const textOf = (html) => html;
@@ -121,13 +133,20 @@ export function overrideEncoding(text) { shownText = text; }
 export function useFrameWindow(w) { frameEl.contentWindow = w; }
 export function reportSelection(text) {
   quote = null;
-  onMessage({ data: { text, rect: { top: 4, left: 6, width: 40 } }, source: frameEl.contentWindow });
+  quote = frameQuoteFromMessage(
+    { data: { text, rect: { top: 4, left: 6, width: 40 } }, source: frameEl.contentWindow },
+    file,
+    searchable,
+    shownFor,
+    shownText,
+    false,
+  );
   return quote;
 }
 export function parseCount() { return parses; }
 `;
 const frameJS = ts.transpileModule(
-  frameHarness + SOURCE.slice(frameStart, frameEnd) + frameExports,
+  frameHarness + FRAME_QUOTE_SOURCE + frameExports,
   { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 } },
 ).outputText;
 const frame = await import(`data:text/javascript,${encodeURIComponent(frameJS)}`);

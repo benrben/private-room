@@ -21,6 +21,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import ts from "typescript";
+import { readReachableSource } from "../support/source-modules.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(here, "../..");
@@ -33,6 +34,7 @@ const load = (rel) => {
   return import(`data:text/javascript,${encodeURIComponent(js)}`);
 };
 const read = (rel) => readFileSync(join(ROOT, rel), "utf8");
+const reachable = (rel) => readReachableSource(rel);
 
 const {
   visibleModels,
@@ -161,7 +163,7 @@ test("an empty shelf never blames the catalogue for a filter miss", () => {
 /* ---------- the wiring, across both languages ---------- */
 
 test("the create area is registered everywhere a rail area must be", () => {
-  const types = read("apps/desktop/src/renderer/workspace/types.ts");
+  const types = reachable("apps/desktop/src/renderer/workspace/types.ts");
   assert.match(types, /\|\s*"create"/, "missing from the WorkArea union");
   assert.match(types, /"create",/, "missing from WORK_AREAS (the runtime list)");
 
@@ -171,17 +173,17 @@ test("the create area is registered everywhere a rail area must be", () => {
   // and More-tools tiers; both surfaces that draw destinations read it from
   // there, so there is one list to be absent from rather than two.
   assert.match(
-    read("apps/desktop/src/renderer/shell/navPrefs.tsx"),
+    reachable("apps/desktop/src/renderer/shell/navPrefs.tsx"),
     /key:\s*"create"/,
     "missing from NAV_AREAS — areaDef would throw",
   );
   assert.match(
-    read("apps/desktop/src/renderer/workspace/ViewerPane.tsx"),
+    reachable("apps/desktop/src/renderer/workspace/ViewerPane.tsx"),
     /area === "create"/,
     "ViewerPane has no branch, so the area would render the empty state",
   );
   assert.match(
-    read("apps/desktop/src/renderer/workspace/ViewerPane.tsx"),
+    reachable("apps/desktop/src/renderer/workspace/ViewerPane.tsx"),
     /create:\s*"Create"/,
     "missing from AREA_CRUMBS",
   );
@@ -191,7 +193,7 @@ test("the create job kind is dispatchable and resumable, not just startable", ()
   // The quiet failure: a job that starts once, then can never be pumped off
   // the queue or resumed after a crash. Neither shows up as a type error.
   assert.match(
-    read("apps/desktop/src/main/creativeJobSurfaceIpc.ts"),
+    reachable("apps/desktop/src/main/creativeJobSurfaceIpc.ts"),
     /setStarter\(queue, "create", createStarter/,
     "the Electron queue has no create starter",
   );
@@ -206,19 +208,19 @@ test("both create commands are registered with the host", () => {
   // The frontend calls these by name through `invoke`; an unregistered command
   // is a runtime rejection, which is exactly what the mock-coverage gate and
   // this assertion exist to catch early.
-  const models = read("apps/desktop/src/main/modelCatalogSurfaceIpc.ts");
-  const jobs = read("apps/desktop/src/main/creativeJobSurfaceIpc.ts");
+  const models = reachable("apps/desktop/src/main/modelCatalogSurfaceIpc.ts");
+  const jobs = reachable("apps/desktop/src/main/creativeJobSurfaceIpc.ts");
   assert.match(models, /handle\("list_create_models"/);
   assert.match(jobs, /handle\("start_create_job"/);
 });
 
 test("generation capability is its own question, separate from vision", () => {
-  const caps = read("apps/desktop/src/main/capabilities.ts");
+  const caps = reachable("apps/desktop/src/main/capabilities.ts");
   assert.match(caps, /"image_generation"/);
   assert.match(caps, /"video_generation"/);
   // The catalog field the whole gate reads from.
   assert.match(
-    read("apps/desktop/src/main/providers.ts"),
+    reachable("apps/desktop/src/main/providers.ts"),
     /output_modalities/,
     "the OpenRouter parse must read output_modalities, not infer from the slug",
   );
@@ -309,5 +311,8 @@ test("the running-job card states the job's label and no figure of its own", () 
   );
   // What it says instead: the provider's own words when there are any, and a
   // state word when there are not.
-  assert.match(page, /live\s*\??\.\s*label/);
+  assert.match(
+    reachable("apps/desktop/src/renderer/workspace/create/CreatePage.tsx"),
+    /live\s*\??\.\s*label/,
+  );
 });

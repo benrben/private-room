@@ -7,28 +7,20 @@
  * the app holds open greeted the user with raw SQLite text. And the Touch ID
  * path did not even do that much: it printed the bare `WRONG_PASSWORD` code.
  *
- * Extracted with a regex rather than imported: src/App.tsx pulls in React and
- * the Tauri bridge at module load, neither of which exists under node.
+ * The formatter is imported from its real implementation module. The facade
+ * and both UI paths are still read below to prove every unlock uses it.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
-import ts from "typescript";
+import {
+  loadTypescriptModule,
+  readRepoFile,
+} from "../support/source-modules.mjs";
 
-const root = join(dirname(fileURLToPath(import.meta.url)), "../..");
-const APP = readFileSync(join(root, "apps/desktop/src/renderer/App.tsx"), "utf8");
-const UNLOCK = readFileSync(join(root, "apps/desktop/src/renderer/screens/UnlockScreen.tsx"), "utf8");
-const fn = APP.slice(
-  APP.indexOf("export function unlockMessage"),
-  APP.indexOf("export default function App"),
-);
-const JS = ts.transpileModule(fn, {
-  compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
-}).outputText;
+const APP = readRepoFile("apps/desktop/src/renderer/App.tsx");
+const UNLOCK = readRepoFile("apps/desktop/src/renderer/screens/UnlockScreen.tsx");
 const { unlockMessage } = await import(
-  `data:text/javascript,${encodeURIComponent(JS)}`
+  loadTypescriptModule("apps/desktop/src/renderer/appOperations.ts"),
 );
 
 test("the wrong-password sentinel never reaches the screen", () => {
@@ -96,5 +88,10 @@ test("both unlock paths actually call it", () => {
 test("a workspace unlock explains what the password does and does not protect", () => {
   assert.match(UNLOCK, /password unlocks chats, memory, search, and history/i);
   assert.match(UNLOCK, /normal files[^.]*remain readable in Finder/i);
-  assert.match(UNLOCK, /!\/\\\.\(\?:arcelle\|roomai\)/);
+  assert.match(UNLOCK, /return \/\\\.\(\?:arcelle\|roomai\)\$\/i\.test\(path\);/);
+  assert.match(
+    UNLOCK,
+    /function WorkspaceFileNote[\s\S]*?if \(isLegacyRoom\(path\)\) return null;/,
+    "the workspace-only note must stay hidden for legacy sealed rooms",
+  );
 });

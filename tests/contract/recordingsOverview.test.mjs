@@ -19,12 +19,11 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync, existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { dirname, join, resolve } from "node:path";
-import ts from "typescript";
+import { dirname, join } from "node:path";
 import { renderToStaticMarkup } from "react-dom/server";
 import { createElement } from "react";
+import { loadTypescriptModule } from "../support/source-modules.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const SRC = join(here, "../../apps/desktop/src/renderer");
@@ -36,80 +35,17 @@ const BARE = {
   "react/jsx-runtime": import.meta.resolve("react/jsx-runtime"),
 };
 
-const asData = (src) => `data:text/javascript,${encodeURIComponent(src)}`;
-
-const FROM_RE = /(?:import|export)\s+([\s\S]*?)\s+from\s+"([^"]+)";/g;
-// A side-effect import — the page pulls in its own stylesheet, which Vite
-// understands and node does not. Dropped rather than stubbed: a stylesheet has
-// no bindings, so there is nothing for the rest of the module to bind to.
-const CSS_IMPORT_RE = /^\s*import\s+"[^"]+\.css";\s*$/gm;
-
-function bindingsOf(clause) {
-  const names = [];
-  const braced = clause.match(/\{([\s\S]*)\}/);
-  if (braced) {
-    for (const raw of braced[1].split(",")) {
-      const n = raw.trim().split(/\s+as\s+/).pop().trim();
-      if (n) names.push(n);
-    }
-  }
-  const head = clause.replace(/\{[\s\S]*\}/, "").replace(/,\s*$/, "").trim();
-  return { names, hasDefault: Boolean(head) };
-}
-
-/** Every binding an inert function — a valid React component and a callable
- *  that returns nothing. */
-function stubModule(clause) {
-  const { names, hasDefault } = bindingsOf(clause);
-  return asData(
-    [
-      "const inert = () => null;",
-      ...names.map((n) => `export const ${n} = inert;`),
-      hasDefault ? "export default inert;" : "",
-    ].join("\n"),
-  );
-}
-
-function loadReal(absPath, stubbed, cache = new Map()) {
-  const hit = cache.get(absPath);
-  if (hit) return hit;
-  const jsx = absPath.endsWith(".tsx");
-  let js = ts.transpileModule(readFileSync(absPath, "utf8"), {
-    compilerOptions: {
-      module: ts.ModuleKind.ESNext,
-      target: ts.ScriptTarget.ES2022,
-      ...(jsx ? { jsx: ts.JsxEmit.ReactJSX } : {}),
-    },
-  }).outputText;
-
-  js = js.replace(CSS_IMPORT_RE, "");
-  js = js.replace(FROM_RE, (whole, clause, spec) => {
-    const swap = (url) => whole.replace(`"${spec}"`, JSON.stringify(url));
-    if (BARE[spec]) return swap(BARE[spec]);
-    if (spec.startsWith("@tauri-apps/")) return swap(stubModule(clause));
-    if (spec.startsWith(".")) {
-      const base = resolve(dirname(absPath), spec);
-      const target = [".ts", ".tsx", "/index.ts"]
-        .map((ext) => base + ext)
-        .find(existsSync);
-      assert.ok(target, `cannot resolve ${spec} from ${absPath}`);
-      if (stubbed.has(target)) return swap(stubModule(clause));
-      return swap(loadReal(target, stubbed, cache));
-    }
-    return swap(stubModule(clause));
-  });
-
-  const url = asData(js);
-  cache.set(absPath, url);
-  return url;
-}
-
 // The adaptive dek is its own feature with its own test (adaptiveText.test.mjs)
 // and its own network path. Stubbed to null, which is a value it really
 // returns — the page then shows its static fallback, which is the state this
 // test wants to read anyway.
-const STUBS = new Set([join(SRC, "workspace/adaptiveText.ts")]);
-const mod = await import(loadReal(join(SRC, "workspace/RecordingsPage.tsx"), STUBS));
+const STUBS = new Map([[join(SRC, "workspace/adaptiveText.ts"), {}]]);
+const mod = await import(
+  loadTypescriptModule(join(SRC, "workspace/RecordingsPage.tsx"), {
+    bare: BARE,
+    stubs: STUBS,
+  }),
+);
 
 const RecordingsPage = mod.default;
 const {

@@ -168,6 +168,19 @@ function sheets() {
   return out;
 }
 
+function stylesheetGraph(entry, seen = new Map()) {
+  if (seen.has(entry)) return seen;
+  const css = read(entry);
+  seen.set(entry, css);
+  for (const [, specifier] of css.matchAll(/@import\s+["']([^"']+)["'];/g)) {
+    stylesheetGraph(join(dirname(entry), specifier), seen);
+  }
+  return seen;
+}
+
+const PAPER_SHEETS = stylesheetGraph("apps/desktop/src/renderer/styles/paper.css");
+const PAPER = [...PAPER_SHEETS.values()].join("\n");
+
 test("box corners are symmetric; only the frames are drawn", () => {
   // A four-corner radius on a box is what the visual pass took out of 90
   // rules. Marks keep theirs — a strip of tape, an underline, a bar — and so
@@ -175,7 +188,7 @@ test("box corners are symmetric; only the frames are drawn", () => {
   // identity rather than one wobble among many.
   const stray = [];
   for (const [path, css] of sheets()) {
-    if (path === "apps/desktop/src/renderer/styles/paper.css") continue;
+    if (PAPER_SHEETS.has(path)) continue;
     for (const [, value] of css.matchAll(/border-radius:\s*([^;]+);/g)) {
       if (/var\(|%|999px/.test(value)) continue;
       const nums = [...value.matchAll(/([\d.]+)px/g)].map((m) => Number(m[1]));
@@ -191,11 +204,10 @@ test("the frame signatures stay within 1px of --radius", () => {
   // They are literals rather than calc() off the token — eight nested calc()s
   // per rule costs every future reader more than the tie is worth — so this
   // is where the tie actually lives.
-  const paper = read("apps/desktop/src/renderer/styles/paper.css");
   const within = (label, selector, tokenName) => {
     const base = Number(new RegExp(`${tokenName}:\\s*(\\d+)px`).exec(TOKENS)[1]);
     const rules = [
-      ...paper.matchAll(new RegExp(`${selector}[^{]*\\{[^}]*?border-radius:\\s*([^;]+);`, "g")),
+      ...PAPER.matchAll(new RegExp(`${selector}[^{]*\\{[^}]*?border-radius:\\s*([^;]+);`, "g")),
     ];
     assert.ok(rules.length >= 1, `${label}: no rules matched`);
     for (const [, value] of rules) {

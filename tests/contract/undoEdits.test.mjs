@@ -25,6 +25,7 @@ import ts from "typescript";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const FILEACTIONS = readFileSync(join(root, "apps/desktop/src/renderer/workspace/fileActions.ts"), "utf8");
+const STORAGE_ACTIONS = readFileSync(join(root, "apps/desktop/src/renderer/workspace/fileStorageActions.ts"), "utf8");
 
 /** A whole function declaration, by brace matching from its signature. */
 function fnSource(src, signature) {
@@ -51,7 +52,17 @@ function fnSource(src, signature) {
 
 const MODULE = [
   "export function makeUndo(s, api, displayName) {",
-  fnSource(FILEACTIONS, "async function undoEdits("),
+  fnSource(FILEACTIONS, "export function undoWindow(").replace(/^export /, ""),
+  fnSource(FILEACTIONS, "export function headMovedSinceAnswer(").replace(/^export /, ""),
+  fnSource(FILEACTIONS, "export function versionToRestore(").replace(/^export /, ""),
+  fnSource(FILEACTIONS, "async function undoFileVersion("),
+  fnSource(FILEACTIONS, "export async function undoFileVersions(").replace(/^export /, ""),
+  fnSource(FILEACTIONS, "export function clearUndoRecord(").replace(/^export /, ""),
+  fnSource(FILEACTIONS, "export async function refreshUndoneFile(").replace(/^export /, ""),
+  fnSource(FILEACTIONS, "export function undoFileName(").replace(/^export /, ""),
+  fnSource(FILEACTIONS, "export function reportUndoneFiles(").replace(/^export /, ""),
+  fnSource(FILEACTIONS, "export function reportMovedFiles(").replace(/^export /, ""),
+  fnSource(STORAGE_ACTIONS, "async function undoEdits("),
   "  return undoEdits;",
   "}",
 ].join("\n");

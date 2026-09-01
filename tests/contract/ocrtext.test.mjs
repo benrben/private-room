@@ -20,6 +20,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import ts from "typescript";
+import { readReachableSource } from "../support/source-modules.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, "../..");
@@ -65,13 +66,13 @@ test("the image row of the format registry hands the text to ImageView", () => {
   const call = registry.slice(start, registry.indexOf("/>", start));
   assert.match(call, /\btext=\{c\.text\}/, "ImageView is rendered without the file's text");
 
-  const view = readFileSync(join(root, "apps/desktop/src/renderer/viewers/ImageView.tsx"), "utf8");
+  const view = readReachableSource("apps/desktop/src/renderer/viewers/ImageView.tsx");
   assert.match(view, /text\?:\s*string \| null;/, "ImageView has no prop for the text");
   assert.match(view, /ocrBody\(text\)/, "ImageView does not derive the shown text");
   assert.match(view, /className="img-ocr"/, "ImageView renders no panel for the text");
   assert.match(
     view,
-    /const accessibleName = name\.trim\(\) \|\| "Image preview";/,
+    /accessibleImageName\(name\)/,
     "ImageView has no stable accessible name when a file name is blank",
   );
   assert.match(view, /alt=\{accessibleName\}/, "the picture has no alternative text");

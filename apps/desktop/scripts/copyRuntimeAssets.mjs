@@ -7,6 +7,10 @@ import { fileURLToPath } from "node:url";
 export const RUNTIME_ASSETS = [
   ["src", "main", "bootStub.html"],
   ["src", "main", "db-host", "schema.sql"],
+  ["src", "main", "browser", "pageCore.js"],
+  ["src", "main", "browser", "pageSnapshot.js"],
+  ["src", "main", "browser", "pageRead.js"],
+  ["src", "main", "browser", "pageActions.js"],
   ["src", "main", "browser", "page.js"],
 ];
 

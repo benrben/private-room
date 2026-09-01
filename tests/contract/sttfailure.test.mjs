@@ -57,7 +57,7 @@ test("the backend's prefix and the viewer's are the same string", () => {
     "utf8",
   );
   // where the frontend finds out rather than in a silent fall-through.
-  assert.match(host, /`failed: \$\{message\}`/);
+  assert.match(host, /`failed: \$\{failureMessage\(error\)\}`/);
   assert.equal(STT_FAILED_PREFIX, "failed: ");
 });
 
@@ -69,8 +69,8 @@ test("the stage reaches the viewer, and the viewer says why", () => {
 
   const view = readFileSync(join(root, "apps/desktop/src/renderer/viewers/AudioView.tsx"), "utf8");
   assert.match(view, /sttStage\?: string;/, "AudioView must accept the stage");
-  assert.match(view, /sttFailure\(sttStage\)/, "…and run it through the rule");
+  assert.match(view, /sttFailure\(stage\)/, "…and run it through the rule");
   // And the reason has to be on screen, not merely in a variable.
-  assert.match(view, /\{sttWhy\}/, "the reason itself must be rendered");
+  assert.match(view, /\{why\}/, "the reason itself must be rendered");
   assert.match(view, /Transcription failed/);
 });

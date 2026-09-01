@@ -21,17 +21,10 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import ts from "typescript";
+import { loadTypescriptModule } from "../support/source-modules.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, "../..");
-
-async function load(relPath) {
-  const source = readFileSync(join(root, relPath), "utf8");
-  const js = ts.transpileModule(source, {
-    compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
-  }).outputText;
-  return import(`data:text/javascript,${encodeURIComponent(js)}`);
-}
 
 const {
   tokenAtCaret,
@@ -40,7 +33,7 @@ const {
   specialistErrorMessage,
   parseComposer,
   hoistTag,
-} = await load("apps/desktop/src/renderer/workspace/composer.ts");
+} = await import(loadTypescriptModule("apps/desktop/src/renderer/workspace/composer.ts"));
 
 /** The roster the sidecar returns for a local-engine room with the web on. */
 const ROSTER = [

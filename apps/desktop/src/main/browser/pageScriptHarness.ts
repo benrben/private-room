@@ -31,11 +31,11 @@ import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import vm from "node:vm";
 import { parseHTML } from "linkedom";
+import { PAGE_SCRIPT_FILES } from "./pageScript.js";
 
 // Vitest can execute its transformed test modules from `dist_boot`, where a
 // stale packaged page.js may be present. Resolve from the working tree
 // instead, whether the focused command starts at apps/desktop or repo root.
-const PAGE_SCRIPT_FILES = ["pageCore.js", "pageSnapshot.js", "pageRead.js", "pageActions.js", "page.js"];
 const PAGE_SCRIPT_ROOT = [
   path.resolve(process.cwd(), "src/main/browser"),
   path.resolve(process.cwd(), "apps/desktop/src/main/browser"),

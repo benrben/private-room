@@ -19,59 +19,63 @@
  * rejection there escaped as an unhandled rejection: every caller invokes it
  * as `void a.stopLiveRecording()`.
  *
- * The two functions are SLICED out of the shipped source (they close over the
- * actions closure and cannot be imported) and driven against fakes — the same
- * technique unsavedGuard/recSession use.
+ * The real owning module is imported after replacing only its platform seams
+ * (API, microphone and recording transport) with recorders. The assertions
+ * therefore drive the shipped lifecycle rather than a copied implementation.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
-import ts from "typescript";
+import { loadTypescriptModule } from "../support/source-modules.mjs";
 
-const root = join(dirname(fileURLToPath(import.meta.url)), "../..");
-const SRC = readFileSync(join(root, "apps/desktop/src/renderer/workspace/recordingActions.ts"), "utf8");
+globalThis.__recordingApi = {};
+globalThis.__recordingAcquireMic = async () => null;
+globalThis.__recordingAttachMicTap = async () => {};
+globalThis.__recordingStopMicTap = () => {};
+globalThis.__recordingNoteLiveStt = () => {};
 
-/** A whole function declaration, by brace matching from its signature. The
- * opening brace is taken at paren depth zero so a parameter's own type
- * annotation cannot be mistaken for the body. */
-function fnSource(src, signature) {
-  const at = src.indexOf(signature);
-  assert.notEqual(at, -1, `${signature} is gone from the source`);
-  let parens = 0;
-  let open = -1;
-  for (let i = at; i < src.length; i++) {
-    if (src[i] === "(") parens++;
-    else if (src[i] === ")") parens--;
-    else if (src[i] === "{" && parens === 0) {
-      open = i;
-      break;
-    }
-  }
-  assert.notEqual(open, -1, `no body found for ${signature}`);
-  let depth = 0;
-  for (let i = open; i < src.length; i++) {
-    if (src[i] === "{") depth++;
-    else if (src[i] === "}" && --depth === 0) return src.slice(at, i + 1);
-  }
-  throw new Error(`unterminated body for ${signature}`);
+const STUBS = new Map([
+  [
+    "apps/desktop/src/renderer/api.ts",
+    {
+      api: "new Proxy({}, { get: (_target, key) => (...args) => globalThis.__recordingApi[key](...args) })",
+    },
+  ],
+  [
+    "apps/desktop/src/renderer/workspace/liveRec.ts",
+    {
+      acquireMic: "(...args) => globalThis.__recordingAcquireMic(...args)",
+      attachMicTap: "(...args) => globalThis.__recordingAttachMicTap(...args)",
+      stopMicTap: "(...args) => globalThis.__recordingStopMicTap(...args)",
+      noteLiveStt: "(...args) => globalThis.__recordingNoteLiveStt(...args)",
+    },
+  ],
+  [
+    "apps/desktop/src/renderer/workspace/recordingTransport.ts",
+    {
+      startRecordingTransport: "() => {}",
+      closeRecordingTransport: "() => {}",
+    },
+  ],
+]);
+const { makeLiveRecordingActions } = await import(
+  loadTypescriptModule(
+    "apps/desktop/src/renderer/workspace/recordingLiveActions.ts",
+    { stubs: STUBS },
+  ),
+);
+
+function makeRec(s, api, viewFile, acquireMic, attachMicTap, stopMicTap, noteLiveStt) {
+  globalThis.__recordingApi = api;
+  globalThis.__recordingAcquireMic = acquireMic ?? (async () => null);
+  globalThis.__recordingAttachMicTap = attachMicTap ?? (async () => {});
+  globalThis.__recordingStopMicTap = stopMicTap ?? (() => {});
+  globalThis.__recordingNoteLiveStt = noteLiveStt ?? (() => {});
+  return makeLiveRecordingActions(s, {
+    viewFile,
+    isMissingSttModel: () => false,
+    showMissingSttModelToast: () => {},
+  });
 }
-
-const MODULE = [
-  "export function makeRec(s, api, viewFile, acquireMic, attachMicTap, stopMicTap, noteLiveStt) {",
-  "const startRecordingTransport = () => {};",
-  "const closeRecordingTransport = () => {};",
-  fnSource(SRC, "async function startLiveRecording("),
-  fnSource(SRC, "async function stopLiveRecording("),
-  "  return { startLiveRecording, stopLiveRecording };",
-  "}",
-].join("\n");
-
-const JS = ts.transpileModule(MODULE, {
-  compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
-}).outputText;
-const { makeRec } = await import(`data:text/javascript,${encodeURIComponent(JS)}`);
 
 function fakeState(recLive = null) {
   const s = {

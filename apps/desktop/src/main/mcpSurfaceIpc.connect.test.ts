@@ -7,6 +7,7 @@ const mocks = vi.hoisted(() => ({
   addApproval: vi.fn(),
   applyConfig: vi.fn(),
   authorize: vi.fn(),
+  cachedPathPrefix: vi.fn(() => "/cached-runtimes/bin"),
   clearTokens: vi.fn(),
   configKey: vi.fn(),
   connect: vi.fn(),
@@ -35,6 +36,10 @@ vi.mock("./mcpClient.js", () => ({
   configKey: mocks.configKey,
   connectMcpClient: mocks.connect,
   parseMcpConfig: mocks.parseConfig,
+}));
+
+vi.mock("./runtimeCatalog.js", () => ({
+  cachedPathPrefix: mocks.cachedPathPrefix,
 }));
 
 vi.mock("./mcpConfig.js", () => ({
@@ -230,6 +235,9 @@ describe("registerMcpSurfaceIpc reconnect with fully fake connector and IPC seam
     expect(existing.close).toHaveBeenCalledOnce();
     expect(runtime.manager.generation).toBe(4);
     expect(mocks.connect).toHaveBeenCalledTimes(3);
+    for (const [, options] of mocks.connect.mock.calls) {
+      expect(options).toEqual({ cachedPathPrefix: "/cached-runtimes/bin" });
+    }
     expect(emit).toHaveBeenCalledTimes(2);
     expect(statuses).toEqual([
       { name: "disabled", status: "disabled", error: null, tools: [], remote: false },

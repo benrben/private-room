@@ -20,9 +20,11 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { readReachableSource } from "../support/source-modules.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const read = (rel) => readFileSync(join(root, rel), "utf8");
+const reachable = (rel) => readReachableSource(rel);
 
 const settings = read("apps/desktop/src/renderer/Settings.tsx");
 const advisors = read("apps/desktop/src/renderer/settings/AdvisorsSection.tsx");
@@ -37,8 +39,8 @@ test("disconnecting OpenRouter falls back to a model that can hold a chat", () =
   // then `ai.defaultModel` — the room's SAVED model, i.e. the openrouter:: one
   // being disconnected — so the dialog's promise was not kept.
   assert.match(
-    settings,
-    /fallbackModel=\{\s*bestLocalModel\(/,
+    reachable("apps/desktop/src/renderer/Settings.tsx"),
+    /fallbackModel=\{defaultAiFallbackModel\(ai\)\}[\s\S]*export function defaultAiFallbackModel\([\s\S]*bestLocalModel\(/,
     "the OpenRouter fallback is not asked in the host's preference order",
   );
   assert.doesNotMatch(
@@ -79,9 +81,9 @@ test("a backdrop click that only asks puts focus back inside the trap", () => {
 test("both post-password-change warnings survive", () => {
   // The recovery-key revocation and the stranded checkpoints are independent
   // facts; the second used to overwrite the first before either was painted.
-  const pushes = privacyHook.match(/warnings\.push\(/g) ?? [];
-  assert.equal(pushes.length, 2, "the two warnings do not share an accumulator");
-  assert.match(privacyHook, /setPwError\(warnings\.join\(" "\)\)/);
+  assert.match(privacyHook, /showPasswordWarning\(revokedRecoveryWarning\([^;]+;/);
+  assert.match(privacyHook, /showPasswordWarning\(strandedWarning, warnings, setPwError\);/);
+  assert.match(privacyHook, /warnings\.push\(warning\)[\s\S]{0,100}setPwError\(warnings\.join\(" "\)\)/);
 });
 
 test("a stopped Leash still knows its saved access level", () => {

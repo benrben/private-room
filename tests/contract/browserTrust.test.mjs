@@ -22,6 +22,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import ts from "typescript";
+import { loadTypescriptModule } from "../support/source-modules.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const read = (p) => readFileSync(join(root, p), "utf8");
@@ -37,32 +38,46 @@ const load = async (source) => {
 };
 
 const VIEW = read("apps/desktop/src/renderer/workspace/BrowserView.tsx");
+const CHROME = read("apps/desktop/src/renderer/workspace/BrowserViewChrome.tsx");
+const RUNTIME = read("apps/desktop/src/renderer/workspace/browserRuntime.ts");
 const READER = read("apps/desktop/src/renderer/workspace/BrowserReader.tsx");
-const CSS = read("apps/desktop/src/renderer/styles/browser.css");
-const CAPTURE = read("tests/visual/browseraudit.mjs");
-
-/* A COMPONENT module cannot be loaded the way the pure ones above are: its
- * react/api/icon specifiers do not resolve from a data: URL. Nothing runs at
- * module scope, so the imports are dropped and the JSX is emitted as
- * `React.createElement` calls inside functions this file never renders — which
- * leaves the page's pure exports callable for real. */
-const loadPureExports = async (source) => {
-  const js = ts.transpileModule(source, {
-    compilerOptions: {
-      module: ts.ModuleKind.ESNext,
-      target: ts.ScriptTarget.ES2022,
-      jsx: ts.JsxEmit.React,
-    },
-  }).outputText;
-  return import(
-    `data:text/javascript,${encodeURIComponent(js.replace(/^import[^;]*;$/gm, ""))}`
-  );
+const readStylesheet = (entry, seen = new Set()) => {
+  if (seen.has(entry)) return "";
+  seen.add(entry);
+  const source = read(entry);
+  const imports = [...source.matchAll(/@import\s+["']([^"']+)["'];/g)];
+  return [
+    source,
+    ...imports.map(([, specifier]) =>
+      readStylesheet(join(dirname(entry), specifier), seen),
+    ),
+  ].join("\n");
 };
+const CSS = readStylesheet("apps/desktop/src/renderer/styles/browser.css");
+const CAPTURE = read("tests/visual/browseraudit.mjs");
 
 const privacy = await load(read("apps/desktop/src/renderer/workspace/browserPrivacy.ts"));
 const chrome = await load(read("apps/desktop/src/renderer/workspace/browserChrome.ts"));
 const journal = await load(read("apps/desktop/src/renderer/workspace/browserJournal.ts"));
-const search = await loadPureExports(read("apps/desktop/src/renderer/workspace/BrowserSearch.tsx"));
+const search = await import(
+  loadTypescriptModule(
+    join(root, "apps/desktop/src/renderer/workspace/BrowserSearchSummary.tsx"),
+    {
+      bare: {
+        react: import.meta.resolve("react"),
+        "react/jsx-runtime": import.meta.resolve("react/jsx-runtime"),
+      },
+      stubs: new Map([
+        [
+          "apps/desktop/src/renderer/workspace/BrowserSearch.tsx",
+          { ENGINE_SLOTS: "[]", PREVIEW_COUNT: "6", engineName: "() => ''" },
+        ],
+        ["apps/desktop/src/renderer/workspace/BrowserSearchCards.tsx", {}],
+        ["apps/desktop/src/renderer/icons.tsx", {}],
+      ]),
+    },
+  ),
+);
 
 // --------------------------------------------------------------------------
 // P0 — the shield must not claim protection it has not got
@@ -177,16 +192,16 @@ test("the view renders the derived claim, not a hardcoded boast", () => {
   // phrase alone: the comments that explain this fix quote the phrase, and a
   // test that forbids naming the bug forbids documenting it.
   assert.ok(
-    !VIEW.includes("no history, cookies or cache. Trackers blocked."),
+    !CHROME.includes("no history, cookies or cache. Trackers blocked."),
     "BrowserView still asserts the old unconditional shield sentence",
   );
   assert.ok(VIEW.includes("privacyClaim("), "BrowserView does not use privacyClaim");
   assert.ok(
-    VIEW.includes("claim.alert"),
+    CHROME.includes("claim.alert") && VIEW.includes("<BrowserProtectionBanner"),
     "BrowserView never surfaces the protection alert",
   );
   assert.ok(
-    VIEW.includes("browserRetryProtection"),
+    VIEW.includes("browserRetryProtection") && CHROME.includes("canRetryProtection"),
     "a failed blocker is reported with no way to retry it",
   );
 });
@@ -352,20 +367,21 @@ test("an extraction hands the page back, so it is not parked then", () => {
 test("the Save strip's own buttons ask the same question as the Save button", () => {
   // THE DEFECT: the four rows inside the strip were gated on `saving` alone, so
   // with zero pages open they stayed clickable and failed down in Rust.
-  const strip = VIEW.slice(
-    VIEW.indexOf("browser-save-row"),
-    VIEW.indexOf("browser-save-hint"),
+  const strip = CHROME.slice(
+    CHROME.indexOf("browser-save-row"),
+    CHROME.indexOf("browser-save-hint"),
   );
   const gates = strip.match(/disabled=\{[^}]*\}/g) ?? [];
   assert.equal(gates.length, 4, "expected four Save rows to gate themselves");
   for (const gate of gates) {
-    assert.match(gate, /can\.save/, `a Save row is still gated on ${gate}`);
+    assert.match(gate, /(?:save|selectionSave)IsDisabled/, `a Save row bypasses the shared save gate: ${gate}`);
   }
+  assert.match(CHROME, /return saving \|\| !can\.save;/, "the shared gate no longer asks can.save");
 });
 
 test("no chrome control derives its own enablement from info.open any more", () => {
   assert.ok(
-    !/disabled=\{!info\.open/.test(VIEW),
+    !/disabled=\{!info\.open/.test(CHROME),
     "a control still reads info.open directly instead of the ability list",
   );
 });
@@ -380,7 +396,7 @@ test("the address bar is cleared by the same move that closes the page", () => {
   assert.equal(chrome.CLOSED_VIEW.search, null);
   assert.ok(VIEW.includes("forgetThePage"), "BrowserView has no last-page reset");
   assert.match(
-    VIEW,
+    RUNTIME,
     /if \(wasOpenRef\.current && !next\.open\) forgetThePage\(editing\)/,
     "the reset is never triggered by the poll that learns the page closed",
   );
@@ -411,7 +427,7 @@ test("the closed view names every page-scoped field, including the new ones", ()
 test("the poll threshold is stated once, not once per reader", () => {
   assert.equal(chrome.MISSES_BEFORE_CLOSED, 2);
   assert.ok(
-    VIEW.includes("MISSES_BEFORE_CLOSED"),
+    RUNTIME.includes("MISSES_BEFORE_CLOSED"),
     "BrowserView hardcodes the threshold beside the module that exports it",
   );
 });
@@ -591,12 +607,12 @@ test("an unreportable clear scope still admits the cache is included", () => {
 
 test("the journal panel opens on this sitting, not on the whole history", () => {
   assert.ok(
-    VIEW.includes("groupSessions("),
+    RUNTIME.includes("groupSessions("),
     "the panel does not group the record into sittings",
   );
   assert.match(
-    VIEW,
-    /showEarlier \? allSessions : allSessions\.slice\(0, 1\)/,
+    RUNTIME,
+    /sessions: showEarlier \? allSessions : allSessions\.slice\(0, 1\)/,
     "the panel still renders every sitting by default",
   );
 });
@@ -641,23 +657,24 @@ test("two overlapping extractions cannot revoke each other's viewport", () => {
 });
 
 test("every control that can start an extraction waits for the last one", () => {
-  const tools = READER.slice(
-    READER.indexOf("browser-reader-tools"),
-    READER.indexOf("</header>"),
+  const toggle = READER.slice(
+    READER.indexOf("function SurroundingContentToggle"),
+    READER.indexOf("function CompareButton"),
   );
-  const buttons = tools.split("<button").slice(1);
-  const starters = buttons.filter((b) => /setMode|load\(mode\)/.test(b));
-  assert.ok(starters.length >= 2, "expected the mode toggle and the re-read");
-  for (const b of starters) {
-    assert.match(b, /disabled=\{busy\}/, "an extraction starter is ungated");
-  }
+  const tools = READER.slice(
+    READER.indexOf("function ReaderTools"),
+    READER.indexOf("function ReaderHeader"),
+  );
+  assert.match(toggle, /disabled=\{busy\}/, "the mode toggle is ungated");
+  assert.match(tools, /<SurroundingContentToggle[^>]*busy=\{busy\}/);
+  assert.match(tools, /<button[^>]*disabled=\{busy\}[^>]*onClick=\{actions\.reload\}/);
 });
 
 test("the reading view's own toggle stays usable while it is open", () => {
   // It went disabled with aria-pressed still true when the results list
   // appeared beneath it — a control the user could not un-press.
   assert.ok(
-    !/disabled=\{!can\.read\}\s*\n\s*aria-pressed=\{readerOpen\}/.test(VIEW),
+    !/disabled=\{!can\.read\}\s*\n\s*aria-pressed=\{readerOpen\}/.test(CHROME),
     "a reader toggle can go disabled while pressed",
   );
 });
@@ -666,8 +683,8 @@ test("Retry only appears beside the failure it can actually act on", () => {
   // A non-ephemeral store and a failed block list can be true at once; the
   // storage warning outranks, and Retry recompiles the tracker list.
   assert.match(
-    VIEW,
-    /claim\.alert === protectionAlert\(info\.protection\)/,
+    CHROME,
+    /claim\.alert === protectionAlert\(protection\)/,
     "Retry is offered under a banner it cannot address",
   );
   const breached = privacy.privacyClaim(false, { state: "failed", reason: "x" });
@@ -682,10 +699,15 @@ test("an extraction always hands the viewport back, even when it fails", () => {
   for (const block of finallies) {
     assert.match(
       block,
-      /onExtracting\(false\)/,
+      /finishExtraction\(setBusy, onExtracting\)/,
       "an extraction path can leave the page holding the stage",
     );
   }
+  const finish = READER.slice(
+    READER.indexOf("function finishExtraction"),
+    READER.indexOf("function useReaderPage"),
+  );
+  assert.match(finish, /onExtracting\(false\)/);
 });
 
 test("the double-Escape instruction only appears when a page can trap focus", () => {
@@ -699,11 +721,12 @@ test("the double-Escape instruction only appears when a page can trap focus", ()
 test("one reading view, one control that toggles it", () => {
   // Two differently-worded buttons opened the same view and only one of them
   // could close it.
-  assert.ok(!VIEW.includes("Read this page as text"), "the old second name survives");
-  const at = VIEW.indexOf('className="browser-skip"');
-  const skip = VIEW.slice(at, VIEW.indexOf("</button>", at));
+  assert.ok(!CHROME.includes("Read this page as text"), "the old second name survives");
+  const at = CHROME.indexOf('className="browser-skip"');
+  const skip = CHROME.slice(at, CHROME.indexOf("</button>", at));
   assert.match(skip, /aria-pressed=\{readerOpen\}/, "the skip control is not a toggle");
-  assert.match(skip, /closeReader\(\)/, "the skip control can only ever open");
+  assert.match(skip, /onClick=\{toggle\}/, "the skip control bypasses its toggle");
+  assert.match(CHROME, /const toggle = \(\) => \(readerOpen \? onClose\(\) : onOpen\(\)\)/);
 });
 
 // --------------------------------------------------------------------------

@@ -31,15 +31,15 @@ test("the stages the backend ends on are the stages the viewer branches on", () 
     join(root, "apps/desktop/src/main/speechSttSurfaceIpc.ts"),
     "utf8",
   );
-  assert.match(host, /\[name, "model-missing"\]/);
+  assert.match(host, /\[preflight\.name, "model-missing"\]/);
   assert.match(host, /text\.trim\(\) === "" \? "none" : "done"/);
   for (const stage of ["model-missing", "none"]) {
-    assert.match(view, new RegExp(`sttStage === "${stage}"`), `${stage} is not branched on`);
+    assert.match(view, new RegExp(`stage === "${stage}"`), `${stage} is not branched on`);
   }
 });
 
 test("a missing speech model is named on screen, with where to fix it", () => {
-  const hint = view.slice(view.indexOf('sttEnd === "model-missing"'));
+  const hint = view.slice(view.indexOf('end === "model-missing"'));
   assert.ok(hint.length > 0, "no model-missing branch to check");
   assert.match(hint, /No speech model is installed/);
   // The one thing that helps: where the model comes from.
@@ -55,7 +55,7 @@ test("asking again is held as queued, not reverted on a timer", () => {
   // The revert that let three decodes of one file be queued.
   assert.doesNotMatch(view, /setTimeout\(\(\) => setKicked\(false\), \d+\)/);
   // Queued is its own word, distinct from "Transcribing on this Mac…".
-  assert.match(view, /const queued = kicked && !transcribing;/);
+  assert.match(view, /queued: kicked && !transcribing/);
   assert.match(view, /Queued for transcription/);
   // And the flag is released by what the lane says about the file.
   assert.match(view, /stageWhenKicked/);

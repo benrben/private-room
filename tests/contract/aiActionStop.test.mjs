@@ -15,17 +15,15 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
+import {
+  readReachableSource,
+  readRepoFile,
+} from "../support/source-modules.mjs";
 
-const root = join(dirname(fileURLToPath(import.meta.url)), "../..");
-const read = (rel) => readFileSync(join(root, rel), "utf8");
-
-const modal = read("apps/desktop/src/renderer/workspace/AiActionModal.tsx");
-const actions = read("apps/desktop/src/renderer/workspace/studioActions.ts");
-const api = read("apps/desktop/src/renderer/api.ts");
-const host = read("apps/desktop/src/main/moonshotAiActions.ts");
+const modal = readRepoFile("apps/desktop/src/renderer/workspace/AiActionModal.tsx");
+const actions = readRepoFile("apps/desktop/src/renderer/workspace/studioActions.ts");
+const api = readReachableSource("apps/desktop/src/renderer/api.ts");
+const host = readRepoFile("apps/desktop/src/main/moonshotAiActions.ts");
 
 test("the AI action modal offers Stop while it is running", () => {
   assert.match(modal, /a\.stopAiAction\(\)/, "no Stop control in the modal");
@@ -42,7 +40,16 @@ test("the AI action modal offers Stop while it is running", () => {
 test("Stop reaches the host through the id the run was started with", () => {
   // One id, minted once, used for both calls — two ids would cancel nothing.
   assert.match(actions, /const opId = /, "the run has no cancel id");
-  assert.match(actions, /opId,\n\s*\}\);/, "the id is not sent with the run");
+  assert.match(
+    actions,
+    /function aiActionOptions[\s\S]*?opId: string[\s\S]*?return \{[\s\S]*?opId,[\s\S]*?\};/,
+    "the action options do not carry the run's id",
+  );
+  assert.match(
+    actions,
+    /const options = aiActionOptions\(p, s\.files, s\.folders, opId\);[\s\S]*?api\.aiAction\(p\.def\.id, options\)/,
+    "the id-bearing options are not sent with the run",
+  );
   assert.match(
     actions,
     /function stopAiAction[\s\S]*?api\.cancelAsk\(opId\)/,

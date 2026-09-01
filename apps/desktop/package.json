@@ -1,7 +1,7 @@
 {
   "name": "@arcelle/desktop",
   "private": true,
-  "version": "0.26.12",
+  "version": "0.26.13",
   "type": "module",
   "description": "Arcelle's Electron main process, preload bridge, and macOS packaging workspace.",
   "main": "dist_package/src/main/index.js",

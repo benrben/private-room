@@ -16,6 +16,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import ts from "typescript";
+import { readReachableSource } from "../support/source-modules.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, "../..");
@@ -41,7 +42,7 @@ test("the card still names the unencrypted workspace", () => {
 });
 
 test("Overlays renders the shared sentences rather than its own copy", () => {
-  const jsx = readFileSync(join(root, "apps/desktop/src/renderer/workspace/Overlays.tsx"), "utf8");
+  const jsx = readReachableSource("apps/desktop/src/renderer/workspace/Overlays.tsx");
   assert.match(jsx, /\{SCRIPT_POWERS\}/);
   assert.match(jsx, /\{SCRIPT_WORKSPACE_NOTE\}/);
   // The old hard-coded sentence must not survive alongside the constants.

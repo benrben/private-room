@@ -16,9 +16,11 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import ts from "typescript";
+import { readReachableSource } from "../support/source-modules.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const read = (p) => readFileSync(join(root, p), "utf8");
+const reachable = (p) => readReachableSource(p);
 
 const load = async (source) => {
   const js = ts.transpileModule(source, {
@@ -34,9 +36,9 @@ const scope = await load(read("apps/desktop/src/renderer/workspace/browserScope.
 const focusSrc = read("apps/desktop/src/renderer/workspace/sketchFocus.ts");
 const focus = await load(focusSrc);
 
-const AI_PANE = read("apps/desktop/src/renderer/workspace/AiPane.tsx");
-const CHAT_ACTIONS = read("apps/desktop/src/renderer/workspace/chatActions.ts");
-const SKETCH_VIEW = read("apps/desktop/src/renderer/viewers/SketchView.tsx");
+const AI_PANE = reachable("apps/desktop/src/renderer/workspace/AiPane.tsx");
+const CHAT_ACTIONS = reachable("apps/desktop/src/renderer/workspace/chatActions.ts");
+const SKETCH_VIEW = reachable("apps/desktop/src/renderer/viewers/SketchView.tsx");
 
 const MAP = {
   fileId: "f-map",
@@ -211,12 +213,12 @@ test("the scope's files are added to the pinned ones on every send path", () => 
     .slice(1)
     .map((b) => b.slice(0, b.indexOf("];")));
   assert.equal(blocks.length, 4);
-  for (const set of blocks) assert.match(set, /fileIds/);
+  for (const set of blocks) assert.match(set, /(?:fileIds|scopedFileIds)/);
   // The paperclip belongs to the composer, so the three paths that send FROM it
   // keep what is pinned there; a rewrite of an old message has no paperclip of
   // its own to add.
   assert.equal(
-    blocks.filter((b) => /s\.attachments\.map\(\(f\) => f\.id\)/.test(b)).length,
+    blocks.filter((b) => /s\.attachments\.map\(\((?:f|file)\) => (?:f|file)\.id\)/.test(b)).length,
     3,
   );
 });

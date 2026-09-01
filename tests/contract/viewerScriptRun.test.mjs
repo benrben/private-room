@@ -22,16 +22,16 @@ const root = join(here, "../..");
 const read = (p) => readFileSync(join(root, p), "utf8");
 
 const ROW = read("apps/desktop/src/renderer/workspace/scripts/ScriptRow.tsx");
-const VIEWER = read("apps/desktop/src/renderer/workspace/ViewerPane.tsx");
+const VIEWER = read("apps/desktop/src/renderer/workspace/ViewerFileHeader.tsx");
 
 test("the viewer's run button uses the Scripts page's own unapproved label", () => {
   const label = ROW.match(/approved \? "Run" : "([^"]+)"/);
   assert.ok(label, "expected ScriptRow to label its run button off `approved`");
 
-  const at = VIEWER.indexOf("isScriptName(openFile.content.name)");
+  const at = VIEWER.indexOf("function ScriptRunAction");
   assert.ok(at > 0, "expected the header's script button in ViewerPane");
   // Just this control: from the kind test that draws it to the end of its IIFE.
-  const to = VIEWER.indexOf("})()}", at);
+  const to = VIEWER.indexOf("function ScriptQuickActions", at);
   assert.ok(to > at, "expected the script button to close its own block");
   const block = VIEWER.slice(at, to);
   assert.ok(

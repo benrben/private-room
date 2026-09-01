@@ -33,6 +33,7 @@ import {
 } from "./mcpConfig.js";
 import { getSetting, setSetting } from "./db-host/settings.js";
 import { mcpRegistryOptinStatus, mcpRegistrySearch, setMcpRegistryOptin } from "./mcpRegistry.js";
+import { cachedPathPrefix } from "./runtimeCatalog.js";
 import type { EventSender } from "./turn.js";
 import {
   authorize as authorizeOauth,
@@ -160,7 +161,7 @@ export function registerMcpSurfaceIpc(
     };
     if (cfg.disabled) return base;
     try {
-      const connected = await connectMcpClient(cfg);
+      const connected = await connectMcpClient(cfg, { cachedPathPrefix: cachedPathPrefix() });
       return { ...base, status: "connected", client: connected.client, tools: connected.tools };
     } catch (error) {
       return { ...base, status: "failed", error: error instanceof Error ? error.message : String(error) };

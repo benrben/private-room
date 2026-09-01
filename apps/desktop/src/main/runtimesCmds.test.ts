@@ -1032,11 +1032,16 @@ describe("registerRuntimesIpc", () => {
     writeFileSync(path.join(uvDir, "uv"), "x");
 
     const events: unknown[] = [];
+    const afterProvision = vi.fn();
     const { ipcMain, call } = fakeIpcMain();
     registerRuntimesIpc(ipcMain, appDataDir, (event, payload) =>
       events.push([event, payload]),
+      afterProvision,
     );
+    expect(cachedPathPrefix()).toBe(uvDir);
+    expect(scriptRunCachedPathPrefix()).toBe(uvDir);
     await call("mcp_provision_runtime", { kind: "uv" });
+    expect(afterProvision).toHaveBeenCalledOnce();
     expect(events).toEqual([]);
     // The publish-after-install step still ran (refreshPathPrefix), so the
     // already-installed uv is now on the published prefix.

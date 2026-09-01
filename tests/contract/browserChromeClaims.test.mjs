@@ -17,15 +17,26 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const SRC = readFileSync(join(here, "../../apps/desktop/src/renderer/workspace/BrowserView.tsx"), "utf8");
+const VIEW = readFileSync(join(here, "../../apps/desktop/src/renderer/workspace/BrowserView.tsx"), "utf8");
+const RUNTIME = readFileSync(join(here, "../../apps/desktop/src/renderer/workspace/browserRuntime.ts"), "utf8");
+const PANELS = readFileSync(join(here, "../../apps/desktop/src/renderer/workspace/BrowserViewPanels.tsx"), "utf8");
 
 /** A named declaration, from its `const <name>` to the next one at indent 2. */
-function decl(name) {
-  const at = SRC.indexOf(`const ${name}`);
+function decl(source, name) {
+  const at = source.indexOf(`const ${name}`);
   assert.notEqual(at, -1, `${name} has been renamed — re-point this test`);
-  const rest = SRC.slice(at + 6);
+  const rest = source.slice(at + 6);
   const end = rest.search(/\n  (?:const|async function|function|\/\*\*|\/\/ ---)/);
   return rest.slice(0, end === -1 ? rest.length : end);
+}
+
+function exportedFunction(source, name) {
+  const sync = source.indexOf(`export function ${name}`);
+  const async = source.indexOf(`export async function ${name}`);
+  const at = sync === -1 ? async : sync;
+  assert.notEqual(at, -1, `${name} has been renamed — re-point this test`);
+  const next = source.indexOf("\nexport ", at + 1);
+  return source.slice(at, next === -1 ? source.length : next);
 }
 
 test("the poll does not rename the address box while the results are in front", () => {
@@ -34,30 +45,32 @@ test("the poll does not rename the address box while the results are in front", 
   // address for a page not on screen, and Enter went there instead of
   // searching again.
   assert.match(
-    decl("refresh"),
+    exportedFunction(RUNTIME, "updateBrowserAddress"),
     /if \(!editing && !searchOpenRef\.current && next\.url\) setAddress\(next\.url\)/,
     "the poll writes the parked page's URL over the query again",
   );
   // Through a REF: `refresh` is what the four native event subscriptions hang
   // off, so taking `searchOpen` as a dependency would re-register them on
   // every results toggle.
-  assert.match(SRC, /searchOpenRef\.current = searchOpen;/, "the mirror is never written");
+  assert.match(VIEW, /searchOpenRef\.current = searchOpen;/, "the mirror is never written");
+  assert.match(VIEW, /updateBrowserAddress\(next, editing, searchOpenRef, setAddress\)/);
 });
 
 test("a privacy check that did not come back does not count as one that did", () => {
   // The shield latched on "Checking" for the rest of that page's life: the
   // page had been marked as verified before the answer arrived, so nothing
   // ever asked again.
-  const refresh = decl("refresh");
+  const refresh = exportedFunction(RUNTIME, "verifyBrowserPrivacy");
   assert.match(refresh, /if \(answer === null\) verifiedForRef\.current = null;/);
   assert.ok(
     !/setEphemeral\(await api\.browserVerifyPrivate/.test(refresh),
     "the claim is still latched before the answer is known",
   );
+  assert.match(VIEW, /verifyBrowserPrivacy\(next, verifiedForRef, setEphemeral\)/);
 });
 
 test("a failed result-open only restores results the user can have come from", () => {
-  const body = decl("openResult");
+  const body = decl(VIEW, "openResult");
   assert.match(
     body,
     /if \(search && !readerOpen\) setSearchOpen\(true\)/,
@@ -67,7 +80,7 @@ test("a failed result-open only restores results the user can have come from", (
   // broadcast a hostname typed minutes earlier to seven search engines.
   assert.match(body, /setFailedInput\(null\)/, "openResult keeps the old retry query");
   assert.match(
-    decl("openResultInNewTab"),
+    decl(VIEW, "openResultInNewTab"),
     /setFailedInput\(null\)/,
     "openResultInNewTab keeps the old retry query",
   );
@@ -76,30 +89,30 @@ test("a failed result-open only restores results the user can have come from", (
 test("one notice, one timer", () => {
   // An earlier notice's timeout went on running against the shared state, so a
   // save confirmation could be erased a second after it appeared.
-  assert.match(SRC, /window\.clearTimeout\(noticeTimer\.current\)/);
-  assert.match(SRC, /setNotice\("Opened in a new tab\.", 4000\)/);
+  assert.match(VIEW, /window\.clearTimeout\(noticeTimer\.current\)/);
+  assert.match(VIEW, /setNotice\("Opened in a new tab\.", 4000\)/);
   assert.ok(
-    !/window\.setTimeout\(\(\) => setNotice\(null\)/.test(SRC),
+    !/window\.setTimeout\(\(\) => setNotice\(null\)/.test(VIEW),
     "a notice still arms its own timer beside the shared one",
   );
 });
 
 test("a journal read that failed is not rendered as a clean history", () => {
   assert.ok(
-    !/browserJournal\(300\)\.catch\(\(\) => \[\]\)/.test(SRC),
+    !/browserJournal\(300\)\.catch\(\(\) => \[\]\)/.test(VIEW),
     "a failed read is still stood down to an empty record",
   );
-  assert.match(decl("loadJournal"), /setJournalError\(String\(e\)\)/);
-  assert.match(SRC, /The record could not be read/, "the failure is never shown");
-  assert.match(SRC, /journalError \? null : \(/, '"Nothing yet." still speaks for a failed read');
+  assert.match(decl(VIEW, "loadJournal"), /setJournalError\(String\(e\)\)/);
+  assert.match(PANELS, /The record could not be read/, "the failure is never shown");
+  assert.match(PANELS, /return error \? null : <p[^>]*>Nothing yet\.<\/p>/, '"Nothing yet." still speaks for a failed read');
 });
 
 test("Erase says what happened, and re-reads either way", () => {
-  const at = SRC.indexOf("browserClearJournal()");
+  const at = VIEW.indexOf("browserClearJournal()");
   assert.notEqual(at, -1, "the erase call has been renamed — re-point this test");
-  const call = SRC.slice(at, at + 800);
-  assert.match(call, /\.catch\(\(e\) => \{/, "the rejection is still unhandled");
-  assert.match(call, /setError\(String\(e\)\)/, "a failed erase is still silent");
+  const call = VIEW.slice(at, at + 800);
+  assert.match(call, /\.catch\(\(error\) => \{/, "the rejection is still unhandled");
+  assert.match(call, /setError\(String\(error\)\)/, "a failed erase is still silent");
   assert.match(call, /void loadJournal\(\);/, "the panel never re-reads what actually survived");
   assert.match(call, /void loadClearScope\(\);/, "Clear keeps the counts from before the erase");
   // The error banner is shared with the address bar, and so is the recovery
@@ -114,21 +127,21 @@ test("Clear is gated on everything it erases, not on the journal alone", () => {
   // no journal row, so an empty record is no evidence there is nothing to
   // erase — and this button is the only control in the app that empties it.
   assert.ok(
-    !/disabled=\{journal\.length === 0\}/.test(SRC),
+    !/disabled=\{journal\.length === 0\}/.test(PANELS),
     "Clear is still disabled by an empty journal alone",
   );
   assert.match(
-    SRC,
+    VIEW,
     /const nothingToErase = journal\.length === 0 && cached === 0;/,
     "the gate no longer counts the cached searches, pages and previews",
   );
-  assert.match(SRC, /disabled=\{nothingToErase\}/);
+  assert.match(PANELS, /disabled=\{nothingToErase\}/);
 });
 
 test("closing the journal disarms the confirmation it was left on", () => {
-  const at = SRC.indexOf("if (!journalOpen) {");
+  const at = VIEW.indexOf("if (!journalOpen) {");
   assert.notEqual(at, -1, "the journal effect no longer handles the closed case");
-  const closed = SRC.slice(at, at + 400);
+  const closed = VIEW.slice(at, at + 400);
   assert.match(closed, /setConfirmClear\(false\)/, "reopening lands on an armed Erase again");
   assert.match(closed, /setClearScope\(null\)/, "…beside the counts from the previous visit");
 });

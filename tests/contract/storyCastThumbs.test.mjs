@@ -20,17 +20,22 @@ import { dirname, join } from "node:path";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const story = readFileSync(join(root, "apps/desktop/src/renderer/workspace/create/StoryTab.tsx"), "utf8");
+const cast = readFileSync(join(root, "apps/desktop/src/renderer/workspace/create/StoryCast.tsx"), "utf8");
+const script = readFileSync(join(root, "apps/desktop/src/renderer/workspace/create/StoryScript.tsx"), "utf8");
 
 /** One top-level `function Name(` declaration's source, up to the next one. */
-function declaration(source, name) {
-  const start = source.indexOf(`\nfunction ${name}(`);
-  assert.notEqual(start, -1, `${name} is gone from StoryTab.tsx`);
-  const next = source.indexOf("\nfunction ", start + 1);
+function declaration(source, name, sourceName) {
+  const start = source.indexOf(`function ${name}(`);
+  assert.notEqual(start, -1, `${name} is gone from ${sourceName}`);
+  const nextExport = source.indexOf("\nexport function ", start + 1);
+  const nextLocal = source.indexOf("\nfunction ", start + 1);
+  const candidates = [nextExport, nextLocal].filter((at) => at !== -1);
+  const next = candidates.length ? Math.min(...candidates) : -1;
   return source.slice(start, next === -1 ? source.length : next);
 }
 
 test("one portrait does not fetch the room's thumbnails for itself", () => {
-  const heroFace = declaration(story, "HeroFace");
+  const heroFace = declaration(script, "HeroFace", "StoryScript.tsx");
   assert.ok(
     !heroFace.includes("storyPictures"),
     "HeroFace is rendered once per cast member, and story_pictures rebuilds " +
@@ -42,7 +47,8 @@ test("one portrait does not fetch the room's thumbnails for itself", () => {
     "and nothing else may be fetched from inside it either",
   );
   // The strip above it does the one read the whole row is drawn from.
-  assert.ok(declaration(story, "CastStrip").includes("storyPictures"));
+  assert.ok(declaration(cast, "CastStrip", "StoryCast.tsx").includes("storyPictures"));
+  assert.match(story, /<CastStrip/, "StoryTab no longer composes the shared cast strip");
 });
 
 test("no clip model is called incapable without one having been looked at", () => {

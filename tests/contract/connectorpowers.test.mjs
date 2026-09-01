@@ -5,12 +5,14 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { readReachableSource } from "../support/source-modules.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const read = (p) => readFileSync(join(root, p), "utf8");
 const view = read("apps/desktop/src/renderer/workspace/ConnectorsView.tsx");
+const reachableView = readReachableSource("apps/desktop/src/renderer/workspace/ConnectorsView.tsx");
 const hook = read("apps/desktop/src/renderer/settings/useMcpConfig.ts");
-const contract = read("apps/desktop/src/shared/ipc-contract.ts");
+const contract = readReachableSource("apps/desktop/src/shared/ipc-contract.ts");
 const mock = read("tests/support/qa-mock.js");
 
 test("both connector powers are wired through Electron and QA", () => {
@@ -25,12 +27,12 @@ test("both connector powers are wired through Electron and QA", () => {
 });
 
 test("each connector states which level is in force", () => {
-  assert.match(view, /connectorPowers\[s\.name\]/);
-  assert.match(view, /over\.auto_approve \?\? autoApprove/);
-  assert.match(view, /over\.outbound_unmask \?\? outboundUnmask/);
-  for (const value of ['value="follow"', 'value="on"', 'value="off"']) assert.ok(view.includes(value));
-  assert.match(view, /from the setting above/);
-  assert.match(view, /set here, so the setting above doesn't apply/);
+  assert.match(reachableView, /connectorPowers\[server\.name\]/);
+  assert.match(reachableView, /override\.auto_approve \?\? autoApprove/);
+  assert.match(reachableView, /override\.outbound_unmask \?\? outboundUnmask/);
+  for (const value of ['value="follow"', 'value="on"', 'value="off"']) assert.ok(reachableView.includes(value));
+  assert.match(reachableView, /from the setting above/);
+  assert.match(reachableView, /set here, so the setting above doesn't apply/);
   assert.match(hook, /value: boolean \| null/);
   assert.match(hook, /mcpSetConnectorPower\(server, power, value\)/);
 });

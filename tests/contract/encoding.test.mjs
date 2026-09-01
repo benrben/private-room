@@ -21,16 +21,14 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { readReachableSource } from "../support/source-modules.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, "../..");
 
 const ENCODING = readFileSync(join(root, "apps/desktop/src/renderer/viewers/TextEncoding.tsx"), "utf8");
 const REGISTRY = readFileSync(join(root, "apps/desktop/src/renderer/viewers/registry.tsx"), "utf8");
-const FILES_HOST = readFileSync(
-  join(root, "apps/desktop/src/main/fileRuntimeSurfaceIpc.ts"),
-  "utf8",
-);
+const FILES_HOST = readReachableSource("apps/desktop/src/main/fileRuntimeSurfaceIpc.ts");
 
 /** Every kind in the Rust table whose text is the file's own bytes, including
  * the fallback `CODE` row (which is chosen by extension, not by the table). */
@@ -75,7 +73,7 @@ test("Edit is offered on a legacy encoding, and withheld only on a lossy read", 
   // "the format allows it AND the decode was clean".
   assert.match(
     FILES_HOST,
-    /editable: !lossy && viewerKind/,
+    /editable: !decoded\.lossy && viewerKind/,
     "the editable rule must be 'the format allows it AND the decode was clean'",
   );
   assert.match(
@@ -127,7 +125,7 @@ test("every in-place editor warns about the conversion, not just Monaco", () => 
   assert.ok(md, "the MarkdownEditor branch is gone from ViewerRouter");
   assert.match(
     md[0],
-    /banner=\{editBanner\(mode, c\.name, encodingSaveNote\(enc\.decoded\)\)\}/,
+    /banner=\{editBanner\([\s\S]{0,140}encodingSaveNote\(props\.enc\.decoded\)/,
     "the Markdown editor must say a save will convert the file too",
   );
 });

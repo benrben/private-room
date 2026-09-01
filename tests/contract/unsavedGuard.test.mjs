@@ -29,6 +29,7 @@ const root = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const read = (p) => readFileSync(join(root, p), "utf8");
 
 const FILEACTIONS = read("apps/desktop/src/renderer/workspace/fileActions.ts");
+const VIEWER_ACTIONS = read("apps/desktop/src/renderer/workspace/fileViewerActions.ts");
 const EFFECTS = read("apps/desktop/src/renderer/workspace/effects.ts");
 
 /** A whole function declaration, by brace matching from its signature. The
@@ -59,10 +60,10 @@ function fnSource(src, signature, from = 0) {
 /** Everything `makeFileActions` declares between `viewFile` and the next
  * verb — `viewFile` itself plus any helper it delegates the actual open to. */
 function openRegion() {
-  const at = FILEACTIONS.indexOf("  async function viewFile(");
-  const end = FILEACTIONS.indexOf('  /** "New page": a blank Markdown note');
+  const at = VIEWER_ACTIONS.indexOf("  async function viewFile(");
+  const end = VIEWER_ACTIONS.indexOf('  /** "New page": a blank Markdown note');
   assert.ok(at !== -1 && end > at, "viewFile is no longer where this test slices");
-  return FILEACTIONS.slice(at, end);
+  return VIEWER_ACTIONS.slice(at, end);
 }
 
 /** The latch `openFile` reads to know it has been superseded. It lives at
@@ -77,20 +78,26 @@ function moduleState() {
 
 const MODULE = [
   moduleState(),
+  fnSource(FILEACTIONS, "export function setOpenIntent(").replace(/^export /, ""),
   // `uniqueFileName` is imported by fileActions.ts, and the slice has no
   // imports — so the collaborators it reaches for arrive as parameters, the
   // way `displayName` already does. Defaulted, so the call sites that do not
   // exercise naming stay as they are.
   "export function makeFiles(s, api, displayName, uniqueFileName = (n) => n) {",
-  fnSource(FILEACTIONS, "function guardLeave("),
+  fnSource(VIEWER_ACTIONS, "function guardLeave("),
   openRegion(),
-  fnSource(FILEACTIONS, "async function writeNewNote("),
-  fnSource(FILEACTIONS, "async function writeNewScript("),
+  fnSource(VIEWER_ACTIONS, "async function writeNewNote("),
+  fnSource(VIEWER_ACTIONS, "async function writeNewScript("),
   "  return { viewFile, guardLeave, writeNewNote, writeNewScript };",
   "}",
   "export function makeEscape(s, a) {",
-  fnSource(EFFECTS, "function onKey(e: KeyboardEvent) {"),
-  "  return onKey;",
+  fnSource(EFFECTS, "export function closeEscapePopover(").replace(/^export /, ""),
+  fnSource(EFFECTS, "export function settingsOwnsEscape(").replace(/^export /, ""),
+  fnSource(EFFECTS, "export function closeEscapePane(").replace(/^export /, ""),
+  fnSource(EFFECTS, "export function typingOutsideNoteEditor(").replace(/^export /, ""),
+  fnSource(EFFECTS, "export function closeOpenFileOnEscape(").replace(/^export /, ""),
+  fnSource(EFFECTS, "export function handleWorkspaceEscape(").replace(/^export /, ""),
+  "  return (event) => handleWorkspaceEscape(event, s, a);",
   "}",
 ].join("\n");
 
@@ -100,6 +107,17 @@ const JS = ts.transpileModule(MODULE, {
 const { makeFiles, makeEscape } = await import(
   `data:text/javascript,${encodeURIComponent(JS)}`
 );
+
+class TestElement {
+  constructor(tagName, ancestors = []) {
+    this.tagName = tagName;
+    this.ancestors = ancestors;
+  }
+  closest(selector) {
+    return this.ancestors.includes(selector) ? {} : null;
+  }
+}
+globalThis.HTMLElement = TestElement;
 
 const settle = () => new Promise((r) => setTimeout(r, 0));
 
@@ -299,10 +317,7 @@ test("a new script opens in edit mode even with another file already showing", a
 /** An element the way the handler asks about one: a tag, and an ancestor
  * lookup. Real targets always answer `closest`; a stub that did not would let
  * the handler read every field in the app as "not the editor". */
-const elem = (tagName, ancestors = []) => ({
-  tagName,
-  closest: (sel) => (ancestors.includes(sel) ? {} : null),
-});
+const elem = (tagName, ancestors = []) => new TestElement(tagName, ancestors);
 
 /** Where the caret actually is while you type in a note. Monaco's visible
  * text is painted; the caret lives in a hidden <textarea class="inputarea">

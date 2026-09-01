@@ -167,10 +167,10 @@ export function resetLoginShellPathCacheForTests(): void {
 export interface StdioConnectOptions {
   /** Stand-in for `crate::commands::cached_path_prefix()` — the downloaded-
    * runtime PATH prefix (`uvx`/`npx` the app provisioned itself). That
-   * subsystem (`commands/runtimes.rs`) has no port in this migration yet, so
-   * this is injected; the default (empty prefix) means only what is already on
-   * the resolved login-shell PATH is found, exactly like an install that has
-   * provisioned nothing. */
+   * subsystem is exposed by `runtimeCatalog.ts` and injected by
+   * `mcpSurfaceIpc.ts`; the default (empty prefix) means only what is already
+   * on the resolved login-shell PATH is found, exactly like an install that
+   * has provisioned nothing. */
   cachedPathPrefix?: string;
   connectTimeoutMs?: number;
   callTimeoutMs?: number;

@@ -25,12 +25,15 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import ts from "typescript";
+import { readReachableSource } from "../support/source-modules.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const read = (p) => readFileSync(join(root, p), "utf8");
 
 const NAV = read("apps/desktop/src/renderer/shell/navPrefs.tsx");
 const LAYOUT = read("apps/desktop/src/renderer/shell/useLayout.ts");
+const LAYOUT_REACHABLE = readReachableSource("apps/desktop/src/renderer/shell/useLayout.ts");
+const LAYOUT_STATE = read("apps/desktop/src/renderer/shell/layoutState.ts");
 const TYPES = read("apps/desktop/src/renderer/workspace/types.ts");
 const RAIL = read("apps/desktop/src/renderer/shell/ActivityRail.tsx");
 const OVERLAYS = read("apps/desktop/src/renderer/workspace/Overlays.tsx");
@@ -76,7 +79,10 @@ const nav = await import(`data:text/javascript,${encodeURIComponent(JS)}`);
 /* ---------- and the real PRESETS object, so it is asserted, not grepped ---- */
 
 const PRESET_JS = ts.transpileModule(
-  LAYOUT.slice(LAYOUT.indexOf("export type PresetName"), LAYOUT.indexOf("type Persisted")),
+  LAYOUT_STATE.slice(
+    LAYOUT_STATE.indexOf("export type PresetName"),
+    LAYOUT_STATE.indexOf("export type PersistedLayout"),
+  ),
   { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 } },
 ).outputText;
 const { PRESETS } = await import(`data:text/javascript,${encodeURIComponent(PRESET_JS)}`);
@@ -181,7 +187,7 @@ test("the only ⌘-key this file still claims is the ⌘3 alias", () => {
   // (that the menu declares them) is menu.rs's
   // `the_pane_keys_are_declared_once_each`, and nativeMenu.test.mjs is what
   // holds the two files to the same story.
-  const map = /export const PANE_KEYS[^=]*=\s*\{([^}]*)\}/.exec(LAYOUT)?.[1];
+  const map = /export const PANE_KEYS[^=]*=\s*\{([^}]*)\}/.exec(LAYOUT_REACHABLE)?.[1];
   assert.ok(map, "PANE_KEYS not found");
   assert.match(map, /"3":\s*"ai"/, "⌘3 has always meant the assistant — keep it");
   assert.ok(!/"1":/.test(map), "⌘1 belongs to the View menu now");
@@ -196,7 +202,7 @@ test("togglePane cannot be handed the workspace", () => {
     "the centre must be excluded by the TYPE, not by a runtime check that a " +
       "caller can forget",
   );
-  assert.match(LAYOUT, /export type SidePane = Exclude<PaneKey, "center">/);
+  assert.match(LAYOUT_REACHABLE, /export type SidePane = Exclude<PaneKey, "center">/);
 });
 
 test("a stored hidden.center is read as false", () => {
@@ -266,7 +272,7 @@ test("the narrow-window collapse never reaches storage", () => {
   );
   // The rail reads the derived value; only the expander knows the preference.
   assert.match(LAYOUT, /railExpanded: railExpanded && !railAutoCollapsed/);
-  assert.match(RAIL, /!layout\.railAutoCollapsed && \(/, "the expander must hide while forced");
+  assert.match(RAIL, /if \(layout\.railAutoCollapsed\) return null;/, "the expander must hide while forced");
 });
 
 /* ============================================ reachability + pane reveals */
@@ -305,8 +311,8 @@ test("picking a chat message out of ⌘K reveals the pane it lives in", () => {
 test("the Assistant's marks appear only while its pane is shut", () => {
   assert.match(TOPBAR, /const aiShowing = layout\.visible\.includes\("ai"\)/,
     "must track what is ON SCREEN — in narrow mode the pane can be un-hidden and still not visible");
-  assert.match(TOPBAR, /\{!aiShowing && approvals > 0 &&/);
-  assert.match(TOPBAR, /\{!aiShowing && approvals === 0 && running > 0 &&/,
+  assert.match(TOPBAR, /function ApprovalMarker[\s\S]*?if \(aiShowing \|\| approvals === 0\) return null;/);
+  assert.match(TOPBAR, /function AssistantMarker[\s\S]*?if \(aiShowing \|\| approvals > 0\) return null;[\s\S]*?if \(running === 0\) return null;/,
     "the two marks are different facts and must not be summed into one number");
 });
 

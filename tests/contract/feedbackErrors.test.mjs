@@ -47,10 +47,11 @@ test("the sheet offers them, off by default, and shows exactly what it would sen
   assert.match(MODAL, /const \[includeErrors, setIncludeErrors\] = useState\(false\)/);
   assert.match(MODAL, /s\.errorLogRef\.current/);
   // The body only grows when the box is ticked.
-  assert.match(MODAL, /includeErrors && recentErrors\.length > 0/);
+  assert.match(MODAL, /if \(!includeErrors \|\| recentErrors\.length === 0\) return "";/);
   assert.match(MODAL, /finalBody[\s\S]{0,200}errorBlock/);
   // …and the lines themselves are on screen to be read first.
   assert.match(MODAL, /data-testid="feedback-errors"/);
-  assert.match(MODAL, /recentErrors\.map\(\(e\) => \(/);
+  assert.match(MODAL, /<ErrorLogOption errors=\{recentErrors\} includeErrors=\{includeErrors\}/);
+  assert.match(MODAL, /errors\.map\(\(error\) => <li/);
   assert.match(MODAL, /an error can name one of your files/);
 });

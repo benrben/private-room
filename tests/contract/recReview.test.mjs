@@ -24,21 +24,34 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { transformSync } from "esbuild";
+import { loadTypescriptModule } from "../support/source-modules.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, "../..");
 const SRC = join(root, "apps/desktop/src/renderer/viewers/recReview.ts");
 
-const js = transformSync(readFileSync(SRC, "utf8"), {
-  loader: "ts",
-  format: "esm",
-  target: "es2022",
-}).code;
-const R = await import(`data:text/javascript;base64,${Buffer.from(js).toString("base64")}`);
+const R = await import(loadTypescriptModule(SRC));
 
 const VIEW = readFileSync(join(root, "apps/desktop/src/renderer/viewers/RecordingView.tsx"), "utf8");
-const CSS = readFileSync(join(root, "apps/desktop/src/renderer/styles/recording.css"), "utf8");
+const SURFACE = readFileSync(join(root, "apps/desktop/src/renderer/viewers/RecordingSurface.tsx"), "utf8");
+const CONTROLLER = readFileSync(join(root, "apps/desktop/src/renderer/viewers/recordingController.ts"), "utf8");
+const BASE = readFileSync(join(root, "apps/desktop/src/renderer/viewers/recordingControllerBase.ts"), "utf8");
+const PRESENTATION = readFileSync(join(root, "apps/desktop/src/renderer/viewers/recordingPresentation.tsx"), "utf8");
+const MODEL = readFileSync(join(root, "apps/desktop/src/renderer/viewers/recordingModel.ts"), "utf8");
+
+function stylesheet(entry, seen = new Set()) {
+  if (seen.has(entry)) return "";
+  seen.add(entry);
+  const css = readFileSync(join(root, entry), "utf8");
+  return [
+    css,
+    ...[...css.matchAll(/@import\s+["']([^"']+)["'];/g)].map(([, specifier]) =>
+      stylesheet(join(dirname(entry), specifier), seen),
+    ),
+  ].join("\n");
+}
+
+const CSS = stylesheet("apps/desktop/src/renderer/styles/recording.css");
 
 /* =====================================================================
  * P1 — ONE TRANSPORT
@@ -49,8 +62,8 @@ test("the recording page has no second, native player on it", () => {
   // was on is the single truth the wave, the transcript, the cut-skipping and
   // the clock all drive, so it has to stay — undrawn.
   // The element itself, not the paragraph of prose above that explains it.
-  const at = VIEW.indexOf("<audio\n");
-  const audio = VIEW.slice(at, VIEW.indexOf("/>", at));
+  const at = SURFACE.indexOf("<audio ");
+  const audio = SURFACE.slice(at, SURFACE.indexOf("/>", at));
   assert.ok(at > 0, "the element must still be rendered");
   assert.ok(
     !/^\s*controls\s*$/m.test(audio),
@@ -66,24 +79,20 @@ test("the recording page has no second, native player on it", () => {
 test("the one transport owns volume, speed and seeking, each with a name", () => {
   // The three things the native player was being kept for. Real form
   // controls, so the keyboard works without a line of key handling.
-  const transport = VIEW.slice(
-    VIEW.indexOf('<div className="rec-transport">'),
-    VIEW.indexOf('className="rec-options"'),
-  );
-  assert.match(transport, /aria-label="Volume"/);
-  assert.match(transport, /aria-label="Playback speed"/);
-  assert.match(transport, /aria-label="Seek in the recording"/);
-  assert.match(transport, /type="range"[\s\S]*?className="rec-seek"/);
-  assert.match(transport, /PLAYBACK_RATES\.map/);
+  assert.match(SURFACE, /aria-label="Volume"/);
+  assert.match(SURFACE, /aria-label="Playback speed"/);
+  assert.match(SURFACE, /aria-label="Seek in the recording"/);
+  assert.match(SURFACE, /type="range" className="rec-seek"/);
+  assert.match(SURFACE, /PLAYBACK_RATES\.map/);
 });
 
 test("the transport's controls ask the element and believe its answer", () => {
   // The same rule the play button already followed: the <audio> element is the
   // truth. A slider that set its own state first could show a level the audio
   // is not at — which is the two-players confusion again, in one control.
-  assert.match(VIEW, /onVolumeChange=\{\(e\) => setVolume\(clampVolume\(e\.currentTarget\.volume\)\)\}/);
-  assert.match(VIEW, /setRate\(e\.currentTarget\.playbackRate\)/);
-  const ask = VIEW.slice(VIEW.indexOf("function askVolume"), VIEW.indexOf("function askVolume") + 400);
+  assert.match(SURFACE, /onVolumeChange=\{\(e\) => setVolume\(clampVolume\(e\.currentTarget\.volume\)\)\}/);
+  assert.match(SURFACE, /setRate\(e\.currentTarget\.playbackRate\)/);
+  const ask = CONTROLLER.slice(CONTROLLER.indexOf("function askVolume"), CONTROLLER.indexOf("function askVolume") + 400);
   assert.ok(!/setVolume\(/.test(ask), "askVolume must not set the state itself");
 });
 
@@ -91,15 +100,15 @@ test("dragging the bar moves the playhead without starting playback", () => {
   // `seek` plays, which is right for a timestamp you clicked and wrong for a
   // bar you are dragging: scrubbing a paused recording to look at a moment
   // must not start it.
-  const scrub = VIEW.slice(VIEW.indexOf("function scrubTo"), VIEW.indexOf("function showInTranscript"));
+  const scrub = CONTROLLER.slice(CONTROLLER.indexOf("function scrubTo"), CONTROLLER.indexOf("function showInTranscript"));
   assert.ok(!/\.play\(\)/.test(scrub), "scrubbing must never call play()");
   assert.match(scrub, /setPlayCs/, "a paused element fires no timeupdate, so the clock is set here");
-  assert.match(VIEW, /onChange=\{\(e\) => scrubTo\(Number\(e\.target\.value\)\)\}/);
+  assert.match(SURFACE, /onChange=\{\(e\) => scrubTo\(Number\(e\.target\.value\)\)\}/);
 });
 
 test("the marks are on the track the seeking happens on", () => {
   assert.equal(typeof R.seekMarks, "function");
-  assert.match(VIEW, /marks\.map\(/);
+  assert.match(SURFACE, /marks\.map\(/);
   assert.match(CSS, /\.rec-seekmarks \{[^}]*pointer-events: none/s);
 });
 
@@ -111,8 +120,8 @@ test("a converted recording's real file remains playable when old duration metad
   assert.equal(R.recordingCanPlay("workspace-media-token", false), true);
   assert.equal(R.recordingCanPlay(null, false), false);
   assert.equal(R.recordingCanPlay("workspace-media-token", true), false);
-  assert.match(VIEW, /const canPlay = !!src;/);
-  assert.doesNotMatch(VIEW, /const canPlay = !!src && durationCs > 0/);
+  assert.match(PRESENTATION, /const canPlay = !!src;/);
+  assert.doesNotMatch(PRESENTATION, /const canPlay = !!src && durationCs > 0/);
 });
 
 test("a mark's place is a percentage of the whole recording, never past its ends", () => {
@@ -189,7 +198,7 @@ test("the capture settings are relocated, not deleted, and written once", () => 
     "Speakers detected automatically — name them later",
     "Live translate",
   ]) {
-    const hits = VIEW.split(label).length - 1;
+    const hits = PRESENTATION.split(label).length - 1;
     assert.equal(hits, 1, `"${label}" is drawn ${hits} times, not once`);
   }
   // `capturable` joined this gate when imported and downloaded media started
@@ -197,36 +206,31 @@ test("the capture settings are relocated, not deleted, and written once", () => 
   // below): the stage says WHEN these are drawn, and `capturable` says whether
   // this file has a capture to configure at all.
   assert.match(
-    VIEW,
-    /\{capturable && showsChoicesInline\(stage\) && \(/,
+    SURFACE,
+    /if \(!capturable \|\| !showsChoicesInline\(stage\)\) return null;/,
     "the inline row is gated by the stage",
   );
-  assert.match(VIEW, /\{capturable && needsPreflight\(stage\) && preflight && \(/);
-  assert.match(VIEW, /\{captureChoices\}/);
+  assert.match(SURFACE, /if \(!capturable \|\| !needsPreflight\(stage\) \|\| !preflight\) return null;/);
+  assert.match(SURFACE, /\{captureChoices\}/);
 });
 
 test("the record button says it is a disclosure when that is what it is", () => {
-  assert.match(VIEW, /aria-expanded=\{primary\.expands \? preflight : undefined\}/);
-  assert.match(VIEW, /expands: needsPreflight\(stage\)/);
+  assert.match(SURFACE, /aria-expanded=\{primary\.expands \? preflight : undefined\}/);
+  assert.match(PRESENTATION, /const expands = needsPreflight\(stage\)/);
   // …and starting the session closes it, or the capture settings would be
   // back beside a running capture's transport.
-  const start = VIEW.slice(VIEW.indexOf("async function start()"));
+  const start = CONTROLLER.slice(CONTROLLER.indexOf("async function start()"));
   assert.match(start.slice(0, 400), /setPreflight\(false\)/);
 });
 
 test("live and paused keep every control they had", () => {
   // The fix moved settings off the REVIEW screen. A live meeting still needs
   // its live-transcription toggle and its live-translate box mid-flight.
-  const from = VIEW.indexOf("{capturable && showsChoicesInline(stage) && (");
-  const to = VIEW.indexOf("{capturable && needsPreflight(stage) && preflight && (");
-  // Both ends must be FOUND: `String.slice` reads a -1 from a renamed gate as
-  // "one from the end", which would quietly widen this slice to the whole file
-  // and leave every assertion below passing on some other part of the page.
-  assert.ok(from > 0 && to > from, "the two gates this slice is bounded by");
-  const options = VIEW.slice(from, to);
-  assert.match(options, /\{isLive && \(/);
-  assert.match(options, /Live transcription/);
+  const options = SURFACE.slice(SURFACE.indexOf("function SessionOptions"), SURFACE.indexOf("function CapturePreflight"));
+  assert.match(options, /showsChoicesInline\(stage\)/);
+  assert.match(options, /<LiveTranscriptionToggle/);
   assert.match(options, /\{liveTranslateOpt\}/);
+  assert.match(SURFACE, /function LiveTranscriptionToggle[\s\S]*?if \(!isLive\) return null;[\s\S]*?Live transcription/);
 });
 
 test("a file this app cannot record into is never offered a record button", () => {
@@ -247,8 +251,8 @@ test("a file this app cannot record into is never offered a record button", () =
   // recording is a far worse failure than an error toast on an import. Only a
   // name positively stating some other container takes the cluster away.
   assert.match(
-    VIEW,
-    /const capturable = isLive \|\| container === null \|\| !NO_CAPTURE_CONTAINERS\.has\(container\);/,
+    MODEL,
+    /return isLive \|\| container === null \|\| !NO_CAPTURE_CONTAINERS\.has\(container\);/,
     "the container the name claims decides it",
   );
   // A LIST of containers, never `!== "wav"`. A file's name is free text a
@@ -270,13 +274,13 @@ test("a file this app cannot record into is never offered a record button", () =
   );
   // Read off the name `rec_get` was already returning and the view was
   // throwing away — no new IPC, no new field on RecMeta.
-  assert.match(VIEW, /setFileName\(r\.name\)/);
-  assert.match(VIEW, /\{status !== "saving" && capturable && \(/, "the record button");
-  assert.match(VIEW, /\{capturable && showsChoicesInline\(stage\) && \(/, "the capture settings");
+  assert.match(BASE, /setFileName\(r\.name\)/);
+  assert.match(SURFACE, /if \(status === "saving" \|\| !capturable\) return null;/, "the record button");
+  assert.match(SURFACE, /if \(!capturable \|\| !showsChoicesInline\(stage\)\) return null;/, "the capture settings");
   // …and the copy that points at them: the "fresh" empty state is one long
   // instruction to press a record button that is not there.
-  assert.match(VIEW, /\{stage === "fresh" && capturable \? \(/);
-  assert.match(VIEW, /\) : stage === "finished" \|\| !capturable \? \(/);
+  assert.match(SURFACE, /if \(stage === "fresh" && capturable\) return <FreshTranscriptMessage/);
+  assert.match(SURFACE, /return stage === "finished" \|\| !capturable;/);
 });
 
 /* =====================================================================
@@ -321,7 +325,7 @@ test("a search that finds nothing finds nothing, loudly", () => {
   assert.equal(out.phrases, 0);
   assert.equal(out.searching, true, "an empty transcript and an empty result are not the same");
   // …and the page says which of the two it is looking at.
-  assert.match(VIEW, /No phrase in this transcript contains/);
+  assert.match(SURFACE, /No phrase in this transcript contains/);
 });
 
 test("the playhead's phrase is the last one that has started", () => {
@@ -335,20 +339,21 @@ test("the playhead's phrase is the last one that has started", () => {
 });
 
 test("one rule decides where the playhead is, so a jump cannot land a line off", () => {
-  const uses = VIEW.match(/segmentAt\(segments,/g) ?? [];
+  const uses = CONTROLLER.match(/segmentAt\(segments,/g) ?? [];
   assert.ok(uses.length >= 3, `only ${uses.length} places ask segmentAt`);
-  const onTime = VIEW.slice(VIEW.indexOf("function onTime()"), VIEW.indexOf("function seek("));
+  const onTime = CONTROLLER.slice(CONTROLLER.indexOf("function onTime()"), CONTROLLER.indexOf("function seek("));
   assert.match(onTime, /segmentAt\(segments, cs\)/, "timeupdate must use it too");
 });
 
 test("the transcript is a line per phrase, each with its own time and its own play", () => {
   // THE DEFECT: one dense block per speaker, a single timestamp at the top,
   // and no way to start from any phrase but the first.
-  const list = VIEW.slice(VIEW.indexOf("{found.turns.map((turn)"), VIEW.indexOf("{standaloneGhosts.map"));
+  const list = SURFACE.slice(SURFACE.indexOf("function TranscriptStamp"), SURFACE.indexOf("function ReadTab"));
   assert.match(list, /className="rec-line/);
   assert.match(list, /data-seg=\{seg\.id\}/, "a line has to be findable to be jumped to");
-  assert.match(list, /aria-label=\{`Play from \$\{formatTimestamp\(seg\.t0\)\}`\}/);
-  assert.match(list, /onClick=\{\(\) => seek\(seg\.t0\)\}/);
+  assert.match(list, /<TranscriptStamp t0=\{seg\.t0\}/);
+  assert.match(list, /aria-label=\{`Play from \$\{formatTimestamp\(t0\)\}`\}/);
+  assert.match(list, /onClick=\{\(\) => seek\(t0\)\}/);
   assert.match(list, /activeSeg === seg\.id \? " is-active" : ""/);
   // The speaker is still said once per turn, not once per line.
   assert.equal(list.split("<SpeakerChip").length - 1, 1);
@@ -361,12 +366,12 @@ test("the rename hint is said DURING a live meeting, not only after one", () => 
   // which is when a person actually knows who is talking. Nothing about
   // renaming is gated on the session: the same chip is drawn either way, and
   // `rename_speaker` is one of the live-safe ops the session socket accepts.
-  const at = VIEW.indexOf('<p className="rec-read-note">');
+  const at = SURFACE.indexOf('<p className="rec-read-note">');
   assert.ok(at > 0, "the hint is still on the page");
-  const gate = VIEW.slice(Math.max(0, at - 200), at);
-  assert.match(gate, /\{segments\.length > 0 && \(/, "drawn as soon as there are words");
+  const gate = SURFACE.slice(SURFACE.indexOf("function TranscriptNote"), at);
+  assert.match(gate, /if \(segments\.length === 0\) return null;/, "drawn as soon as there are words");
   assert.doesNotMatch(gate, /isLive/, "a live session must not hide the rename hint");
-  const note = VIEW.slice(at, VIEW.indexOf("</p>", at));
+  const note = SURFACE.slice(at, SURFACE.indexOf("</p>", at));
   assert.match(note, /Click a speaker’s name to say who they were\./);
   // The OTHER half of the same paragraph keeps its gate, and must: the backend
   // refuses rec_delete_range and rec_correct_range while the file has a live
@@ -375,7 +380,12 @@ test("the rename hint is said DURING a live meeting, not only after one", () => 
   // affordance for an advertised one that does nothing.
   assert.match(
     note,
-    /\{canEdit &&\s*" Select words above to correct them, or to delete them from the recording\."\}/,
+    /<TranscriptEditingHint/,
+    "the editing half stays behind canEdit",
+  );
+  assert.match(
+    SURFACE,
+    /function TranscriptEditingHint[\s\S]*?if \(!canEdit\) return null;[\s\S]*?Select words above to correct them/,
     "the editing half stays behind canEdit",
   );
 });
@@ -384,9 +394,9 @@ test("selecting words to correct or delete still works on a line", () => {
   // The whole transcript-editing feature reads these two attributes off the
   // word spans; breaking them while resegmenting would take correcting,
   // deleting, marking and noting with it.
-  assert.match(VIEW, /data-t0=\{w\.t0\}/);
-  assert.match(VIEW, /data-t1=\{w\.t1\}/);
-  assert.match(VIEW, /querySelectorAll<HTMLElement>\("\[data-t0\]"\)/);
+  assert.match(SURFACE, /data-t0=\{word\.t0\}/);
+  assert.match(SURFACE, /data-t1=\{word\.t1\}/);
+  assert.match(CONTROLLER, /querySelectorAll<HTMLElement>\("\[data-t0\]"\)/);
 });
 
 test("a highlight quotes the phrases it overlaps and nothing else", () => {
@@ -429,11 +439,11 @@ test("a first sentence too long to be a heading keeps its words in the excerpt",
 });
 
 test("the highlight row carries the words, the time, who wrote it, and both acts", () => {
-  const panel = VIEW.slice(VIEW.indexOf('{kind === "highlights" &&'), VIEW.indexOf('{kind === "notes" &&'));
-  assert.match(panel, /highlightQuote\(quotes, h\.t0, h\.t1\)/, "quoted, never invented");
+  const panel = VIEW.slice(VIEW.indexOf("function HighlightRows"), VIEW.indexOf("function HighlightExcerpt"));
+  assert.match(panel, /highlightQuote\(quotes, highlight\.t0, highlight\.t1\)/, "quoted, never invented");
   assert.match(panel, /rec-hl-title/);
-  assert.match(panel, /formatTimestamp\(h\.t0\)}–\{formatTimestamp\(h\.t1\)/);
-  assert.match(panel, /onJump\(h\.t0\)/, "read it in the transcript…");
+  assert.match(panel, /formatTimestamp\(highlight\.t0\)}–\{formatTimestamp\(highlight\.t1\)/);
+  assert.match(panel, /onJump\(highlight\.t0\)/, "read it in the transcript…");
   assert.match(panel, /Show in transcript/);
   // …or hear it: the row's timestamp is its play control, and there is only
   // the one — a second play button beside it is the two-transports mistake in
@@ -448,15 +458,15 @@ test("the words a highlight quotes are the words on screen", () => {
   // Taken off the turns, where "Show deleted" and the delete edits have
   // already been applied — never off `seg.text`, which still holds every
   // deleted word. A quote nobody can find in the transcript is a fabrication.
-  const quotes = VIEW.slice(VIEW.indexOf("const quotes = useMemo"), VIEW.indexOf("// ---- playback"));
+  const quotes = CONTROLLER.slice(CONTROLLER.indexOf("const quotes = useMemo"), CONTROLLER.indexOf("// ---- playback"));
   assert.match(quotes, /turns\.flatMap/);
   assert.ok(!/seg\.text/.test(quotes), "seg.text still contains the deleted words");
 });
 
 test("jumping to a moment reads it rather than playing it", () => {
-  const jump = VIEW.slice(
-    VIEW.indexOf("function showInTranscript"),
-    VIEW.indexOf("function askVolume"),
+  const jump = CONTROLLER.slice(
+    CONTROLLER.indexOf("function showInTranscript"),
+    CONTROLLER.indexOf("function askVolume"),
   );
   assert.ok(!/\.play\(\)/.test(jump), "'Show in transcript' must not start the audio");
   assert.match(jump, /setQuery\(""\)/, "a jump into a phrase the filter hides lands on nothing");
@@ -480,7 +490,7 @@ test("nothing new on this page moves by itself", () => {
 });
 
 test("the one scroll this adds respects a reader who asked for stillness", () => {
-  assert.match(VIEW, /prefersReducedMotion\(\) \? "auto" : "smooth"/);
+  assert.match(CONTROLLER, /prefersReducedMotion\(\) \? "auto" : "smooth"/);
 });
 
 test("the timestamp on every part of the page is drawn by one function", () => {
@@ -489,7 +499,7 @@ test("the timestamp on every part of the page is drawn by one function", () => {
   assert.equal(R.formatTimestamp(6100), "1:01");
   assert.equal(R.formatTimestamp(360_000), "1:00:00");
   assert.ok(
-    !/function formatTimestamp/.test(VIEW),
+    !/function formatTimestamp/.test(`${VIEW}\n${SURFACE}\n${CONTROLLER}\n${PRESENTATION}`),
     "the view must import it, not keep a second copy that can drift",
   );
 });

@@ -8,11 +8,10 @@
  * the question in front of the user. Settings had done all of this correctly
  * the whole time (`useFocusTrap`).
  *
- * Pinned as a source scan rather than a render test: the cards live inside
- * Overlays, which needs the whole Tauri backend and the workspace state object
- * before it will render a single node. What can be checked without any of that
- * is that no card is drawn by hand any more, and that the shared frame is the
- * one thing that draws them.
+ * Pinned as a source scan rather than a render test: the shared frame lives in
+ * Overlays and the individual cards live in OverlayMenus; rendering the whole
+ * stack needs the backend and workspace state. What can be checked without any
+ * of that is that no card is drawn by hand and every card uses the shared frame.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -21,12 +20,26 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const SOURCE = readFileSync(join(here, "../../apps/desktop/src/renderer/workspace/Overlays.tsx"), "utf8");
+const FRAME_SOURCE = readFileSync(
+  join(here, "../../apps/desktop/src/renderer/workspace/Overlays.tsx"),
+  "utf8",
+);
+const CARDS_SOURCE = readFileSync(
+  join(here, "../../apps/desktop/src/renderer/workspace/OverlayMenus.tsx"),
+  "utf8",
+);
+
+function componentSource(name) {
+  const start = CARDS_SOURCE.indexOf(`export function ${name}`);
+  assert.notEqual(start, -1, `${name} is gone from OverlayMenus.tsx`);
+  const next = CARDS_SOURCE.indexOf("\nexport function ", start + 1);
+  return CARDS_SOURCE.slice(start, next < 0 ? undefined : next);
+}
 
 test("every consent card is drawn by the trapped frame, not by hand", () => {
   // One definition, in ApproveCard itself. A hand-rolled backdrop anywhere else
   // is a card that took no focus.
-  const backdrops = SOURCE.split('className="approve-backdrop"').length - 1;
+  const backdrops = `${FRAME_SOURCE}\n${CARDS_SOURCE}`.split('className="approve-backdrop"').length - 1;
   assert.equal(
     backdrops,
     1,
@@ -36,12 +49,12 @@ test("every consent card is drawn by the trapped frame, not by hand", () => {
 });
 
 test("the frame really traps: it uses the shared hook", () => {
-  assert.match(SOURCE, /import \{ useFocusTrap \}/);
-  assert.match(SOURCE, /useFocusTrap\(onDecline\)/);
+  assert.match(FRAME_SOURCE, /import \{ useFocusTrap \}/);
+  assert.match(FRAME_SOURCE, /useFocusTrap\(onDecline\)/);
 });
 
 test("Escape answers the card instead of closing the file behind it", () => {
-  const frame = SOURCE.split("function ApproveCard")[1] ?? "";
+  const frame = FRAME_SOURCE.split("function ApproveCard")[1] ?? "";
   const head = frame.slice(0, 1600);
   assert.match(
     head,
@@ -54,22 +67,29 @@ test("each card is keyed by its request, so the next one gets focus too", () => 
   // useFocusTrap moves focus in on MOUNT. Without a key React reuses the
   // component instance for the next request in the queue and the effect never
   // runs again — the second card would take no focus.
-  for (const key of [
-    "key={pendingScript.id}",
-    "key={pendingApproval.id}",
-    "key={pendingBrowse.id}",
-    "key={pendingEdit.id}",
+  for (const component of [
+    "ScriptApprovalCard",
+    "McpDeleteApprovalCard",
+    "McpToolApprovalCard",
+    "BrowseApprovalCard",
+    "EditApprovalCard",
   ]) {
-    assert.ok(SOURCE.includes(key), `missing ${key}`);
+    assert.ok(
+      componentSource(component).includes("key={request.id}"),
+      `${component} is not keyed by its request`,
+    );
   }
 });
 
 test("Escape declines — never approves — on all four", () => {
   const declines = [
-    'onDecline={() => a.resolveScriptApproval(pendingScript, "deny")}',
-    'onDecline={() => a.resolveMcpApproval(pendingApproval, "deny")}',
-    'onDecline={() => a.resolveBrowseConsent(pendingBrowse, false)}',
-    'onDecline={() => a.resolveEditApproval(pendingEdit, "deny")}',
+    ["ScriptApprovalCard", 'onDecline={() => a.resolveScriptApproval(request, "deny")}'],
+    ["McpDeleteApprovalCard", 'onDecline={() => a.resolveMcpApproval(request, "deny")}'],
+    ["McpToolApprovalCard", 'onDecline={() => a.resolveMcpApproval(request, "deny")}'],
+    ["BrowseApprovalCard", "onDecline={() => a.resolveBrowseConsent(request, false)}"],
+    ["EditApprovalCard", 'onDecline={() => a.resolveEditApproval(request, "deny")}'],
   ];
-  for (const d of declines) assert.ok(SOURCE.includes(d), `missing ${d}`);
+  for (const [component, decline] of declines) {
+    assert.ok(componentSource(component).includes(decline), `${component} is missing ${decline}`);
+  }
 });

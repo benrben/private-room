@@ -31,6 +31,8 @@ const read = (p) => readFileSync(join(root, p), "utf8");
 const MCP = read("apps/desktop/src/renderer/settings/useMcpConfig.ts");
 const GRAPH = read("apps/desktop/src/renderer/viewers/roomMap/useRoomGraph.ts");
 const READER = read("apps/desktop/src/renderer/workspace/BrowserReader.tsx");
+const BROWSER_RUNTIME = read("apps/desktop/src/renderer/workspace/browserRuntime.ts");
+const BROWSER_CHROME = read("apps/desktop/src/renderer/workspace/BrowserViewChrome.tsx");
 
 /* The hook's module imports React and the Tauri bridge, neither of which
  * resolves from a data: URL. The IMPORTS are dropped and the rest of the real
@@ -137,21 +139,21 @@ test("an extraction that has been superseded is dropped, not merged", () => {
   const starts = READER.match(/const run = \+\+runRef\.current;/g) ?? [];
   assert.equal(starts.length, 2, "expected both load and more to claim a run");
   // Every answer is checked before it is allowed to touch the panel.
-  const answers = READER.match(/await api\.browserPageText\([^\n]*\n\s*if \(runRef\.current !== run\) return;/g) ?? [];
+  const answers = READER.match(/await api\.browserPageText\([^\n]*\n\s*if \(!isCurrent\(runRef, run\)\) return;/g) ?? [];
   assert.equal(answers.length, 2, "an extraction can still land on a page it did not come from");
   // …including the failures: a refusal from a page we have left must not blank
   // the one that is on screen.
-  const catches = READER.match(/\} catch \(e\) \{[\s\S]*?setError\(String\(e\)\);/g) ?? [];
+  const catches = READER.match(/\} catch \(error\) \{[\s\S]*?setError\(String\(error\)\);/g) ?? [];
   assert.equal(catches.length, 2, "expected both extraction paths to report failure");
   for (const block of catches) {
-    assert.match(block, /runRef\.current !== run/, "a stale failure can still overwrite the panel");
+    assert.match(block, /!isCurrent\(runRef, run\)/, "a stale failure can still overwrite the panel");
   }
 });
 
 test("the reader claims encryption only for a page it can read the scheme of", () => {
   // It printed a green ENCRYPTED tape for anything not literally "http://",
   // including a blank tab, six inches under a chrome that says nothing at all.
-  assert.ok(!/startsWith\("http:\/\/"\)/.test(READER), "the two-valued scheme test survives");
-  assert.match(READER, /const secure = scheme === "https:"/, "https is not being read as its own answer");
-  assert.match(READER, /\{\(secure \|\| insecure\) && \(/, "the tape is drawn for a scheme nobody checked");
+  assert.ok(!/startsWith\("http:\/\/"\)/.test(BROWSER_RUNTIME), "the two-valued scheme test survives");
+  assert.match(BROWSER_RUNTIME, /const secure = scheme === "https:"/, "https is not being read as its own answer");
+  assert.match(BROWSER_CHROME, /const hasConnectionStatus = secure \|\| insecure/, "the tape is drawn for a scheme nobody checked");
 });

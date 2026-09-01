@@ -30,19 +30,20 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { readReachableSource } from "../support/source-modules.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, "../..");
 const read = (p) => readFileSync(join(root, p), "utf8");
 
-const STATE = read("apps/desktop/src/renderer/workspace/state.ts");
-const ACTIONS = read("apps/desktop/src/renderer/workspace/fileActions.ts");
+const STATE = readReachableSource("apps/desktop/src/renderer/workspace/state.ts");
+const ACTIONS = read("apps/desktop/src/renderer/workspace/fileSelectionActions.ts");
 const ROW = read("apps/desktop/src/renderer/workspace/FileRow.tsx");
-const SIDEBAR = read("apps/desktop/src/renderer/workspace/Sidebar.tsx");
-const OVERLAYS = read("apps/desktop/src/renderer/workspace/Overlays.tsx");
-const TRASH = read("apps/desktop/src/renderer/workspace/TrashPanel.tsx");
-const API = read("apps/desktop/src/renderer/api.ts");
-const IPC = read("apps/desktop/src/main/fileSurfaceIpc.ts");
+const SIDEBAR = read("apps/desktop/src/renderer/workspace/SidebarFiles.tsx");
+const OVERLAYS = read("apps/desktop/src/renderer/workspace/OverlayMenus.tsx");
+const TRASH = readReachableSource("apps/desktop/src/renderer/workspace/TrashPanel.tsx");
+const API = readReachableSource("apps/desktop/src/renderer/api.ts");
+const IPC = readReachableSource("apps/desktop/src/main/fileSurfaceIpc.ts");
 const MOCK = read("tests/support/qa-mock.js");
 
 /** A TS/TSX function body, by brace matching from a signature fragment.
@@ -103,9 +104,11 @@ test("a shift-range can only ever cover rows that are on the screen", () => {
   // select rows the filter has hidden or a collapsed folder is holding — i.e.
   // arm a destructive action against files nobody can review first.
   const body = fnBody(ACTIONS, "function clickFile(");
-  assert.match(body, /visibleFileOrder/);
+  assert.match(body, /selectionRange\(f\.id\)/, "shift-click bypasses the shared range rule");
+  const range = fnBody(ACTIONS, "function selectionRange(");
+  assert.match(range, /visibleFileOrder/);
   assert.ok(
-    !/\bs\.files\b/.test(body),
+    !/\bs\.files\b/.test(range),
     "the range must be taken from the painted order, never the whole room",
   );
   // Collapsed folders contribute nothing to that order.
@@ -115,12 +118,13 @@ test("a shift-range can only ever cover rows that are on the screen", () => {
 test("the context menu's destructive arm acts on the whole list it names", () => {
   // The label and the action must read the same source. A `.file.id` here with
   // a `.files.length` in the label is the exact silent mismatch this pins.
-  const menu = OVERLAYS.slice(OVERLAYS.indexOf("s.ctxMenu && ("));
+  const menu = fnBody(OVERLAYS, "export function removeContextFiles(");
   assert.match(menu, /removeFiles\(ids\)/, "many files → the batch verb");
   assert.match(menu, /removeFile\(ids\[0\]\)/, "one file → the single verb");
+  const confirm = fnBody(OVERLAYS, "export function ContextDeleteConfirm(");
   assert.match(
-    menu,
-    /Move \$\{s\.ctxMenu\.files\.length\} files to the trash\?/,
+    confirm,
+    /Move \$\{menu\.files\.length\} files to the trash\?/,
     "the confirm question must state the count it is about to act on",
   );
 });

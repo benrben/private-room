@@ -16,9 +16,11 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import ts from "typescript";
+import { readReachableSource } from "../support/source-modules.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const src = (p) => readFileSync(join(here, "../../apps/desktop/src/renderer", p), "utf8");
+const reachable = (p) => readReachableSource(`apps/desktop/src/renderer/${p}`);
 
 const load = async (file) => {
   const js = ts.transpileModule(src(file), {
@@ -75,12 +77,12 @@ test("sealed exports offer the current password or a validated alternate passwor
     sealedExportPasswordProblem("short", "short", 8),
     "Backup password must be at least 8 characters.",
   );
-  const dialog = src("workspace/SealedExportDialog.tsx");
+  const dialog = reachable("workspace/SealedExportDialog.tsx");
   assert.match(dialog, /useState<PasswordMode>\("room"\)/,
     "the safe default must reuse the current room password");
   assert.match(dialog, /Use this room&apos;s password/);
   assert.match(dialog, /Use a different password/);
-  assert.match(dialog, /alternate \? password : null/,
+  assert.match(dialog, /mode === "alternate" \? password : null/,
     "the renderer must send null for the backend-held room password and only send an explicit alternate");
   assert.match(dialog, /role="dialog"/);
   assert.match(dialog, /aria-modal="true"/);
@@ -92,10 +94,7 @@ test("the start screen says when a recent room's file is gone", () => {
   // type did not declare `missing` and no screen read it — so a moved or
   // deleted room still looked identical to a working one and you found out
   // only after typing the password.
-  const types = readFileSync(
-    join(here, "../../apps/desktop/src/shared/apiTypes.ts"),
-    "utf8",
-  );
+  const types = readReachableSource("apps/desktop/src/shared/apiTypes.ts");
   const start = src("screens/StartScreen.tsx");
   assert.match(types, /missing\?: boolean/, "RecentRoom must declare missing");
   assert.match(start, /room\.missing/, "the start screen must read it");
@@ -143,7 +142,7 @@ test("a running model download can be stopped from every surface that starts one
   // it had no Stop at all; the image viewer's vision-helper offer is the 3 GB
   // one the finding was written about.
   assert.match(
-    src("viewers/ImageView.tsx"),
+    reachable("viewers/ImageView.tsx"),
     /cancelAsk\(`pull:\$\{name\}`\)/,
     "the image viewer's vision-helper offer must be stoppable",
   );
@@ -237,10 +236,11 @@ test("a partial failure is said ALONGSIDE the success, never instead of it", () 
   const saved = hook.indexOf("setPwSaved(true)");
   assert.ok(saved > 0, "the change must still report itself as saved");
   assert.ok(
-    saved < hook.indexOf("const warnings"),
+    saved < hook.indexOf("await showPostPasswordWarnings", saved),
     "the saved state is set before the warnings are gathered, so both show",
   );
   const section = src("settings/PrivacySection.tsx");
-  assert.match(section, /\{pwError && /, "the panel must render the warning");
-  assert.match(section, /pwSaved \?/, "and the changed state at the same time");
+  assert.match(section, /<GateError message=\{pwError\} \/>/, "the panel must render the warning");
+  assert.match(section, /<PasswordChangeButton[\s\S]{0,100}pwSaved=\{pwSaved\}/,
+    "and the changed state at the same time");
 });

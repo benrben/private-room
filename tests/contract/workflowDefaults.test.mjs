@@ -25,7 +25,7 @@ const load = (rel) => {
 
 const { KIND_DEFAULTS, KIND_LABELS } = await load("../../apps/desktop/src/renderer/workspace/workflows/kinds.ts");
 const WORKFLOW_HOST = readFileSync(
-  join(here, "../../apps/desktop/src/main/workflowModel.ts"),
+  join(here, "../../apps/desktop/src/main/workflowModelCore.ts"),
   "utf8",
 );
 

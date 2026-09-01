@@ -12,24 +12,10 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
-import ts from "typescript";
+import { loadTypescriptModule } from "../support/source-modules.mjs";
 
-const here = dirname(fileURLToPath(import.meta.url));
-const root = join(here, "../..");
-
-async function load(relPath) {
-  const source = readFileSync(join(root, relPath), "utf8");
-  const js = ts.transpileModule(source, {
-    compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
-  }).outputText;
-  return import(`data:text/javascript,${encodeURIComponent(js)}`);
-}
-
-const { displayName, fileLabel, ambiguousDisplayNames } = await load(
-  "apps/desktop/src/renderer/workspace/composer.ts",
+const { displayName, fileLabel, ambiguousDisplayNames } = await import(
+  loadTypescriptModule("apps/desktop/src/renderer/workspace/composer.ts"),
 );
 
 const files = (...names) => names.map((name) => ({ name }));

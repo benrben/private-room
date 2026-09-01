@@ -12,13 +12,14 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { readReachableSource } from "../support/source-modules.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, "../..");
 const read = (relativePath) => readFileSync(join(root, relativePath), "utf8");
 
 function has(relativePath, ...patterns) {
-  const source = read(relativePath);
+  const source = readReachableSource(relativePath);
   for (const pattern of patterns) {
     assert.match(source, pattern, `${relativePath} is missing ${pattern}`);
   }
@@ -30,18 +31,18 @@ function liveArc(id) {
 }
 
 test("[ARC-001] canonical roster stays visible with disabled prerequisite rows", () => {
-  has("services/agent-sidecar/src/arcelle_sidecar/agents.py", /def specialist_catalog\(/, /"capabilityReason"/, /"localHandoff"/);
-  has("apps/desktop/src/renderer/workspace/ComposerPane.tsx", /aria-disabled=\{it\.disabled/, /className=\{`ac-item/);
+  has("services/agent-sidecar/src/arcelle_sidecar/agent_specialists.py", /def specialist_catalog\(/, /"capabilityReason"/, /"localHandoff"/);
+  has("apps/desktop/src/renderer/workspace/ComposerPane.tsx", /aria-disabled=\{item\.disabled \|\| undefined\}/, /className=\{`ac-item/);
   liveArc("001");
 });
 
 test("[ARC-002] final-response redaction is provider-independent", () => {
-  has("services/agent-sidecar/src/arcelle_sidecar/server.py", /output_policy\.output_redactor\(\)/, /redactor\.feed/);
+  has("services/agent-sidecar/src/arcelle_sidecar/server_run.py", /policy\.output_redactor\(\)/, /redactor\.feed/);
   has("services/agent-sidecar/tests/test_server.py", /test_run_output_gate_redacts_local_final_and_unmapped_canary/);
 });
 
 test("[ARC-003] provider selection preserves and probes exact model IDs", () => {
-  has("apps/desktop/src/main/providers.ts", /probeOpenrouterModelSelection/, /model:\s*exactId/, /max_tokens:\s*1/);
+  has("apps/desktop/src/main/providers.ts", /probeOpenrouterModelSelection/, /openrouterProbeRequest\(key, exactId\)/, /model,\s*messages:/, /max_tokens:\s*1/);
   has("apps/desktop/src/main/modelCatalogSurfaceIpc.ts", /createModelSelectionValidator/, /probeProviderModel\?\.\(exactId\)/);
 });
 
@@ -79,13 +80,13 @@ test("[ARC-009] Electron helper suite remains a release gate", () => {
 
 test("[ARC-010] command failures persist as inline turn errors", () => {
   has("apps/desktop/src/main/db-host/messages.ts", /kind = 'turn_error'/);
-  has("apps/desktop/src/renderer/workspace/ChatPane.tsx", /m\.kind === "turn_error"/, /is-turn-error/);
+  has("apps/desktop/src/renderer/workspace/ChatPane.tsx", /message\.kind === "turn_error"/, /is-turn-error/);
   liveArc("010");
 });
 
 test("[ARC-011] video interpretation carries the exact frame receipt", () => {
   has("apps/desktop/src/renderer/viewers/frameGrab.ts", /frameSha256/, /atSeconds/, /exact PNG attached to the model/);
-  has("apps/desktop/src/main/execTool.ts", /MediaFrameReceipt/, /effects\.mediaFrames\.push\(receipt\)/);
+  has("apps/desktop/src/main/execTool.ts", /MediaFrameReceipt/, /effects\.mediaFrames\.push\(result\.receipt\)/);
 });
 
 test("[ARC-012] extraction fields exclude source residue without truncating prose", () => {
@@ -176,13 +177,13 @@ test("[ARC-027] re-transcription returns a durable terminal receipt", () => {
 });
 
 test("[ARC-028] Web Browse and Connector rows name exact prerequisites", () => {
-  has("services/agent-sidecar/src/arcelle_sidecar/agents.py", /Turn on room internet/, /Install and enable a connector/);
+  has("services/agent-sidecar/src/arcelle_sidecar/agent_specialists.py", /Turn on room internet/, /Install and enable a connector/);
   has("apps/desktop/src/renderer/workspace/composer.ts", /capabilityReason/, /disabled: sp\.capability === "unavailable"/);
   liveArc("028");
 });
 
 test("[ARC-029] Antigravity empty output gets one bounded diagnostic retry", () => {
-  has("apps/desktop/src/main/externalAdvisor.ts", /antigravity-cli/, /run = await runOnce\(\)/, /failed after one bounded retry/);
+  has("apps/desktop/src/main/externalAdvisor.ts", /antigravity-cli/, /const first = await runSuccessfulCli\(engine, runOnce\)/, /const retry = await runSuccessfulCli\(engine, runOnce\)/, /failed after one bounded retry/);
   has("apps/desktop/src/main/externalAdvisor.test.ts", /retries Antigravity once when it exits successfully without a terminal answer/);
 });
 

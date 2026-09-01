@@ -13,10 +13,9 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync, existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { dirname, join, resolve } from "node:path";
-import ts from "typescript";
+import { dirname, join } from "node:path";
+import { loadTypescriptModule } from "../support/source-modules.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const SRC = join(here, "../../apps/desktop/src/renderer");
@@ -28,22 +27,6 @@ const BARE = {
   "react/jsx-runtime": import.meta.resolve("react/jsx-runtime"),
 };
 
-const asData = (src) => `data:text/javascript,${encodeURIComponent(src)}`;
-const FROM_RE = /(?:import|export)\s+([\s\S]*?)\s+from\s+"([^"]+)";/g;
-
-function bindingsOf(clause) {
-  const names = [];
-  const braced = clause.match(/\{([\s\S]*)\}/);
-  if (braced) {
-    for (const raw of braced[1].split(",")) {
-      const n = raw.trim().split(/\s+as\s+/).pop().trim();
-      if (n) names.push(n);
-    }
-  }
-  const head = clause.replace(/\{[\s\S]*\}/, "").replace(/,\s*$/, "").trim();
-  return { names, hasDefault: Boolean(head) };
-}
-
 /** The recorded run: six steps, and nothing at index 6 or beyond. `__asked`
  *  keeps every index the panel requested, in order. */
 const API_RECORDER = `{
@@ -54,56 +37,22 @@ const API_RECORDER = `{
   },
 }`;
 
-function stubModule(clause, overrides = {}) {
-  const { names, hasDefault } = bindingsOf(clause);
-  const body = [
-    "const inert = () => null;",
-    ...names.map((n) => `export const ${n} = ${overrides[n] ?? "inert"};`),
-    hasDefault ? "export default inert;" : "",
-  ].join("\n");
-  return asData(body);
-}
-
-function loadReal(absPath, stubbed, cache = new Map()) {
-  const hit = cache.get(absPath);
-  if (hit) return hit;
-  const jsx = absPath.endsWith(".tsx");
-  let js = ts.transpileModule(readFileSync(absPath, "utf8"), {
-    compilerOptions: {
-      module: ts.ModuleKind.ESNext,
-      target: ts.ScriptTarget.ES2022,
-      ...(jsx ? { jsx: ts.JsxEmit.ReactJSX } : {}),
-    },
-  }).outputText;
-
-  js = js.replace(FROM_RE, (whole, clause, spec) => {
-    const swap = (url) => whole.replace(`"${spec}"`, JSON.stringify(url));
-    if (BARE[spec]) return swap(BARE[spec]);
-    if (spec.startsWith("@tauri-apps/")) return swap(stubModule(clause));
-    if (spec.startsWith(".")) {
-      const base = resolve(dirname(absPath), spec);
-      const target = [".ts", ".tsx", "/index.ts"].map((ext) => base + ext).find(existsSync);
-      assert.ok(target, `cannot resolve ${spec} from ${absPath}`);
-      if (stubbed.has(target)) return swap(stubModule(clause, { api: API_RECORDER }));
-      return swap(loadReal(target, stubbed, cache));
-    }
-    return swap(stubModule(clause));
-  });
-
-  // `fetchRunSteps` is private to RunHistory.tsx and should stay that way —
-  // nothing in the app calls it from outside. Re-exporting it here keeps the
-  // test pointed at the shipped code rather than a copy of it.
-  if (absPath.endsWith("RunHistory.tsx")) js += "\nexport { fetchRunSteps };\n";
-
-  const url = asData(js);
-  cache.set(absPath, url);
-  return url;
-}
-
 // The backend seam and the panel's neighbours: `api` is the recorder above,
 // the icon set and the status-dot selector are not what this test is about.
-const STUBS = new Set(["api.ts", "icons.tsx", "workspace/workflows/selectors.ts"].map((p) => join(SRC, p)));
-const { fetchRunSteps } = await import(loadReal(join(SRC, "workspace/workflows/RunHistory.tsx"), STUBS));
+const STUBS = new Map(
+  ["api.ts", "icons.tsx", "workspace/workflows/selectors.ts"].map((p) => [join(SRC, p), {}]),
+);
+STUBS.set(join(SRC, "api.ts"), { api: API_RECORDER });
+const PRIVATE_EXPORTS = new Map([
+  [join(SRC, "workspace/workflows/RunHistory.tsx"), "\nexport { fetchRunSteps };\n"],
+]);
+const { fetchRunSteps } = await import(
+  loadTypescriptModule(join(SRC, "workspace/workflows/RunHistory.tsx"), {
+    bare: BARE,
+    stubs: STUBS,
+    append: PRIVATE_EXPORTS,
+  }),
+);
 
 /** A run of `n` steps, each with a stored WfArtifact. */
 function recorded(n) {

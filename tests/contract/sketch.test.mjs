@@ -12,27 +12,46 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { transformSync } from "esbuild";
+import { buildSync } from "esbuild";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, "../..");
 const SRC = join(root, "apps/desktop/src/renderer/viewers/sketch/model.ts");
 
-const js = transformSync(readFileSync(SRC, "utf8"), {
-  loader: "ts",
+const js = buildSync({
+  entryPoints: [SRC],
+  bundle: true,
   format: "esm",
+  platform: "node",
   target: "es2022",
-}).code;
+  write: false,
+}).outputFiles[0].text;
 const M = await import(`data:text/javascript;base64,${Buffer.from(js).toString("base64")}`);
 
-const HOST = readFileSync(
-  join(root, "apps/desktop/src/main/sketchDoc.ts"),
-  "utf8",
-);
+const HOST_MODEL = readFileSync(join(root, "apps/desktop/src/main/sketchDocModel.ts"), "utf8");
+const HOST_ROUTING = readFileSync(join(root, "apps/desktop/src/main/sketchDocRouting.ts"), "utf8");
 const SRC_TEXT = readFileSync(SRC, "utf8");
-const VIEW = readFileSync(join(root, "apps/desktop/src/renderer/viewers/SketchView.tsx"), "utf8");
+const SKETCH_VIEW = readFileSync(join(root, "apps/desktop/src/renderer/viewers/SketchView.tsx"), "utf8");
+const BASE = readFileSync(join(root, "apps/desktop/src/renderer/viewers/sketchControllerBase.ts"), "utf8");
+const GESTURES = readFileSync(join(root, "apps/desktop/src/renderer/viewers/sketchGestures.ts"), "utf8");
+const ACTIONS = readFileSync(join(root, "apps/desktop/src/renderer/viewers/sketchActions.ts"), "utf8");
+const SURFACE = readFileSync(join(root, "apps/desktop/src/renderer/viewers/SketchSurface.tsx"), "utf8");
+
+function stylesheet(entry, seen = new Set()) {
+  if (seen.has(entry)) return "";
+  seen.add(entry);
+  const css = readFileSync(join(root, entry), "utf8");
+  return [
+    css,
+    ...[...css.matchAll(/@import\s+["']([^"']+)["'];/g)].map(([, specifier]) =>
+      stylesheet(join(dirname(entry), specifier), seen),
+    ),
+  ].join("\n");
+}
+
+const SKETCH_CSS = stylesheet("apps/desktop/src/renderer/viewers/sketch.css");
 
 // --------------------------------------------------------------- the format
 
@@ -40,8 +59,8 @@ test("the page size matches the one Rust clamps to", () => {
   // A frontend that thought the page was bigger would let the user draw where
   // the agent can never place anything, and every such shape would come back
   // from a Rust round trip moved.
-  const w = HOST.match(/CANVAS_W = (\d+)/)[1];
-  const h = HOST.match(/CANVAS_H = (\d+)/)[1];
+  const w = HOST_MODEL.match(/CANVAS_W = (\d+)/)[1];
+  const h = HOST_MODEL.match(/CANVAS_H = (\d+)/)[1];
   assert.equal(M.CANVAS_W, Number(w));
   assert.equal(M.CANVAS_H, Number(h));
 });
@@ -49,7 +68,7 @@ test("the page size matches the one Rust clamps to", () => {
 test("the five pens are the five the Electron host accepts", () => {
   // Rust refuses an unknown colour outright, so a sixth pen here would be a
   // swatch that draws shapes the agent can never recolour or reproduce.
-  const arm = HOST.match(/export type Ink = ([^;]+);/)?.[1] ?? "";
+  const arm = HOST_MODEL.match(/export type Ink = ([^;]+);/)?.[1] ?? "";
   const hostInks = [...arm.matchAll(/"(\w+)"/g)].map((m) => m[1]);
   assert.deepEqual([...M.INKS].sort(), hostInks.sort());
 });
@@ -279,15 +298,15 @@ test("the pointer is captured on the canvas ROOT, never on what was clicked", ()
   // goes to something no longer in the document — the canvas stops responding
   // and the page reads as frozen. The root is never removed.
   assert.ok(
-    /svgRef\.current\?\.setPointerCapture/.test(VIEW),
+    /svgRef\.current\?\.setPointerCapture/.test(GESTURES),
     "capture must be taken on the svg root",
   );
   assert.ok(
-    !/\(ev\.target as Element\)\.setPointerCapture/.test(VIEW),
+    !/\(ev\.target as Element\)\.setPointerCapture/.test(GESTURES),
     "capture must NOT be taken on the event target — that is the freeze",
   );
   assert.ok(
-    /releasePointerCapture/.test(VIEW),
+    /releasePointerCapture/.test(GESTURES),
     "a captured pointer must be released when the gesture ends",
   );
 });
@@ -297,10 +316,10 @@ test("a gesture reads the document through the ref it also advances", () => {
   // the next document from `docRef.current` has to write the result back to it
   // synchronously, or the next event of the same swipe works from a stale copy
   // — an erased shape returns, a drag loses ground.
-  const advances = VIEW.match(/advance\(next\)/g) ?? [];
+  const advances = GESTURES.match(/advance\(next\)/g) ?? [];
   assert.ok(advances.length >= 2, "erase and drag both have to advance the ref");
   assert.ok(
-    /docRef\.current = next;/.test(VIEW),
+    /docRef\.current = next;/.test(BASE),
     "advance() must write the ref, not only React state",
   );
 });
@@ -449,7 +468,7 @@ test("a connector can only hang off a real shape", () => {
 test("the editor and Electron host route connectors by the same rule", () => {
   // Two implementations of one connector's geometry disagree the first time
   // either is touched, and the file would then draw differently from the page.
-  assert.ok(/function edgePoint/.test(HOST), "the host owns edgePoint");
+  assert.ok(/function edgePoint/.test(HOST_ROUTING), "the host owns edgePoint");
   assert.ok(/export function edgePoint/.test(SRC_TEXT), "and the editor ports it");
 });
 
@@ -603,17 +622,15 @@ test("handles sit on the corners and the middles of the sides", () => {
 
 /* ---------- the editor's own promises ---------- */
 
-const VIEW2 = readFileSync(join(root, "apps/desktop/src/renderer/viewers/SketchView.tsx"), "utf8");
-
 test("a sketch opens in Select, never in a mode that changes it", () => {
   // Every sketch used to open with the pen armed, so panning around someone
   // else's diagram left marks on it. This is the whole P0.
-  assert.match(VIEW2, /useState<Tool>\("select"\)/);
+  assert.match(BASE, /useState<Tool>\("select"\)/);
 });
 
 test("making one thing returns to Select unless the tool was armed to stay", () => {
-  assert.match(VIEW2, /if \(!sticky\) setTool\("select"\);/);
-  assert.match(VIEW2, /onDoubleClick=\{\(\) => \{\s*setTool\(tl\.key\);\s*setSticky/);
+  assert.match(GESTURES, /if \(!sticky\) setTool\("select"\);/);
+  assert.match(SURFACE, /onDoubleClick=\{\(\) => \{\s*setTool\(tl\.key\);\s*setSticky/);
 });
 
 test("Escape is claimed before the shell can close the file", () => {
@@ -621,60 +638,60 @@ test("Escape is claimed before the shell can close the file", () => {
   // `window`; the shell's is registered first, so in the bubble phase it
   // always won — pressing Escape to dismiss the Arrange menu closed the whole
   // drawing. Capture is the only phase that gets there first.
-  const esc = VIEW2.slice(VIEW2.indexOf("const onEscape = (e: KeyboardEvent)"));
+  const esc = ACTIONS.slice(ACTIONS.indexOf("const onEscape = (e: KeyboardEvent)"));
   const body = esc.slice(0, esc.indexOf("window.addEventListener"));
-  assert.match(VIEW2, /addEventListener\("keydown", onEscape, \{ capture: true \}\)/);
-  assert.match(VIEW2, /removeEventListener\("keydown", onEscape, \{ capture: true \}\)/);
+  assert.match(ACTIONS, /addEventListener\("keydown", onEscape, \{ capture: true \}\)/);
+  assert.match(ACTIONS, /removeEventListener\("keydown", onEscape, \{ capture: true \}\)/);
   // …and it stops the event ONLY for the layers it actually handles, or
   // Escape-closes-the-file would break everywhere else in the app.
-  const stops = body.match(/e\.stopPropagation\(\)/g) ?? [];
-  assert.equal(stops.length, 2, "one for the menu layer, one for the selection layer");
+  assert.match(ACTIONS, /const closeMenuForEscape[\s\S]*?event\.stopPropagation\(\)/);
+  assert.match(ACTIONS, /const resetToolForEscape[\s\S]*?event\.stopPropagation\(\)/);
   assert.match(body, /if \(menuRef\.current\)/, "the topmost thing goes first");
-  assert.match(body, /setSelected\(\[\]\)/);
-  assert.match(body, /setTool\("select"\)/);
+  assert.match(body, /resetToolForEscape\(e\)/);
+  assert.match(ACTIONS, /const resetToolForEscape[\s\S]*?setSelected\(\[\]\)[\s\S]*?setTool\("select"\)/);
 });
 
 test("a text field keeps its own Escape", () => {
-  const esc = VIEW2.slice(VIEW2.indexOf("const onEscape = (e: KeyboardEvent)"));
+  const esc = ACTIONS.slice(ACTIONS.indexOf("const onEscape = (e: KeyboardEvent)"));
   assert.match(
     esc.slice(0, 700),
-    /tagName === "INPUT" \|\| el\.tagName === "TEXTAREA"/,
+    /keyboardLeavesPageAlone\(pageRef\.current\)/,
     "cancelling a label edit must not be stolen by the canvas",
   );
+  assert.match(SKETCH_VIEW, /element\.tagName === "INPUT" \|\| element\.tagName === "TEXTAREA"/);
 });
 
 test("every edit that can move a shape re-routes the connectors", () => {
   // A move, a resize, an align, a distribute and a delete each change where a
   // box is. Any one of them that skipped reflow would leave the diagram lying
   // about what joins what — silently, and only until someone looked.
-  const calls = VIEW2.match(/reflow\(\{/g) ?? [];
+  const calls = `${ACTIONS}\n${GESTURES}`.match(/reflow\(\{/g) ?? [];
   assert.ok(calls.length >= 5, `only ${calls.length} edits reflow`);
 });
 
 test("a locked element cannot be picked, dragged or lassoed", () => {
-  assert.match(VIEW2, /if \(hit\?\.locked\)/, "a click on it starts a marquee instead");
-  assert.match(VIEW2, /\.filter\(\(e\) => !e\.locked\)/, "and a lasso passes over it");
+  assert.match(GESTURES, /if \(hit\?\.locked\)/, "a click on it starts a marquee instead");
+  assert.match(GESTURES, /\.filter\(\(e\) => !e\.locked\)/, "and a lasso passes over it");
 });
 
 test("the canvas is more than a count of anonymous images", () => {
   // The audit's accessibility finding: objects reached the accessibility tree
   // only as unnamed `image` children, so there was no way to learn what was on
   // the page or to reach any of it.
-  assert.match(VIEW2, /role="listbox"/);
-  assert.match(VIEW2, /aria-label="Objects on this page"/);
-  assert.match(VIEW2, /aria-selected=\{selected\.includes/);
+  assert.match(SURFACE, /role="listbox"/);
+  assert.match(SURFACE, /aria-label="Objects on this page"/);
+  assert.match(SURFACE, /aria-selected=\{selected\.includes/);
   // The naming moved into the model, where the chat's scope block reads the
   // same sentences — the two describing one selection differently would be a
   // quieter bug than either of them being wrong.
   assert.equal(typeof M.describeElement, "function");
-  assert.match(VIEW2, /describeElement\(e\)/);
+  assert.match(SURFACE, /describeElement\(e\)/);
 });
 
 test("the empty state cannot swallow the first click on the canvas", () => {
-  const css = readFileSync(join(root, "apps/desktop/src/renderer/viewers/sketch.css"), "utf8");
-  const block = css.slice(css.indexOf(".sk-empty {"), css.indexOf(".sk-empty-cards"));
+  const block = SKETCH_CSS.slice(SKETCH_CSS.indexOf(".sk-empty {"), SKETCH_CSS.indexOf(".sk-empty-cards"));
   assert.match(block, /pointer-events: none/);
-  assert.match(css.slice(css.indexOf(".sk-empty-card {")), /pointer-events: auto/);
+  assert.match(SKETCH_CSS.slice(SKETCH_CSS.indexOf(".sk-empty-card {")), /pointer-events: auto/);
 });
 
 test("the canvas toolbar has no export control at all", () => {
@@ -682,15 +699,15 @@ test("the canvas toolbar has no export control at all", () => {
   // things: this one wrote a flattened copy INTO the room, the file header's
   // writes a copy OUT of it, and neither said which. File-level acts belong to
   // the file header, so both formats moved there.
-  assert.doesNotMatch(VIEW2, />\s*Export SVG\s*</);
-  assert.doesNotMatch(VIEW2, /aria-label="Export"/);
-  assert.doesNotMatch(VIEW2, /exportAs\(/, "the canvas no longer owns the act");
+  assert.doesNotMatch(SURFACE, />\s*Export SVG\s*</);
+  assert.doesNotMatch(SURFACE, /aria-label="Export"/);
+  assert.doesNotMatch(SURFACE, /exportAs\(/, "the canvas no longer owns the act");
 });
 
 test("a drawing's two flat formats live in the file header, once each", () => {
-  const viewer = readFileSync(join(root, "apps/desktop/src/renderer/workspace/ViewerPane.tsx"), "utf8");
-  assert.match(viewer, /exportSketchAs\(openFile\.id, "png"\)/);
-  assert.match(viewer, /exportSketchAs\(openFile\.id, "svg"\)/);
+  const viewer = readFileSync(join(root, "apps/desktop/src/renderer/workspace/ViewerFileHeader.tsx"), "utf8");
+  assert.match(viewer, /exportSketchAs\(fileId, "png"\)/);
+  assert.match(viewer, /exportSketchAs\(fileId, "svg"\)/);
   // Worded so the two acts cannot be confused: one writes into this room, the
   // Export button beside it writes out of it.
   assert.match(viewer, /Save a picture \(PNG\) in this room/);
@@ -698,8 +715,7 @@ test("a drawing's two flat formats live in the file header, once each", () => {
 });
 
 test("the toolbar gives way instead of wrapping onto a second row", () => {
-  const css = readFileSync(join(root, "apps/desktop/src/renderer/viewers/sketch.css"), "utf8");
-  assert.match(css, /\.sk-tools \{[^}]*flex-wrap: nowrap/s);
+  assert.match(SKETCH_CSS, /\.sk-tools \{[^}]*flex-wrap: nowrap/s);
 });
 
 // ------------------------------------------------- the object strip
@@ -745,12 +761,12 @@ test("an attached arrow is called a connector, because it behaves like one", () 
 test("the strip follows the selection instead of leaving it off the end", () => {
   // One row that scrolls sideways: without this it shows a row of unselected
   // chips while claiming to be the list of what is selected.
-  assert.match(VIEW2, /chipRefs\.current\.get\(first\)\?\.scrollIntoView/);
-  assert.match(VIEW2, /\}, \[selected\]\);/);
+  assert.match(ACTIONS, /chipRefs\.current\.get\(first\)\?\.scrollIntoView/);
+  assert.match(ACTIONS, /\}, \[selected\]\);/);
 });
 
 test("every chip states its place in the set and carries the full sentence", () => {
-  const strip = VIEW2.slice(VIEW2.indexOf('className="sk-objects-row"'));
+  const strip = SURFACE.slice(SURFACE.indexOf('className="sk-objects-row"'));
   assert.match(strip, /aria-posinset=\{i \+ 1\}/);
   assert.match(strip, /aria-setsize=\{doc\.elements\.length\}/);
   assert.match(strip, /aria-label=\{describeElement\(e\)\}/);
@@ -758,14 +774,13 @@ test("every chip states its place in the set and carries the full sentence", () 
 });
 
 test("the count opens the whole set, and says it is a disclosure", () => {
-  assert.match(VIEW2, /className="sk-objects-toggle"/);
-  assert.match(VIEW2, /aria-expanded=\{stripOpen\}/);
-  const css = readFileSync(join(root, "apps/desktop/src/renderer/viewers/sketch.css"), "utf8");
+  assert.match(SURFACE, /className="sk-objects-toggle"/);
+  assert.match(SURFACE, /aria-expanded=\{stripOpen\}/);
   // Closed it is one scrolling row; open it wraps, bounded so listing the
   // drawing never costs more of the window than the drawing.
-  assert.match(css, /\.sk-objects-row \{[^}]*overflow-x: auto/s);
-  assert.match(css, /\.sk-objects-open \.sk-objects-row \{[^}]*flex-wrap: wrap/s);
-  assert.match(css, /\.sk-objects-open \.sk-objects-row \{[^}]*max-height/s);
+  assert.match(SKETCH_CSS, /\.sk-objects-row \{[^}]*overflow-x: auto/s);
+  assert.match(SKETCH_CSS, /\.sk-objects-open \.sk-objects-row \{[^}]*flex-wrap: wrap/s);
+  assert.match(SKETCH_CSS, /\.sk-objects-open \.sk-objects-row \{[^}]*max-height/s);
 });
 
 // ------------------------------------------------- which undo is which
@@ -792,19 +807,20 @@ test("an empty history says it is empty rather than nothing at all", () => {
 });
 
 test("the buttons say which undo they are, and the footer says it in words", () => {
-  assert.match(VIEW2, /aria-label="Undo drawing change"/);
-  assert.match(VIEW2, /aria-label="Redo drawing change"/);
+  assert.match(SURFACE, /aria-label="Undo drawing change"/);
+  assert.match(SURFACE, /aria-label="Redo drawing change"/);
   // Said in the footer because a disabled button cannot say it.
-  assert.match(VIEW2, /⌘Z undoes your typing here/);
-  assert.match(VIEW2, /toolbar’s undo covers the drawing/);
+  assert.match(SURFACE, /⌘Z undoes your typing here/);
+  assert.match(SURFACE, /toolbar’s undo covers the drawing/);
 });
 
 test("⌘Z inside a text field is still left alone", () => {
   // The fix is what the page SAYS, not what it does: the field's own undo was
   // always correct, and taking ⌘Z back would break the half that worked.
-  const keys = VIEW2.slice(VIEW2.indexOf("const onKey = (e: KeyboardEvent)"));
+  const keys = ACTIONS.slice(ACTIONS.indexOf("const onKey = (e: KeyboardEvent)"));
   assert.match(
     keys.slice(0, 400),
-    /el\.tagName === "INPUT" \|\| el\.tagName === "TEXTAREA"\)\) return;/,
+    /keyboardLeavesPageAlone\(pageRef\.current\)\) return;/,
   );
+  assert.match(SKETCH_VIEW, /element\.tagName === "INPUT" \|\| element\.tagName === "TEXTAREA"/);
 });

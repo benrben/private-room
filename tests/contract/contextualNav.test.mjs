@@ -18,9 +18,11 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import ts from "typescript";
+import { readReachableSource } from "../support/source-modules.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const read = (p) => readFileSync(join(root, p), "utf8");
+const reachable = (p) => readReachableSource(p);
 
 const load = async (source) => {
   const js = ts.transpileModule(source, {
@@ -36,16 +38,16 @@ const DESTINATIONS = read("apps/desktop/src/renderer/workspace/destinations.ts")
 const VISIBILITY = read("apps/desktop/src/renderer/workspace/fileVisibility.ts");
 const PAGES = read("apps/desktop/src/renderer/workspace/browserPages.ts");
 const TABS = read("apps/desktop/src/renderer/workspace/tabs.ts");
-const TYPES = read("apps/desktop/src/renderer/workspace/types.ts");
-const SHELL = read("apps/desktop/src/renderer/Workspace.tsx");
-const SIDEBAR = read("apps/desktop/src/renderer/workspace/Sidebar.tsx");
-const LAYOUT = read("apps/desktop/src/renderer/shell/useLayout.ts");
+const TYPES = reachable("apps/desktop/src/renderer/workspace/types.ts");
+const SHELL = reachable("apps/desktop/src/renderer/Workspace.tsx");
+const SIDEBAR = reachable("apps/desktop/src/renderer/workspace/Sidebar.tsx");
+const LAYOUT = reachable("apps/desktop/src/renderer/shell/useLayout.ts");
 const SCHEMA = read("apps/desktop/src/main/db-host/schema.sql");
-const MIGRATE = read("apps/desktop/src/main/db-host/migrate.ts");
+const MIGRATE = reachable("apps/desktop/src/main/db-host/migrate.ts");
 
 /** Every destination the rail can reach, read out of the runtime list so this
  * file cannot fall behind the union. */
-const AREAS = [...TYPES.matchAll(/^ {2}"(\w+)",$/gm)].map((m) => m[1]);
+const AREAS = [...read("apps/desktop/src/renderer/workspace/types.ts").matchAll(/^ {2}"(\w+)",$/gm)].map((m) => m[1]);
 
 const dest = await load(DESTINATIONS);
 const vis = await load(VISIBILITY);
@@ -370,37 +372,37 @@ test("the section is named the way the rail names it", () => {
 });
 
 test("promotion states the value instead of toggling it, so it is idempotent", () => {
-  const actions = read("apps/desktop/src/renderer/workspace/fileActions.ts");
+  const actions = reachable("apps/desktop/src/renderer/workspace/fileActions.ts");
   assert.match(actions, /api\.setFileInLibrary\(id, linked\)/);
   assert.doesNotMatch(actions, /setFileInLibrary\(id, !/, "a toggle would race the agent");
-  const host = read("apps/desktop/src/main/db-host/files.ts");
+  const host = reachable("apps/desktop/src/main/db-host/files.ts");
   assert.match(host, /SET files SET library_visibility|UPDATE files SET library_visibility/, "the value is stated");
   // Removing the Home reference must never touch the object itself.
   assert.doesNotMatch(host, /setLibraryVisibility[\s\S]{0,500}DELETE/);
 });
 
 test("removing from the Library says, in the UI, that it does not delete", () => {
-  const viewer = read("apps/desktop/src/renderer/workspace/ViewerPane.tsx");
+  const viewer = reachable("apps/desktop/src/renderer/workspace/ViewerPane.tsx");
   assert.match(viewer, /Remove from Library/);
   assert.match(viewer, /this does not delete it/);
   assert.match(viewer, /no duplicate/, "the Add dialog must rule out a copy");
 });
 
 test("the agent may promote, but is told not to do it on its own", () => {
-  const agent = read("apps/desktop/src/main/toolSpecs.ts");
+  const agent = reachable("apps/desktop/src/main/toolSpecs.ts");
   const spec = agent.slice(agent.indexOf('name: "set_in_library"'));
   const description = spec.slice(0, spec.indexOf('parameters:'));
   assert.match(description, /never automatically/);
   assert.match(description, /nothing is exported or copied/i);
   // …and the act is reported, like any other room write.
-  const arm = read("apps/desktop/src/main/organizeTools.ts");
+  const arm = reachable("apps/desktop/src/main/organizeTools.ts");
   assert.match(arm, /effects\.wrote = true/);
   assert.match(arm, /no copy was made/);
 });
 
 test("the agent can tell a section-only object from a Library one", () => {
   assert.match(
-    read("apps/desktop/src/main/db-host/files.ts"),
+    reachable("apps/desktop/src/main/db-host/files.ts"),
     /section only — in \$\{origin\}/,
   );
 });
@@ -521,7 +523,7 @@ test("a second attempt replaces the first failure rather than stacking on it", (
 });
 
 test("opening a file names it, offers the way back, and clears on success", () => {
-  const src = read("apps/desktop/src/renderer/workspace/fileActions.ts");
+  const src = reachable("apps/desktop/src/renderer/workspace/fileActions.ts");
   // `viewFile` is the door (it asks about an unsaved edit first — see
   // unsavedGuard.test.mjs); `openFile` is the read this test is about.
   const fn = src.slice(src.indexOf("async function openFile("));
@@ -544,16 +546,13 @@ test("opening a file names it, offers the way back, and clears on success", () =
 test("the destinations that hold their own documents say which", () => {
   const fn = TYPES.slice(TYPES.indexOf("export function areaHoldsFile"));
   const body = fn.slice(0, fn.indexOf("\n}"));
-  for (const [area, test_] of [
-    ["recordings", /isRecordingFile/],
-    ["scripts", /scripts\.some/],
-    ["sketch", /isSketchFile/],
-    ["create", /isCreationFile/],
-  ]) {
-    assert.match(body, new RegExp(`area === "${area}"`), `${area} must answer`);
-    assert.match(body, test_);
+  assert.match(body, /area === "scripts"[\s\S]*scripts\.some/);
+  assert.match(body, /holdsClassifiedFile\(area, file\)/);
+  const classified = TYPES.slice(TYPES.indexOf("function holdsClassifiedFile"));
+  for (const [area, test_] of [["recordings", /isRecordingFile/], ["sketch", /isSketchFile/], ["create", /isCreationFile/]]) {
+    assert.match(classified.slice(0, classified.indexOf("\n}")), new RegExp(`area === "${area}"[\\s\\S]*${test_.source}`), `${area} must answer`);
   }
-  assert.match(body, /return false;\s*$/, "anything else holds no files");
+  assert.match(classified.slice(0, classified.indexOf("\n}")), /return false;\s*$/, "anything else holds no files");
 });
 
 test("a creation is identified by where it came from, never by its pixels", () => {
@@ -566,7 +565,7 @@ test("a creation is identified by where it came from, never by its pixels", () =
 });
 
 test("a foreign document moves the app Home in one commit", () => {
-  const block = SHELL.slice(SHELL.indexOf("A DOCUMENT ALWAYS APPEARS"));
+  const block = SHELL.slice(SHELL.indexOf("const open = s.openFile"));
   const body = block.slice(0, block.indexOf("}, [s.openFile?.id"));
   assert.match(body, /areaHoldsFile\(area, open\.id, s\.files, s\.scripts\)/);
   assert.match(body, /s\.setArea\("files"\)/);
@@ -580,8 +579,8 @@ test("each destination remembers its own selection", () => {
   const block = SHELL.slice(SHELL.indexOf("const openArea = useCallback"));
   const body = block.slice(0, block.indexOf("[showArea, guardLeave"));
   assert.match(body, /lastFileRef\.current\[area\] =/, "remember on the way out");
-  assert.match(body, /lastFileRef\.current\[next\]/, "restore on the way in");
-  assert.match(body, /s\.files\.some\(\(f\) => f\.id === want\)/, "never reopen a deleted file");
+  assert.match(body, /restoreRememberedFile\(next, lastFileRef, s\.files, a\.viewFile\)/, "restore on the way in");
+  assert.match(SHELL, /lastFileRef\.current\[area\][\s\S]{0,100}files\.some\(\(file\) => file\.id === wanted\)/, "never reopen a deleted file");
 });
 
 /* ---------- 7. the column itself ---------- */
@@ -603,10 +602,12 @@ test("the browser's column lists pages and no longer explains where they are", (
 test("a page row can be closed without a pointer", () => {
   const nav = SIDEBAR.slice(SIDEBAR.indexOf("function PagesNav"));
   const body = nav.slice(0, nav.indexOf("\n/* ----------"));
-  assert.match(body, /e\.key === "Backspace" \|\| e\.key === "Delete"/);
-  assert.match(body, /aria-label=\{`Close \$\{pageAccessibleName\(p\)\}`\}/);
-  assert.match(body, /tabIndex=\{current \? 0 : -1\}/, "a tablist owes roving focus");
-  assert.match(body, /ArrowDown|ArrowUp/);
+  assert.match(SIDEBAR, /isPageCloseKey\(event\.key\)/);
+  assert.match(SIDEBAR, /onKeyDown=\{\(event\) => handlePageKey\(event, index, page, pages\)\}/);
+  assert.match(SIDEBAR, /return key === "Backspace" \|\| key === "Delete"/);
+  assert.match(SIDEBAR, /aria-label=\{`Close \$\{pageAccessibleName\(page\)\}`\}/);
+  assert.match(SIDEBAR, /tabIndex=\{current \? 0 : -1\}/, "a tablist owes roving focus");
+  assert.match(SIDEBAR, /ArrowDown|ArrowUp/);
 });
 
 test("the map's column is the map's, not the room's file list", () => {

@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import ts from "typescript";
+import { readReachableSource } from "../support/source-modules.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const source = readFileSync(join(root, "apps/desktop/src/renderer/workspaceOperationProgress.ts"), "utf8");
@@ -66,7 +67,7 @@ test("overlapping operations stay visible and updates replace only their own row
 });
 
 test("the renderer API subscribes to the Electron progress event", () => {
-  const api = readFileSync(join(root, "apps/desktop/src/renderer/api.ts"), "utf8");
+  const api = readReachableSource("apps/desktop/src/renderer/api.ts");
   const app = readFileSync(join(root, "apps/desktop/src/renderer/App.tsx"), "utf8");
   const surface = readFileSync(
     join(root, "apps/desktop/src/renderer/screens/WorkspaceOperationProgress.tsx"),
@@ -75,7 +76,7 @@ test("the renderer API subscribes to the Electron progress event", () => {
   assert.match(api, /onWorkspaceOperationProgress/);
   assert.match(api, /"workspace-operation-progress"/);
   assert.match(app, /api\.onWorkspaceOperationProgress/);
-  assert.match(app, /<WorkspaceOperationProgress operations=\{workspaceOperations\}/);
+  assert.match(readReachableSource("apps/desktop/src/renderer/App.tsx"), /<WorkspaceOperationProgress\s+operations=\{operations\}/);
   assert.match(surface, /aria-live="polite"/);
   assert.match(surface, /role="status"/);
   assert.match(surface, /<progress/);

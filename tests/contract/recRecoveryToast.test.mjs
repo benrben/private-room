@@ -9,10 +9,10 @@
  * very thing the message exists to report. The host now peeks and emits a copy,
  * so both copies can arrive and the workspace is what makes them one toast.
  *
- * That de-duplication is five lines inside `useWorkspaceEffects`' mount-once
- * effect, which closes over React state and cannot be imported. So it is SLICED
- * out of the shipped source and driven here against a fake workspace — the same
- * technique unsavedGuard/contextualNav use. Nothing below re-implements it.
+ * That de-duplication is five lines inside the mount-once workspace
+ * subscriptions, which close over React state and cannot be imported. So it is
+ * SLICED out of the shipped source and driven here against a fake workspace —
+ * the same technique unsavedGuard/contextualNav use. Nothing below re-implements it.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -22,18 +22,21 @@ import { dirname, join } from "node:path";
 import ts from "typescript";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "../..");
-const EFFECTS = readFileSync(join(root, "apps/desktop/src/renderer/workspace/effects.ts"), "utf8");
+const SUBSCRIPTIONS = readFileSync(
+  join(root, "apps/desktop/src/renderer/workspace/workspaceSubscriptions.ts"),
+  "utf8",
+);
 
 /** The recovery-delivery region: the de-duplicator, the `rec-error` listener
  * that routes through it, and the mount-time collection of the parked copy. */
 function recoveryRegion() {
-  const at = EFFECTS.indexOf("    const shownRecovery = new Set<string>();");
-  assert.notEqual(at, -1, "the recovery de-duplicator is gone from effects.ts");
-  const take = EFFECTS.indexOf(".takeRecRecoveryError()", at);
+  const at = SUBSCRIPTIONS.indexOf("    const shownRecovery = new Set<string>();");
+  assert.notEqual(at, -1, "the recovery de-duplicator is gone from workspaceSubscriptions.ts");
+  const take = SUBSCRIPTIONS.indexOf(".takeRecRecoveryError()", at);
   assert.notEqual(take, -1, "the mount-time collect no longer follows it");
-  const end = EFFECTS.indexOf(".catch(() => {});", take);
+  const end = SUBSCRIPTIONS.indexOf(".catch(() => {});", take);
   assert.notEqual(end, -1, "the collect's tail moved — this slice is stale");
-  return EFFECTS.slice(at, end + ".catch(() => {});".length);
+  return SUBSCRIPTIONS.slice(at, end + ".catch(() => {});".length);
 }
 
 const MODULE = [

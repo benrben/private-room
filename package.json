@@ -2,7 +2,7 @@
   "name": "arcelle",
   "private": true,
   "license": "UNLICENSED",
-  "version": "0.26.12",
+  "version": "0.26.13",
   "type": "module",
   "workspaces": [
     "apps/desktop"

@@ -8,6 +8,7 @@ import {
   runtimeAssetsOutputRoot,
   SHARED_RUNTIME_ASSETS,
 } from "./copyRuntimeAssets.mjs";
+import { PAGE_SCRIPT_FILES } from "../src/main/browser/pageScript.ts";
 
 const roots = [];
 afterEach(async () => {
@@ -15,6 +16,14 @@ afterEach(async () => {
 });
 
 describe("copyRuntimeAssets", () => {
+  it("packages every browser preload fragment registered by the main process", () => {
+    const packagedPageScripts = RUNTIME_ASSETS
+      .filter((parts) => parts[0] === "src" && parts[1] === "main" && parts[2] === "browser")
+      .map((parts) => parts.at(-1));
+
+    expect(packagedPageScripts).toEqual(PAGE_SCRIPT_FILES);
+  });
+
   it("targets the compiled-main runtime tree when a test build asks for it", () => {
     expect(runtimeAssetsOutputRoot("/app", ["--output-root", "dist_main"])).toBe("/app/dist_main");
     expect(runtimeAssetsOutputRoot("/app", [])).toBe("/app/dist_package");

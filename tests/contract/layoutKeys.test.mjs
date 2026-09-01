@@ -21,14 +21,8 @@ import ts from "typescript";
 const root = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const read = (p) => readFileSync(join(root, p), "utf8");
 
-const SRC = read("apps/desktop/src/renderer/shell/useLayout.ts");
-const fn =
-  SRC.slice(SRC.indexOf("const LAYOUT_PREFIX"), SRC.indexOf("/** The saved-layout key")) +
-  SRC.slice(
-    SRC.indexOf("export function layoutKey"),
-    SRC.indexOf("/** Drop every saved layout"),
-  );
-const JS = ts.transpileModule(fn, {
+const SRC = read("apps/desktop/src/renderer/shell/layoutState.ts");
+const JS = ts.transpileModule(SRC, {
   compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
 }).outputText;
 const { layoutKey } = await import(`data:text/javascript,${encodeURIComponent(JS)}`);
@@ -52,7 +46,7 @@ test("same name, different folder, different layout", () => {
 test("legacy name-keyed entries are swept, and clearing recents clears layouts", () => {
   assert.match(SRC, /function sweepLegacyLayoutKeys/);
   assert.ok(
-    /loadPersisted\(key: string\): Persisted \{\s*\n\s*sweepLegacyLayoutKeys\(\);/.test(SRC),
+    /loadPersistedLayout\(key: string\): PersistedLayout \{\s*\n\s*sweepLegacyLayoutKeys\(\);/.test(SRC),
     "nothing sweeps the old name-keyed entries on load",
   );
   const app = read("apps/desktop/src/renderer/App.tsx");

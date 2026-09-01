@@ -21,13 +21,14 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { readReachableSource } from "../support/source-modules.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, "../..");
 const read = (p) => readFileSync(join(root, p), "utf8");
 
 const VIEW = read("apps/desktop/src/renderer/workspace/ConnectorsView.tsx");
-const DRIVER = read("apps/desktop/src/renderer/agent/driver.ts");
+const DRIVER = readReachableSource("apps/desktop/src/renderer/agent/driver.ts");
 
 test("the Connectors page fences itself off from the UI-driving agent", () => {
   // The fence has to be on the page ROOT, not sprinkled on whichever control

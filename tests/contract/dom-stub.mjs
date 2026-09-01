@@ -334,8 +334,10 @@ export function install(scriptSource) {
   selectionText = "";
   g.getSelection = () => ({ toString: () => selectionText });
 
-  // The script guards against double-injection; clear the previous run's copy.
+  // The split preload guards both its public bridge and its private assembly
+  // scope. A fresh document gets neither, so clear both between fixtures.
   delete g.__arcelleBrowse;
+  delete g.__arcellePageScope;
   // eslint-disable-next-line no-new-func
   new Function(scriptSource)();
   return g.__arcelleBrowse;

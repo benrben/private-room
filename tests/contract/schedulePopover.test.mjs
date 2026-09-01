@@ -12,28 +12,18 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
-import ts from "typescript";
+import { loadTypescriptModule } from "../support/source-modules.mjs";
 
-const here = dirname(fileURLToPath(import.meta.url));
-const SOURCE = readFileSync(
-  join(here, "../../apps/desktop/src/renderer/workspace/workflows/SchedulePopover.tsx"),
-  "utf8",
-);
-const JS = ts.transpileModule(SOURCE, {
-  compilerOptions: {
-    module: ts.ModuleKind.ESNext,
-    target: ts.ScriptTarget.ES2022,
-    jsx: ts.JsxEmit.Preserve,
-  },
-}).outputText;
-// Strip the React/api imports: only the pure validator is under test, and the
-// module's own JSX never runs here.
-const PURE = JS.replace(/^import[^\n]*\n/gm, "");
 const { scheduleProblem } = await import(
-  `data:text/javascript,${encodeURIComponent(PURE.split("export function SchedulePopover")[0])}`
+  loadTypescriptModule(
+    "apps/desktop/src/renderer/workspace/workflows/SchedulePopover.tsx",
+    {
+      bare: {
+        react: import.meta.resolve("react"),
+        "react/jsx-runtime": import.meta.resolve("react/jsx-runtime"),
+      },
+    },
+  ),
 );
 
 test("Off needs nothing", () => {

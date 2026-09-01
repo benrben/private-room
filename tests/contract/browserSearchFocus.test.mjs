@@ -25,6 +25,7 @@ const root = join(here, "../..");
 
 const SEARCH = readFileSync(join(root, "apps/desktop/src/renderer/workspace/BrowserSearch.tsx"), "utf8");
 const VIEW = readFileSync(join(root, "apps/desktop/src/renderer/workspace/BrowserView.tsx"), "utf8");
+const CHROME = readFileSync(join(root, "apps/desktop/src/renderer/workspace/BrowserViewChrome.tsx"), "utf8");
 
 test("the focus guard's container is one BrowserView actually renders", () => {
   const m = SEARCH.match(/closest\("\.([a-z-]+)"\)/);
@@ -45,10 +46,7 @@ test("the address bar the user just submitted is inside that container", () => {
   const cls = SEARCH.match(/closest\("\.([a-z-]+)"\)/)[1];
   const open = VIEW.indexOf(`className="${cls}"`);
   assert.ok(open >= 0);
-  const address = VIEW.indexOf("ref={addressRef}");
-  assert.ok(address >= 0, "BrowserView no longer has an address input to be focused in");
-  assert.ok(
-    address > open,
-    "the address input is drawn outside the container the focus guard trusts",
-  );
+  assert.ok(VIEW.indexOf("<BrowserChrome", open) > open, "the trusted container does not compose the chrome");
+  assert.match(VIEW, /<BrowserChrome[\s\S]*?addressRef=\{addressRef\}/, "BrowserView does not hand its address ref to the chrome");
+  assert.match(CHROME, /<input\s*\n\s*ref=\{addressRef\}/, "the chrome no longer places that ref on its address input");
 });

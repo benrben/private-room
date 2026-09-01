@@ -34,32 +34,44 @@ const { branchFor, runDotClass } = await import(
 
 /* The param sheet's fan-in checkbox, run as the REAL function.
  *
- * A hand-written mirror of `toggleInput` would pass forever after the sheet
+ * A hand-written mirror of the fan-in toggle would pass forever after the sheet
  * regressed — the whole defect here was that the sheet disagreed with the rule
  * everything else followed. So the function is lifted verbatim out of
  * NodeParamSheet.tsx (which cannot simply be imported: it needs React) and run
  * with the four values it closes over injected. If someone deletes the
- * `branchFor` call from the sheet, this snippet changes with it and the test
+ * `branchFor` call from the sheet, this expression changes with it and the test
  * below fails. */
 const SHEET = readFileSync(
   join(here, "../../apps/desktop/src/renderer/workspace/workflows/NodeParamSheet.tsx"),
   "utf8",
 );
-function lift(name) {
-  const at = SHEET.indexOf(`function ${name}(`);
-  assert.notEqual(at, -1, `${name} is gone from NodeParamSheet.tsx`);
-  let depth = 0;
-  let end = SHEET.indexOf("{", at);
-  for (let i = end; i < SHEET.length; i++) {
-    if (SHEET[i] === "{") depth++;
-    else if (SHEET[i] === "}" && --depth === 0) {
-      end = i + 1;
-      break;
-    }
+const SHEET_TREE = ts.createSourceFile(
+  "NodeParamSheet.tsx",
+  SHEET,
+  ts.ScriptTarget.Latest,
+  true,
+  ts.ScriptKind.TSX,
+);
+const FAN_IN = SHEET_TREE.statements.find(
+  (statement) => ts.isFunctionDeclaration(statement) && statement.name?.text === "FanInEditor",
+);
+assert.ok(FAN_IN, "FanInEditor is gone from NodeParamSheet.tsx");
+let toggleExpression;
+function findToggle(node) {
+  if (
+    ts.isVariableDeclaration(node) &&
+    ts.isIdentifier(node.name) &&
+    node.name.text === "toggle" &&
+    node.initializer
+  ) {
+    toggleExpression = node.initializer.getText(SHEET_TREE);
+    return;
   }
-  return SHEET.slice(at, end);
+  ts.forEachChild(node, findToggle);
 }
-const TOGGLE_SRC = ts.transpileModule(lift("toggleInput"), {
+findToggle(FAN_IN);
+assert.ok(toggleExpression, "the fan-in toggle is gone from NodeParamSheet.tsx");
+const TOGGLE_SRC = ts.transpileModule(`const toggleInput = ${toggleExpression};`, {
   compilerOptions: { target: ts.ScriptTarget.ES2022 },
 }).outputText;
 function toggleInput(nodes, edges, fromId, toId) {

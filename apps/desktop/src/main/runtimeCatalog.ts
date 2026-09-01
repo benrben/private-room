@@ -213,12 +213,11 @@ export function pathPrefix(appDataDir: string): string {
 let prefixCell = "";
 
 /**
- * Recompute and publish the prefix. Call after a provision (and, once a
- * startup hook exists in this migration, at launch) — a runtime downloaded
- * mid-session must reach the next connector launch without a restart. Ported
- * from `refresh_path_prefix`, EXTENDED to also publish to `scriptRun.ts`'s
- * pre-existing stand-in cell (see this file's header for why there are two
- * cells here where Rust has one).
+ * Recompute and publish the prefix. Runtime IPC calls this at startup and
+ * after every provision, so both existing and newly downloaded runtimes reach
+ * the next connector launch. Ported from `refresh_path_prefix`, EXTENDED to
+ * also publish to `scriptRun.ts`'s pre-existing stand-in cell (see this file's
+ * header for why there are two cells here where Rust has one).
  */
 export function refreshPathPrefix(appDataDir: string): void {
   const next = pathPrefix(appDataDir);

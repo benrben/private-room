@@ -330,7 +330,12 @@ export function registerAllIpc(opts: RegisterAllIpcOptions): RegisterAllIpcResul
     trashItem: (targetPath) => shell.shell.trashItem(targetPath),
     currentRoomPath: () => state.room?.path ?? null,
   });
-  registerRuntimesIpc(recordingIpcMain, userDataDir, emit);
+  registerRuntimesIpc(
+    recordingIpcMain,
+    userDataDir,
+    emit,
+    () => refreshMcpConnections(state, liveServices),
+  );
 
   // ---- OpenRoom-shaped RoomSource modules ----
   registerDocxEditIpc(recordingIpcMain, roomSource, emit);

@@ -3,6 +3,17 @@
 All notable, user-facing changes to Arcelle. Versions follow
 [semver](https://semver.org); dates are the GitHub release dates.
 
+## 0.26.13 — 2026-09-01
+
+Browser automation is fully wired in packaged builds again. All five ordered
+page-preload fragments are now copied into the application, and packaging tests
+compare that asset list directly with the production registration manifest.
+
+Downloaded connector runtimes are discovered at startup, added to MCP server
+processes, and immediately retry the room's connectors after installation.
+The contract suite now follows the focused modules that own behavior after the
+quality refactor, with explicit dependency seams and fail-closed source loaders.
+
 ## 0.26.12 — 2026-09-01
 
 Arcelle's desktop and sidecar internals have been split into focused modules

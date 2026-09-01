@@ -10,12 +10,18 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { readReachableSource } from "../support/source-modules.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const read = (path) => readFileSync(join(root, path), "utf8");
+const reachable = (path) => readReachableSource(path);
+const readParts = (base, count) => Array.from(
+  { length: count },
+  (_, index) => read(`${base}.part-${String(index + 1).padStart(2, "0")}.css`),
+).join("\n");
 
 test("GH #19: Ignore dismisses only the memory suggestion and cannot submit the composer", () => {
-  const chat = read("apps/desktop/src/renderer/workspace/ChatPane.tsx");
+  const chat = reachable("apps/desktop/src/renderer/workspace/ChatPane.tsx");
   const start = chat.indexOf("Worth remembering?");
   const end = chat.indexOf("Always save", start);
   const card = chat.slice(start, end);
@@ -24,8 +30,8 @@ test("GH #19: Ignore dismisses only the memory suggestion and cannot submit the 
 });
 
 test("GH #20: long toast copy owns a flexible column instead of a 1–2 word sliver", () => {
-  const frame = read("apps/desktop/src/renderer/styles/settings.css");
-  const chrome = read("apps/desktop/src/renderer/styles/misc.css");
+  const frame = readParts("apps/desktop/src/renderer/styles/settings", 4);
+  const chrome = readParts("apps/desktop/src/renderer/styles/misc", 2);
   assert.match(frame, /\.toast\s*\{[\s\S]*?display:\s*grid;[\s\S]*?grid-template-columns:\s*auto minmax\(0,\s*1fr\) auto;/);
   assert.match(frame, /\.toast-text\s*\{[\s\S]*?grid-column:\s*2;[\s\S]*?min-width:\s*0;/);
   assert.match(frame, /width:\s*min\(420px,\s*calc\(100vw - 32px\)\);/);
@@ -33,26 +39,26 @@ test("GH #20: long toast copy owns a flexible column instead of a 1–2 word sli
 });
 
 test("GH #21 and #23: Home and Library are first-class sidebar destinations", () => {
-  const nav = read("apps/desktop/src/renderer/shell/navPrefs.tsx");
+  const nav = reachable("apps/desktop/src/renderer/shell/navPrefs.tsx");
   assert.match(nav, /key:\s*"home",\s*label:\s*"Home"/);
   assert.match(nav, /key:\s*"files",\s*label:\s*"Library"/);
   assert.match(nav, /DEFAULT_PINNED[^=]*=\s*\["home",\s*"files",\s*"recordings",\s*"browser",\s*"sketch"\]/);
 });
 
 test("GH #22: Recordings exposes capture, import guidance, a complete list, and row deletion", () => {
-  const sidebar = read("apps/desktop/src/renderer/workspace/Sidebar.tsx");
+  const sidebar = read("apps/desktop/src/renderer/workspace/SidebarDestinations.tsx");
   const start = sidebar.indexOf("function RecordingsNav");
-  const end = sidebar.indexOf("/* ---------- Workflows lens", start);
+  const end = sidebar.indexOf("export function", start + 1);
   const recordings = sidebar.slice(start, end);
   assert.match(recordings, /New live recording/);
   assert.match(recordings, /Voice note/);
   assert.match(recordings, /import audio\/video files/);
   assert.match(recordings, /recs\.map\(\(f\) => \(\s*<FileRow/);
-  const fileRow = read("apps/desktop/src/renderer/workspace/FileRow.tsx");
-  const overlays = read("apps/desktop/src/renderer/workspace/Overlays.tsx");
+  const fileRow = reachable("apps/desktop/src/renderer/workspace/FileRow.tsx");
+  const overlays = reachable("apps/desktop/src/renderer/workspace/Overlays.tsx");
   assert.match(fileRow, /title="More actions"/);
-  assert.match(overlays, /Remove \$\{s\.ctxMenu\.files\.length\} files from room/);
-  assert.match(overlays, /void a\.removeFile\(ids\[0\]\)/);
+  assert.match(overlays, /Remove \$\{menu\.files\.length\} files from room/);
+  assert.match(overlays, /removeContextFiles\(ids, a\)/);
 });
 
 test("GH #24: the long Hebrew translation regression exercises all 45 minutes", () => {
@@ -63,27 +69,28 @@ test("GH #24: the long Hebrew translation regression exercises all 45 minutes", 
 });
 
 test("GH #25: local model management has known-version choices, capabilities, and deletion", () => {
-  const models = read("apps/desktop/src/renderer/settings/ModelSection.tsx");
+  const models = reachable("apps/desktop/src/renderer/settings/ModelSection.tsx");
   assert.match(models, /data-testid="download-model-choice"/);
   assert.match(models, /qwen3\.5:0\.8b/);
   assert.match(models, /qwen3\.5:9b/);
   assert.match(models, /gemma3:4b/);
-  assert.match(models, /cap\.tools/);
-  assert.match(models, /cap\.vision/);
+  assert.match(models, /capability\.tools/);
+  assert.match(models, /capability\.vision/);
   assert.match(models, /<DeleteControl/);
-  assert.match(models, /confirmRemoveModel\(m\)/);
+  assert.match(models, /confirmRemoveModel\(name\)/);
 });
 
 test("GH #27: the shared model picker separates local models from cloud engines", () => {
-  const picker = read("apps/desktop/src/renderer/workspace/EngineModelPicker.tsx");
+  const picker = reachable("apps/desktop/src/renderer/workspace/EngineModelPicker.tsx");
   assert.match(picker, /role="tab"[\s\S]*?>\s*On this Mac\s*<\/button>/);
   assert.match(picker, /role="tab"[\s\S]*?>\s*Cloud\s*<\/button>/);
   assert.match(picker, /Claude Code, Codex, Antigravity/);
-  assert.match(picker, /ai\.external\.map\(\(engine\)/);
+  assert.match(picker, /engines:\s*ai\.external/);
+  assert.match(picker, /return engines\.map\(\(engine\)/);
 });
 
 test("GH #28: an edit prompt can grant a persistent per-room permission", () => {
-  const overlays = read("apps/desktop/src/renderer/workspace/Overlays.tsx");
+  const overlays = reachable("apps/desktop/src/renderer/workspace/Overlays.tsx");
   const actions = read("apps/desktop/src/renderer/workspace/miscActions.ts");
   assert.match(overlays, /Always allow in this room/);
   const start = actions.indexOf("async function alwaysAllowEdits");
@@ -99,7 +106,7 @@ test("GH #28: an edit prompt can grant a persistent per-room permission", () => 
 });
 
 test("GH #29: the GUI downloader detects Homebrew ffmpeg and requests mergeable streams", () => {
-  const downloader = read("apps/desktop/src/main/ytdlp.ts");
+  const downloader = reachable("apps/desktop/src/main/ytdlp.ts");
   const tests = read("apps/desktop/src/main/ytdlp.test.ts");
   assert.match(downloader, /"\/opt\/homebrew\/bin\/ffmpeg"/);
   assert.match(downloader, /bv\*\[vcodec\^=avc1\]\+ba/);
@@ -108,8 +115,8 @@ test("GH #29: the GUI downloader detects Homebrew ffmpeg and requests mergeable 
 });
 
 test("GH #4/#30: new rooms coexist while an opted-in room cleans echo without automatic gain", () => {
-  const mic = read("apps/desktop/src/renderer/workspace/liveRec.ts");
-  const effects = read("apps/desktop/src/renderer/workspace/effects.ts");
+  const mic = reachable("apps/desktop/src/renderer/workspace/liveRec.ts");
+  const effects = reachable("apps/desktop/src/renderer/workspace/effects.ts");
   const settings = read("apps/desktop/src/renderer/settings/MicSection.tsx");
   const qaMock = read("tests/support/qa-mock.js");
   assert.match(mic, /let voiceProcessing = false;/);
@@ -127,7 +134,7 @@ test("GH #31: transcription keeps clear speech and rejects periodic stock halluc
   const decoder = read("services/agent-sidecar/src/arcelle_sidecar/stt/live.py");
   assert.match(hallucinations, /is_stock_hallucination\("Thank you\."\)/);
   assert.match(hallucinations, /is_stock_hallucination\("Thank you\. Thank you\. Thank you\."\)/);
-  assert.match(decoder, /is_stock_hallucination\(text\) and mean_p < STOCK_MAX_CONFIDENCE/);
+  assert.match(decoder, /is_stock_hallucination\(text\) and mean_probability < STOCK_MAX_CONFIDENCE/);
   assert.match(recording, /test_retranscribe_rebuilds_a_corrupted_transcript_and_preserves_the_users_edits/);
   assert.match(recording, /assert "quick brown fox" in lowered/);
   assert.match(recording, /assert "tomorrow" in lowered or "agenda" in lowered/);
@@ -135,7 +142,7 @@ test("GH #31: transcription keeps clear speech and rejects periodic stock halluc
 });
 
 test("GH #32: a native display-size change enters one-pane mode and restores the wide layout", () => {
-  const layout = read("apps/desktop/src/renderer/shell/useLayout.ts");
+  const layout = reachable("apps/desktop/src/renderer/shell/useLayout.ts");
   const deep = read("tests/e2e/desktop/electron-deep.mjs");
   assert.match(layout, /const NARROW_QUERY = "\(max-width: 1080px\)"/);
   assert.match(layout, /mq\.addEventListener\("change", onChange\)/);
@@ -146,14 +153,14 @@ test("GH #32: a native display-size change enters one-pane mode and restores the
 });
 
 test("GH #33: installed remote connectors expose OAuth and dual-stack discovery can reach IPv4", () => {
-  const connectors = read("apps/desktop/src/renderer/workspace/ConnectorsView.tsx");
+  const connectors = reachable("apps/desktop/src/renderer/workspace/ConnectorsView.tsx");
   const guard = read("apps/desktop/src/main/browser/guard.ts");
   const oauthTests = read("apps/desktop/src/main/mcpOauth.test.ts");
   assert.match(connectors, /function RemoteOauthControls/);
-  assert.match(connectors, /s\.remote && <RemoteOauthControls server=\{s\.name\}/);
+  assert.match(connectors, /server\.remote && <RemoteOauthControls server=\{server\.name\}/);
   assert.match(connectors, /Connect account \(sign in\)/);
   assert.match(connectors, /api\.mcpOauthAuthorize\(server\)/);
-  assert.match(guard, /addrs\.find\(\(a\) => a\.family === 4\) \?\? addrs\[0\]/);
+  assert.match(guard, /addrs\.find\(\(address\) => address\.family === 4\) \?\? addrs\[0\]/);
   assert.match(oauthTests, /discovers, registers, and drives the whole authorize flow to a stored token/);
 });
 

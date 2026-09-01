@@ -22,21 +22,24 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { readReachableSource } from "../support/source-modules.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, "../..");
 const read = (p) => readFileSync(join(root, p), "utf8");
+const reachable = (p) => readReachableSource(p);
 
 /** Line comments, gone — comments around these seams necessarily describe
  * the door, so a comment-blind grep would read documentation as code. */
 const stripComments = (src) => src.replace(/\/\/[^\n]*/g, "");
 
 const AUDIO = stripComments(read("apps/desktop/src/main/studiosPodcastAudio.ts"));
+const AUDIO_REACHABLE = stripComments(reachable("apps/desktop/src/main/studiosPodcastAudio.ts"));
 const PODCAST = read("apps/desktop/src/main/studiosPodcast.ts");
-const JOBS = read("apps/desktop/src/main/creativeJobSurfaceIpc.ts");
+const JOBS = reachable("apps/desktop/src/main/creativeJobSurfaceIpc.ts");
 const PANEL = read("apps/desktop/src/renderer/workspace/PodcastPanel.tsx");
-const API = read("apps/desktop/src/renderer/api.ts");
-const CONTRACT = read("apps/desktop/src/shared/ipc-contract.ts");
+const API = reachable("apps/desktop/src/renderer/api.ts");
+const CONTRACT = reachable("apps/desktop/src/shared/ipc-contract.ts");
 const MOCK = read("tests/support/qa-mock.js");
 const CATALOG = read("apps/desktop/src/renderer/settings/voiceCatalog.ts");
 const SETTINGS = read("apps/desktop/src/renderer/settings/VoiceSection.tsx");
@@ -47,7 +50,7 @@ test("every line of an episode goes through the same door one sentence does", ()
   // service around it.
   assert.match(
     AUDIO,
-    /speakableText\(anyOpenDb\(rooms\), t\.line\)/,
+    /speakableText\(db, turn\.line\)/,
     "the recording path must go through speakableText",
   );
   // The ONLY sidecar call in the recording path is the synthesis one, and the
@@ -56,8 +59,7 @@ test("every line of an episode goes through the same door one sentence does", ()
   // one now (Stop must reach it mid-episode), and counting only the plain name
   // would have gone quiet on exactly the line it is here to watch.
   const renderAt = AUDIO.indexOf("export async function renderPodcastAudio");
-  const renderEnd = AUDIO.indexOf("export function timedTranscript", renderAt);
-  const render = AUDIO.slice(renderAt, renderEnd);
+  const render = AUDIO.slice(renderAt);
   const sidecarCalls = render.match(/sidecarJsonCancellable\(/g) || [];
   assert.equal(sidecarCalls.length, 1, "one outbound call, and it is the audited one");
   assert.match(render, /"\/tts\/podcast"/);
@@ -65,7 +67,7 @@ test("every line of an episode goes through the same door one sentence does", ()
   // shared body rather than a path of its own.
   assert.match(AUDIO, /return speakOne\(db, text, voice, rate, pitch\)/);
   assert.match(
-    AUDIO,
+    AUDIO_REACHABLE,
     /export async function speakOne[\s\S]{0,900}speakableText\(db, trimmed\)/,
     "the shared speak body must itself go through the door",
   );
@@ -75,8 +77,8 @@ test("the transcript records what was spoken, not what the script said", () => {
   // With the door on, the line that LEFT is the redacted one. Writing the
   // original beside audio of the placeholder would be the app disagreeing with
   // itself about what left this Mac.
-  assert.match(AUDIO, /spoken\.push\(text\)/);
-  assert.match(AUDIO, /export function timedTranscript\([\s\S]{0,500}spoken: readonly string\[\]/);
+  assert.match(AUDIO, /spoken\.push\(rendered\.text\)/);
+  assert.match(AUDIO_REACHABLE, /export function timedTranscript\([\s\S]{0,500}spoken: readonly string\[\]/);
 });
 
 test("the panel states the redaction consequence before the Record button", () => {
@@ -92,7 +94,7 @@ test("the panel states the redaction consequence before the Record button", () =
   const cloudAt = PANEL.indexOf("Recording uses a cloud voice");
   assert.ok(cloudAt !== -1 && cloudAt < recordAt);
   // An offline room cannot record, and the button says so rather than failing.
-  assert.match(PANEL, /disabled=\{!s\.webOn \|\| dirty\}/);
+  assert.match(PANEL, /disabled=\{!webOn \|\| dirty\}/);
 });
 
 test("the generated page no longer promises audio as a future feature", () => {
@@ -135,9 +137,9 @@ test("a fresh cast never gives two hosts the same voice", () => {
   // Two hosts in one voice is not a two-voice podcast — it is one narrator
   // reading a dialogue, which is the thing this feature exists to stop being.
   assert.match(CATALOG, /export function suggestDistinctVoices/);
-  assert.match(CATALOG, /!picked\.includes\(v\.id\)/);
+  assert.match(CATALOG, /!picked\.includes\(voice\.id\)/);
   // …and it prefers the other gender first, the strongest "different person" cue.
-  assert.match(CATALOG, /v\.gender !== lastGender/);
+  assert.match(CATALOG, /voice\.gender !== lastGender/);
 });
 
 test("every podcast command is registered, invoked and faked", () => {
@@ -171,7 +173,7 @@ test("the cast a host is saved under is trimmed, or their lines fall to the defa
   // Ada's own lines, and the whole episode reads her in the default voice,
   // discovered after a multi-minute cloud render. The panel is the only writer
   // of a typed name, so it trims on the way in.
-  assert.match(AUDIO, /eqIgnoreAsciiCase\(h\.name, t\.speaker\.trim\(\)\)/);
+  assert.match(AUDIO, /eqIgnoreAsciiCase\(host\.name, turn\.speaker\.trim\(\)\)/);
   const sent = PANEL.match(/setPodcastCast\(fileId,\s*([A-Za-z_]\w*)\)/);
   assert.ok(sent, "the panel saves the cast through setPodcastCast");
   assert.match(

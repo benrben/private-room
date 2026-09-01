@@ -14,12 +14,14 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync, existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { dirname, join, resolve } from "node:path";
-import ts from "typescript";
+import { dirname, join } from "node:path";
 import { renderToStaticMarkup } from "react-dom/server";
 import { createElement } from "react";
+import {
+  loadTypescriptModule,
+  readReachableSource,
+} from "../support/source-modules.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const SRC = join(here, "../../apps/desktop/src/renderer");
@@ -31,77 +33,22 @@ const BARE = {
   "react/jsx-runtime": import.meta.resolve("react/jsx-runtime"),
 };
 
-const asData = (src) => `data:text/javascript,${encodeURIComponent(src)}`;
-const FROM_RE = /(?:import|export)\s+([\s\S]*?)\s+from\s+"([^"]+)";/g;
-
-function bindingsOf(clause) {
-  const names = [];
-  const braced = clause.match(/\{([\s\S]*)\}/);
-  if (braced) {
-    for (const raw of braced[1].split(",")) {
-      const n = raw.trim().split(/\s+as\s+/).pop().trim();
-      if (n) names.push(n);
-    }
-  }
-  const head = clause.replace(/\{[\s\S]*\}/, "").replace(/,\s*$/, "").trim();
-  return { names, hasDefault: Boolean(head) };
-}
-
-function stubModule(clause) {
-  const { names, hasDefault } = bindingsOf(clause);
-  const body = [
-    "const inert = () => null;",
-    ...names.map((n) => `export const ${n} = inert;`),
-    hasDefault ? "export default inert;" : "",
-  ].join("\n");
-  return asData(body);
-}
-
-function loadReal(absPath, stubbed, cache = new Map()) {
-  const hit = cache.get(absPath);
-  if (hit) return hit;
-  const jsx = absPath.endsWith(".tsx");
-  let js = ts.transpileModule(readFileSync(absPath, "utf8"), {
-    compilerOptions: {
-      module: ts.ModuleKind.ESNext,
-      target: ts.ScriptTarget.ES2022,
-      ...(jsx ? { jsx: ts.JsxEmit.ReactJSX } : {}),
-    },
-  }).outputText;
-
-  js = js.replace(FROM_RE, (whole, clause, spec) => {
-    const swap = (url) => whole.replace(`"${spec}"`, JSON.stringify(url));
-    if (BARE[spec]) return swap(BARE[spec]);
-    if (spec.startsWith("@tauri-apps/")) return swap(stubModule(clause));
-    if (spec.startsWith(".")) {
-      const base = resolve(dirname(absPath), spec);
-      const target = [".ts", ".tsx", "/index.ts"].map((ext) => base + ext).find(existsSync);
-      assert.ok(target, `cannot resolve ${spec} from ${absPath}`);
-      if (stubbed.has(target)) return swap(stubModule(clause));
-      return swap(loadReal(target, stubbed, cache));
-    }
-    return swap(stubModule(clause));
-  });
-
-  // `GUIDANCE_OPENERS` is private to ScriptRow.tsx and should stay that way —
-  // nothing else in the app reads the runner's wording. Re-exporting it here
-  // keeps the drift check pointed at the shipped list rather than a copy.
-  if (absPath.endsWith("ScriptRow.tsx")) js += "\nexport { GUIDANCE_OPENERS };\n";
-
-  const url = asData(js);
-  cache.set(absPath, url);
-  return url;
-}
-
 // The row's neighbours are not what this test is about: the icon set, the
 // schedule popover and the run-history panel.
-const STUBS = new Set(
+const STUBS = new Map(
   ["icons.tsx", "workspace/workflows/SchedulePopover.tsx", "workspace/workflows/RunHistory.tsx"].map(
-    (p) => join(SRC, p),
+    (p) => [join(SRC, p), {}],
   ),
 );
+const PRIVATE_EXPORTS = new Map([
+  [join(SRC, "workspace/scripts/ScriptRow.tsx"), "\nexport { GUIDANCE_OPENERS };\n"],
+]);
 const { ScriptRow, GUIDANCE_OPENERS } = await import(
-  loadReal(join(SRC, "workspace/scripts/ScriptRow.tsx"), STUBS)
+  loadTypescriptModule(join(SRC, "workspace/scripts/ScriptRow.tsx"), {
+    bare: BARE,
+    stubs: STUBS,
+    append: PRIVATE_EXPORTS,
+  }),
 );
 
 /** Word-for-word what `script_run.rs` stores for a package it could not
@@ -200,10 +147,7 @@ test("a chained traceback has no advice, so the card offers none", () => {
 });
 
 test("the guidance openers are the words the runner actually writes", () => {
-  const host = readFileSync(
-    join(here, "../../apps/desktop/src/main/scriptRun.ts"),
-    "utf8",
-  );
+  const host = readReachableSource("apps/desktop/src/main/scriptRun.ts");
   assert.ok(GUIDANCE_OPENERS.length >= 2, "the openers list did not load");
   for (const opener of GUIDANCE_OPENERS) {
     assert.ok(
